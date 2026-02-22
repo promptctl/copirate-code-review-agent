@@ -11,10 +11,10 @@ AI-powered GitHub Pull Request code review using Z.ai models. Automatic PR comme
 
 ## Quickstart
 
-Add this to your `.github/workflows/ai-review.yml`:
+Add this to your `.github/workflows/code-review.yml`:
 
 ```yaml
-name: AI Code Review
+name: AI Code Review with Z.ai
 
 on:
   pull_request:
@@ -26,10 +26,13 @@ permissions:
 
 jobs:
   review:
+    name: Review
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: tarmojussila/zai-code-review@main
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Code Review
+        uses: tarmojussila/zai-code-review@v0.1.1
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
