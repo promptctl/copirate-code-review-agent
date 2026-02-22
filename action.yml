@@ -1,5 +1,5 @@
 name: "Z.ai Code Review"
-description: "AI-powered PR code review using Z.ai models"
+description: "AI-powered code review using Z.ai models"
 inputs:
   ZAI_API_KEY:
     description: "Z.ai API key"
