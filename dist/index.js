@@ -31839,6 +31839,7 @@ const github = __nccwpck_require__(3228);
 const https = __nccwpck_require__(5692);
 
 const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
+const COMMENT_MARKER = '<!-- zai-code-review -->';
 
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
   const { data: files } = await octokit.rest.pulls.listFiles({
@@ -31934,15 +31935,32 @@ async function run() {
 
   core.info(`Sending ${files.length} file(s) to Z.ai for review...`);
   const review = await callZaiApi(apiKey, model, prompt);
+  const body = `## Z.ai Code Review\n\n${review}\n\n${COMMENT_MARKER}`;
 
-  await octokit.rest.issues.createComment({
+  const { data: comments } = await octokit.rest.issues.listComments({
     owner,
     repo,
     issue_number: pullNumber,
-    body: `## Z.ai Code Review\n\n${review}`,
   });
+  const existing = comments.find(c => c.body.includes(COMMENT_MARKER));
 
-  core.info('Review posted successfully.');
+  if (existing) {
+    await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: existing.id,
+      body,
+    });
+    core.info('Review comment updated.');
+  } else {
+    await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: pullNumber,
+      body,
+    });
+    core.info('Review comment posted.');
+  }
 }
 
 run().catch(err => core.setFailed(err.message));
