@@ -13,4 +13,4 @@ runs:
   main: "dist/index.js"
 branding:
   icon: "check-circle"
-  color: "black"
+  color: "gray-dark"
