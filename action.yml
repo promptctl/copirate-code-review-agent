@@ -11,6 +11,7 @@ inputs:
   GITHUB_TOKEN:
     description: "GitHub token for API access"
     required: false
+    default: ${{ github.token }}
 runs:
   using: "node20"
   main: "dist/index.js"
