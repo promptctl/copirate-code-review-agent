@@ -42,6 +42,7 @@ jobs:
 | `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
 | `ZAI_MODEL` | No | `glm-4.7` | Z.ai model to use for review |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Custom system prompt for the AI reviewer |
+| `ZAI_REVIEWER_NAME` | No | `Z.ai Code Review` | Name shown in the review comment header |
 
 The default system prompt is:
 

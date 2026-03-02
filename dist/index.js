@@ -31917,6 +31917,7 @@ async function run() {
   core.setSecret(apiKey);
   const model = core.getInput('ZAI_MODEL') || 'glm-4.7';
   const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT') || 'You are an expert code reviewer. Review the provided code changes and give clear, actionable feedback.';
+  const reviewerName = core.getInput('ZAI_REVIEWER_NAME') || 'Z.ai Code Review';
   const token = core.getInput('GITHUB_TOKEN') || process.env.GITHUB_TOKEN;
 
   const { context } = github;
@@ -31942,7 +31943,7 @@ async function run() {
 
   core.info(`Sending ${files.length} file(s) to Z.ai for review...`);
   const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
-  const body = `## Z.ai Code Review\n\n${review}\n\n${COMMENT_MARKER}`;
+  const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
 
   const { data: comments } = await octokit.rest.issues.listComments({
     owner,
