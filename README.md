@@ -29,8 +29,6 @@ jobs:
     name: Review
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
       - name: Code Review
         uses: tarmojussila/zai-code-review@v0.2.0
         with:
@@ -44,6 +42,7 @@ jobs:
 | `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
 | `ZAI_MODEL` | No | `glm-4.7` | Z.ai model to use for review |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Custom system prompt for the AI reviewer |
+| `ZAI_REVIEWER_NAME` | No | `Z.ai Code Review` | Name shown in the review comment header |
 
 The default system prompt is:
 
@@ -72,7 +71,7 @@ Generate an API key from your Z.ai dashboard.
 
 ## Advanced configuration
 
-Instead of using default values for `ZAI_MODEL` and `ZAI_SYSTEM_PROMPT`, you can override them, and manage them as GitHub Actions variables. This lets you update the model or review prompt without touching the workflow file.
+Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_REVIEWER_NAME`, you can override them, and manage them as GitHub Actions variables. This lets you update the model, review prompt, or reviewer name without touching the workflow file.
 
 ### 1️⃣ Add the variables to your repository
 
@@ -84,6 +83,7 @@ Instead of using default values for `ZAI_MODEL` and `ZAI_SYSTEM_PROMPT`, you can
 
    - **Name:** `ZAI_MODEL` — **Value:** e.g. `glm-4.7`
    - **Name:** `ZAI_SYSTEM_PROMPT` — **Value:** your custom system prompt
+   - **Name:** `ZAI_REVIEWER_NAME` — **Value:** e.g. `AI Code Review`
 
 ### 2️⃣ Reference them in your workflow
 
@@ -94,6 +94,7 @@ Instead of using default values for `ZAI_MODEL` and `ZAI_SYSTEM_PROMPT`, you can
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
           ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
+          ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
 ```
 
 ## Contributing
