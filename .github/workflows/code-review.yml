@@ -13,8 +13,6 @@ jobs:
     name: Review
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
       - name: Code Review
         uses: tarmojussila/zai-code-review@v0.2.0
         with:
