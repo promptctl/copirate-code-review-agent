@@ -5,6 +5,7 @@ const https = require('https');
 const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
 const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 300_000;
 
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
   const files = [];
@@ -91,6 +92,9 @@ function callZaiApi(apiKey, model, systemPrompt, prompt) {
     });
 
     req.on('error', reject);
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error('Z.ai API request timed out.'));
+    });
     req.write(body);
     req.end();
   });
