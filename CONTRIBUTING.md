@@ -1,4 +1,4 @@
-# Contributing to Z.ai Code Review
+# Contributing
 
 Thank you for your interest in contributing!
 
