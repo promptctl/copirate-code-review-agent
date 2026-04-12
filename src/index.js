@@ -10,8 +10,9 @@ const REQUEST_TIMEOUT_MS = 300_000;
 function matchesPattern(filename, pattern) {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '.*')
-    .replace(/\*/g, '[^/]*');
+    .replace(/\*\*/g, '\x00')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\x00/g, '.*');
   const regex = new RegExp(`^${escaped}$`);
   const basename = filename.split('/').pop();
   return regex.test(filename) || regex.test(basename);
