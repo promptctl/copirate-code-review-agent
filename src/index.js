@@ -7,6 +7,23 @@ const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 300_000;
 
+function matchesPattern(filename, pattern) {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*');
+  const regex = new RegExp(`^${escaped}$`);
+  const basename = filename.split('/').pop();
+  return regex.test(filename) || regex.test(basename);
+}
+
+function filterFiles(files, excludePatterns) {
+  if (!excludePatterns || excludePatterns.length === 0) {
+    return files;
+  }
+  return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
+}
+
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
   const files = [];
   let page = 1;
@@ -25,11 +42,27 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
   return files;
 }
 
-function buildPrompt(files) {
-  const diffs = files
-    .filter(f => f.patch)
-    .map(f => `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.patch}\n\`\`\``)
-    .join('\n\n');
+function buildPrompt(files, maxDiffChars) {
+  const patchableFiles = files.filter(f => f.patch);
+  const includedDiffs = [];
+  const skippedFiles = [];
+  let totalChars = 0;
+
+  for (const f of patchableFiles) {
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
+      skippedFiles.push(f.filename);
+    } else {
+      includedDiffs.push(entry);
+      totalChars += entry.length;
+    }
+  }
+
+  let diffs = includedDiffs.join('\n\n');
+
+  if (skippedFiles.length > 0) {
+    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
+  }
 
   return `Please review the following pull request changes and provide concise, constructive feedback. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments.\n\n${diffs}`;
 }
@@ -106,6 +139,11 @@ async function run() {
   const model = core.getInput('ZAI_MODEL');
   const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
+  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
+    .split(',')
+    .map(p => p.trim())
+    .filter(p => p.length > 0);
+  const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
 
@@ -123,14 +161,23 @@ async function run() {
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const files = await getChangedFiles(octokit, owner, repo, pullNumber);
 
-  if (!files.some(f => f.patch)) {
-    core.info('No patchable changes found. Skipping review.');
+  const filteredFiles = filterFiles(files, excludePatterns);
+
+  if (excludePatterns.length > 0) {
+    const excluded = files.length - filteredFiles.length;
+    if (excluded > 0) {
+      core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
+    }
+  }
+
+  if (!filteredFiles.some(f => f.patch)) {
+    core.info('No patchable changes found after filtering. Skipping review.');
     return;
   }
 
-  const prompt = buildPrompt(files);
+  const prompt = buildPrompt(filteredFiles, maxDiffChars);
 
-  core.info(`Sending ${files.length} file(s) to Z.ai for review...`);
+  core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
   const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
   const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
 
