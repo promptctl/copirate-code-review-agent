@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.3.0
+        uses: tarmojussila/zai-code-review@v0.4.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -42,6 +42,8 @@ jobs:
 | `ZAI_MODEL` | No | `glm-4.7` | Z.ai model to use for review |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Custom system prompt for the AI reviewer |
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Code Review` | Name shown in the review comment header |
+| `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
+| `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to the API |
 
 The default system prompt is:
 
@@ -88,7 +90,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 
 ```yaml
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.3.0
+        uses: tarmojussila/zai-code-review@v0.4.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
