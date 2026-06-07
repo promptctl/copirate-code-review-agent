@@ -1,15 +1,15 @@
 name: "Z.ai Code Review"
-description: "AI-powered code review using Z.ai models"
+description: "AI-powered code review using Claude Code with Z.ai Coding Plan credentials"
 inputs:
   ZAI_API_KEY:
     description: "Z.ai API key"
     required: true
   ZAI_MODEL:
-    description: "Z.ai AI model"
+    description: "Model passed to Claude Code"
     required: false
     default: "glm-4.7"
   ZAI_SYSTEM_PROMPT:
-    description: "Custom system prompt for the AI reviewer"
+    description: "Additional system prompt appended to Claude Code"
     required: false
     default: "You are an expert code reviewer. Review the provided code changes and give clear, actionable feedback."
   ZAI_REVIEWER_NAME:

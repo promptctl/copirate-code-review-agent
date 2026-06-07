@@ -1,11 +1,25 @@
 const core = require('@actions/core');
 const github = require('@actions/github');
-const https = require('https');
+const { spawn } = require('child_process');
 
-const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
+const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
+const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 300_000;
+const CLAUDE_TIMEOUT_MS = 3_000_000;
+const CLAUDE_MAX_TURNS = '8';
+const CLAUDE_ALLOWED_TOOLS = [
+  'Read',
+  'Grep',
+  'Glob',
+];
+const CLAUDE_DISALLOWED_TOOLS = [
+  'Bash',
+  'Edit',
+  'Write',
+  'WebFetch',
+  'WebSearch',
+];
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -65,72 +79,133 @@ function buildPrompt(files, maxDiffChars) {
     diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
   }
 
-  return `Please review the following pull request changes and provide concise, constructive feedback. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments.\n\n${diffs}`;
+  return `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return only the review comment body. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments.\n\n${diffs}`;
 }
 
-function callZaiApi(apiKey, model, systemPrompt, prompt) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'system',
-          content: systemPrompt,
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    });
+function buildClaudeArgs(model, systemPrompt) {
+  const args = [
+    '-y',
+    `${CLAUDE_CODE_PACKAGE}@latest`,
+    '-p',
+    '--output-format',
+    'json',
+    '--no-session-persistence',
+    '--max-turns',
+    CLAUDE_MAX_TURNS,
+    '--tools',
+    'Read,Grep,Glob',
+    '--allowedTools',
+    CLAUDE_ALLOWED_TOOLS.join(','),
+    '--disallowedTools',
+    CLAUDE_DISALLOWED_TOOLS.join(','),
+    '--permission-mode',
+    'dontAsk',
+  ];
 
-    const url = new URL(ZAI_API_URL);
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(body),
-      },
+  if (model) {
+    args.push('--model', model);
+  }
+
+  if (systemPrompt) {
+    args.push('--append-system-prompt', systemPrompt);
+  }
+
+  args.push('Review the pull request instructions and diff from stdin.');
+
+  return args;
+}
+
+function parseClaudeOutput(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error('Claude Code returned invalid JSON.');
+  }
+
+  if (parsed.is_error || parsed.subtype === 'error') {
+    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
+  }
+
+  if (typeof parsed.result !== 'string' || parsed.result.trim().length === 0) {
+    throw new Error('Claude Code returned an empty review result.');
+  }
+
+  return parsed.result.trim();
+}
+
+function runClaudeCode(apiKey, model, systemPrompt, prompt) {
+  return new Promise((resolve, reject) => {
+    // [LAW:single-enforcer] Z.ai auth is translated exactly once at the agent runner boundary.
+    const env = {
+      ...process.env,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+      ANTHROPIC_BASE_URL: ZAI_ANTHROPIC_BASE_URL,
+      ANTHROPIC_MODEL: model,
+      API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
+      CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+      NO_COLOR: '1',
+    };
+    const child = spawn('npx', buildClaudeArgs(model, systemPrompt), {
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finish = result => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      result();
     };
 
-    const req = https.request(options, res => {
-      let data = '';
-      res.on('data', chunk => {
-        data += chunk;
-        if (data.length > MAX_RESPONSE_SIZE) {
-          req.destroy(new Error('Z.ai API response exceeded size limit.'));
-        }
+    const timeout = setTimeout(() => {
+      finish(() => {
+        child.kill('SIGTERM');
+        reject(new Error('Claude Code review timed out.'));
       });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          let parsed;
-          try {
-            parsed = JSON.parse(data);
-          } catch {
-            reject(new Error('Z.ai API returned invalid JSON.'));
-            return;
-          }
-          const content = parsed.choices?.[0]?.message?.content;
-          if (!content) {
-            reject(new Error('Z.ai API returned an empty response.'));
-          } else {
-            resolve(content);
-          }
-        } else {
-          reject(new Error(`Z.ai API error ${res.statusCode}: ${data.slice(0, 200)}`));
+    }, CLAUDE_TIMEOUT_MS);
+
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      if (stdout.length > MAX_RESPONSE_SIZE) {
+        finish(() => {
+          child.kill('SIGTERM');
+          reject(new Error('Claude Code response exceeded size limit.'));
+        });
+      }
+    });
+
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+      if (stderr.length > MAX_RESPONSE_SIZE) {
+        stderr = stderr.slice(-MAX_RESPONSE_SIZE);
+      }
+    });
+
+    child.on('error', err => {
+      finish(() => reject(err));
+    });
+
+    child.on('close', code => {
+      finish(() => {
+        if (code !== 0) {
+          reject(new Error(`Claude Code exited with status ${code}: ${stderr.slice(-2000)}`));
+          return;
+        }
+        try {
+          resolve(parseClaudeOutput(stdout));
+        } catch (err) {
+          reject(err);
         }
       });
     });
 
-    req.on('error', reject);
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error('Z.ai API request timed out.'));
-    });
-    req.write(body);
-    req.end();
+    child.stdin.end(prompt);
   });
 }
 
@@ -178,8 +253,9 @@ async function run() {
 
   const prompt = buildPrompt(filteredFiles, maxDiffChars);
 
-  core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
-  const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
+  // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
+  core.info(`Running Claude Code with Z.ai credentials for ${filteredFiles.length} file(s)...`);
+  const review = await runClaudeCode(apiKey, model, systemPrompt, prompt);
   const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
 
   const { data: comments } = await octokit.rest.issues.listComments({
