@@ -7,7 +7,7 @@ const { spawn } = require('child_process');
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
-const COMMENT_MARKER = '<!-- zai-coding-agent-review -->';
+const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 3_000_000;
 const CLAUDE_MAX_TURNS = '8';
@@ -44,6 +44,39 @@ function filterFiles(files, excludePatterns) {
   return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
 }
 
+function buildPatchAnchors(file) {
+  const anchors = new Set();
+  let leftLine = 0;
+  let rightLine = 0;
+
+  for (const line of file.patch.split('\n')) {
+    if (line.length === 0) {
+      continue;
+    }
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      leftLine = Number(hunk[1]);
+      rightLine = Number(hunk[2]);
+    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+      anchors.add(`${file.filename}:${rightLine}:RIGHT`);
+      rightLine++;
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      anchors.add(`${file.filename}:${leftLine}:LEFT`);
+      leftLine++;
+    } else if (!line.startsWith('\\')) {
+      anchors.add(`${file.filename}:${rightLine}:RIGHT`);
+      leftLine++;
+      rightLine++;
+    }
+  }
+
+  return anchors;
+}
+
+function buildReviewAnchors(files) {
+  return new Set(files.filter(f => f.patch).flatMap(f => [...buildPatchAnchors(f)]));
+}
+
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
   const files = [];
   let page = 1;
@@ -62,9 +95,10 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
   return files;
 }
 
-function buildPrompt(files, maxDiffChars) {
+function buildReviewInput(files, maxDiffChars) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
+  const includedFiles = [];
   const skippedFiles = [];
   let totalChars = 0;
 
@@ -74,6 +108,7 @@ function buildPrompt(files, maxDiffChars) {
       skippedFiles.push(f.filename);
     } else {
       includedDiffs.push(entry);
+      includedFiles.push(f);
       totalChars += entry.length;
     }
   }
@@ -84,7 +119,11 @@ function buildPrompt(files, maxDiffChars) {
     diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
   }
 
-  return `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return only the review comment body. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments.\n\n${diffs}`;
+  return {
+    // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
+    files: includedFiles,
+    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return only minified JSON with this exact shape: {"summary":"one concise sentence","findings":[{"path":"file path from diff","line":123,"side":"RIGHT","body":"actionable review comment"}]}. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. Return {"summary":"No findings.","findings":[]} when there are no bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests.\n\n${diffs}`,
+  };
 }
 
 function buildClaudeArgs(model, systemPrompt) {
@@ -137,6 +176,66 @@ function parseClaudeOutput(stdout) {
   }
 
   return parsed.result.trim();
+}
+
+function parseReview(review) {
+  let parsed;
+  try {
+    parsed = JSON.parse(review);
+  } catch {
+    throw new Error('Claude Code returned review text that was not valid JSON.');
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Claude Code returned a review JSON value with the wrong shape.');
+  }
+
+  if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
+    throw new Error('Claude Code review JSON must include a non-empty summary.');
+  }
+  const summary = parsed.summary.trim();
+  if (!Array.isArray(parsed.findings)) {
+    throw new Error('Claude Code review JSON must include a findings array.');
+  }
+
+  const findings = parsed.findings.map((finding, index) => {
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      throw new Error(`Claude Code finding ${index + 1} is not an object.`);
+    }
+    const pathValue = finding.path;
+    const line = finding.line;
+    const side = finding.side;
+    const body = finding.body;
+    if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid path.`);
+    }
+    if (!Number.isInteger(line) || line <= 0) {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid line.`);
+    }
+    if (side !== 'RIGHT' && side !== 'LEFT') {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid side.`);
+    }
+    if (typeof body !== 'string' || body.trim().length === 0) {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid body.`);
+    }
+    return {
+      path: pathValue.trim(),
+      line,
+      side,
+      body: body.trim(),
+    };
+  });
+
+  return { summary, findings };
+}
+
+function validateFindings(findings, anchors) {
+  for (const finding of findings) {
+    const anchor = `${finding.path}:${finding.line}:${finding.side}`;
+    if (!anchors.has(anchor)) {
+      throw new Error(`Claude Code finding references a line outside the review diff: ${anchor}`);
+    }
+  }
 }
 
 function createReviewerHome() {
@@ -224,6 +323,31 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
   });
 }
 
+async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review) {
+  const event = review.findings.length > 0 ? 'REQUEST_CHANGES' : 'APPROVE';
+  const body = `## ${reviewerName}\n\n${review.summary}\n\n${REVIEW_MARKER}`;
+  const comments = review.findings.map(finding => ({
+    path: finding.path,
+    line: finding.line,
+    side: finding.side,
+    body: finding.body,
+  }));
+  const reviewRequest = {
+    owner,
+    repo,
+    pull_number: pullNumber,
+    commit_id: commitId,
+    event,
+    body,
+  };
+
+  // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
+  await octokit.rest.pulls.createReview({
+    ...reviewRequest,
+    ...(comments.length > 0 ? { comments } : {}),
+  });
+}
+
 async function run() {
   const apiKey = core.getInput('ZAI_API_KEY', { required: true });
   core.setSecret(apiKey);
@@ -240,9 +364,11 @@ async function run() {
 
   const { context } = github;
   const { owner, repo } = context.repo;
-  const pullNumber = context.payload.pull_request?.number;
+  const pullRequest = context.payload.pull_request;
+  const pullNumber = pullRequest?.number;
+  const headSha = pullRequest?.head?.sha;
 
-  if (!pullNumber) {
+  if (!pullNumber || !headSha) {
     core.setFailed('This action only runs on pull_request events.');
     return;
   }
@@ -261,49 +387,34 @@ async function run() {
     }
   }
 
-  if (!filteredFiles.some(f => f.patch)) {
-    core.info('No patchable changes found after filtering. Skipping review.');
+  const patchableFiles = filteredFiles.filter(f => f.patch);
+
+  if (patchableFiles.length === 0) {
+    await submitReview(octokit, owner, repo, pullNumber, headSha, reviewerName, {
+      summary: 'No patchable changes found after filtering.',
+      findings: [],
+    });
+    core.info('Review approved because no patchable changes were found after filtering.');
     return;
   }
 
-  const prompt = buildPrompt(filteredFiles, maxDiffChars);
+  const reviewInput = buildReviewInput(filteredFiles, maxDiffChars);
+  const anchors = buildReviewAnchors(reviewInput.files);
   const reviewerHome = createReviewerHome();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running Claude Code with Z.ai credentials for ${filteredFiles.length} file(s)...`);
-  let review;
+  let reviewText;
   try {
-    review = await runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome);
+    reviewText = await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome);
   } finally {
     // [LAW:no-ambient-temporal-coupling] The same owner that creates the reviewer home also tears it down.
     fs.rmSync(reviewerHome, { recursive: true });
   }
-  const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
-
-  const { data: comments } = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number: pullNumber,
-  });
-  const existing = comments.find(c => c.body.includes(COMMENT_MARKER));
-
-  if (existing) {
-    await octokit.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: existing.id,
-      body,
-    });
-    core.info('Review comment updated.');
-  } else {
-    await octokit.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number: pullNumber,
-      body,
-    });
-    core.info('Review comment posted.');
-  }
+  const review = parseReview(reviewText);
+  validateFindings(review.findings, anchors);
+  await submitReview(octokit, owner, repo, pullNumber, headSha, reviewerName, review);
+  core.info(review.findings.length > 0 ? 'Review requested changes.' : 'Review approved.');
 }
 
 run().catch(err => core.setFailed(err.message));

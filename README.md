@@ -1,13 +1,14 @@
 # Z.ai Coding Agent Review
 
-AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then posts or updates a pull request review comment.
+AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then submits a pull request review with inline review threads.
 
 ## Features
 
 - Detect bugs
 - Suggest improvements
 - Use bundled reviewer `CLAUDE.md` instructions
-- Post or update a stable GitHub PR comment
+- Leave inline review threads on specific findings
+- Request changes when findings exist, otherwise approve the pull request
 
 ## Quickstart
 
@@ -102,7 +103,7 @@ git commit -m "Install Z.ai coding agent review action"
 
 The default appended system prompt is:
 
-> Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence; skip style-only comments.
+> Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence.
 
 The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
 
@@ -132,7 +133,7 @@ Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatibl
 - `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`
 - `ANTHROPIC_AUTH_TOKEN` from `ZAI_API_KEY`
 
-The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files.
+The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Review findings become inline GitHub review comments, and the action requests changes when findings exist or approves the pull request when there are no findings.
 
 ## Advanced configuration
 
