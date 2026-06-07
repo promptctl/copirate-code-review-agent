@@ -36,9 +36,57 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+```
+
+## Agent install instructions
+
+Copy and paste this into the target repository to install the action:
+
+```bash
+mkdir -p .github/workflows
+cat > .github/workflows/code-review.yml <<'YAML'
+name: AI Code Review with Z.ai
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Code Review
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
+        with:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+YAML
+```
+
+If the repository does not already have the secret, set it with GitHub CLI:
+
+```bash
+gh secret set ZAI_API_KEY --body "$ZAI_API_KEY"
+```
+
+Then commit the workflow:
+
+```bash
+git add .github/workflows/code-review.yml
+git commit -m "Install Z.ai coding agent review action"
 ```
 
 ## Inputs
@@ -106,7 +154,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 
 ```yaml
       - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
