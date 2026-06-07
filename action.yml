@@ -1,4 +1,4 @@
-name: "Z.ai Code Review"
+name: "Z.ai Coding Agent Review"
 description: "AI-powered code review using Claude Code with Z.ai Coding Plan credentials"
 inputs:
   ZAI_API_KEY:
@@ -15,7 +15,7 @@ inputs:
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header"
     required: false
-    default: "Z.ai Code Review"
+    default: "Z.ai Coding Agent Review"
   EXCLUDE_PATTERNS:
     description: "Comma-separated file patterns to exclude from review (e.g. '*.lock,dist/**,*.min.js')"
     required: false

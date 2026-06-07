@@ -31840,7 +31840,7 @@ const { spawn } = __nccwpck_require__(5317);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
-const COMMENT_MARKER = '<!-- zai-code-review -->';
+const COMMENT_MARKER = '<!-- zai-coding-agent-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 3_000_000;
 const CLAUDE_MAX_TURNS = '8';

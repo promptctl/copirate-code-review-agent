@@ -1,4 +1,4 @@
-# Z.ai Code Review
+# Z.ai Coding Agent Review
 
 AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then posts or updates a pull request review comment.
 
@@ -36,7 +36,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.4.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -48,7 +48,7 @@ jobs:
 | `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
 | `ZAI_MODEL` | No | `glm-4.7` | Model passed to Claude Code |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code |
-| `ZAI_REVIEWER_NAME` | No | `Z.ai Code Review` | Name shown in the review comment header |
+| `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
 | `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
 
@@ -106,7 +106,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 
 ```yaml
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.4.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
