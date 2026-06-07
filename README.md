@@ -1,13 +1,13 @@
-# Z.ai Code Review
+# Z.ai Coding Agent Review
 
-AI-powered GitHub Pull Request code review using Z.ai models. Automatic PR comments, bug detection, and improvement suggestions via GitHub Actions.
+AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then posts or updates a pull request review comment.
 
 ## Features
 
-- 🚀 Detect bugs
-- 🔍 Suggest improvements
-- 🧠 AI-driven PR feedback
-- ⚡ Works with GitHub Actions
+- Detect bugs
+- Suggest improvements
+- Use repository `CLAUDE.md` instructions
+- Post or update a stable GitHub PR comment
 
 ## Quickstart
 
@@ -21,6 +21,8 @@ on:
     types: [opened, synchronize]
 
 permissions:
+  contents: read
+  issues: write
   pull-requests: write
 
 jobs:
@@ -28,8 +30,13 @@ jobs:
     name: Review
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.4.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
@@ -39,29 +46,29 @@ jobs:
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
-| `ZAI_MODEL` | No | `glm-4.7` | Z.ai model to use for review |
-| `ZAI_SYSTEM_PROMPT` | No | See below | Custom system prompt for the AI reviewer |
-| `ZAI_REVIEWER_NAME` | No | `Z.ai Code Review` | Name shown in the review comment header |
+| `ZAI_MODEL` | No | `glm-4.7` | Model passed to Claude Code |
+| `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code |
+| `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
-| `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to the API |
+| `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
 
 The default system prompt is:
 
 > You are an expert code reviewer. Review the provided code changes and give clear, actionable feedback.
 
-You can override it to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
+Claude Code also loads repository instructions such as `CLAUDE.md` from the checked-out project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
 
 > You are a security-focused code reviewer. Identify vulnerabilities, unsafe patterns, and authentication issues. Skip style comments.
 
 ## Configuration
 
-To use this action, you must add your Z.ai API key as a GitHub secret.
+To use this action, add your Z.ai API key as a GitHub secret. The action maps it to Claude Code's Anthropic-compatible environment variables for the Z.ai Coding Plan endpoint.
 
-### 1️⃣ Get your Z.ai API key
+### 1. Get your Z.ai API key
 
 Generate an API key from your Z.ai dashboard.
 
-### 2️⃣ Add the API key to your repository
+### 2. Add the API key to your repository
 
 1. Go to your GitHub repository  
 2. Click **Settings**  
@@ -70,11 +77,20 @@ Generate an API key from your Z.ai dashboard.
 
    - **Name:** `ZAI_API_KEY` — **Value:** your Z.ai API key
 
+## Claude Code configuration
+
+Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatible endpoint:
+
+- `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`
+- `ANTHROPIC_AUTH_TOKEN` from `ZAI_API_KEY`
+
+The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files.
+
 ## Advanced configuration
 
 Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_REVIEWER_NAME`, you can override them, and manage them as GitHub Actions variables. This lets you update the model, review prompt, or reviewer name without touching the workflow file.
 
-### 1️⃣ Add the variables to your repository
+### 1. Add the variables to your repository
 
 1. Go to your GitHub repository
 2. Click **Settings**
@@ -86,11 +102,11 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
    - **Name:** `ZAI_SYSTEM_PROMPT` — **Value:** your custom system prompt
    - **Name:** `ZAI_REVIEWER_NAME` — **Value:** e.g. `AI Code Review`
 
-### 2️⃣ Reference them in your workflow
+### 2. Reference them in your workflow
 
 ```yaml
       - name: Code Review
-        uses: tarmojussila/zai-code-review@v0.4.0
+        uses: brandon-fryslie/zai-coding-agent-review@0.1.0
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
