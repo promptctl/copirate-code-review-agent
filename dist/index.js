@@ -31836,6 +31836,9 @@ module.exports = parseParams
 var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
+const fs = __nccwpck_require__(9896);
+const os = __nccwpck_require__(857);
+const path = __nccwpck_require__(6928);
 const { spawn } = __nccwpck_require__(5317);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
@@ -31856,6 +31859,8 @@ const CLAUDE_DISALLOWED_TOOLS = [
   'WebFetch',
   'WebSearch',
 ];
+const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
+const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31970,11 +31975,21 @@ function parseClaudeOutput(stdout) {
   return parsed.result.trim();
 }
 
-function runClaudeCode(apiKey, model, systemPrompt, prompt) {
+function createReviewerHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-home-'));
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  // [LAW:single-enforcer] The packaged action owns reusable reviewer instructions.
+  fs.copyFileSync(REVIEW_AGENT_CLAUDE_PATH, path.join(claudeDir, 'CLAUDE.md'));
+  return home;
+}
+
+function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
   return new Promise((resolve, reject) => {
     // [LAW:single-enforcer] Z.ai auth is translated exactly once at the agent runner boundary.
     const env = {
       ...process.env,
+      HOME: reviewerHome,
       ANTHROPIC_AUTH_TOKEN: apiKey,
       ANTHROPIC_BASE_URL: ZAI_ANTHROPIC_BASE_URL,
       ANTHROPIC_MODEL: model,
@@ -32088,10 +32103,17 @@ async function run() {
   }
 
   const prompt = buildPrompt(filteredFiles, maxDiffChars);
+  const reviewerHome = createReviewerHome();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running Claude Code with Z.ai credentials for ${filteredFiles.length} file(s)...`);
-  const review = await runClaudeCode(apiKey, model, systemPrompt, prompt);
+  let review;
+  try {
+    review = await runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome);
+  } finally {
+    // [LAW:no-ambient-temporal-coupling] The same owner that creates the reviewer home also tears it down.
+    fs.rmSync(reviewerHome, { recursive: true });
+  }
   const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
 
   const { data: comments } = await octokit.rest.issues.listComments({
