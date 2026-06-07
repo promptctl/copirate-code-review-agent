@@ -6,7 +6,7 @@ AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Pl
 
 - Detect bugs
 - Suggest improvements
-- Use repository `CLAUDE.md` instructions
+- Use bundled reviewer `CLAUDE.md` instructions
 - Post or update a stable GitHub PR comment
 
 ## Quickstart
@@ -46,17 +46,17 @@ jobs:
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
-| `ZAI_MODEL` | No | `glm-4.7` | Model passed to Claude Code |
+| `ZAI_MODEL` | No | `glm-5.1` | Model passed to Claude Code |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code |
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
 | `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
 
-The default system prompt is:
+The default appended system prompt is:
 
-> You are an expert code reviewer. Review the provided code changes and give clear, actionable feedback.
+> Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence; skip style-only comments.
 
-Claude Code also loads repository instructions such as `CLAUDE.md` from the checked-out project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
+The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
 
 > You are a security-focused code reviewer. Identify vulnerabilities, unsafe patterns, and authentication issues. Skip style comments.
 
@@ -98,7 +98,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 4. Click the **Variables** tab
 5. Click **New repository variable** and add:
 
-   - **Name:** `ZAI_MODEL` — **Value:** e.g. `glm-4.7`
+   - **Name:** `ZAI_MODEL` — **Value:** e.g. `glm-5.1`
    - **Name:** `ZAI_SYSTEM_PROMPT` — **Value:** your custom system prompt
    - **Name:** `ZAI_REVIEWER_NAME` — **Value:** e.g. `AI Code Review`
 
