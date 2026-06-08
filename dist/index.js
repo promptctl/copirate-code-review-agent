@@ -32018,7 +32018,7 @@ function buildClaudeArgs(model, systemPrompt, mcpConfigPath) {
 function assertClaudeSucceeded(stdout) {
   const parsed = parseJsonEnvelope(stdout);
   if (!parsed) {
-    throw new Error('Claude Code returned invalid JSON.');
+    throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
   }
 
   if (parsed.is_error || parsed.subtype === 'error') {
@@ -32162,7 +32162,8 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
       CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
       NO_COLOR: '1',
     };
-    const child = spawn('npx', buildClaudeArgs(model, systemPrompt, mcpConfigPath), {
+    const args = buildClaudeArgs(model, systemPrompt, mcpConfigPath);
+    const child = spawn('npx', args, {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -32210,7 +32211,7 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
     child.on('close', code => {
       finish(() => {
         if (code !== 0) {
-          reject(new Error(`Claude Code exited with status ${code}: ${stderr.slice(-2000)}`));
+          reject(new Error(formatClaudeFailure(code, args, stdout, stderr)));
           return;
         }
         try {
@@ -32224,6 +32225,23 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
 
     child.stdin.end(prompt);
   });
+}
+
+function formatOutputTail(label, value) {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return `${label}: <empty>`;
+  }
+  return `${label}:\n${trimmed.slice(-4000)}`;
+}
+
+function formatClaudeFailure(code, args, stdout, stderr) {
+  return [
+    `Claude Code exited with status ${code}.`,
+    `Command: npx ${args.map(arg => JSON.stringify(arg)).join(' ')}`,
+    formatOutputTail('stderr tail', stderr),
+    formatOutputTail('stdout tail', stdout),
+  ].join('\n\n');
 }
 
 function writeJsonRpcResponse(id, result) {
