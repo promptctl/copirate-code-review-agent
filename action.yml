@@ -28,6 +28,9 @@ inputs:
     description: "GitHub token for API access"
     required: false
     default: ${{ github.token }}
+  GITHUB_REVIEW_TOKEN:
+    description: "Optional token used to submit PR reviews when the default GITHUB_TOKEN is not allowed to approve pull requests."
+    required: false
 runs:
   using: "node24"
   main: "dist/index.js"

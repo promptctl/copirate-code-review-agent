@@ -100,6 +100,7 @@ git commit -m "Install Z.ai coding agent review action"
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
 | `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
+| `GITHUB_REVIEW_TOKEN` | No | — | Optional token for submitting reviews when `GITHUB_TOKEN` cannot approve pull requests |
 
 The default appended system prompt is:
 
@@ -135,6 +136,8 @@ Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatibl
 
 The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Review findings become inline GitHub review comments, and the action requests changes when findings exist or approves the pull request when there are no findings.
 
+GitHub may block approval reviews from the default `GITHUB_TOKEN` unless Actions approvals are enabled for the repository or organization. Enable **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests**. If that setting is unavailable, pass an optional approval-capable token with `GITHUB_REVIEW_TOKEN`.
+
 ## Advanced configuration
 
 Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_REVIEWER_NAME`, you can override them, and manage them as GitHub Actions variables. This lets you update the model, review prompt, or reviewer name without touching the workflow file.
@@ -161,6 +164,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
           ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
+          GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
 ## Contributing

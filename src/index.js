@@ -342,10 +342,17 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   };
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
-  await octokit.rest.pulls.createReview({
-    ...reviewRequest,
-    ...(comments.length > 0 ? { comments } : {}),
-  });
+  try {
+    await octokit.rest.pulls.createReview({
+      ...reviewRequest,
+      ...(comments.length > 0 ? { comments } : {}),
+    });
+  } catch (err) {
+    if (event === 'APPROVE' && err.status === 422 && /not permitted to approve pull requests/i.test(err.message)) {
+      throw new Error('GitHub refused the approval review. Enable "Allow GitHub Actions to create and approve pull requests" in repository or organization Actions settings, or pass GITHUB_REVIEW_TOKEN from an approval-capable user or GitHub App.');
+    }
+    throw err;
+  }
 }
 
 async function run() {
@@ -361,6 +368,10 @@ async function run() {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
+  const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
+  if (reviewToken) {
+    core.setSecret(reviewToken);
+  }
 
   const { context } = github;
   const { owner, repo } = context.repo;
@@ -374,6 +385,7 @@ async function run() {
   }
 
   const octokit = github.getOctokit(token);
+  const reviewOctokit = github.getOctokit(reviewToken || token);
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const files = await getChangedFiles(octokit, owner, repo, pullNumber);
@@ -390,7 +402,7 @@ async function run() {
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
-    await submitReview(octokit, owner, repo, pullNumber, headSha, reviewerName, {
+    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
     });
@@ -413,7 +425,7 @@ async function run() {
   }
   const review = parseReview(reviewText);
   validateFindings(review.findings, anchors);
-  await submitReview(octokit, owner, repo, pullNumber, headSha, reviewerName, review);
+  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
   core.info(review.findings.length > 0 ? 'Review requested changes.' : 'Review approved.');
 }
 
