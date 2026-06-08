@@ -27,6 +27,28 @@ const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..')
 const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
+const REVIEW_RESULT_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          line: { type: 'integer' },
+          side: { type: 'string', enum: ['RIGHT', 'LEFT'] },
+          body: { type: 'string' },
+        },
+        required: ['path', 'line', 'side', 'body'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['summary', 'findings'],
+  additionalProperties: false,
+};
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -124,7 +146,7 @@ function buildReviewInput(files, maxDiffChars) {
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
-    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return only minified JSON with this exact shape: {"summary":"one concise sentence","findings":[{"path":"file path from diff","line":123,"side":"RIGHT","body":"actionable review comment"}]}. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. Return {"summary":"No findings.","findings":[]} when there are no bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests.\n\n${diffs}`,
+    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return a review result matching the configured JSON schema. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. Return an empty findings array when there are no bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests.\n\n${diffs}`,
   };
 }
 
@@ -135,6 +157,9 @@ function buildClaudeArgs(model, systemPrompt) {
     '-p',
     '--output-format',
     'json',
+    // [LAW:types-are-the-program] Claude Code must produce the typed review artifact, not prose that callers repair.
+    '--json-schema',
+    JSON.stringify(REVIEW_RESULT_SCHEMA),
     '--no-session-persistence',
     '--max-turns',
     CLAUDE_MAX_TURNS,
