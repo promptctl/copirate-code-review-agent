@@ -31862,6 +31862,7 @@ const CLAUDE_DISALLOWED_TOOLS = [
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
 const APPROVED_MESSAGE = '✅ Approved';
+const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -32265,7 +32266,7 @@ async function run() {
   validateFindings(review.findings, anchors);
   if (review.findings.length > 0) {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
-    core.info('Review requested changes.');
+    core.info(REQUEST_CHANGES_MESSAGE);
   } else {
     await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
   }

@@ -134,7 +134,7 @@ Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatibl
 - `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`
 - `ANTHROPIC_AUTH_TOKEN` from `ZAI_API_KEY`
 
-The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Review findings become inline GitHub review comments, and the action requests changes when findings exist. When there are no findings, the action prints `✅ Approved`; it also submits a formal approval review when `GITHUB_REVIEW_TOKEN` is provided.
+The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Review findings become inline GitHub review comments. The action prints `❌ Request Changes` when findings exist and `✅ Approved` when there are no findings; it also submits a formal approval review when `GITHUB_REVIEW_TOKEN` is provided.
 
 `GITHUB_REVIEW_TOKEN` is optional. Leave it unset for the default workflow: findings request changes, and clean reviews finish successfully with `✅ Approved`. Set it to an approval-capable user or GitHub App token only when you want the action to submit a formal approval review.
 
