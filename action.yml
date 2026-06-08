@@ -11,7 +11,7 @@ inputs:
   ZAI_SYSTEM_PROMPT:
     description: "Additional system prompt appended to Claude Code"
     required: false
-    default: "Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence."
+    default: "Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with specific diff evidence."
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header"
     required: false

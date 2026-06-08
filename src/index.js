@@ -50,9 +50,8 @@ function filterFiles(files, excludePatterns) {
 }
 
 function buildPatchAnchors(file) {
-  const anchors = new Set();
-  let leftLine = 0;
-  let rightLine = 0;
+  const anchors = new Map();
+  let position = 0;
 
   for (const line of file.patch.split('\n')) {
     if (line.length === 0) {
@@ -60,18 +59,11 @@ function buildPatchAnchors(file) {
     }
     const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunk) {
-      leftLine = Number(hunk[1]);
-      rightLine = Number(hunk[2]);
-    } else if (line.startsWith('+') && !line.startsWith('+++')) {
-      anchors.add(`${file.filename}:${rightLine}:RIGHT`);
-      rightLine++;
-    } else if (line.startsWith('-') && !line.startsWith('---')) {
-      anchors.add(`${file.filename}:${leftLine}:LEFT`);
-      leftLine++;
-    } else if (!line.startsWith('\\')) {
-      anchors.add(`${file.filename}:${rightLine}:RIGHT`);
-      leftLine++;
-      rightLine++;
+      continue;
+    }
+    if (!line.startsWith('\\')) {
+      position++;
+      anchors.set(`${file.filename}:${position}`, { path: file.filename, position });
     }
   }
 
@@ -79,7 +71,27 @@ function buildPatchAnchors(file) {
 }
 
 function buildReviewAnchors(files) {
-  return new Set(files.filter(f => f.patch).flatMap(f => [...buildPatchAnchors(f)]));
+  return new Map(files.filter(f => f.patch).flatMap(f => [...buildPatchAnchors(f)]));
+}
+
+function annotatePatchWithPositions(patch) {
+  let position = 0;
+  const lines = [];
+
+  for (const line of patch.split('\n')) {
+    if (line.length === 0) {
+      continue;
+    }
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      lines.push(line);
+    } else if (!line.startsWith('\\')) {
+      position++;
+      lines.push(`POSITION ${position}: ${line}`);
+    }
+  }
+
+  return lines.join('\n');
 }
 
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
@@ -108,7 +120,7 @@ function buildReviewInput(files, maxDiffChars) {
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithPositions(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       skippedFiles.push(f.filename);
     } else {
@@ -127,7 +139,7 @@ function buildReviewInput(files, maxDiffChars) {
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
-    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Record every finding by calling mcp__review_collector__report_finding with path, line, side, and body. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. Do not report bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests in your final text; the collector tools are the only review output channel.\n\n${diffs}`,
+    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Each visible diff line is annotated as POSITION N. Record every finding by calling mcp__review_collector__report_finding with path, position, and body using the displayed POSITION value. Every finding must point to a visible line in the diff. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. Do not report bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests in your final text; the collector tools are the only review output channel.\n\n${diffs}`,
   };
 }
 
@@ -214,25 +226,20 @@ function parseReviewValue(parsed, context) {
       throw new Error(`Claude Code finding ${index + 1} is not an object.`);
     }
     const pathValue = finding.path;
-    const line = finding.line;
-    const side = finding.side;
+    const position = finding.position;
     const body = finding.body;
     if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
       throw new Error(`Claude Code finding ${index + 1} has an invalid path.`);
     }
-    if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid line.`);
-    }
-    if (side !== 'RIGHT' && side !== 'LEFT') {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid side.`);
+    if (!Number.isInteger(position) || position <= 0) {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid position.`);
     }
     if (typeof body !== 'string' || body.trim().length === 0) {
       throw new Error(`Claude Code finding ${index + 1} has an invalid body.`);
     }
     return {
       path: pathValue.trim(),
-      line,
-      side,
+      position,
       body: body.trim(),
     };
   });
@@ -249,7 +256,7 @@ function parseFindingValue(finding, index) {
 
 function validateFindings(findings, anchors) {
   for (const finding of findings) {
-    const anchor = `${finding.path}:${finding.line}:${finding.side}`;
+    const anchor = `${finding.path}:${finding.position}`;
     if (!anchors.has(anchor)) {
       throw new Error(`Claude Code finding references a line outside the review diff: ${anchor}`);
     }
@@ -408,11 +415,10 @@ function collectorTools() {
         type: 'object',
         properties: {
           path: { type: 'string' },
-          line: { type: 'integer' },
-          side: { type: 'string', enum: ['RIGHT', 'LEFT'] },
+          position: { type: 'integer' },
           body: { type: 'string' },
         },
-        required: ['path', 'line', 'side', 'body'],
+        required: ['path', 'position', 'body'],
         additionalProperties: false,
       },
     },
@@ -504,8 +510,7 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   const body = `## ${reviewerName}\n\n${review.summary}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => ({
     path: finding.path,
-    line: finding.line,
-    side: finding.side,
+    position: finding.position,
     body: finding.body,
   }));
   const reviewRequest = {
