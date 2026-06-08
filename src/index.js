@@ -25,6 +25,7 @@ const CLAUDE_DISALLOWED_TOOLS = [
 ];
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
+const APPROVED_MESSAGE = '✅ Approved';
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -342,17 +343,19 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   };
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
-  try {
-    await octokit.rest.pulls.createReview({
-      ...reviewRequest,
-      ...(comments.length > 0 ? { comments } : {}),
-    });
-  } catch (err) {
-    if (event === 'APPROVE' && err.status === 422 && /not permitted to approve pull requests/i.test(err.message)) {
-      throw new Error('GitHub refused the approval review. Enable "Allow GitHub Actions to create and approve pull requests" in repository or organization Actions settings, or pass GITHUB_REVIEW_TOKEN from an approval-capable user or GitHub App.');
-    }
-    throw err;
+  await octokit.rest.pulls.createReview({
+    ...reviewRequest,
+    ...(comments.length > 0 ? { comments } : {}),
+  });
+}
+
+async function submitCleanReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove) {
+  if (canApprove) {
+    await submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review);
+  } else {
+    core.info('No approval-capable review token was configured; skipping formal approval review.');
   }
+  core.info(APPROVED_MESSAGE);
 }
 
 async function run() {
@@ -402,11 +405,10 @@ async function run() {
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
-    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
+    await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
-    });
-    core.info('Review approved because no patchable changes were found after filtering.');
+    }, Boolean(reviewToken));
     return;
   }
 
@@ -425,8 +427,12 @@ async function run() {
   }
   const review = parseReview(reviewText);
   validateFindings(review.findings, anchors);
-  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
-  core.info(review.findings.length > 0 ? 'Review requested changes.' : 'Review approved.');
+  if (review.findings.length > 0) {
+    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
+    core.info('Review requested changes.');
+  } else {
+    await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
+  }
 }
 
 run().catch(err => core.setFailed(err.message));
