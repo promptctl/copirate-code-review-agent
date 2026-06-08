@@ -31851,6 +31851,8 @@ const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
   'Glob',
+  'mcp__review_collector__report_finding',
+  'mcp__review_collector__finish_review',
 ];
 const CLAUDE_DISALLOWED_TOOLS = [
   'Bash',
@@ -31863,28 +31865,7 @@ const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..')
 const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
-const REVIEW_RESULT_SCHEMA = {
-  type: 'object',
-  properties: {
-    summary: { type: 'string' },
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          path: { type: 'string' },
-          line: { type: 'integer' },
-          side: { type: 'string', enum: ['RIGHT', 'LEFT'] },
-          body: { type: 'string' },
-        },
-        required: ['path', 'line', 'side', 'body'],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ['summary', 'findings'],
-  additionalProperties: false,
-};
+const COLLECTOR_SERVER_ARG = '--review-collector-server';
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31982,20 +31963,17 @@ function buildReviewInput(files, maxDiffChars) {
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
-    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Return a review result matching the configured JSON schema. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. Return an empty findings array when there are no bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests.\n\n${diffs}`,
+    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Record every finding by calling mcp__review_collector__report_finding with path, line, side, and body. Use side RIGHT for added or unchanged lines and LEFT for deleted lines. Every finding must point to a line visible in the diff. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. Do not report bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests in your final text; the collector tools are the only review output channel.\n\n${diffs}`,
   };
 }
 
-function buildClaudeArgs(model, systemPrompt) {
+function buildClaudeArgs(model, systemPrompt, mcpConfigPath) {
   const args = [
     '-y',
     `${CLAUDE_CODE_PACKAGE}@latest`,
     '-p',
     '--output-format',
     'json',
-    // [LAW:types-are-the-program] Claude Code must produce the typed review artifact, not prose that callers repair.
-    '--json-schema',
-    JSON.stringify(REVIEW_RESULT_SCHEMA),
     '--no-session-persistence',
     '--max-turns',
     CLAUDE_MAX_TURNS,
@@ -32005,6 +31983,9 @@ function buildClaudeArgs(model, systemPrompt) {
     CLAUDE_ALLOWED_TOOLS.join(','),
     '--disallowedTools',
     CLAUDE_DISALLOWED_TOOLS.join(','),
+    '--mcp-config',
+    mcpConfigPath,
+    '--strict-mcp-config',
     '--permission-mode',
     'dontAsk',
   ];
@@ -32022,43 +32003,46 @@ function buildClaudeArgs(model, systemPrompt) {
   return args;
 }
 
-function parseClaudeOutput(stdout) {
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
+function assertClaudeSucceeded(stdout) {
+  const parsed = parseJsonEnvelope(stdout);
+  if (!parsed) {
     throw new Error('Claude Code returned invalid JSON.');
   }
 
   if (parsed.is_error || parsed.subtype === 'error') {
     throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
   }
-
-  if (typeof parsed.result !== 'string' || parsed.result.trim().length === 0) {
-    throw new Error('Claude Code returned an empty review result.');
-  }
-
-  return parsed.result.trim();
 }
 
-function parseReview(review) {
-  let parsed;
+function parseJsonEnvelope(stdout) {
   try {
-    parsed = JSON.parse(review);
+    return JSON.parse(stdout);
   } catch {
-    throw new Error('Claude Code returned review text that was not valid JSON.');
+    const trimmed = stdout.trim();
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {
+      return undefined;
+    }
   }
+}
 
+function parseReviewValue(parsed, context) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('Claude Code returned a review JSON value with the wrong shape.');
+    throw new Error(`${context} has the wrong shape.`);
   }
 
   if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
-    throw new Error('Claude Code review JSON must include a non-empty summary.');
+    throw new Error(`${context} must include a non-empty summary.`);
   }
   const summary = parsed.summary.trim();
   if (!Array.isArray(parsed.findings)) {
-    throw new Error('Claude Code review JSON must include a findings array.');
+    throw new Error(`${context} must include a findings array.`);
   }
 
   const findings = parsed.findings.map((finding, index) => {
@@ -32092,6 +32076,13 @@ function parseReview(review) {
   return { summary, findings };
 }
 
+function parseFindingValue(finding, index) {
+  return parseReviewValue({
+    summary: 'collector finding',
+    findings: [finding],
+  }, `Review collector finding ${index + 1}`).findings[0];
+}
+
 function validateFindings(findings, anchors) {
   for (const finding of findings) {
     const anchor = `${finding.path}:${finding.line}:${finding.side}`;
@@ -32110,7 +32101,48 @@ function createReviewerHome() {
   return home;
 }
 
-function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
+function createReviewCollector() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-review-collector-'));
+  const recordsPath = path.join(dir, 'records.jsonl');
+  const mcpConfigPath = path.join(dir, 'mcp.json');
+  const mcpConfig = {
+    mcpServers: {
+      review_collector: {
+        command: process.execPath,
+        args: [__filename, COLLECTOR_SERVER_ARG],
+        env: {
+          REVIEW_COLLECTOR_RECORDS: recordsPath,
+        },
+      },
+    },
+  };
+  fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig), 'utf8');
+  return { dir, recordsPath, mcpConfigPath };
+}
+
+function readCollectedReview(recordsPath) {
+  if (!fs.existsSync(recordsPath)) {
+    throw new Error('Claude Code did not call the review collector tools.');
+  }
+
+  const records = fs.readFileSync(recordsPath, 'utf8')
+    .split('\n')
+    .filter(line => line.trim().length > 0)
+    .map(line => JSON.parse(line));
+  const finishes = records.filter(record => record.type === 'finish');
+  if (finishes.length !== 1) {
+    throw new Error(`Claude Code must call finish_review exactly once; saw ${finishes.length}.`);
+  }
+  const findings = records
+    .filter(record => record.type === 'finding')
+    .map((record, index) => parseFindingValue(record.finding, index));
+  return parseReviewValue({
+    summary: finishes[0].summary,
+    findings,
+  }, 'Review collector output');
+}
+
+function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpConfigPath) {
   return new Promise((resolve, reject) => {
     // [LAW:single-enforcer] Z.ai auth is translated exactly once at the agent runner boundary.
     const env = {
@@ -32123,7 +32155,7 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
       CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
       NO_COLOR: '1',
     };
-    const child = spawn('npx', buildClaudeArgs(model, systemPrompt), {
+    const child = spawn('npx', buildClaudeArgs(model, systemPrompt, mcpConfigPath), {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -32175,7 +32207,8 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
           return;
         }
         try {
-          resolve(parseClaudeOutput(stdout));
+          assertClaudeSucceeded(stdout);
+          resolve();
         } catch (err) {
           reject(err);
         }
@@ -32183,6 +32216,122 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome) {
     });
 
     child.stdin.end(prompt);
+  });
+}
+
+function writeJsonRpcResponse(id, result) {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
+}
+
+function writeJsonRpcError(id, code, message) {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } })}\n`);
+}
+
+function appendCollectorRecord(record) {
+  const recordsPath = process.env.REVIEW_COLLECTOR_RECORDS;
+  if (!recordsPath) {
+    throw new Error('REVIEW_COLLECTOR_RECORDS is required.');
+  }
+  fs.appendFileSync(recordsPath, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+function collectorTools() {
+  return [
+    {
+      name: 'report_finding',
+      description: 'Record one actionable pull request review finding anchored to a visible diff line.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          line: { type: 'integer' },
+          side: { type: 'string', enum: ['RIGHT', 'LEFT'] },
+          body: { type: 'string' },
+        },
+        required: ['path', 'line', 'side', 'body'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'finish_review',
+      description: 'Finish the review after all findings have been reported.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string' },
+        },
+        required: ['summary'],
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+function callCollectorTool(name, args) {
+  if (name === 'report_finding') {
+    const finding = parseFindingValue(args, 0);
+    appendCollectorRecord({ type: 'finding', finding });
+    return { content: [{ type: 'text', text: 'Finding recorded.' }] };
+  }
+  if (name === 'finish_review') {
+    if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {
+      throw new Error('finish_review requires a non-empty summary.');
+    }
+    appendCollectorRecord({ type: 'finish', summary: args.summary.trim() });
+    return { content: [{ type: 'text', text: 'Review finished.' }] };
+  }
+  throw new Error(`Unknown review collector tool: ${name}`);
+}
+
+function handleCollectorMessage(message) {
+  if (!message || typeof message !== 'object') {
+    return;
+  }
+  if (message.id === undefined) {
+    return;
+  }
+
+  try {
+    if (message.method === 'initialize') {
+      writeJsonRpcResponse(message.id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'zai-review-collector', version: '0.1.0' },
+      });
+    } else if (message.method === 'tools/list') {
+      writeJsonRpcResponse(message.id, { tools: collectorTools() });
+    } else if (message.method === 'tools/call') {
+      const result = callCollectorTool(message.params?.name, message.params?.arguments || {});
+      writeJsonRpcResponse(message.id, result);
+    } else {
+      writeJsonRpcError(message.id, -32601, `Unknown method: ${message.method}`);
+    }
+  } catch (err) {
+    writeJsonRpcError(message.id, -32000, err.message);
+  }
+}
+
+function runReviewCollectorServer() {
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.trim().length === 0) {
+        continue;
+      }
+      try {
+        const message = JSON.parse(line);
+        const messages = Array.isArray(message) ? message : [message];
+        for (const item of messages) {
+          handleCollectorMessage(item);
+        }
+      } catch {
+        writeJsonRpcError(null, -32700, 'Invalid JSON-RPC message.');
+      }
+    }
   });
 }
 
@@ -32277,27 +32426,32 @@ async function run() {
   const reviewInput = buildReviewInput(filteredFiles, maxDiffChars);
   const anchors = buildReviewAnchors(reviewInput.files);
   const reviewerHome = createReviewerHome();
+  const collector = createReviewCollector();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running Claude Code with Z.ai credentials for ${filteredFiles.length} file(s)...`);
-  let reviewText;
   try {
-    reviewText = await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome);
+    await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, collector.mcpConfigPath);
+    const review = readCollectedReview(collector.recordsPath);
+    validateFindings(review.findings, anchors);
+    if (review.findings.length > 0) {
+      await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
+      core.info(REQUEST_CHANGES_MESSAGE);
+    } else {
+      await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
+    }
   } finally {
-    // [LAW:no-ambient-temporal-coupling] The same owner that creates the reviewer home also tears it down.
+    // [LAW:no-ambient-temporal-coupling] The same owner that creates temporary review state also tears it down.
     fs.rmSync(reviewerHome, { recursive: true });
-  }
-  const review = parseReview(reviewText);
-  validateFindings(review.findings, anchors);
-  if (review.findings.length > 0) {
-    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
-    core.info(REQUEST_CHANGES_MESSAGE);
-  } else {
-    await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
+    fs.rmSync(collector.dir, { recursive: true });
   }
 }
 
-run().catch(err => core.setFailed(err.message));
+if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
+  runReviewCollectorServer();
+} else {
+  run().catch(err => core.setFailed(err.message));
+}
 
 module.exports = __webpack_exports__;
 /******/ })()
