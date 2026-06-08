@@ -10,7 +10,6 @@ const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 3_000_000;
-const CLAUDE_MAX_TURNS = '8';
 const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
@@ -151,8 +150,6 @@ function buildClaudeArgs(model, systemPrompt, mcpConfigPath) {
     '--output-format',
     'json',
     '--no-session-persistence',
-    '--max-turns',
-    CLAUDE_MAX_TURNS,
     '--tools',
     'Read,Grep,Glob',
     '--allowedTools',
