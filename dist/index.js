@@ -31850,7 +31850,7 @@ const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
   'Glob',
-  'mcp__review_collector__report_finding',
+  'mcp__review_collector__request_change',
   'mcp__review_collector__finish_review',
 ];
 const CLAUDE_DISALLOWED_TOOLS = [
@@ -31974,7 +31974,7 @@ function buildReviewInput(files, maxDiffChars) {
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
-    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Each visible diff line is annotated as POSITION N. Record every finding by calling mcp__review_collector__report_finding with path, position, and body using the displayed POSITION value. Every finding must point to a visible line in the diff. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. Do not report bugs, security issues, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests in your final text; the collector tools are the only review output channel.\n\n${diffs}`,
+    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Each visible diff line is annotated as POSITION N. Call mcp__review_collector__request_change only for code that must change before merge: bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests. Do not call request_change for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes. Every requested change must use path, position, and body with the displayed POSITION value. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.\n\n${diffs}`,
   };
 }
 
@@ -32138,7 +32138,7 @@ function readCollectedReview(recordsPath) {
     throw new Error(`Claude Code must call finish_review exactly once; saw ${finishes.length}.`);
   }
   const findings = records
-    .filter(record => record.type === 'finding')
+    .filter(record => record.type === 'request_change')
     .map((record, index) => parseFindingValue(record.finding, index));
   return parseReviewValue({
     summary: finishes[0].summary,
@@ -32260,8 +32260,8 @@ function appendCollectorRecord(record) {
 function collectorTools() {
   return [
     {
-      name: 'report_finding',
-      description: 'Record one actionable pull request review finding anchored to a visible diff line.',
+      name: 'request_change',
+      description: 'Request a required pre-merge code change anchored to a visible diff line. Do not use for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -32275,7 +32275,7 @@ function collectorTools() {
     },
     {
       name: 'finish_review',
-      description: 'Finish the review after all findings have been reported.',
+      description: 'Finish the review after all required changes have been requested.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -32289,10 +32289,10 @@ function collectorTools() {
 }
 
 function callCollectorTool(name, args) {
-  if (name === 'report_finding') {
+  if (name === 'request_change') {
     const finding = parseFindingValue(args, 0);
-    appendCollectorRecord({ type: 'finding', finding });
-    return { content: [{ type: 'text', text: 'Finding recorded.' }] };
+    appendCollectorRecord({ type: 'request_change', finding });
+    return { content: [{ type: 'text', text: 'Required change recorded.' }] };
   }
   if (name === 'finish_review') {
     if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {

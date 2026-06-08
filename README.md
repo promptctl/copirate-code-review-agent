@@ -7,8 +7,8 @@ AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Pl
 - Detect bugs
 - Suggest improvements
 - Use bundled reviewer `CLAUDE.md` instructions
-- Leave inline review threads on specific findings
-- Request changes when findings exist, otherwise approve the pull request
+- Leave inline review threads on required changes
+- Request changes when required changes exist, otherwise approve the pull request
 
 ## Quickstart
 
@@ -104,7 +104,7 @@ git commit -m "Install Z.ai coding agent review action"
 
 The default appended system prompt is:
 
-> Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with specific diff evidence.
+> Review according to the repository LAWS. Request changes only for blocking issues: bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests. Do not request changes for praise, good architecture, neutral observations, optional improvements, or style preferences.
 
 The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
 
@@ -134,9 +134,9 @@ Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatibl
 - `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`
 - `ANTHROPIC_AUTH_TOKEN` from `ZAI_API_KEY`
 
-The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Claude Code records review findings through a local collector tool; the action validates those collected records before turning findings into inline GitHub review comments. The action prints `❌ Request Changes` when findings exist and `✅ Approved` when there are no findings; it also submits a formal approval review when `GITHUB_REVIEW_TOKEN` is provided.
+The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Claude Code records required changes through a local collector tool; the action validates those collected records before turning them into inline GitHub review comments. The action prints `❌ Request Changes` when required changes exist and `✅ Approved` when there are no required changes; it also submits a formal approval review when `GITHUB_REVIEW_TOKEN` is provided.
 
-`GITHUB_REVIEW_TOKEN` is optional. Leave it unset for the default workflow: findings request changes, and clean reviews finish successfully with `✅ Approved`. Set it to an approval-capable user or GitHub App token only when you want the action to submit a formal approval review.
+`GITHUB_REVIEW_TOKEN` is optional. Leave it unset for the default workflow: required changes request changes, and clean reviews finish successfully with `✅ Approved`. Set it to an approval-capable user or GitHub App token only when you want the action to submit a formal approval review.
 
 ## Advanced configuration
 
