@@ -29938,6 +29938,9 @@ const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 3_000_000;
+const OVERLOAD_RETRY_BUDGET_MS = 60 * 60 * 1000;
+const OVERLOAD_BACKOFF_BASE_MS = 2_000;
+const OVERLOAD_BACKOFF_MAX_MS = 60_000;
 const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
@@ -29976,12 +29979,6 @@ function filterFiles(files, excludePatterns) {
   return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
 }
 
-// [LAW:single-enforcer] GitHub's review `position` numbering is defined once here;
-// the anchor table and the model-facing annotation both derive from it. GitHub
-// counts position 1 at the line after the FIRST hunk header, and every later
-// line — context, additions, deletions, and subsequent @@ headers — advances the
-// count. Only the first header is the baseline; treating every header as
-// skippable (as a naive reader would) drifts comments off by one per extra hunk.
 // [LAW:one-source-of-truth] The new-file line number is the one honest anchor for a
 // changed line; both GitHub (line+side) and Gitea (new_position) speak it natively.
 // Each hunk header resets the new-side counter; only added/context lines advance it
@@ -30408,20 +30405,72 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
     child.on('close', code => {
       finish(() => {
         if (code !== 0) {
-          reject(new Error(formatClaudeFailure(code, args, stdout, stderr)));
+          reject(classifyClaudeError(new Error(formatClaudeFailure(code, args, stdout, stderr)), `${stdout}\n${stderr}`));
           return;
         }
         try {
           assertClaudeSucceeded(stdout);
           resolve();
         } catch (err) {
-          reject(err);
+          reject(classifyClaudeError(err, stdout));
         }
       });
     });
 
     child.stdin.end(prompt);
   });
+}
+
+// [LAW:types-are-the-program] "Transient overload" is a type, not a flag bolted onto a
+// generic Error. The raw 529/overloaded signal is classified once, here at the boundary;
+// the retry loop dispatches on the error's type, never a re-matched string.
+class OverloadError extends Error {}
+
+function classifyClaudeError(err, text) {
+  return /\b529\b|overloaded/i.test(text) ? new OverloadError(err.message) : err;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function overloadBackoffMs(attempt) {
+  const cap = Math.min(OVERLOAD_BACKOFF_MAX_MS, OVERLOAD_BACKOFF_BASE_MS * 2 ** (attempt - 1));
+  return cap / 2 + Math.random() * (cap / 2);
+}
+
+// One attempt at producing a validated review against a fresh collector. The
+// collector is recreated per attempt so partial records from a 529'd attempt can
+// never leak into a later successful read. [LAW:no-silent-failure]
+async function produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
+  const collector = createReviewCollector();
+  try {
+    await runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, collector.mcpConfigPath);
+    const review = readCollectedReview(collector.recordsPath);
+    validateFindings(review.findings, anchors);
+    return review;
+  } finally {
+    fs.rmSync(collector.dir, { recursive: true });
+  }
+}
+
+// [LAW:no-ambient-temporal-coupling] This loop is the single explicit owner of retry
+// timing; runClaudeCode does one attempt and stays timing-free. Overload (529) failures
+// retry until the time budget is spent — at least an hour of transient overload is
+// ridden out; everything else surfaces immediately. [LAW:no-silent-failure]
+async function produceReview(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
+  const deadline = Date.now() + OVERLOAD_RETRY_BUDGET_MS;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors);
+    } catch (err) {
+      if (!(err instanceof OverloadError) || Date.now() >= deadline) {
+        throw err;
+      }
+      const delay = overloadBackoffMs(attempt);
+      const minsLeft = Math.ceil((deadline - Date.now()) / 60_000);
+      core.warning(`z.ai overloaded (HTTP 529); retrying in ${Math.round(delay)}ms (~${minsLeft}m of retry budget left).`);
+      await sleep(delay);
+    }
+  }
 }
 
 function formatOutputTail(label, value) {
@@ -30664,19 +30713,15 @@ async function run() {
   const reviewInput = buildReviewInput(filteredFiles, maxDiffChars);
   const anchors = buildReviewAnchors(reviewInput.files);
   const reviewerHome = createReviewerHome();
-  const collector = createReviewCollector();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s)...`);
   try {
-    await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, collector.mcpConfigPath);
-    const review = readCollectedReview(collector.recordsPath);
-    validateFindings(review.findings, anchors);
+    const review = await produceReview(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, anchors);
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport);
   } finally {
     // [LAW:no-ambient-temporal-coupling] The same owner that creates temporary review state also tears it down.
     fs.rmSync(reviewerHome, { recursive: true });
-    fs.rmSync(collector.dir, { recursive: true });
   }
 }
 
@@ -30686,7 +30731,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
   run().catch(err => core.setFailed(err.message));
 }
 
-module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget };
+module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget, OverloadError, classifyClaudeError, overloadBackoffMs };
 
 
 /***/ }),
