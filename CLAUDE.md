@@ -1,0 +1,72 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A GitHub Action that runs Claude Code (pointed at Z.ai's Anthropic-compatible endpoint) as a PR reviewer. It feeds the PR diff to Claude Code, which records required changes through a private MCP "collector" tool, then the action turns those records into inline GitHub review comments and submits a `REQUEST_CHANGES` or `APPROVE` review.
+
+## Build and release
+
+```bash
+npm install
+npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.txt)
+```
+
+- **`dist/` MUST be committed.** The Actions runner executes `dist/index.js` directly — it never runs `npm install` or a build step. Every change to `src/index.js` requires `npm run build` and committing both `src/` and `dist/`.
+- There is **no test suite, linter, or test command**. "Verify" means building cleanly and reasoning through the runtime path; there is no `npm test`.
+- Keep PRs to one fix/feature each, against `main`.
+
+### Cutting a release
+
+Releases are git tags (`0.1.1`, no `v` prefix). Consumers pin the action by tag — the `dist/index.js` + `action.yml` at the tagged commit are what executes — and most pin the **moving major tag** `v<major>` (e.g. `@v1`), which always points at the latest release in that major line.
+
+Versioning is split into two parts, deliberately:
+
+1. **Bump** = a normal change. Edit `package.json`'s `version`, run `npm run build`, commit `package.json` + `dist/`, and merge it to `main` via a PR like any other.
+2. **Publish** = `scripts/release.sh`, run on a clean, up-to-date `main`:
+
+   ```bash
+   git checkout main && git pull && ./scripts/release.sh
+   ```
+
+   It reads the version from `package.json` (the single source of truth), refuses to run if the committed `dist/` doesn't match a fresh build, then tags the commit, re-points `v<major>`, pushes the tags, and creates the GitHub Release with generated notes. It never edits or commits anything — the bump already happened in step 1.
+
+- A **breaking change** gets a new major (`2.0.0`); `scripts/release.sh` then manages `v2`, leaving `v1` frozen at the last 1.x so existing consumers don't break.
+
+## Architecture
+
+Everything lives in `src/index.js`. It is a **single file with two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
+
+1. **Action orchestrator** (`run`) — the default mode the runner invokes.
+2. **MCP collector server** (`runReviewCollectorServer`) — the *same file* re-spawned as a stdio MCP subprocess by Claude Code. The MCP config (`createReviewCollector`) wires `command: node, args: [__filename, '--review-collector-server']`, so the binary is self-referential.
+
+The central design seam is **judgment vs. transport**:
+
+- **Claude Code owns review judgment.** It runs in non-interactive print mode (`-p --output-format json`), read-only (allowed: `Read`/`Grep`/`Glob` + the two collector tools; disallowed: `Bash`/`Edit`/`Write`/`Web*`). Its *only* output channel is the collector tools — it cannot post to GitHub itself.
+- **The action owns GitHub transport.** It reads the collector's records, validates them, and calls the GitHub review API.
+
+This boundary is why findings flow through an MCP tool rather than being parsed from Claude's prose: `request_change` / `finish_review` produce typed, schema-validated records (`records.jsonl`), and `readCollectedReview` enforces "exactly one `finish_review`" before anything reaches GitHub.
+
+### The position-numbering invariant (most fragile part)
+
+GitHub anchors inline comments to a diff `position`, not a file line number. The numbering rule (position 1 = line after the *first* hunk header; every subsequent line *including later `@@` headers* increments) is defined **once** in `patchPositions` (`src/index.js`). Three consumers derive from it and must never reimplement it:
+
+- `annotatePatchWithPositions` — labels each diff line `POSITION N` in the prompt so the model cites the right anchor.
+- `buildReviewAnchors` — the `path:position` set used by `validateFindings` to reject any finding outside the visible diff.
+- `submitReview` — passes `position` straight to GitHub.
+
+The two-way contract: the model can only comment on lines it was shown as `POSITION N`, and the action rejects anything else. If you touch diff handling, keep all positions sourced from `patchPositions`.
+
+### Auth and environment
+
+Z.ai credentials are translated to Claude Code's env exactly once in `runClaudeCode`: `ZAI_API_KEY` → `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`, plus a per-run temp `HOME` (`createReviewerHome`) holding the bundled `review-agent/CLAUDE.md` as the reviewer's user-global instructions. Temp `HOME` and collector dirs are created and torn down by the same owner (the `try/finally` in `run`).
+
+### Approval permissions
+
+The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`, a clean review just logs `✅ Approved` (no formal approval submitted); findings still submit a `REQUEST_CHANGES` review. Set `GITHUB_REVIEW_TOKEN` (used for *all* GitHub calls when present) to submit formal approvals.
+
+## Two CLAUDE.md files — do not confuse them
+
+- **This file** (`/CLAUDE.md`) — guidance for working *on* this repo.
+- **`review-agent/CLAUDE.md`** — a runtime artifact: the reviewer's instructions, copied into the spawned reviewer's `~/.claude/CLAUDE.md`. Editing it changes *how reviews are conducted*, not how you develop here. The review task prompt itself (the law priorities, the `request_change` rules) is the big template literal in `buildReviewInput`.
