@@ -32013,8 +32013,9 @@ Review this pull request. Use the repository working tree for context and the di
     - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag when the diff clearly violates them.
 
     Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns. When unsure whether
-    something rises to must-change, it does not — leave it for the summary. The finish_review summary states the overall verdict, the count
-    and nature of must-change items, and any pattern-level or pre-existing concerns worth the author's attention.
+    something rises to must-change, it does not — leave it for the summary. The finish_review summary describes the nature of any must-change
+    items and any pattern-level or pre-existing concerns worth the author's attention. Do NOT state an overall verdict, approval status, or
+    must-change count — the action derives the verdict from the recorded changes and appends it itself.
     \n\n${diffs}`,
   };
 }
@@ -32398,8 +32399,12 @@ function runReviewCollectorServer() {
 }
 
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review) {
-  const event = review.findings.length > 0 ? 'REQUEST_CHANGES' : 'APPROVE';
-  const body = `## ${reviewerName}\n\n${review.summary}\n\n${REVIEW_MARKER}`;
+  // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
+  // rendered verdict, so they cannot disagree. The model never states the verdict.
+  const requestsChanges = review.findings.length > 0;
+  const event = requestsChanges ? 'REQUEST_CHANGES' : 'APPROVE';
+  const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
+  const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => ({
     path: finding.path,
     position: finding.position,
