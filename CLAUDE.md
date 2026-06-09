@@ -52,19 +52,28 @@ Everything lives in `src/index.js`. It is a **single file with two entry points*
 The central design seam is **judgment vs. transport**:
 
 - **Claude Code owns review judgment.** It runs in non-interactive print mode (`-p --output-format json`), read-only (allowed: `Read`/`Grep`/`Glob` + the two collector tools; disallowed: `Bash`/`Edit`/`Write`/`Web*`). Its *only* output channel is the collector tools — it cannot post to GitHub itself.
-- **The action owns GitHub transport.** It reads the collector's records, validates them, and calls the GitHub review API.
+- **The transport owns host I/O.** It reads the collector's records, validates them, and calls the review API of whichever host the runner reports.
 
-This boundary is why findings flow through an MCP tool rather than being parsed from Claude's prose: `request_change` / `finish_review` produce typed, schema-validated records (`records.jsonl`), and `readCollectedReview` enforces "exactly one `finish_review`" before anything reaches GitHub.
+This boundary is why findings flow through an MCP tool rather than being parsed from Claude's prose: `request_change` / `finish_review` produce typed, schema-validated records (`records.jsonl`), and `readCollectedReview` enforces "exactly one `finish_review`" before anything reaches the host.
 
-### The position-numbering invariant (most fragile part)
+### The line-anchor invariant (most fragile part)
 
-GitHub anchors inline comments to a diff `position`, not a file line number. The numbering rule (position 1 = line after the *first* hunk header; every subsequent line *including later `@@` headers* increments) is defined **once** in `patchPositions` (`src/index.js`). Three consumers derive from it and must never reimplement it:
+A finding anchors to a **new-file line number**, defined **once** in `patchLines` (`src/index.js`): each `@@` hunk header resets the new-side counter; only added (`+`) and context (` `) lines advance it and are anchorable (deletions have no new-side line). Three consumers derive from it and must never reimplement it:
 
-- `annotatePatchWithPositions` — labels each diff line `POSITION N` in the prompt so the model cites the right anchor.
-- `buildReviewAnchors` — the `path:position` set used by `validateFindings` to reject any finding outside the visible diff.
-- `submitReview` — passes `position` straight to GitHub.
+- `annotatePatchWithLines` — labels each anchorable diff line `LINE N` in the prompt so the model cites the right line.
+- `buildReviewAnchors` — the `path:line` set used by `validateFindings` to reject any finding outside the visible diff.
+- `transport.toComment` — maps a finding's `line` to the host's comment anchor.
 
-The two-way contract: the model can only comment on lines it was shown as `POSITION N`, and the action rejects anything else. If you touch diff handling, keep all positions sourced from `patchPositions`.
+The two-way contract: the model can only comment on lines it was shown as `LINE N`, and the action rejects anything else.
+
+### Host transport (GitHub + Gitea)
+
+The action talks to whatever host the runner reports — the API base comes from `GITHUB_API_URL` (set by GitHub Actions and Gitea's `act_runner` alike), never hardcoded. The two host families differ in exactly two places, both behind one `transport` chosen once by **capability** in `selectTransport` (not by hostname):
+
+- **Diff source.** GitHub's `listFiles` carries per-file `patch`; Gitea's does not. When no file has a `patch`, the transport fetches the unified `.diff` and `parseUnifiedDiff` splits it into the same `{filename, status, patch}` shape.
+- **Comment anchor.** The same new-file line number becomes `{line, side: 'RIGHT'}` on GitHub and `{new_position}` on Gitea.
+
+Everything downstream (`patchLines`, anchors, validation, the prompt) is host-agnostic. To support another host, add a transport instance; touch nothing else.
 
 ### Auth and environment
 

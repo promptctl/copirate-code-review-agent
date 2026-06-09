@@ -54,48 +54,54 @@ function filterFiles(files, excludePatterns) {
 // line — context, additions, deletions, and subsequent @@ headers — advances the
 // count. Only the first header is the baseline; treating every header as
 // skippable (as a naive reader would) drifts comments off by one per extra hunk.
-function* patchPositions(patch) {
-  let position = 0;
-  let seenHunk = false;
-
-  for (const line of patch.split('\n')) {
-    if (line.length === 0) {
+// [LAW:one-source-of-truth] The new-file line number is the one honest anchor for a
+// changed line; both GitHub (line+side) and Gitea (new_position) speak it natively.
+// Each hunk header resets the new-side counter; only added/context lines advance it
+// and are anchorable (deletions have no new-side line).
+function* patchLines(patch) {
+  let newLine = 0;
+  let inHunk = false;
+  for (const text of patch.split('\n')) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      inHunk = true;
+      yield { kind: 'meta', text };
       continue;
     }
-    if (!seenHunk) {
-      seenHunk = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line);
-      yield { kind: 'baseline', line };
+    const marker = inHunk ? text[0] : undefined;
+    if (marker === '+' || marker === ' ') {
+      yield { kind: 'line', line: newLine, text };
+      newLine++;
       continue;
     }
-    position++;
-    yield { kind: 'positioned', position, line };
+    yield { kind: 'meta', text };
   }
 }
 
-function buildPatchAnchors(file) {
+function buildFileAnchors(file) {
   const anchors = new Map();
-  for (const entry of patchPositions(file.patch)) {
-    if (entry.kind !== 'positioned') {
-      continue;
+  for (const entry of patchLines(file.patch)) {
+    if (entry.kind === 'line') {
+      anchors.set(`${file.filename}:${entry.line}`, { path: file.filename, line: entry.line });
     }
-    anchors.set(`${file.filename}:${entry.position}`, { path: file.filename, position: entry.position });
   }
   return anchors;
 }
 
 function buildReviewAnchors(files) {
-  return new Map(files.filter(f => f.patch).flatMap(f => [...buildPatchAnchors(f)]));
+  return new Map(files.filter(f => f.patch).flatMap(f => [...buildFileAnchors(f)]));
 }
 
-function annotatePatchWithPositions(patch) {
+function annotatePatchWithLines(patch) {
   const lines = [];
-  for (const entry of patchPositions(patch)) {
-    lines.push(entry.kind === 'positioned' ? `POSITION ${entry.position}: ${entry.line}` : entry.line);
+  for (const entry of patchLines(patch)) {
+    lines.push(entry.kind === 'line' ? `LINE ${entry.line}: ${entry.text}` : entry.text);
   }
   return lines.join('\n');
 }
 
-async function getChangedFiles(octokit, owner, repo, pullNumber) {
+async function listAllFiles(octokit, owner, repo, pullNumber) {
   const files = [];
   let page = 1;
   while (true) {
@@ -113,6 +119,66 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
   return files;
 }
 
+// Parse a unified diff into the same {filename, status, patch} shape GitHub's
+// listFiles returns, where `patch` is the hunk text from the first @@ onward.
+function parseUnifiedDiff(diff) {
+  const files = [];
+  let cur = null;
+  const flush = () => {
+    if (cur && cur.hunks.length > 0) {
+      files.push({ filename: cur.filename, status: cur.status, patch: cur.hunks.join('\n') });
+    }
+  };
+  for (const line of diff.split('\n')) {
+    const header = /^diff --git a\/.+ b\/(.+)$/.exec(line);
+    if (header) {
+      flush();
+      cur = { filename: header[1], status: 'modified', hunks: [], inHunk: false };
+      continue;
+    }
+    if (!cur) {
+      continue;
+    }
+    if (line.startsWith('new file mode')) cur.status = 'added';
+    else if (line.startsWith('deleted file mode')) cur.status = 'removed';
+    else if (line.startsWith('rename to ')) cur.status = 'renamed';
+    if (/^@@ /.test(line)) cur.inHunk = true;
+    if (cur.inHunk) cur.hunks.push(line);
+  }
+  flush();
+  return files;
+}
+
+// [LAW:one-type-per-behavior] One transport; the host differs only in how the diff is
+// sourced and how a finding's new-file line becomes a review comment.
+// [LAW:dataflow-not-control-flow] Capability — does listFiles carry per-file patch? —
+// selects the instance, not a hardcoded hostname (GitHub & Enterprise carry it; Gitea does not).
+function gitHubTransport(files) {
+  return { files, toComment: f => ({ path: f.path, line: f.line, side: 'RIGHT', body: f.body }) };
+}
+
+function giteaTransport(files) {
+  return { files, toComment: f => ({ path: f.path, new_position: f.line, body: f.body }) };
+}
+
+async function selectTransport(octokit, owner, repo, pullNumber) {
+  const files = await listAllFiles(octokit, owner, repo, pullNumber);
+  if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
+    return gitHubTransport(files);
+  }
+  // [LAW:no-silent-failure] Gitea omits per-file patch; its unified .diff carries the hunks.
+  const { data } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}.diff', {
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+  const parsed = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  if (parsed.length === 0) {
+    throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
+  }
+  return giteaTransport(parsed);
+}
+
 function buildReviewInput(files, maxDiffChars) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
@@ -121,7 +187,7 @@ function buildReviewInput(files, maxDiffChars) {
   let totalChars = 0;
 
   for (const f of patchableFiles) {
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithPositions(f.patch)}\n\`\`\``;
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
       skippedFiles.push(f.filename);
     } else {
@@ -142,19 +208,19 @@ function buildReviewInput(files, maxDiffChars) {
     files: includedFiles,
     prompt: `
 Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
-    Each visible diff line is annotated as POSITION N. Call mcp__review_collector__request_change only for code that must change before merge.
-    Every requested change must use path, position, and body with the displayed POSITION value. When the review is complete,
+    Each visible diff line is annotated as LINE N. Call mcp__review_collector__request_change only for code that must change before merge.
+    Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
     call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.
 
     You review against the LAWS in your guidance. You flag violations; you do not fix them. A change MUST change before merge only if this
     diff introduces or worsens a LAW violation, or introduces a correctness bug. Pre-existing violations in unchanged code, and matters of
     taste the laws do not cover, are NOT request_change material — mention the significant ones in the finish_review summary instead.
 
-    You can ONLY attach a comment to a line shown as POSITION N — that is, a line this diff changed. You cannot comment on unchanged code;
-    GitHub does not allow it. When the diff introduces a violation whose root cause sits in unchanged code (e.g. it feeds a bad state into
-    an existing guard, or relies on an existing loose type), attach the comment to the changed POSITION that is responsible for the new
-    problem and explain the upstream link in the body. If a finding cannot be tied to any changed POSITION, it goes in the finish_review
-    summary, not a request_change.
+    You can ONLY attach a comment to a line shown as LINE N — that is, a line this diff added or kept as context. You cannot comment on
+    unchanged or deleted code; the host does not allow it. When the diff introduces a violation whose root cause sits in unchanged code
+    (e.g. it feeds a bad state into an existing guard, or relies on an existing loose type), attach the comment to the changed LINE that is
+    responsible for the new problem and explain the upstream link in the body. If a finding cannot be tied to any changed LINE, it goes in
+    the finish_review summary, not a request_change.
 
     Each request_change body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow]; (2) one sentence naming the
     specific violation on that line; (3) the concrete fix. Keep it short. One comment per distinct issue — do not repeat the same finding
@@ -265,20 +331,20 @@ function parseReviewValue(parsed, context) {
       throw new Error(`Claude Code finding ${index + 1} is not an object.`);
     }
     const pathValue = finding.path;
-    const position = finding.position;
+    const line = finding.line;
     const body = finding.body;
     if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
       throw new Error(`Claude Code finding ${index + 1} has an invalid path.`);
     }
-    if (!Number.isInteger(position) || position <= 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid position.`);
+    if (!Number.isInteger(line) || line <= 0) {
+      throw new Error(`Claude Code finding ${index + 1} has an invalid line.`);
     }
     if (typeof body !== 'string' || body.trim().length === 0) {
       throw new Error(`Claude Code finding ${index + 1} has an invalid body.`);
     }
     return {
       path: pathValue.trim(),
-      position,
+      line,
       body: body.trim(),
     };
   });
@@ -295,7 +361,7 @@ function parseFindingValue(finding, index) {
 
 function validateFindings(findings, anchors) {
   for (const finding of findings) {
-    const anchor = `${finding.path}:${finding.position}`;
+    const anchor = `${finding.path}:${finding.line}`;
     if (!anchors.has(anchor)) {
       throw new Error(`Claude Code finding references a line outside the review diff: ${anchor}`);
     }
@@ -472,10 +538,10 @@ function collectorTools() {
         type: 'object',
         properties: {
           path: { type: 'string' },
-          position: { type: 'integer' },
+          line: { type: 'integer' },
           body: { type: 'string' },
         },
-        required: ['path', 'position', 'body'],
+        required: ['path', 'line', 'body'],
         additionalProperties: false,
       },
     },
@@ -571,18 +637,14 @@ function reviewEvent(requestsChanges, canApprove) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
 }
 
-async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove) {
+async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
   // rendered verdict, so they cannot disagree. The model never states the verdict.
   const requestsChanges = review.findings.length > 0;
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => ({
-    path: finding.path,
-    position: finding.position,
-    body: finding.body,
-  }));
+  const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({
@@ -630,7 +692,8 @@ async function run() {
   const reviewOctokit = github.getOctokit(reviewToken || token);
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const files = await getChangedFiles(octokit, owner, repo, pullNumber);
+  const transport = await selectTransport(octokit, owner, repo, pullNumber);
+  const files = transport.files;
 
   const filteredFiles = filterFiles(files, excludePatterns);
 
@@ -647,7 +710,7 @@ async function run() {
     await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
-    }, Boolean(reviewToken));
+    }, Boolean(reviewToken), transport);
     return;
   }
 
@@ -662,7 +725,7 @@ async function run() {
     await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, collector.mcpConfigPath);
     const review = readCollectedReview(collector.recordsPath);
     validateFindings(review.findings, anchors);
-    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
+    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport);
   } finally {
     // [LAW:no-ambient-temporal-coupling] The same owner that creates temporary review state also tears it down.
     fs.rmSync(reviewerHome, { recursive: true });
@@ -672,6 +735,8 @@ async function run() {
 
 if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
   runReviewCollectorServer();
-} else {
+} else if (require.main === module) {
   run().catch(err => core.setFailed(err.message));
 }
+
+module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport };
