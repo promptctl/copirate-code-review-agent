@@ -45,7 +45,7 @@ git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1 \
 # Otherwise the Actions runner (which executes dist/index.js directly) ships
 # stale code. Rebuild, diff, and restore the tree either way. [LAW:no-silent-failure]
 echo "→ verifying dist matches source (npm run build)…"
-npm run build >/dev/null 2>&1 || die "build failed. Run 'npm run build' to see the error."
+npm run build >/dev/null || die "build failed (see the error above)."
 if ! git diff --quiet -- dist; then
   git checkout -- dist
   die "dist is out of date with src. Rebuild and commit dist via a PR before releasing."
