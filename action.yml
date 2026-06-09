@@ -11,7 +11,7 @@ inputs:
   ZAI_SYSTEM_PROMPT:
     description: "Additional system prompt appended to Claude Code"
     required: false
-    default: "Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence; skip style-only comments."
+    default: "Review according to the LAWS. Request changes for blocking issues: LAW VIOLATIONS, bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests."
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header"
     required: false
@@ -28,6 +28,9 @@ inputs:
     description: "GitHub token for API access"
     required: false
     default: ${{ github.token }}
+  GITHUB_REVIEW_TOKEN:
+    description: "Optional token to set when you want the agent to submit PRs with no requested changes as approvals.  If this is set, it will be used for all GitHub API requests."
+    required: false
 runs:
   using: "node24"
   main: "dist/index.js"

@@ -1,15 +1,18 @@
 # Z.ai Coding Agent Review
 
-AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then posts or updates a pull request review comment.
+AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then submits a pull request review with inline review threads.
 
 ## Features
 
 - Detect bugs
 - Suggest improvements
 - Use bundled reviewer `CLAUDE.md` instructions
-- Post or update a stable GitHub PR comment
+- Leave inline review threads on required changes
+- Request changes when required changes exist, otherwise approve the pull request
 
-## Quickstart
+## Quickstart (hand this to your agent)
+
+````
 
 Add this to your `.github/workflows/code-review.yml`:
 
@@ -89,6 +92,8 @@ git add .github/workflows/code-review.yml
 git commit -m "Install Z.ai coding agent review action"
 ```
 
+````
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -99,18 +104,25 @@ git commit -m "Install Z.ai coding agent review action"
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
 | `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
+| `GITHUB_REVIEW_TOKEN` | No | — | Optional token for submitting reviews when `GITHUB_TOKEN` cannot approve pull requests |
 
-The default appended system prompt is:
-
-> Review according to the repository LAWS. Find bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, and missing behavior tests. Return concise actionable findings with file/line evidence; skip style-only comments.
-
-The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
-
-> You are a security-focused code reviewer. Identify vulnerabilities, unsafe patterns, and authentication issues. Skip style comments.
+The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project.
 
 ## Configuration
 
 To use this action, add your Z.ai API key as a GitHub secret. The action maps it to Claude Code's Anthropic-compatible environment variables for the Z.ai Coding Plan endpoint.
+
+## Operation
+
+This action will provide code reviews for your PRs using z.ai coding plan.  
+
+By default, the agent will use the standard non-privileged GITHUB_TOKEN which does not provide write access to the repo, and therefore cannot mark a PR as approved.
+
+To have the agent APPROVE your PR, set GITHUB_REVIEW_TOKEN to a token with appropriate permissions.
+
+In either case, if there are no findings, it will print an approval message.
+
+If there are findings, it will mark the PR with CHANGES_REQUESTED.  Have your agent resolve the review threads and dismiss the review to continue.
 
 ### 1. Get your Z.ai API key
 
@@ -132,7 +144,9 @@ Claude Code runs in non-interactive print mode with the Z.ai Anthropic-compatibl
 - `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`
 - `ANTHROPIC_AUTH_TOKEN` from `ZAI_API_KEY`
 
-The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files.
+The action allows read/search-oriented tools for review and denies shell, web, and edit-oriented tools. Check out the pull request before running the action so Claude Code can inspect repository files. Claude Code records required changes through a local collector tool; the action validates those collected records before turning them into inline GitHub review comments. The action prints `❌ Request Changes` when required changes exist and `✅ Approved` when there are no required changes; it also submits a formal approval review when `GITHUB_REVIEW_TOKEN` is provided.
+
+`GITHUB_REVIEW_TOKEN` is optional. Leave it unset for the default workflow: required changes request changes, and clean reviews finish successfully with `✅ Approved`. Set it to an approval-capable user or GitHub App token only when you want the action to submit a formal approval review.
 
 ## Advanced configuration
 
@@ -160,6 +174,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
           ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
+          GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
 ## Contributing
