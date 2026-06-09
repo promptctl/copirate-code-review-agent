@@ -31884,24 +31884,38 @@ function filterFiles(files, excludePatterns) {
   return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
 }
 
-function buildPatchAnchors(file) {
-  const anchors = new Map();
+// [LAW:single-enforcer] GitHub's review `position` numbering is defined once here;
+// the anchor table and the model-facing annotation both derive from it. GitHub
+// counts position 1 at the line after the FIRST hunk header, and every later
+// line — context, additions, deletions, and subsequent @@ headers — advances the
+// count. Only the first header is the baseline; treating every header as
+// skippable (as a naive reader would) drifts comments off by one per extra hunk.
+function* patchPositions(patch) {
   let position = 0;
+  let seenHunk = false;
 
-  for (const line of file.patch.split('\n')) {
+  for (const line of patch.split('\n')) {
     if (line.length === 0) {
       continue;
     }
-    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
+    if (!seenHunk) {
+      seenHunk = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line);
+      yield { kind: 'baseline', line };
       continue;
     }
-    if (!line.startsWith('\\')) {
-      position++;
-      anchors.set(`${file.filename}:${position}`, { path: file.filename, position });
-    }
+    position++;
+    yield { kind: 'positioned', position, line };
   }
+}
 
+function buildPatchAnchors(file) {
+  const anchors = new Map();
+  for (const entry of patchPositions(file.patch)) {
+    if (entry.kind !== 'positioned') {
+      continue;
+    }
+    anchors.set(`${file.filename}:${entry.position}`, { path: file.filename, position: entry.position });
+  }
   return anchors;
 }
 
@@ -31910,22 +31924,10 @@ function buildReviewAnchors(files) {
 }
 
 function annotatePatchWithPositions(patch) {
-  let position = 0;
   const lines = [];
-
-  for (const line of patch.split('\n')) {
-    if (line.length === 0) {
-      continue;
-    }
-    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
-      lines.push(line);
-    } else if (!line.startsWith('\\')) {
-      position++;
-      lines.push(`POSITION ${position}: ${line}`);
-    }
+  for (const entry of patchPositions(patch)) {
+    lines.push(entry.kind === 'positioned' ? `POSITION ${entry.position}: ${entry.line}` : entry.line);
   }
-
   return lines.join('\n');
 }
 
@@ -31974,7 +31976,46 @@ function buildReviewInput(files, maxDiffChars) {
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
-    prompt: `Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface. Each visible diff line is annotated as POSITION N. Call mcp__review_collector__request_change only for code that must change before merge: bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests. Do not call request_change for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes. Every requested change must use path, position, and body with the displayed POSITION value. When the review is complete, call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.\n\n${diffs}`,
+    prompt: `
+Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
+    Each visible diff line is annotated as POSITION N. Call mcp__review_collector__request_change only for code that must change before merge.
+    Every requested change must use path, position, and body with the displayed POSITION value. When the review is complete,
+    call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.
+
+    You review against the LAWS in your guidance. You flag violations; you do not fix them. A change MUST change before merge only if this
+    diff introduces or worsens a LAW violation, or introduces a correctness bug. Pre-existing violations in unchanged code, and matters of
+    taste the laws do not cover, are NOT request_change material — mention the significant ones in the finish_review summary instead.
+
+    You can ONLY attach a comment to a line shown as POSITION N — that is, a line this diff changed. You cannot comment on unchanged code;
+    GitHub does not allow it. When the diff introduces a violation whose root cause sits in unchanged code (e.g. it feeds a bad state into
+    an existing guard, or relies on an existing loose type), attach the comment to the changed POSITION that is responsible for the new
+    problem and explain the upstream link in the body. If a finding cannot be tied to any changed POSITION, it goes in the finish_review
+    summary, not a request_change.
+
+    Each request_change body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow]; (2) one sentence naming the
+    specific violation on that line; (3) the concrete fix. Keep it short. One comment per distinct issue — do not repeat the same finding
+    across many lines; flag the clearest instance and note the pattern once.
+
+    Priorities, highest first:
+    - [LAW:dataflow-not-control-flow] — the most common and most important violation to catch. Flag: a new \`if\`/\`switch\` that selects WHICH
+      operation runs rather than letting data decide the result; a guard that makes an operation sometimes-run, sometimes-skip (especially
+      \`if (x) { ...work... }\` with no else — that is [LAW:no-defensive-null-guards] too); branching on a mode/flag instead of passing a
+      value; logic whose described mechanics need "if / and / when / skip / only". Fix toward: the operation always runs, variability moves
+      into the values flowing through it.
+    - [LAW:decomposition] / [LAW:composability] — a new function that does more than one thing (needs "and" to describe), or hardcodes a
+      caller-specific choice that should be a parameter. Fix toward: split, or lift the choice to the seam as a value.
+    - [LAW:types-are-the-program] — a new type that admits illegal states (\`any\`, \`string\` for an enum, fields that must agree but aren't
+      tied), or a body that branches/guards to compensate for a too-loose type. Fix toward: tighten the type so the bad state cannot compile.
+    - [LAW:effects-at-boundaries] — new code mixing computation with IO/mutation/network/clock/randomness in the same unit. Fix toward:
+      pure core, effects at the edge.
+    - [LAW:no-silent-failure] — newly introduced swallowed errors, \`|| true\`, \`2>/dev/null\`, empty catches, or meaning-changing fallbacks.
+    - [LAW:one-source-of-truth] / [LAW:single-enforcer] — a new second home for an existing fact, or a duplicated enforcement check.
+    - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag when the diff clearly violates them.
+
+    Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns. When unsure whether
+    something rises to must-change, it does not — leave it for the summary. The finish_review summary states the overall verdict, the count
+    and nature of must-change items, and any pattern-level or pre-existing concerns worth the author's attention.
+    \n\n${diffs}`,
   };
 }
 
@@ -32449,7 +32490,7 @@ async function run() {
   const collector = createReviewCollector();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
-  core.info(`Running Claude Code with Z.ai credentials for ${filteredFiles.length} file(s)...`);
+  core.info(`Running PR review for ${filteredFiles.length} file(s)...`);
   try {
     await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, collector.mcpConfigPath);
     const review = readCollectedReview(collector.recordsPath);

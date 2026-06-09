@@ -48,24 +48,38 @@ function filterFiles(files, excludePatterns) {
   return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
 }
 
-function buildPatchAnchors(file) {
-  const anchors = new Map();
+// [LAW:single-enforcer] GitHub's review `position` numbering is defined once here;
+// the anchor table and the model-facing annotation both derive from it. GitHub
+// counts position 1 at the line after the FIRST hunk header, and every later
+// line — context, additions, deletions, and subsequent @@ headers — advances the
+// count. Only the first header is the baseline; treating every header as
+// skippable (as a naive reader would) drifts comments off by one per extra hunk.
+function* patchPositions(patch) {
   let position = 0;
+  let seenHunk = false;
 
-  for (const line of file.patch.split('\n')) {
+  for (const line of patch.split('\n')) {
     if (line.length === 0) {
       continue;
     }
-    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
+    if (!seenHunk) {
+      seenHunk = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line);
+      yield { kind: 'baseline', line };
       continue;
     }
-    if (!line.startsWith('\\')) {
-      position++;
-      anchors.set(`${file.filename}:${position}`, { path: file.filename, position });
-    }
+    position++;
+    yield { kind: 'positioned', position, line };
   }
+}
 
+function buildPatchAnchors(file) {
+  const anchors = new Map();
+  for (const entry of patchPositions(file.patch)) {
+    if (entry.kind !== 'positioned') {
+      continue;
+    }
+    anchors.set(`${file.filename}:${entry.position}`, { path: file.filename, position: entry.position });
+  }
   return anchors;
 }
 
@@ -74,22 +88,10 @@ function buildReviewAnchors(files) {
 }
 
 function annotatePatchWithPositions(patch) {
-  let position = 0;
   const lines = [];
-
-  for (const line of patch.split('\n')) {
-    if (line.length === 0) {
-      continue;
-    }
-    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
-      lines.push(line);
-    } else if (!line.startsWith('\\')) {
-      position++;
-      lines.push(`POSITION ${position}: ${line}`);
-    }
+  for (const entry of patchPositions(patch)) {
+    lines.push(entry.kind === 'positioned' ? `POSITION ${entry.position}: ${entry.line}` : entry.line);
   }
-
   return lines.join('\n');
 }
 
