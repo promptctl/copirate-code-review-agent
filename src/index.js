@@ -659,6 +659,20 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   core.info(verdict);
 }
 
+// [LAW:single-enforcer] One resolver decides which pull request to review, from
+// whichever provenance the triggering event offers. pull_request / pull_request_target
+// carry the PR in the event payload; other events (workflow_run, workflow_dispatch)
+// carry no PR, so the caller passes PR_NUMBER / HEAD_SHA explicitly. Explicit inputs win
+// when present; the event payload is the zero-config default. Neither present is a loud
+// failure upstream, never a silent skip. [LAW:no-silent-failure]
+function resolveReviewTarget(numberInput, headShaInput, payload) {
+  const pr = payload.pull_request;
+  return {
+    pullNumber: numberInput ? Number(numberInput) : pr?.number,
+    headSha: headShaInput || pr?.head?.sha,
+  };
+}
+
 async function run() {
   const apiKey = core.getInput('ZAI_API_KEY', { required: true });
   core.setSecret(apiKey);
@@ -679,12 +693,17 @@ async function run() {
 
   const { context } = github;
   const { owner, repo } = context.repo;
-  const pullRequest = context.payload.pull_request;
-  const pullNumber = pullRequest?.number;
-  const headSha = pullRequest?.head?.sha;
+  const { pullNumber, headSha } = resolveReviewTarget(
+    core.getInput('PR_NUMBER'),
+    core.getInput('HEAD_SHA'),
+    context.payload,
+  );
 
-  if (!pullNumber || !headSha) {
-    core.setFailed('This action only runs on pull_request events.');
+  if (!Number.isInteger(pullNumber) || pullNumber <= 0 || !headSha) {
+    core.setFailed(
+      'Could not determine which pull request to review. On pull_request events this is '
+      + 'detected automatically; on other events (e.g. workflow_run) pass PR_NUMBER and HEAD_SHA explicitly.',
+    );
     return;
   }
 
@@ -739,4 +758,4 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
   run().catch(err => core.setFailed(err.message));
 }
 
-module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport };
+module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget };

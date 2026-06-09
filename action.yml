@@ -31,6 +31,12 @@ inputs:
   GITHUB_REVIEW_TOKEN:
     description: "Optional token to set when you want the agent to submit PRs with no requested changes as approvals.  If this is set, it will be used for all GitHub API requests."
     required: false
+  PR_NUMBER:
+    description: "Pull request number to review. Auto-detected on pull_request events; pass explicitly on other events (e.g. workflow_run) where there is no pull_request payload."
+    required: false
+  HEAD_SHA:
+    description: "Head commit SHA the review is anchored to. Auto-detected on pull_request events; pass explicitly on other events (e.g. workflow_run)."
+    required: false
 runs:
   using: "node24"
   main: "dist/index.js"
