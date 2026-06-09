@@ -10,7 +10,9 @@ AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Pl
 - Leave inline review threads on required changes
 - Request changes when required changes exist, otherwise approve the pull request
 
-## Quickstart
+## Quickstart (hand this to your agent)
+
+````
 
 Add this to your `.github/workflows/code-review.yml`:
 
@@ -90,6 +92,8 @@ git add .github/workflows/code-review.yml
 git commit -m "Install Z.ai coding agent review action"
 ```
 
+````
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -102,17 +106,23 @@ git commit -m "Install Z.ai coding agent review action"
 | `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
 | `GITHUB_REVIEW_TOKEN` | No | — | Optional token for submitting reviews when `GITHUB_TOKEN` cannot approve pull requests |
 
-The default appended system prompt is:
-
-> Review according to the repository LAWS. Request changes only for blocking issues: bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests. Do not request changes for praise, good architecture, neutral observations, optional improvements, or style preferences.
-
-The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project. You can override the appended prompt to focus on specific concerns, enforce coding standards, or adjust the review tone, e.g.:
-
-> You are a security-focused code reviewer. Identify vulnerabilities, unsafe patterns, and authentication issues. Skip style comments.
+The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project.
 
 ## Configuration
 
 To use this action, add your Z.ai API key as a GitHub secret. The action maps it to Claude Code's Anthropic-compatible environment variables for the Z.ai Coding Plan endpoint.
+
+## Operation
+
+This action will provide code reviews for your PRs using z.ai coding plan.  
+
+By default, the agent will use the standard non-privileged GITHUB_TOKEN which does not provide write access to the repo, and therefore cannot mark a PR as approved.
+
+To have the agent APPROVE your PR, set GITHUB_REVIEW_TOKEN to a token with appropriate permissions.
+
+In either case, if there are no findings, it will print an approval message.
+
+If there are findings, it will mark the PR with CHANGES_REQUESTED.  Have your agent resolve the review threads and dismiss the review to continue.
 
 ### 1. Get your Z.ai API key
 
