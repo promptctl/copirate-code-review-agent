@@ -32398,11 +32398,20 @@ function runReviewCollectorServer() {
   });
 }
 
-async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review) {
+// [LAW:dataflow-not-control-flow] A review is ALWAYS posted to the PR. The data
+// (findings present? token approval-capable?) selects only the GitHub event —
+// never whether the message is posted. canApprove gates APPROVE vs COMMENT
+// because the default GITHUB_TOKEN cannot submit a formal approval, but a
+// visible "✅ Approved" message must still land on the PR either way.
+function reviewEvent(requestsChanges, canApprove) {
+  return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
+}
+
+async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
   // rendered verdict, so they cannot disagree. The model never states the verdict.
   const requestsChanges = review.findings.length > 0;
-  const event = requestsChanges ? 'REQUEST_CHANGES' : 'APPROVE';
+  const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => ({
@@ -32410,29 +32419,18 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
     position: finding.position,
     body: finding.body,
   }));
-  const reviewRequest = {
+
+  // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
+  await octokit.rest.pulls.createReview({
     owner,
     repo,
     pull_number: pullNumber,
     commit_id: commitId,
     event,
     body,
-  };
-
-  // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
-  await octokit.rest.pulls.createReview({
-    ...reviewRequest,
     ...(comments.length > 0 ? { comments } : {}),
   });
-}
-
-async function submitCleanReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove) {
-  if (canApprove) {
-    await submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review);
-  } else {
-    core.info('No approval-capable review token was configured; skipping formal approval review.');
-  }
-  core.info(APPROVED_MESSAGE);
+  core.info(verdict);
 }
 
 async function run() {
@@ -32482,7 +32480,7 @@ async function run() {
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
   if (patchableFiles.length === 0) {
-    await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
+    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, {
       summary: 'No patchable changes found after filtering.',
       findings: [],
     }, Boolean(reviewToken));
@@ -32500,12 +32498,7 @@ async function run() {
     await runClaudeCode(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, collector.mcpConfigPath);
     const review = readCollectedReview(collector.recordsPath);
     validateFindings(review.findings, anchors);
-    if (review.findings.length > 0) {
-      await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review);
-      core.info(REQUEST_CHANGES_MESSAGE);
-    } else {
-      await submitCleanReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
-    }
+    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken));
   } finally {
     // [LAW:no-ambient-temporal-coupling] The same owner that creates temporary review state also tears it down.
     fs.rmSync(reviewerHome, { recursive: true });
