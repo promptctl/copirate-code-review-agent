@@ -21,9 +21,17 @@ npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.t
 
 Releases are git tags (`0.1.1`, no `v` prefix). Consumers pin the action by tag — the `dist/index.js` + `action.yml` at the tagged commit are what executes — and most pin the **moving major tag** `v<major>` (e.g. `@v1`), which always points at the latest release in that major line.
 
+**Every PR that changes what consumers run bumps the version, in that same PR.** The shipped surface is `src/`, `action.yml`, `review-agent/`, and the `dist/` built from them. A PR touching any of those edits `package.json`'s `version` by the correct semver level and rebuilds `dist/` — so `main`'s `package.json` is *always* the next publishable version, never lagging what's merged (the drift that left `package.json` at `0.1.0` while the tag was `0.1.1`). [LAW:one-source-of-truth] A PR that touches only docs, `scripts/`, or this file does **not** bump — bumping it would cut a release with no consumer-visible change.
+
+Pick the level by what the diff does to the consumer contract:
+
+- **patch** (`1.0.0 → 1.0.1`) — a bug fix or internal change; inputs and observable behavior are unchanged.
+- **minor** (`1.0.0 → 1.1.0`) — a backward-compatible addition: a new optional input, a new capability existing workflows keep working without.
+- **major** (`1.0.0 → 2.0.0`) — a breaking change: a removed/renamed input, a changed default, or behavior existing consumers depend on.
+
 Versioning is split into two parts, deliberately:
 
-1. **Bump** = a normal change. Edit `package.json`'s `version`, run `npm run build`, commit `package.json` + `dist/`, and merge it to `main` via a PR like any other.
+1. **Bump** = part of the change itself, not a separate release chore. In the same PR that changes the shipped surface, edit `package.json`'s `version` to the level above, run `npm run build`, commit `package.json` + `dist/`, and merge to `main` via a PR like any other.
 2. **Publish** = `scripts/release.sh`, run on a clean, up-to-date `main`:
 
    ```bash
