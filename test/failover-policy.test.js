@@ -1,6 +1,6 @@
 'use strict';
 
-const { describe, it, before, beforeEach } = require('node:test');
+const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { TransientError, produceReview, buildAttributionFooter } = require('../src/failover');
@@ -228,7 +228,7 @@ describe('produceReview — single-config chain', () => {
 describe('produceReview — configUsed', () => {
   it('configUsed is chain[0] on first-attempt success', async () => {
     const chain = [cfg('alpha'), cfg('beta')];
-    const result = await produceReview(chain, () => 'p', {},makeStub(), NO_SLEEP);
+    const result = await produceReview(chain, () => 'p', {}, makeStub(), NO_SLEEP);
     assert.equal(result.configUsed.name, 'alpha');
   });
 
