@@ -1,10 +1,12 @@
 'use strict';
 const { claudeCodeAdapter } = require('./claude-code');
+const { codexAdapter } = require('./codex');
 
 // [LAW:single-enforcer] The only enumeration of engine adapters.
 // To support a new engine, add it here and implement the adapter contract.
 const adapters = new Map([
   ['claude-code', claudeCodeAdapter],
+  ['codex', codexAdapter],
 ]);
 
 function get(name) {
