@@ -152,9 +152,6 @@ describe('produceReview — budget exhaustion', () => {
   });
 
   it('succeeds after 2 same-config retries; backoff sleeps fired once per retry', async () => {
-    // Verifies the happy retry path: 2 failures then success, with sleepFn called twice.
-    // Note: the budgetLeft===0 branch (throw lastErr mid-retry) requires a fake clock;
-    // it is not exercised here due to the 60-min budget far exceeding test runtime.
     const chain = [cfg('only')];
     const transient = new TransientError('server down');
     let sleepCalls = 0;
@@ -168,7 +165,19 @@ describe('produceReview — budget exhaustion', () => {
     const result = await produceReview(chain, () => 'p', {}, stub, trackSleep);
     assert.equal(result.configUsed.name, 'only');
     assert.equal(result.attempts, 3);
-    assert.equal(sleepCalls, 2); // two same-config retries → two backoff sleeps
+    assert.equal(sleepCalls, 2);
+  });
+
+  it('throws last TransientError when budget is already expired on first failure', async () => {
+    // budgetMs=0 makes deadline = Date.now()+0; the first attempt fails transient,
+    // then budgetLeft === 0 fires and re-throws lastErr as the original TransientError.
+    const chain = [cfg('only')];
+    const transient = new TransientError('rate limited');
+    const stub = async () => { throw transient; };
+    await assert.rejects(
+      () => produceReview(chain, () => 'p', {}, stub, NO_SLEEP, 0),
+      err => err === transient && err instanceof TransientError,
+    );
   });
 
   it('terminates chain-restart loop via sleepFn sentinel; each config gets full per-config retries', async () => {

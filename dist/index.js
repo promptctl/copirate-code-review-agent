@@ -30765,10 +30765,12 @@ function transientBackoffMs(attempt) {
 // After 3 transient failures on one config: advance to next config IMMEDIATELY — different
 // provider, waiting buys nothing. Chain exhausted → exponential backoff (cap 60s) by sweep
 // count, restart from chain[0], until the 60-min budget is spent.
-async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep) {
+// [LAW:effects-at-boundaries] budgetMs is injectable so tests can set a zero/tiny budget
+// to cover the 'deadline exceeded mid-retry' throw path without real 60-min waits.
+async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepFn = sleep, budgetMs = TRANSIENT_RETRY_BUDGET_MS) {
   // [LAW:no-silent-failure] An empty chain never assigns lastErr; throw undefined is opaque.
   if (!chain.length) throw new Error('produceReview: chain must not be empty');
-  const deadline = Date.now() + TRANSIENT_RETRY_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
   let totalAttempts = 0;
   let lastErr;
   const PER_CONFIG_LIMIT = 3;
@@ -31054,7 +31056,7 @@ const { selectTransport, submitReview, resolveReviewTarget } = __nccwpck_require
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { validateFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
-const { TransientError, produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
+const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
