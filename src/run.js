@@ -9,7 +9,7 @@ const { selectTransport, submitReview, resolveReviewTarget } = require('./transp
 const { buildReviewInput } = require('./prompt');
 const { validateFindings } = require('./review');
 const { createReviewCollector, readCollectedReview } = require('./collector');
-const { TransientError, sleep, transientBackoffMs, TRANSIENT_RETRY_BUDGET_MS } = require('./failover');
+const { produceReview, buildAttributionFooter } = require('./failover');
 const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
 const { ZAI_ANTHROPIC_BASE_URL } = require('./engine/claude-code');
@@ -38,11 +38,14 @@ function synthesizeZaiConfig(apiKey, model, systemPrompt) {
 }
 
 // One attempt at producing a validated review against a fresh collector and home.
+// buildPromptFor(toolNames) is called here so each engine gets the MCP tool identifiers
+// its adapter registers, not chain[0]'s identifiers. [LAW:types-are-the-program]
 // Nested try/finally guarantees cleanup even when materializeHome throws: the
 // outer finally cleans collector.dir unconditionally; the inner finally cleans
 // home only when materializeHome succeeded and home is defined. [LAW:no-silent-failure]
-async function produceReviewOnce(config, prompt, anchors) {
+async function produceReviewOnce(config, buildPromptFor, anchors) {
   const adapter = registry.get(config.engine);
+  const prompt = buildPromptFor(adapter.toolNames);
   const collector = createReviewCollector();
   try {
     const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
@@ -56,30 +59,6 @@ async function produceReviewOnce(config, prompt, anchors) {
     }
   } finally {
     fs.rmSync(collector.dir, { recursive: true });
-  }
-}
-
-// [LAW:no-ambient-temporal-coupling] This loop is the single explicit owner of retry
-// timing; runEngine does one attempt and stays timing-free. Transient failures (429
-// rate-limited, 529 overloaded) retry until the time budget is spent; everything else
-// surfaces immediately. [LAW:no-silent-failure]
-async function produceReview(config, prompt, anchors) {
-  const deadline = Date.now() + TRANSIENT_RETRY_BUDGET_MS;
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await produceReviewOnce(config, prompt, anchors);
-    } catch (err) {
-      if (!(err instanceof TransientError) || Date.now() >= deadline) {
-        throw err;
-      }
-      const budgetLeft = Math.max(0, deadline - Date.now());
-      const hintOrBackoff = err.retryAfterMs ?? transientBackoffMs(attempt);
-      const delay = Math.min(hintOrBackoff, budgetLeft);
-      const minsLeft = Math.ceil(budgetLeft / 60_000);
-      const delaySource = hintOrBackoff <= budgetLeft ? (err.retryAfterMs !== null ? 'Retry-After' : 'backoff') : 'budget';
-      core.warning(`Transient error on '${config.name}' (${err.message}); retrying in ${Math.round(delay / 1000)}s [${delaySource}] (~${minsLeft}m of retry budget left).`);
-      await sleep(delay);
-    }
   }
 }
 
@@ -179,18 +158,19 @@ async function run() {
     return;
   }
 
-  // chain[0] is the selected/default config. T5 will pass the full chain for failover.
-  // The adapter is looked up once to get toolNames for buildReviewInput so the prompt
-  // references the correct MCP tool identifiers for this engine.
-  const config = chain[0];
-  const adapter = registry.get(config.engine);
-  const reviewInput = buildReviewInput(filteredFiles, maxDiffChars, adapter.toolNames);
-  const anchors = buildReviewAnchors(reviewInput.files);
+  // buildPromptFor(toolNames) is called per-attempt in produceReviewOnce so each engine gets
+  // the MCP tool identifiers its adapter registers. Anchors are engine-agnostic (purely
+  // diff-line based), so they are computed once here from any toolNames. [LAW:types-are-the-program]
+  // [LAW:no-ambient-temporal-coupling] produceReview owns all retry/failover timing.
+  const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames);
+  const anchors = buildReviewAnchors(anchorInput.files);
+  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames).prompt;
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
-  core.info(`Running PR review for ${filteredFiles.length} file(s)...`);
-  const review = await produceReview(config, reviewInput.prompt, anchors);
-  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport);
+  core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
+  const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
+  const footer = buildAttributionFooter(configUsed);
+  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
 }
 
 module.exports = { run };

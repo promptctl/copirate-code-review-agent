@@ -63,13 +63,14 @@ function reviewEvent(requestsChanges, canApprove) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
 }
 
-async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport) {
+async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
   // rendered verdict, so they cannot disagree. The model never states the verdict.
   const requestsChanges = review.findings.length > 0;
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
-  const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}\n\n${REVIEW_MARKER}`;
+  const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
+  const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
