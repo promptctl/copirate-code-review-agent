@@ -201,7 +201,7 @@ function peekConfigNames(filePath) {
     throw new Error(`Config file '${filePath}': 'default' must be a non-empty string.`);
   }
   const configNames = Object.keys(raw.configs);
-  const defaultName = String(raw.default);
+  const defaultName = raw.default;
   if (!configNames.includes(defaultName)) {
     throw new Error(
       `Config file '${filePath}': default '${defaultName}' does not name a defined config. Defined: ${configNames.join(', ')}.`,
