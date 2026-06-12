@@ -13,6 +13,7 @@ const { TransientError, sleep, transientBackoffMs, TRANSIENT_RETRY_BUDGET_MS } =
 const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
 const { ZAI_ANTHROPIC_BASE_URL } = require('./engine/claude-code');
+const { loadConfig, assertNoLegacyConflict } = require('./config');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -83,10 +84,46 @@ async function produceReview(config, prompt, anchors) {
 }
 
 async function run() {
-  const apiKey = core.getInput('ZAI_API_KEY', { required: true });
-  core.setSecret(apiKey);
-  const model = core.getInput('ZAI_MODEL');
-  const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
+  // [LAW:one-source-of-truth] Default path is declared in action.yml; do not duplicate it here.
+  const configFilePath = core.getInput('CONFIG_FILE');
+  const configName = core.getInput('CONFIG');
+  const apiKey = core.getInput('ZAI_API_KEY');
+  const hasConfigFile = fs.existsSync(configFilePath);
+
+  // [LAW:one-source-of-truth] [LAW:no-silent-failure] Two config sources = two sources
+  // of truth for the same fact. Fail loud before touching anything else.
+  try {
+    assertNoLegacyConflict(configFilePath, hasConfigFile, apiKey);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+
+  // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
+  // a validated multi-config chain; ZAI_* inputs synthesize a single-entry compat chain.
+  let chain;
+  if (hasConfigFile) {
+    try {
+      chain = loadConfig(configFilePath, configName || undefined, process.env);
+    } catch (e) {
+      core.setFailed(e.message);
+      return;
+    }
+    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
+  } else {
+    if (!apiKey) {
+      core.setFailed(
+        `No configuration found. '${configFilePath}' does not exist and ZAI_API_KEY is not set. ` +
+        'Provide a valid CONFIG_FILE path or ZAI_API_KEY.',
+      );
+      return;
+    }
+    core.setSecret(apiKey);
+    const model = core.getInput('ZAI_MODEL');
+    const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
+    chain = [synthesizeZaiConfig(apiKey, model, systemPrompt)];
+  }
+
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
     .split(',')
@@ -142,10 +179,10 @@ async function run() {
     return;
   }
 
-  // [LAW:types-are-the-program] Synthesize a typed ReviewConfig from v1 ZAI_* inputs.
+  // chain[0] is the selected/default config. T5 will pass the full chain for failover.
   // The adapter is looked up once to get toolNames for buildReviewInput so the prompt
   // references the correct MCP tool identifiers for this engine.
-  const config = synthesizeZaiConfig(apiKey, model, systemPrompt);
+  const config = chain[0];
   const adapter = registry.get(config.engine);
   const reviewInput = buildReviewInput(filteredFiles, maxDiffChars, adapter.toolNames);
   const anchors = buildReviewAnchors(reviewInput.files);

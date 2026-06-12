@@ -1,9 +1,16 @@
 name: "Z.ai Coding Agent Review"
 description: "AI-powered code review using Claude Code with Z.ai Coding Plan credentials"
 inputs:
+  CONFIG_FILE:
+    description: "Path to the review-agents config file (default: .github/review-agents.yml). When present, overrides ZAI_* inputs."
+    required: false
+    default: ".github/review-agents.yml"
+  CONFIG:
+    description: "Select a named config from the config file. Overrides the file's 'default' field."
+    required: false
   ZAI_API_KEY:
-    description: "Z.ai API key"
-    required: true
+    description: "Z.ai API key (legacy single-engine mode). Mutually exclusive with CONFIG_FILE."
+    required: false
   ZAI_MODEL:
     description: "Model passed to Claude Code"
     required: false
