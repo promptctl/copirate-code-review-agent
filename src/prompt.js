@@ -1,7 +1,15 @@
 'use strict';
 const { annotatePatchWithLines } = require('./diff');
 
-function buildReviewInput(files, maxDiffChars) {
+// [LAW:one-source-of-truth] Default tool names match claude-code adapter's toolNames.
+// Callers pass adapter.toolNames so all three engines can use this same function
+// with their CLI's actual MCP tool identifiers. [LAW:composability]
+const DEFAULT_TOOL_NAMES = {
+  requestChange: 'mcp__review_collector__request_change',
+  finishReview: 'mcp__review_collector__finish_review',
+};
+
+function buildReviewInput(files, maxDiffChars, toolNames = DEFAULT_TOOL_NAMES) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -30,9 +38,9 @@ function buildReviewInput(files, maxDiffChars) {
     files: includedFiles,
     prompt: `
 Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
-    Each visible diff line is annotated as LINE N. Call mcp__review_collector__request_change only for code that must change before merge.
+    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
-    call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.
+    call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
 
     You review against the LAWS in your guidance. You flag violations; you do not fix them. A change MUST change before merge only if this
     diff introduces or worsens a LAW violation, or introduces a correctness bug. Pre-existing violations in unchanged code, and matters of

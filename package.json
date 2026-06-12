@@ -1,6 +1,6 @@
 {
   "name": "zai-coding-agent-review",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "AI-powered code review GitHub Action using Z.ai",
   "main": "dist/index.js",
   "scripts": {

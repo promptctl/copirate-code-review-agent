@@ -30222,6 +30222,291 @@ module.exports = {
 
 /***/ }),
 
+/***/ 3048:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
+const os = __nccwpck_require__(857);
+const { TransientError, parseRetryAfterMs } = __nccwpck_require__(2887);
+const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
+
+const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
+const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
+const CLAUDE_TIMEOUT_MS = 3_000_000;
+const CLAUDE_ALLOWED_TOOLS = [
+  'Read',
+  'Grep',
+  'Glob',
+  'mcp__review_collector__request_change',
+  'mcp__review_collector__finish_review',
+];
+const CLAUDE_DISALLOWED_TOOLS = [
+  'Bash',
+  'Edit',
+  'Write',
+  'WebFetch',
+  'WebSearch',
+];
+
+// [LAW:effects-at-boundaries] The only effect in this adapter: writing files to a temp HOME.
+// The caller (produceReviewOnce) owns cleanup via fs.rmSync in its finally block.
+function materializeHome({ config, instructionsPath, collector }) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-home-'));
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  // [LAW:single-enforcer] The packaged action owns reusable reviewer instructions.
+  fs.copyFileSync(instructionsPath, path.join(claudeDir, 'CLAUDE.md'));
+  return home;
+}
+
+// [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
+// [LAW:single-enforcer] Z.ai/Anthropic auth translation happens exactly once, here in the adapter.
+function buildCommand({ config, collector, home }) {
+  const args = [
+    '-y',
+    `${CLAUDE_CODE_PACKAGE}@latest`,
+    '-p',
+    '--output-format',
+    'json',
+    '--no-session-persistence',
+    '--tools',
+    'Read,Grep,Glob',
+    '--allowedTools',
+    CLAUDE_ALLOWED_TOOLS.join(','),
+    '--disallowedTools',
+    CLAUDE_DISALLOWED_TOOLS.join(','),
+    '--mcp-config',
+    collector.mcpConfigPath,
+    '--strict-mcp-config',
+    '--permission-mode',
+    'dontAsk',
+  ];
+
+  if (config.model) {
+    args.push('--model', config.model);
+  }
+
+  if (config.systemPrompt) {
+    args.push('--append-system-prompt', config.systemPrompt);
+  }
+
+  args.push('Review the pull request instructions and diff from stdin.');
+
+  const env = {
+    ...process.env,
+    HOME: home,
+    ANTHROPIC_AUTH_TOKEN: config.endpoint.apiKey,
+    ANTHROPIC_BASE_URL: config.endpoint.baseUrl,
+    ANTHROPIC_MODEL: config.model,
+    API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
+    CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    NO_COLOR: '1',
+  };
+
+  if (config.reasoning) {
+    env.CLAUDE_CODE_EFFORT_LEVEL = config.reasoning;
+  }
+
+  return { command: 'npx', args, env };
+}
+
+function assertSucceeded(stdout) {
+  const parsed = parseJsonEnvelope(stdout);
+  if (!parsed) {
+    throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
+  }
+  if (parsed.is_error || parsed.subtype === 'error') {
+    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
+  }
+}
+
+// [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
+// once, here at the engine boundary. 529/overloaded has no hint header;
+// 429/rate-limited attaches it when the CLI echoes it. [LAW:one-source-of-truth]
+function classifyError(err, text) {
+  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`, parseRetryAfterMs(text));
+  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  return err;
+}
+
+// [LAW:one-source-of-truth] classifyClaudeError is the stable public name re-exported
+// from src/index.js for test compatibility; classifyError is the adapter interface name.
+const classifyClaudeError = classifyError;
+
+// [LAW:one-type-per-behavior] One adapter object per engine CLI; adapters compose with
+// the generic runEngine via the declared interface contract.
+const claudeCodeAdapter = {
+  name: 'claude-code',
+  timeoutMs: CLAUDE_TIMEOUT_MS,
+  capabilities: {
+    // [LAW:types-are-the-program] Capability declarations are the single source of truth
+    // for config validation in src/config.js (T4). Illegal combos are rejected at load
+    // time via these declarations, never discovered at spawn time.
+    reasoningEfforts: ['low', 'medium', 'high', 'max'],
+    endpointKinds: ['anthropic-messages'],
+    findingsChannels: ['mcp-collector'],
+  },
+  toolNames: {
+    requestChange: 'mcp__review_collector__request_change',
+    finishReview: 'mcp__review_collector__finish_review',
+  },
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+};
+
+module.exports = {
+  ZAI_ANTHROPIC_BASE_URL,
+  classifyClaudeError,
+  claudeCodeAdapter,
+};
+
+
+/***/ }),
+
+/***/ 25:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { claudeCodeAdapter } = __nccwpck_require__(3048);
+
+// [LAW:single-enforcer] The only enumeration of engine adapters.
+// To support a new engine, add it here and implement the adapter contract.
+const adapters = new Map([
+  ['claude-code', claudeCodeAdapter],
+]);
+
+function get(name) {
+  const adapter = adapters.get(name);
+  if (!adapter) {
+    throw new Error(`Unknown engine: ${name}. Valid engines: ${[...adapters.keys()].join(', ')}`);
+  }
+  return adapter;
+}
+
+module.exports = { get };
+
+
+/***/ }),
+
+/***/ 8861:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { spawn } = __nccwpck_require__(5317);
+
+const MAX_RESPONSE_SIZE = 1024 * 1024;
+
+function parseJsonEnvelope(stdout) {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    const trimmed = stdout.trim();
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function formatOutputTail(label, value) {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return `${label}: <empty>`;
+  }
+  return `${label}:\n${trimmed.slice(-4000)}`;
+}
+
+// [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
+// All engine-specific logic (args, env, success check, error classification) lives in the adapter.
+// [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
+// [LAW:effects-at-boundaries] This is the only place that spawns a child process.
+function runEngine(adapter, config, prompt, home, collector) {
+  return new Promise((resolve, reject) => {
+    const { command, args, env } = adapter.buildCommand({ config, collector, home });
+    const timeoutMs = adapter.timeoutMs ?? 3_000_000;
+    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      result();
+    };
+
+    const timeout = setTimeout(() => {
+      finish(() => {
+        child.kill('SIGTERM');
+        reject(new Error(`${adapter.name} review timed out.`));
+      });
+    }, timeoutMs);
+
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      if (stdout.length > MAX_RESPONSE_SIZE) {
+        finish(() => {
+          child.kill('SIGTERM');
+          reject(new Error(`${adapter.name} response exceeded size limit.`));
+        });
+      }
+    });
+
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+      if (stderr.length > MAX_RESPONSE_SIZE) {
+        stderr = stderr.slice(-MAX_RESPONSE_SIZE);
+      }
+    });
+
+    child.on('error', err => {
+      finish(() => reject(adapter.classifyError(err, '')));
+    });
+
+    child.on('close', code => {
+      finish(() => {
+        if (code !== 0) {
+          const msg = [
+            `${adapter.name} exited with status ${code}.`,
+            `Command: ${command} ${args.map(a => JSON.stringify(a)).join(' ')}`,
+            formatOutputTail('stderr tail', stderr),
+            formatOutputTail('stdout tail', stdout),
+          ].join('\n\n');
+          reject(adapter.classifyError(new Error(msg), `${stdout}\n${stderr}`));
+          return;
+        }
+        try {
+          adapter.assertSucceeded(stdout);
+          resolve();
+        } catch (err) {
+          reject(adapter.classifyError(err, stdout));
+        }
+      });
+    });
+
+    child.stdin.end(prompt);
+  });
+}
+
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine };
+
+
+/***/ }),
+
 /***/ 2887:
 /***/ ((module) => {
 
@@ -30234,9 +30519,9 @@ const TRANSIENT_BACKOFF_MAX_MS = 60_000;
 
 // [LAW:types-are-the-program] "Transient retryable error" is a type, not a flag bolted
 // onto a generic Error. The raw 429/rate-limited and 529/overloaded signals are classified
-// once, here at the boundary; the retry loop dispatches on the error's type, never a
-// re-matched string. [LAW:one-type-per-behavior] Both share identical retry behavior, so
-// they are one type — the cause survives only as a value (the message prefix).
+// once, at the engine adapter boundary; the retry loop dispatches on the error's type,
+// never a re-matched string. [LAW:one-type-per-behavior] Both share identical retry
+// behavior, so they are one type — the cause survives only as a value (the message prefix).
 // retryAfterMs carries the server-specified wait when the Retry-After header is echoed in
 // CLI output; null means fall back to exponential backoff. [LAW:dataflow-not-control-flow]
 class TransientError extends Error {
@@ -30256,14 +30541,6 @@ function parseRetryAfterMs(text) {
   return parseInt(match[1], 10) * 1000;
 }
 
-// [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly once.
-// 529/overloaded has no hint header; 429/rate-limited attaches it when the CLI echoes it.
-function classifyClaudeError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`, parseRetryAfterMs(text));
-  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
-  return err;
-}
-
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function transientBackoffMs(attempt) {
@@ -30275,7 +30552,6 @@ module.exports = {
   TRANSIENT_RETRY_BUDGET_MS,
   TransientError,
   parseRetryAfterMs,
-  classifyClaudeError,
   sleep,
   transientBackoffMs,
 };
@@ -30302,7 +30578,8 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
 const { gitHubTransport, giteaTransport, resolveReviewTarget } = __nccwpck_require__(7228);
-const { TransientError, classifyClaudeError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
+const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
+const { classifyClaudeError } = __nccwpck_require__(3048);
 
 module.exports = {
   patchLines,
@@ -30328,7 +30605,15 @@ module.exports = {
 
 const { annotatePatchWithLines } = __nccwpck_require__(9898);
 
-function buildReviewInput(files, maxDiffChars) {
+// [LAW:one-source-of-truth] Default tool names match claude-code adapter's toolNames.
+// Callers pass adapter.toolNames so all three engines can use this same function
+// with their CLI's actual MCP tool identifiers. [LAW:composability]
+const DEFAULT_TOOL_NAMES = {
+  requestChange: 'mcp__review_collector__request_change',
+  finishReview: 'mcp__review_collector__finish_review',
+};
+
+function buildReviewInput(files, maxDiffChars, toolNames = DEFAULT_TOOL_NAMES) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -30357,9 +30642,9 @@ function buildReviewInput(files, maxDiffChars) {
     files: includedFiles,
     prompt: `
 Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
-    Each visible diff line is annotated as LINE N. Call mcp__review_collector__request_change only for code that must change before merge.
+    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
-    call mcp__review_collector__finish_review exactly once with a concise summary. The collector tools are the only review output channel.
+    call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
 
     You review against the LAWS in your guidance. You flag violations; you do not fix them. A change MUST change before merge only if this
     diff introduces or worsens a LAW violation, or introduces a correctness bug. Pre-existing violations in unchanged code, and matters of
@@ -30480,229 +30765,67 @@ module.exports = { parseReviewValue, parseFindingValue, validateFindings };
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
 const fs = __nccwpck_require__(9896);
-const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
-const { spawn } = __nccwpck_require__(5317);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { validateFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
-const { TransientError, classifyClaudeError, sleep, transientBackoffMs, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
+const { TransientError, sleep, transientBackoffMs, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
+const { runEngine } = __nccwpck_require__(8861);
+const registry = __nccwpck_require__(25);
+const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
 
-const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
-const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
-const MAX_RESPONSE_SIZE = 1024 * 1024;
-const CLAUDE_TIMEOUT_MS = 3_000_000;
-const CLAUDE_ALLOWED_TOOLS = [
-  'Read',
-  'Grep',
-  'Glob',
-  'mcp__review_collector__request_change',
-  'mcp__review_collector__finish_review',
-];
-const CLAUDE_DISALLOWED_TOOLS = [
-  'Bash',
-  'Edit',
-  'Write',
-  'WebFetch',
-  'WebSearch',
-];
+// ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
+// is set) or from src/ during local development (one level above __dirname).
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
-const REVIEW_AGENT_CLAUDE_PATH = path.join(ACTION_ROOT, 'review-agent', 'CLAUDE.md');
+const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
-function buildClaudeArgs(model, systemPrompt, mcpConfigPath) {
-  const args = [
-    '-y',
-    `${CLAUDE_CODE_PACKAGE}@latest`,
-    '-p',
-    '--output-format',
-    'json',
-    '--no-session-persistence',
-    '--tools',
-    'Read,Grep,Glob',
-    '--allowedTools',
-    CLAUDE_ALLOWED_TOOLS.join(','),
-    '--disallowedTools',
-    CLAUDE_DISALLOWED_TOOLS.join(','),
-    '--mcp-config',
-    mcpConfigPath,
-    '--strict-mcp-config',
-    '--permission-mode',
-    'dontAsk',
-  ];
-
-  if (model) {
-    args.push('--model', model);
-  }
-
-  if (systemPrompt) {
-    args.push('--append-system-prompt', systemPrompt);
-  }
-
-  args.push('Review the pull request instructions and diff from stdin.');
-
-  return args;
+// [LAW:types-are-the-program] The ReviewConfig typed value is the single representation
+// of what engine, endpoint, and model are being invoked. [LAW:one-source-of-truth]
+// This compat shim synthesizes one from legacy ZAI_* inputs for v1 workflows.
+function synthesizeZaiConfig(apiKey, model, systemPrompt) {
+  return {
+    name: 'zai-compat',
+    engine: 'claude-code',
+    model,
+    systemPrompt: systemPrompt || undefined,
+    endpoint: {
+      kind: 'anthropic-messages',
+      baseUrl: ZAI_ANTHROPIC_BASE_URL,
+      apiKey,
+    },
+  };
 }
 
-function parseJsonEnvelope(stdout) {
-  try {
-    return JSON.parse(stdout);
-  } catch {
-    const trimmed = stdout.trim();
-    const firstBrace = trimmed.indexOf('{');
-    const lastBrace = trimmed.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-      return undefined;
-    }
-    try {
-      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function assertClaudeSucceeded(stdout) {
-  const parsed = parseJsonEnvelope(stdout);
-  if (!parsed) {
-    throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
-  }
-
-  if (parsed.is_error || parsed.subtype === 'error') {
-    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
-  }
-}
-
-function createReviewerHome() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-home-'));
-  const claudeDir = path.join(home, '.claude');
-  fs.mkdirSync(claudeDir, { recursive: true });
-  // [LAW:single-enforcer] The packaged action owns reusable reviewer instructions.
-  fs.copyFileSync(REVIEW_AGENT_CLAUDE_PATH, path.join(claudeDir, 'CLAUDE.md'));
-  return home;
-}
-
-function formatOutputTail(label, value) {
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return `${label}: <empty>`;
-  }
-  return `${label}:\n${trimmed.slice(-4000)}`;
-}
-
-function formatClaudeFailure(code, args, stdout, stderr) {
-  return [
-    `Claude Code exited with status ${code}.`,
-    `Command: npx ${args.map(arg => JSON.stringify(arg)).join(' ')}`,
-    formatOutputTail('stderr tail', stderr),
-    formatOutputTail('stdout tail', stdout),
-  ].join('\n\n');
-}
-
-function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpConfigPath) {
-  return new Promise((resolve, reject) => {
-    // [LAW:single-enforcer] Z.ai auth is translated exactly once at the agent runner boundary.
-    const env = {
-      ...process.env,
-      HOME: reviewerHome,
-      ANTHROPIC_AUTH_TOKEN: apiKey,
-      ANTHROPIC_BASE_URL: ZAI_ANTHROPIC_BASE_URL,
-      ANTHROPIC_MODEL: model,
-      API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
-      CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
-      NO_COLOR: '1',
-    };
-    const args = buildClaudeArgs(model, systemPrompt, mcpConfigPath);
-    const child = spawn('npx', args, {
-      env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const finish = result => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      result();
-    };
-
-    const timeout = setTimeout(() => {
-      finish(() => {
-        child.kill('SIGTERM');
-        reject(new Error('Claude Code review timed out.'));
-      });
-    }, CLAUDE_TIMEOUT_MS);
-
-    child.stdout.on('data', chunk => {
-      stdout += chunk;
-      if (stdout.length > MAX_RESPONSE_SIZE) {
-        finish(() => {
-          child.kill('SIGTERM');
-          reject(new Error('Claude Code response exceeded size limit.'));
-        });
-      }
-    });
-
-    child.stderr.on('data', chunk => {
-      stderr += chunk;
-      if (stderr.length > MAX_RESPONSE_SIZE) {
-        stderr = stderr.slice(-MAX_RESPONSE_SIZE);
-      }
-    });
-
-    child.on('error', err => {
-      finish(() => reject(err));
-    });
-
-    child.on('close', code => {
-      finish(() => {
-        if (code !== 0) {
-          reject(classifyClaudeError(new Error(formatClaudeFailure(code, args, stdout, stderr)), `${stdout}\n${stderr}`));
-          return;
-        }
-        try {
-          assertClaudeSucceeded(stdout);
-          resolve();
-        } catch (err) {
-          reject(classifyClaudeError(err, stdout));
-        }
-      });
-    });
-
-    child.stdin.end(prompt);
-  });
-}
-
-// One attempt at producing a validated review against a fresh collector. The
-// collector is recreated per attempt so partial records from a transient-failed attempt
-// can never leak into a later successful read. [LAW:no-silent-failure]
-async function produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
+// One attempt at producing a validated review against a fresh collector and home.
+// Both are created here and destroyed in the finally block so partial state from a
+// failed attempt can never leak into a later successful read. [LAW:no-silent-failure]
+async function produceReviewOnce(config, prompt, anchors) {
+  const adapter = registry.get(config.engine);
   const collector = createReviewCollector();
+  const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
   try {
-    await runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, collector.mcpConfigPath);
+    await runEngine(adapter, config, prompt, home, collector);
     const review = readCollectedReview(collector.recordsPath);
     validateFindings(review.findings, anchors);
     return review;
   } finally {
     fs.rmSync(collector.dir, { recursive: true });
+    fs.rmSync(home, { recursive: true });
   }
 }
 
 // [LAW:no-ambient-temporal-coupling] This loop is the single explicit owner of retry
-// timing; runClaudeCode does one attempt and stays timing-free. Transient failures (429
+// timing; runEngine does one attempt and stays timing-free. Transient failures (429
 // rate-limited, 529 overloaded) retry until the time budget is spent; everything else
 // surfaces immediately. [LAW:no-silent-failure]
-async function produceReview(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
+async function produceReview(config, prompt, anchors) {
   const deadline = Date.now() + TRANSIENT_RETRY_BUDGET_MS;
   for (let attempt = 1; ; attempt++) {
     try {
-      return await produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors);
+      return await produceReviewOnce(config, prompt, anchors);
     } catch (err) {
       if (!(err instanceof TransientError) || Date.now() >= deadline) {
         throw err;
@@ -30712,7 +30835,7 @@ async function produceReview(apiKey, model, systemPrompt, prompt, reviewerHome, 
       const delay = Math.min(hintOrBackoff, budgetLeft);
       const minsLeft = Math.ceil(budgetLeft / 60_000);
       const delaySource = hintOrBackoff <= budgetLeft ? (err.retryAfterMs !== null ? 'Retry-After' : 'backoff') : 'budget';
-      core.warning(`z.ai transient error (${err.message}); retrying in ${Math.round(delay / 1000)}s [${delaySource}] (~${minsLeft}m of retry budget left).`);
+      core.warning(`Transient error on '${config.name}' (${err.message}); retrying in ${Math.round(delay / 1000)}s [${delaySource}] (~${minsLeft}m of retry budget left).`);
       await sleep(delay);
     }
   }
@@ -30778,19 +30901,18 @@ async function run() {
     return;
   }
 
-  const reviewInput = buildReviewInput(filteredFiles, maxDiffChars);
+  // [LAW:types-are-the-program] Synthesize a typed ReviewConfig from v1 ZAI_* inputs.
+  // The adapter is looked up once to get toolNames for buildReviewInput so the prompt
+  // references the correct MCP tool identifiers for this engine.
+  const config = synthesizeZaiConfig(apiKey, model, systemPrompt);
+  const adapter = registry.get(config.engine);
+  const reviewInput = buildReviewInput(filteredFiles, maxDiffChars, adapter.toolNames);
   const anchors = buildReviewAnchors(reviewInput.files);
-  const reviewerHome = createReviewerHome();
 
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s)...`);
-  try {
-    const review = await produceReview(apiKey, model, systemPrompt, reviewInput.prompt, reviewerHome, anchors);
-    await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport);
-  } finally {
-    // [LAW:no-ambient-temporal-coupling] The same owner that creates temporary review state also tears it down.
-    fs.rmSync(reviewerHome, { recursive: true });
-  }
+  const review = await produceReview(config, reviewInput.prompt, anchors);
+  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport);
 }
 
 module.exports = { run };
