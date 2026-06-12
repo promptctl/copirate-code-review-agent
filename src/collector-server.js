@@ -1,0 +1,120 @@
+'use strict';
+const fs = require('fs');
+const { parseFindingValue } = require('./review');
+
+function writeJsonRpcResponse(id, result) {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
+}
+
+function writeJsonRpcError(id, code, message) {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } })}\n`);
+}
+
+function appendCollectorRecord(record) {
+  const recordsPath = process.env.REVIEW_COLLECTOR_RECORDS;
+  if (!recordsPath) {
+    throw new Error('REVIEW_COLLECTOR_RECORDS is required.');
+  }
+  fs.appendFileSync(recordsPath, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+function collectorTools() {
+  return [
+    {
+      name: 'request_change',
+      description: 'Request a required pre-merge code change anchored to a visible diff line. Do not use for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          line: { type: 'integer' },
+          body: { type: 'string' },
+        },
+        required: ['path', 'line', 'body'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'finish_review',
+      description: 'Finish the review after all required changes have been requested.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string' },
+        },
+        required: ['summary'],
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+function callCollectorTool(name, args) {
+  if (name === 'request_change') {
+    const finding = parseFindingValue(args, 0);
+    appendCollectorRecord({ type: 'request_change', finding });
+    return { content: [{ type: 'text', text: 'Required change recorded.' }] };
+  }
+  if (name === 'finish_review') {
+    if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {
+      throw new Error('finish_review requires a non-empty summary.');
+    }
+    appendCollectorRecord({ type: 'finish', summary: args.summary.trim() });
+    return { content: [{ type: 'text', text: 'Review finished.' }] };
+  }
+  throw new Error(`Unknown review collector tool: ${name}`);
+}
+
+function handleCollectorMessage(message) {
+  if (!message || typeof message !== 'object') {
+    return;
+  }
+  if (message.id === undefined) {
+    return;
+  }
+
+  try {
+    if (message.method === 'initialize') {
+      writeJsonRpcResponse(message.id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'zai-review-collector', version: '0.1.0' },
+      });
+    } else if (message.method === 'tools/list') {
+      writeJsonRpcResponse(message.id, { tools: collectorTools() });
+    } else if (message.method === 'tools/call') {
+      const result = callCollectorTool(message.params?.name, message.params?.arguments || {});
+      writeJsonRpcResponse(message.id, result);
+    } else {
+      writeJsonRpcError(message.id, -32601, `Unknown method: ${message.method}`);
+    }
+  } catch (err) {
+    writeJsonRpcError(message.id, -32000, err.message);
+  }
+}
+
+function runReviewCollectorServer() {
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.trim().length === 0) {
+        continue;
+      }
+      try {
+        const message = JSON.parse(line);
+        const messages = Array.isArray(message) ? message : [message];
+        for (const item of messages) {
+          handleCollectorMessage(item);
+        }
+      } catch {
+        writeJsonRpcError(null, -32700, 'Invalid JSON-RPC message.');
+      }
+    }
+  });
+}
+
+module.exports = { runReviewCollectorServer };
