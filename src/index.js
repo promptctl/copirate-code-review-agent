@@ -498,14 +498,29 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
 // once, here at the boundary; the retry loop dispatches on the error's type, never a
 // re-matched string. [LAW:one-type-per-behavior] Both share identical retry behavior, so
 // they are one type — the cause survives only as a value (the message prefix).
-class TransientError extends Error {}
+// retryAfterMs carries the server-specified wait when the Retry-After header is echoed in
+// CLI output; null means fall back to exponential backoff. [LAW:dataflow-not-control-flow]
+class TransientError extends Error {
+  constructor(message, retryAfterMs = null) {
+    super(message);
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
-// Known gap: 429 responses carry a Retry-After header that signals the exact reset window,
-// but we run Claude Code as a subprocess and see only its text output — the header is not
-// surfaced. Both causes fall back to exponential backoff (cap 60 s). A follow-up should
-// either parse the value if the CLI echoes it in stderr or switch to the SDK directly.
+// Extract the server's Retry-After hint (seconds form) from CLI text output.
+// Returns the exact value in milliseconds, or null if absent. No cap: the caller
+// must honor the full server-specified window; TRANSIENT_BACKOFF_MAX_MS belongs
+// on the exponential backoff path only. [LAW:one-source-of-truth]
+function parseRetryAfterMs(text) {
+  const match = /retry.?after[:\s]+(\d+)/i.exec(text);
+  if (!match) return null;
+  return parseInt(match[1], 10) * 1000;
+}
+
+// [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly once.
+// 529/overloaded has no hint header; 429/rate-limited attaches it when the CLI echoes it.
 function classifyClaudeError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
+  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`, parseRetryAfterMs(text));
   if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
   return err;
 }
@@ -545,9 +560,12 @@ async function produceReview(apiKey, model, systemPrompt, prompt, reviewerHome, 
       if (!(err instanceof TransientError) || Date.now() >= deadline) {
         throw err;
       }
-      const delay = transientBackoffMs(attempt);
-      const minsLeft = Math.ceil((deadline - Date.now()) / 60_000);
-      core.warning(`z.ai transient error (${err.message}); retrying in ${Math.round(delay)}ms (~${minsLeft}m of retry budget left).`);
+      const budgetLeft = Math.max(0, deadline - Date.now());
+      const hintOrBackoff = err.retryAfterMs ?? transientBackoffMs(attempt);
+      const delay = Math.min(hintOrBackoff, budgetLeft);
+      const minsLeft = Math.ceil(budgetLeft / 60_000);
+      const delaySource = hintOrBackoff <= budgetLeft ? (err.retryAfterMs !== null ? 'Retry-After' : 'backoff') : 'budget';
+      core.warning(`z.ai transient error (${err.message}); retrying in ${Math.round(delay / 1000)}s [${delaySource}] (~${minsLeft}m of retry budget left).`);
       await sleep(delay);
     }
   }
@@ -811,4 +829,4 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
   run().catch(err => core.setFailed(err.message));
 }
 
-module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget, TransientError, classifyClaudeError, transientBackoffMs };
+module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget, TransientError, classifyClaudeError, parseRetryAfterMs, transientBackoffMs };
