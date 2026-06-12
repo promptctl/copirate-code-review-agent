@@ -29938,9 +29938,9 @@ const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 3_000_000;
-const OVERLOAD_RETRY_BUDGET_MS = 60 * 60 * 1000;
-const OVERLOAD_BACKOFF_BASE_MS = 2_000;
-const OVERLOAD_BACKOFF_MAX_MS = 60_000;
+const TRANSIENT_RETRY_BUDGET_MS = 60 * 60 * 1000;
+const TRANSIENT_BACKOFF_BASE_MS = 2_000;
+const TRANSIENT_BACKOFF_MAX_MS = 60_000;
 const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
@@ -30421,25 +30421,29 @@ function runClaudeCode(apiKey, model, systemPrompt, prompt, reviewerHome, mcpCon
   });
 }
 
-// [LAW:types-are-the-program] "Transient overload" is a type, not a flag bolted onto a
-// generic Error. The raw 529/overloaded signal is classified once, here at the boundary;
-// the retry loop dispatches on the error's type, never a re-matched string.
-class OverloadError extends Error {}
+// [LAW:types-are-the-program] "Transient retryable error" is a type, not a flag bolted
+// onto a generic Error. The raw 429/rate-limited and 529/overloaded signals are classified
+// once, here at the boundary; the retry loop dispatches on the error's type, never a
+// re-matched string. [LAW:one-type-per-behavior] Both share identical retry behavior, so
+// they are one type — the cause survives only as a value (the message prefix).
+class TransientError extends Error {}
 
 function classifyClaudeError(err, text) {
-  return /\b529\b|overloaded/i.test(text) ? new OverloadError(err.message) : err;
+  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
+  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  return err;
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function overloadBackoffMs(attempt) {
-  const cap = Math.min(OVERLOAD_BACKOFF_MAX_MS, OVERLOAD_BACKOFF_BASE_MS * 2 ** (attempt - 1));
+function transientBackoffMs(attempt) {
+  const cap = Math.min(TRANSIENT_BACKOFF_MAX_MS, TRANSIENT_BACKOFF_BASE_MS * 2 ** (attempt - 1));
   return cap / 2 + Math.random() * (cap / 2);
 }
 
 // One attempt at producing a validated review against a fresh collector. The
-// collector is recreated per attempt so partial records from a 529'd attempt can
-// never leak into a later successful read. [LAW:no-silent-failure]
+// collector is recreated per attempt so partial records from a transient-failed attempt
+// can never leak into a later successful read. [LAW:no-silent-failure]
 async function produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
   const collector = createReviewCollector();
   try {
@@ -30453,21 +30457,21 @@ async function produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHo
 }
 
 // [LAW:no-ambient-temporal-coupling] This loop is the single explicit owner of retry
-// timing; runClaudeCode does one attempt and stays timing-free. Overload (529) failures
-// retry until the time budget is spent — at least an hour of transient overload is
-// ridden out; everything else surfaces immediately. [LAW:no-silent-failure]
+// timing; runClaudeCode does one attempt and stays timing-free. Transient failures (429
+// rate-limited, 529 overloaded) retry until the time budget is spent; everything else
+// surfaces immediately. [LAW:no-silent-failure]
 async function produceReview(apiKey, model, systemPrompt, prompt, reviewerHome, anchors) {
-  const deadline = Date.now() + OVERLOAD_RETRY_BUDGET_MS;
+  const deadline = Date.now() + TRANSIENT_RETRY_BUDGET_MS;
   for (let attempt = 1; ; attempt++) {
     try {
       return await produceReviewOnce(apiKey, model, systemPrompt, prompt, reviewerHome, anchors);
     } catch (err) {
-      if (!(err instanceof OverloadError) || Date.now() >= deadline) {
+      if (!(err instanceof TransientError) || Date.now() >= deadline) {
         throw err;
       }
-      const delay = overloadBackoffMs(attempt);
+      const delay = transientBackoffMs(attempt);
       const minsLeft = Math.ceil((deadline - Date.now()) / 60_000);
-      core.warning(`z.ai overloaded (HTTP 529); retrying in ${Math.round(delay)}ms (~${minsLeft}m of retry budget left).`);
+      core.warning(`z.ai transient error (${err.message}); retrying in ${Math.round(delay)}ms (~${minsLeft}m of retry budget left).`);
       await sleep(delay);
     }
   }
@@ -30731,7 +30735,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
   run().catch(err => core.setFailed(err.message));
 }
 
-module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget, OverloadError, classifyClaudeError, overloadBackoffMs };
+module.exports = { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, gitHubTransport, giteaTransport, resolveReviewTarget, TransientError, classifyClaudeError, transientBackoffMs };
 
 
 /***/ }),
