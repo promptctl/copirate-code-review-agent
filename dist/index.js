@@ -30441,7 +30441,7 @@ function parseRetryAfterMs(text) {
   const match = /retry.?after[:\s]+(\d+)/i.exec(text);
   if (!match) return null;
   const seconds = parseInt(match[1], 10);
-  return seconds > 0 ? Math.min(seconds * 1000, TRANSIENT_BACKOFF_MAX_MS) : null;
+  return seconds >= 0 ? Math.min(seconds * 1000, TRANSIENT_BACKOFF_MAX_MS) : null;
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly once.
