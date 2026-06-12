@@ -30633,8 +30633,18 @@ const TOOL_NAMES = {
 function buildConfigToml(config, collectorSpawn) {
   const { command, args, env: collectorEnv } = collectorSpawn;
 
-  // TOML string escaping: escape backslashes then double-quotes.
-  const q = v => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  // TOML basic-string escaping per TOML 1.0 spec: backslash first, then double-quote, then
+  // control characters. Raw \n/\r in a single-line basic string breaks TOML parsing and
+  // could allow injection (e.g., a crafted baseUrl containing \napproval_policy = "always"
+  // overrides a hardened setting). [LAW:effects-at-boundaries] values from external sources
+  // (baseUrl, apiKeyEnv, recordsPath) must be sanitized at this trust boundary.
+  const q = v => `"${String(v)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)}"`;
   const arr = vs => `[${vs.map(q).join(', ')}]`;
 
   const lines = [
@@ -30688,22 +30698,33 @@ function materializeHome({ config, instructionsPath, collector }) {
 // externally sandboxed environment (per Codex docs: "Intended solely for running in
 // environments that are externally sandboxed"). MCP tool calls do not auto-execute in
 // --json mode without this flag regardless of approval_policy in config.toml.
+//
+// Env is an explicit allowlist — never process.env spread. Codex is an AI agent that can
+// read env vars via shell expressions; spreading process.env would expose GITHUB_TOKEN and
+// all repo secrets to prompt-injection payloads in the diff under review. Only the minimum
+// required variables are passed: PATH (npx resolution), HOME (system tools), CODEX_HOME
+// (config isolation), and the single apiKeyEnv credential. [LAW:effects-at-boundaries]
 function buildCommand({ config, home }) {
   return {
     command: 'npx',
     args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox'],
     env: {
-      ...process.env,
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
       CODEX_HOME: home,
       [config.endpoint.apiKeyEnv]: config.endpoint.apiKey,
     },
   };
 }
 
-// Parse the JSONL event stream from codex exec --json. Success = turn.completed present
-// without a prior turn.failed. Non-JSON lines (stderr noise) are skipped.
-// [LAW:no-silent-failure] A turn.failed event always surfaces its message.
+// Parse the JSONL event stream from codex exec --json. Non-JSON lines (stderr noise) are skipped.
+// [LAW:no-silent-failure] Both failure modes are surfaced:
+//   turn.failed  — explicit engine error (throw immediately)
+//   no turn.completed — Codex exited 0 but the turn never finished (interrupted mid-turn,
+//     internal timeout, buffering error). Without this check a clean-exit incomplete turn
+//     silently passes as success with no findings collected.
 function assertSucceeded(stdout) {
+  let completed = false;
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -30712,6 +30733,10 @@ function assertSucceeded(stdout) {
     if (event.type === 'turn.failed') {
       throw new Error(`Codex review failed: ${event.error?.message ?? 'unknown error'}`);
     }
+    if (event.type === 'turn.completed') completed = true;
+  }
+  if (!completed) {
+    throw new Error('Codex review did not complete: turn.completed event was not emitted.');
   }
 }
 

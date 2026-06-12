@@ -91,11 +91,33 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.ok(toml.includes('REVIEW_COLLECTOR_RECORDS = "/tmp/records.jsonl"'), 'records path not found');
   });
 
-  test('strings with special characters are escaped', () => {
+  test('double-quotes in string values are escaped', () => {
     const spawn = { ...MOCK_COLLECTOR_SPAWN, command: '/path/with "quotes"' };
     const toml = buildConfigToml(BASE_CONFIG, spawn);
-    // The quotes in the command value should be escaped in the TOML output.
     assert.ok(toml.includes('\\"quotes\\"'), 'quote escaping not found');
+  });
+
+  test('newlines in values are escaped to \\n (prevents TOML injection)', () => {
+    // A crafted baseUrl containing \n could override later config keys if not escaped.
+    const config = { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://evil.example.com/\napproval_policy = "always"' } };
+    const toml = buildConfigToml(config, MOCK_COLLECTOR_SPAWN);
+    // The newline must be escaped in the output.
+    assert.ok(toml.includes('\\n'), 'newline not escaped');
+    // The injected payload must NOT appear as a bare key-value line (i.e., must be inside a quoted string).
+    // Bare injection would look like: \napproval_policy = "always" as a new TOML line.
+    assert.equal(toml.includes('\napproval_policy = "always"'), false, 'unescaped injection line appeared');
+  });
+
+  test('carriage returns in values are escaped to \\r', () => {
+    const spawn = { ...MOCK_COLLECTOR_SPAWN, command: '/path/with\rreturn' };
+    const toml = buildConfigToml(BASE_CONFIG, spawn);
+    assert.ok(toml.includes('\\r'), 'carriage return not escaped');
+  });
+
+  test('tab characters in values are escaped to \\t', () => {
+    const spawn = { ...MOCK_COLLECTOR_SPAWN, command: '/path/with\ttab' };
+    const toml = buildConfigToml(BASE_CONFIG, spawn);
+    assert.ok(toml.includes('\\t'), 'tab not escaped');
   });
 });
 
@@ -136,15 +158,24 @@ describe('codexAdapter.buildCommand', () => {
     assert.equal(env.OPENAI_API_KEY, 'sk-test-key-xyz');
   });
 
-  test('env inherits process.env entries', () => {
+  test('PATH is passed through for npx resolution', () => {
     const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    assert.ok('PATH' in env);
+    assert.equal(env.PATH, process.env.PATH);
   });
 
-  test('does not set HOME (codex uses CODEX_HOME, not HOME)', () => {
+  test('HOME is passed through for system tools', () => {
     const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    // CODEX_HOME is the relevant key; HOME should not be overridden for codex
-    assert.equal(env.CODEX_HOME, MOCK_HOME);
+    assert.equal(env.HOME, process.env.HOME);
+  });
+
+  test('env is an explicit allowlist — does not contain arbitrary process.env vars', () => {
+    // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
+    // Only PATH, HOME, CODEX_HOME, and the apiKeyEnv credential are permitted.
+    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME', BASE_CONFIG.endpoint.apiKeyEnv]);
+    for (const key of Object.keys(env)) {
+      assert.ok(allowedKeys.has(key), `unexpected env var leaked into subprocess: ${key}`);
+    }
   });
 });
 
@@ -188,9 +219,25 @@ describe('codexAdapter.assertSucceeded', () => {
     assert.doesNotThrow(() => codexAdapter.assertSucceeded(stdout));
   });
 
-  test('does not throw on empty output (no terminal event)', () => {
-    // runEngine throws on non-zero exit; assertSucceeded only classifies the envelope.
-    assert.doesNotThrow(() => codexAdapter.assertSucceeded(''));
+  test('throws on empty output — turn.completed was never emitted', () => {
+    // Codex can exit 0 mid-turn (interrupted, internal timeout, buffering error) without
+    // emitting turn.completed. Treating this as success would silently produce no findings.
+    assert.throws(
+      () => codexAdapter.assertSucceeded(''),
+      /did not complete.*turn\.completed/,
+    );
+  });
+
+  test('throws when stdout has events but no turn.completed', () => {
+    const stdout = [
+      '{"type":"thread.started","thread_id":"abc"}',
+      '{"type":"turn.started"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}',
+    ].join('\n');
+    assert.throws(
+      () => codexAdapter.assertSucceeded(stdout),
+      /did not complete/,
+    );
   });
 });
 
