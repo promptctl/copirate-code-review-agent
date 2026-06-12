@@ -508,12 +508,13 @@ class TransientError extends Error {
 }
 
 // Extract the server's Retry-After hint (seconds form) from CLI text output.
-// Returns the value in milliseconds, capped at TRANSIENT_BACKOFF_MAX_MS, or null if absent.
+// Returns the exact value in milliseconds, or null if absent. No cap: the caller
+// must honor the full server-specified window; TRANSIENT_BACKOFF_MAX_MS belongs
+// on the exponential backoff path only. [LAW:one-source-of-truth]
 function parseRetryAfterMs(text) {
   const match = /retry.?after[:\s]+(\d+)/i.exec(text);
   if (!match) return null;
-  const seconds = parseInt(match[1], 10);
-  return Math.min(seconds * 1000, TRANSIENT_BACKOFF_MAX_MS);
+  return parseInt(match[1], 10) * 1000;
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly once.
