@@ -14,7 +14,7 @@ npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.t
 ```
 
 - **`dist/` MUST be committed.** The Actions runner executes `dist/index.js` directly — it never runs `npm install` or a build step. Every change to `src/index.js` requires `npm run build` and committing both `src/` and `dist/`.
-- There is **no test suite, linter, or test command**. "Verify" means building cleanly and reasoning through the runtime path; there is no `npm test`.
+- **`npm test`** runs the `node:test` suite in `test/`. Tests cover the exported pure functions in `src/index.js` and a dist smoke test that spawns `dist/index.js --review-collector-server` and performs a full MCP handshake. CI also asserts that committed `dist/` matches a fresh build (`npm run build` + `git diff --exit-code dist/`).
 - Keep PRs to one fix/feature each, against `main`.
 
 ### Cutting a release
