@@ -16,7 +16,7 @@ const {
 // subsequent refactor ticket must pass these fixtures unchanged.
 
 const SIMPLE_PATCH = [
-  '@@ -1,4 +1,5 @@',
+  '@@ -1,4 +1,4 @@',
   ' context line 1',   // line 1
   '+added line',       // line 2
   ' context line 3',   // line 3

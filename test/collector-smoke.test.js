@@ -15,32 +15,36 @@ const DIST = path.join(__dirname, '..', 'dist', 'index.js');
 // Send one JSON-RPC message and await the next response line from the process.
 // [LAW:no-ambient-temporal-coupling] each step is gated on the prior response;
 // ordering is explicit in the request/response pairs, not in timing assumptions.
-function rpc(child, recordsDir, id, method, params) {
+// [LAW:no-silent-failure] child 'close' rejects the promise so a crashed server
+// surfaces an error immediately rather than hanging the test indefinitely.
+function rpc(child, id, method, params) {
   return new Promise((resolve, reject) => {
     const msg = JSON.stringify({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) });
 
     let buffer = '';
+    const cleanup = () => {
+      child.stdout.removeListener('data', onData);
+      child.removeListener('close', onClose);
+    };
     const onData = chunk => {
       buffer += chunk;
       const nl = buffer.indexOf('\n');
       if (nl === -1) return;
       const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      child.stdout.removeListener('data', onData);
-      child.stderr.removeListener('data', onErr);
+      cleanup();
       try {
         resolve(JSON.parse(line));
       } catch (e) {
         reject(new Error(`Non-JSON response: ${line}`));
       }
     };
-    const onErr = chunk => {
-      // Ignore stderr — the server writes nothing to stderr normally;
-      // any error will surface as a missing response timeout instead.
+    const onClose = code => {
+      cleanup();
+      reject(new Error(`Child exited with code ${code} before responding to ${method}`));
     };
 
     child.stdout.on('data', onData);
-    child.stderr.on('data', onErr);
+    child.once('close', onClose);
     child.stdin.write(`${msg}\n`);
   });
 }
@@ -56,7 +60,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
 
   try {
     // 1. initialize
-    const initResp = await rpc(child, tmpDir, 1, 'initialize', {
+    const initResp = await rpc(child, 1, 'initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
       clientInfo: { name: 'smoke-test', version: '0.0.1' },
@@ -66,7 +70,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     assert.ok(initResp.result.serverInfo, 'initialize result must include serverInfo');
 
     // 2. tools/list
-    const listResp = await rpc(child, tmpDir, 2, 'tools/list', {});
+    const listResp = await rpc(child, 2, 'tools/list', {});
     assert.equal(listResp.id, 2);
     const tools = listResp.result.tools;
     assert.ok(Array.isArray(tools));
@@ -75,7 +79,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     assert.ok(toolNames.includes('finish_review'), 'tools must include finish_review');
 
     // 3. tools/call request_change
-    const changeResp = await rpc(child, tmpDir, 3, 'tools/call', {
+    const changeResp = await rpc(child, 3, 'tools/call', {
       name: 'request_change',
       arguments: { path: 'src/foo.js', line: 10, body: 'Fix this invariant.' },
     });
@@ -84,7 +88,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     assert.ok(!changeResp.error, `request_change must not error: ${JSON.stringify(changeResp.error)}`);
 
     // 4. tools/call finish_review
-    const finishResp = await rpc(child, tmpDir, 4, 'tools/call', {
+    const finishResp = await rpc(child, 4, 'tools/call', {
       name: 'finish_review',
       arguments: { summary: 'One required change.' },
     });
@@ -121,13 +125,13 @@ test('collector smoke: unknown method returns JSON-RPC error', async () => {
 
   try {
     // Send initialize first so the server is ready
-    await rpc(child, tmpDir, 1, 'initialize', {
+    await rpc(child, 1, 'initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
       clientInfo: { name: 'smoke-test', version: '0.0.1' },
     });
 
-    const errResp = await rpc(child, tmpDir, 99, 'nonexistent/method', {});
+    const errResp = await rpc(child, 99, 'nonexistent/method', {});
     assert.equal(errResp.id, 99);
     assert.ok(errResp.error, 'unknown method must return a JSON-RPC error');
     assert.equal(errResp.error.code, -32601);
