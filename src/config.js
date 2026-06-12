@@ -180,4 +180,27 @@ function loadConfig(filePath, selectedName, env, reg) {
   return resolveSecrets(chain, env);
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict };
+// Fast read: returns configNames and defaultName without full validation or secret resolution.
+// Used by run.js to get config names for PR-level selection before the full loadConfig call.
+// [LAW:effects-at-boundaries] Reads the filesystem but accepts filePath as a value.
+// [LAW:no-silent-failure] Throws if the file is unreadable or lacks 'configs'/'default'.
+function peekConfigNames(filePath) {
+  let raw;
+  try {
+    raw = yaml.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    throw new Error(`Failed to read config file '${filePath}': ${e.message}`);
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`Config file '${filePath}': not a YAML mapping.`);
+  }
+  if (!raw.configs || typeof raw.configs !== 'object' || Array.isArray(raw.configs)) {
+    throw new Error(`Config file '${filePath}': missing or invalid 'configs' map.`);
+  }
+  if (!raw.default) {
+    throw new Error(`Config file '${filePath}': missing required field 'default'.`);
+  }
+  return { configNames: Object.keys(raw.configs), defaultName: String(raw.default) };
+}
+
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict, peekConfigNames };

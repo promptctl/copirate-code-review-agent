@@ -30294,7 +30294,30 @@ function loadConfig(filePath, selectedName, env, reg) {
   return resolveSecrets(chain, env);
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict };
+// Fast read: returns configNames and defaultName without full validation or secret resolution.
+// Used by run.js to get config names for PR-level selection before the full loadConfig call.
+// [LAW:effects-at-boundaries] Reads the filesystem but accepts filePath as a value.
+// [LAW:no-silent-failure] Throws if the file is unreadable or lacks 'configs'/'default'.
+function peekConfigNames(filePath) {
+  let raw;
+  try {
+    raw = yaml.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    throw new Error(`Failed to read config file '${filePath}': ${e.message}`);
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`Config file '${filePath}': not a YAML mapping.`);
+  }
+  if (!raw.configs || typeof raw.configs !== 'object' || Array.isArray(raw.configs)) {
+    throw new Error(`Config file '${filePath}': missing or invalid 'configs' map.`);
+  }
+  if (!raw.default) {
+    throw new Error(`Config file '${filePath}': missing required field 'default'.`);
+  }
+  return { configNames: Object.keys(raw.configs), defaultName: String(raw.default) };
+}
+
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict, peekConfigNames };
 
 
 /***/ }),
@@ -31065,7 +31088,8 @@ const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
-const { loadConfig, assertNoLegacyConflict } = __nccwpck_require__(1283);
+const { loadConfig, assertNoLegacyConflict, peekConfigNames } = __nccwpck_require__(1283);
+const { selectConfig } = __nccwpck_require__(675);
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -31117,7 +31141,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
 async function run() {
   // [LAW:one-source-of-truth] Default path is declared in action.yml; do not duplicate it here.
   const configFilePath = core.getInput('CONFIG_FILE');
-  const configName = core.getInput('CONFIG');
+  const configNameInput = core.getInput('CONFIG');
   const apiKey = core.getInput('ZAI_API_KEY');
   const hasConfigFile = fs.existsSync(configFilePath);
 
@@ -31128,31 +31152,6 @@ async function run() {
   } catch (e) {
     core.setFailed(e.message);
     return;
-  }
-
-  // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
-  // a validated multi-config chain; ZAI_* inputs synthesize a single-entry compat chain.
-  let chain;
-  if (hasConfigFile) {
-    try {
-      chain = loadConfig(configFilePath, configName || undefined, process.env);
-    } catch (e) {
-      core.setFailed(e.message);
-      return;
-    }
-    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
-  } else {
-    if (!apiKey) {
-      core.setFailed(
-        `No configuration found. '${configFilePath}' does not exist and ZAI_API_KEY is not set. ` +
-        'Provide a valid CONFIG_FILE path or ZAI_API_KEY.',
-      );
-      return;
-    }
-    core.setSecret(apiKey);
-    const model = core.getInput('ZAI_MODEL');
-    const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
-    chain = [synthesizeZaiConfig(apiKey, model, systemPrompt)];
   }
 
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
@@ -31186,6 +31185,56 @@ async function run() {
 
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
+
+  // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
+  // a validated multi-config chain; ZAI_* inputs synthesize a single-entry compat chain.
+  let chain;
+  if (hasConfigFile) {
+    // [LAW:one-source-of-truth] One pulls.get call for both label and body provenance.
+    // peekConfigNames is a fast read so config names are available before the API call.
+    let configNames, defaultName;
+    try {
+      ({ configNames, defaultName } = peekConfigNames(configFilePath));
+    } catch (e) {
+      core.setFailed(e.message);
+      return;
+    }
+
+    const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+
+    let selectedName;
+    try {
+      selectedName = selectConfig(
+        { labels: pr.labels, body: pr.body },
+        { configInput: configNameInput, configNames, defaultName },
+      );
+    } catch (e) {
+      core.setFailed(e.message);
+      return;
+    }
+
+    core.info(`Selected reviewer config: '${selectedName}'`);
+
+    try {
+      chain = loadConfig(configFilePath, selectedName, process.env);
+    } catch (e) {
+      core.setFailed(e.message);
+      return;
+    }
+    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
+  } else {
+    if (!apiKey) {
+      core.setFailed(
+        `No configuration found. '${configFilePath}' does not exist and ZAI_API_KEY is not set. ` +
+        'Provide a valid CONFIG_FILE path or ZAI_API_KEY.',
+      );
+      return;
+    }
+    core.setSecret(apiKey);
+    const model = core.getInput('ZAI_MODEL');
+    const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
+    chain = [synthesizeZaiConfig(apiKey, model, systemPrompt)];
+  }
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const transport = await selectTransport(octokit, owner, repo, pullNumber);
@@ -31226,6 +31275,73 @@ async function run() {
 }
 
 module.exports = { run };
+
+
+/***/ }),
+
+/***/ 675:
+/***/ ((module) => {
+
+"use strict";
+
+
+// [LAW:effects-at-boundaries] Pure: no IO, no side effects.
+// selectConfig(pr, opts) -> string (selected config name)
+// [LAW:no-silent-failure] Throws on: multiple review: labels, unknown config name.
+// [LAW:dataflow-not-control-flow] Precedence is expressed as a waterfall over values
+// (label > body > configInput > defaultName), not as branch logic that skips operations.
+
+const REVIEW_LABEL_PREFIX = 'review:';
+// [LAW:one-source-of-truth] Single regex for the PR-body directive; identical to the plan spec.
+const BODY_DIRECTIVE_RE = /^\s*review-config:\s*([a-z0-9_-]+)\s*$/im;
+
+// Returns the selected config name.
+// pr:   { labels: [{name: string}], body: string|null|undefined }
+// opts: { configInput: string, configNames: string[], defaultName: string }
+// [LAW:no-silent-failure] Unknown name → throws an error naming the request, source, and
+// defined configs. Multiple review: labels → throws naming all found labels.
+function selectConfig(pr, { configInput, configNames, defaultName }) {
+  const reviewLabels = (pr.labels || []).filter(l => l.name.startsWith(REVIEW_LABEL_PREFIX));
+
+  if (reviewLabels.length > 1) {
+    const found = reviewLabels.map(l => l.name).join(', ');
+    throw new Error(
+      `Ambiguous reviewer selection: ${reviewLabels.length} review: labels found (${found}). ` +
+      `Remove all but one. Defined configs: ${configNames.join(', ')}.`,
+    );
+  }
+
+  let selected, source;
+
+  if (reviewLabels.length === 1) {
+    selected = reviewLabels[0].name.slice(REVIEW_LABEL_PREFIX.length);
+    source = `label '${reviewLabels[0].name}'`;
+  } else {
+    const bodyMatch = (pr.body || '').match(BODY_DIRECTIVE_RE);
+    if (bodyMatch) {
+      selected = bodyMatch[1];
+      source = `body directive 'Review-Config: ${bodyMatch[1]}'`;
+    } else if (configInput) {
+      selected = configInput;
+      source = `CONFIG input '${configInput}'`;
+    } else {
+      // [LAW:no-defensive-null-guards] defaultName is always valid — it was read from the
+      // config file by peekConfigNames and verified to exist in configs by loadConfig.
+      return defaultName;
+    }
+  }
+
+  if (!configNames.includes(selected)) {
+    throw new Error(
+      `Requested config '${selected}' (source: ${source}) is not defined. ` +
+      `Defined configs: ${configNames.join(', ')}.`,
+    );
+  }
+
+  return selected;
+}
+
+module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 
 /***/ }),
