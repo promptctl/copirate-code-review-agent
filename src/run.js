@@ -97,8 +97,16 @@ async function run() {
   // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode:
   // the action never reviews a fork PR (its diff is untrusted and would spend the host's
   // own AI credits on outside contributors). Skipping is an intentional clean no-op — logged,
-  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced.
-  if (prIsFromFork(pr)) {
+  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced;
+  // malformed PR data (no base repo) throws here and surfaces as a loud failure, never a skip.
+  let isFork;
+  try {
+    isFork = prIsFromFork(pr);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  if (isFork) {
     core.info(
       `Skipping review: PR #${pullNumber} is from a fork. Fork pull requests are not reviewed `
       + 'by this action.',

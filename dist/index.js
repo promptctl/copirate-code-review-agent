@@ -31464,8 +31464,16 @@ async function run() {
   // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode:
   // the action never reviews a fork PR (its diff is untrusted and would spend the host's
   // own AI credits on outside contributors). Skipping is an intentional clean no-op — logged,
-  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced.
-  if (prIsFromFork(pr)) {
+  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced;
+  // malformed PR data (no base repo) throws here and surfaces as a loud failure, never a skip.
+  let isFork;
+  try {
+    isFork = prIsFromFork(pr);
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  if (isFork) {
     core.info(
       `Skipping review: PR #${pullNumber} is from a fork. Fork pull requests are not reviewed `
       + 'by this action.',
@@ -31749,14 +31757,22 @@ function resolveReviewTarget(numberInput, headShaInput, payload) {
 }
 
 // [LAW:effects-at-boundaries] Pure: a PR is from a fork when its head repository is not
-// the base repository, compared by stable numeric repo id (rename-safe). A head repo of
-// null — the source fork was deleted — is treated as a fork: there is no trusted same-repo
-// source to review, so the only correct answer is "fork". [LAW:no-defensive-null-guards]
-// the null branch is a real domain state with a meaningful outcome, not a guard that skips work.
+// the base repository, compared by stable numeric repo id (rename-safe).
+//
+// The two absent-repo cases are NOT the same and must not be folded together:
+//   - head.repo == null is a real domain state — the source fork was deleted — and the
+//     only correct answer is "fork": there is no trusted same-repo source to review.
+//     [LAW:no-defensive-null-guards] a real optional value with a meaningful outcome.
+//   - base.repo absent is impossible for a well-formed PR (every PR has a base repository).
+//     Treating it as "fork" would silently turn malformed data into a skipped review, so we
+//     reject it loudly instead and let the boundary report it. [LAW:no-silent-failure]
 function prIsFromFork(pr) {
-  const headRepo = pr.head?.repo;
   const baseRepo = pr.base?.repo;
-  if (!headRepo || !baseRepo) return true;
+  if (!baseRepo) {
+    throw new Error('PR data has no base repository; cannot determine fork status.');
+  }
+  const headRepo = pr.head?.repo;
+  if (!headRepo) return true;
   return headRepo.id !== baseRepo.id;
 }
 

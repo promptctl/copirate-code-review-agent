@@ -59,9 +59,9 @@ describe('prIsFromFork', () => {
     assert.equal(prIsFromFork(pr), true);
   });
 
-  test('missing base repo is treated as a fork (no trusted base to compare)', () => {
+  test('missing base repo fails loud (malformed PR data, not a silent skip)', () => {
     const pr = { head: { repo: { id: 100 } }, base: {} };
-    assert.equal(prIsFromFork(pr), true);
+    assert.throws(() => prIsFromFork(pr), /no base repository/);
   });
 });
 
