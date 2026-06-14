@@ -1,6 +1,14 @@
 name: "Z.ai Coding Agent Review"
 description: "AI-powered code review. Defaults to the Codex/OpenAI engine; the provider is selected explicitly via PROVIDER, never inferred from which credential is set."
 inputs:
+  MODE:
+    description: "Review material: 'pr' (default — review a pull request diff and post an inline review) or 'repo' (on-demand whole-repo review, typically via workflow_dispatch, that prints a findings report to the Step Summary and needs no PR)."
+    required: false
+    default: "pr"
+  SCOPE:
+    description: "Optional free-text focus for MODE=repo, injected into the review prompt (e.g. 'the auth layer', 'error handling across services'). Empty means a broad whole-repo review. Ignored when MODE=pr."
+    required: false
+    default: ""
   CONFIG_FILE:
     description: "Path to the review-agents config file (default: .github/review-agents.yml). When this file exists it owns engine selection and the simple-mode PROVIDER/key inputs are ignored."
     required: false

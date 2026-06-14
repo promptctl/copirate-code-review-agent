@@ -4,11 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A GitHub Action that runs an AI coding agent as a PR reviewer. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against Z.ai's Anthropic-compatible endpoint. The engine is chosen explicitly by the `PROVIDER` input (default `codex`) in `src/provider.js` — never inferred from which credential happens to be set. Whichever engine runs, it records required changes through a private MCP "collector" tool, then the action turns those records into inline GitHub review comments and submits a `REQUEST_CHANGES` or `APPROVE` review.
+A GitHub Action that runs an AI coding agent as a code reviewer. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against Z.ai's Anthropic-compatible endpoint. The engine is chosen explicitly by the `PROVIDER` input (default `codex`) in `src/provider.js` — never inferred from which credential happens to be set. Whichever engine runs, it records required changes through a private MCP "collector" tool.
+
+**Two review modes, selected by the `MODE` input (`src/run.js`).** `MODE` is the explicit discriminator between two *materials* and two *sinks*, never inferred from "is a PR present":
+- **`pr`** (default) — review a pull request diff and submit an inline `REQUEST_CHANGES`/`APPROVE` GitHub review (`runPrReview`).
+- **`repo`** — an on-demand whole-repo review (typically `workflow_dispatch`) with an optional free-text `SCOPE` injected into the prompt; the engine explores the working tree with Read/Grep/Glob (no diff, no anchors), and findings are printed as a Markdown report to the GitHub Step Summary + run log — no PR, no host review, no GitHub write token (`runRepoReview`). Pre-existing issues are in scope here, the inverse of PR mode.
+
+The two modes share the entire **ENGINE**: `collectReviewOnce` (one engine attempt → validated review + usage), `buildConfigChain`, `produceReview` (retry/failover), and the cost machinery. They differ only in the *material* prompt (`buildReviewInput` vs `buildRepoReviewInput` in `src/prompt.js`) and the *sink* (`submitReview` in `src/transport.js` vs `renderRepoReport` in `src/report.js`). The PR-diff anchor machinery (`patchLines`/`buildReviewAnchors`/`partitionFindings`) is a `pr`-mode-only concern; in `repo` mode any `file:line` the agent cites is valid.
 
 In simple mode (no `CONFIG_FILE`), `src/provider.js` is the single seam that turns the `PROVIDER` value plus its provider-specific inputs (`OPENAI_*` / `ZAI_*`) into a typed `ReviewConfig`. A committed `.github/review-agents.yml` config file is the advanced path: when it exists it owns engine selection (incl. per-PR selection and failover chains) and the simple-mode inputs are ignored.
 
-**Fork PRs are never reviewed.** `run` fetches the PR once up front and gates on `prIsFromFork` (`src/transport.js`: head repo id ≠ base repo id, or a deleted/absent head repo) — a fork PR is skipped cleanly (logged, exit 0, no engine spawned) before any credential is read. This is unconditional with no opt-in input, so an outside contributor's PR can never spend the host's AI credits.
+**Fork PRs are never reviewed.** `runPrReview` fetches the PR once up front and gates on `prIsFromFork` (`src/transport.js`: head repo id ≠ base repo id, or a deleted/absent head repo) — a fork PR is skipped cleanly (logged, exit 0, no engine spawned) before any credential is read. This is unconditional with no opt-in input, so an outside contributor's PR can never spend the host's AI credits.
 
 ## Build and release
 
@@ -48,10 +54,10 @@ Versioning is split into two parts, deliberately:
 
 ## Architecture
 
-Everything lives in `src/index.js`. It is a **single file with two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
+The source is split into focused modules under `src/` (orchestrator `run.js`, engine adapters under `engine/`, `prompt.js`, `transport.js`, `review.js`, `usage.js`, `report.js`, etc.); `src/index.js` is the thin entry point that bundles to `dist/index.js`. It has **two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
 
-1. **Action orchestrator** (`run`) — the default mode the runner invokes.
-2. **MCP collector server** (`runReviewCollectorServer`) — the *same file* re-spawned as a stdio MCP subprocess by Claude Code. The MCP config (`createReviewCollector`) wires `command: node, args: [__filename, '--review-collector-server']`, so the binary is self-referential.
+1. **Action orchestrator** (`run` in `src/run.js`) — the default mode the runner invokes.
+2. **MCP collector server** (`runReviewCollectorServer` in `src/collector-server.js`) — the *same bundled binary* re-spawned as a stdio MCP subprocess by the engine. The MCP config (`createReviewCollector`) wires `command: node, args: [__filename, '--review-collector-server']`, so the binary is self-referential.
 
 The central design seam is **judgment vs. transport**:
 
@@ -62,13 +68,13 @@ This boundary is why findings flow through an MCP tool rather than being parsed 
 
 ### The line-anchor invariant (most fragile part)
 
-A finding anchors to a **new-file line number**, defined **once** in `patchLines` (`src/index.js`): each `@@` hunk header resets the new-side counter; only added (`+`) and context (` `) lines advance it and are anchorable (deletions have no new-side line). Three consumers derive from it and must never reimplement it:
+This section applies to **`pr` mode only** — `repo` mode has no diff and no anchors. A finding anchors to a **new-file line number**, defined **once** in `patchLines` (`src/diff.js`): each `@@` hunk header resets the new-side counter; only added (`+`) and context (` `) lines advance it and are anchorable (deletions have no new-side line). Three consumers derive from it and must never reimplement it:
 
 - `annotatePatchWithLines` — labels each anchorable diff line `LINE N` in the prompt so the model cites the right line.
 - `buildReviewAnchors` — the `path:line` set used by `partitionFindings` to reconcile each finding with the visible diff.
 - `transport.toComment` — maps a finding's `line` to the host's comment anchor.
 
-The two-way contract: the model is shown lines as `LINE N` and should comment on those. When it anchors slightly off (a line just outside the hunk), `partitionFindings` (`src/review.js`) does **not** abort the review — that would discard every valid finding and red the run for one model slip. Instead it reconciles each finding as a value: a line within `MAX_ANCHOR_SNAP_DISTANCE` of a reviewed line is snapped to that line (body annotated so the move is explicit); a line too far from any reviewed line becomes an *unanchored* finding that `submitReview` renders in the review summary and `run` logs as a warning. Either way the finding still counts toward the `REQUEST_CHANGES` verdict, so a mis-anchored real issue can never silently downgrade to APPROVE. [LAW:no-silent-failure]
+The two-way contract: the model is shown lines as `LINE N` and should comment on those. When it anchors slightly off (a line just outside the hunk), `partitionFindings` (`src/review.js`) does **not** abort the review — that would discard every valid finding and red the run for one model slip. Instead it reconciles each finding as a value: a line within `MAX_ANCHOR_SNAP_DISTANCE` of a reviewed line is snapped to that line (body annotated so the move is explicit); a line too far from any reviewed line becomes an *unanchored* finding that `submitReview` renders in the review summary and `produceReviewOnce` logs as a warning. Either way the finding still counts toward the `REQUEST_CHANGES` verdict, so a mis-anchored real issue can never silently downgrade to APPROVE. [LAW:no-silent-failure]
 
 ### Host transport (GitHub + Gitea)
 

@@ -112,6 +112,8 @@ The engine is selected by `PROVIDER` alone. Each provider needs its own credenti
 | `ZAI_BASE_URL` | No | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for the `zai` provider |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code (`zai` provider) |
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
+| `MODE` | No | `pr` | Review material: `pr` (review a pull request diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review-mode-on-demand), prints a report to the Step Summary, needs no PR). |
+| `SCOPE` | No | — | Free-text focus for `MODE=repo`, injected into the review prompt (e.g. `the auth layer`). Empty = broad whole-repo review. Ignored when `MODE=pr`. |
 | `CONFIG_FILE` | No | `.github/review-agents.yml` | Multi-engine config file. When it exists it owns engine selection and the `PROVIDER`/key inputs above are ignored. |
 | `CONFIG` | No | — | Select a named config from the config file, overriding its `default` |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
@@ -194,6 +196,46 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
           GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
+
+## Whole-repo review mode (on-demand)
+
+Set `MODE: repo` to review the **whole repository** instead of a pull request diff — an on-demand "give me an overall look at this repo" pass. There is no PR: the engine explores the checked-out working tree with its Read/Grep/Glob tools, and findings are printed as a report to the **GitHub Step Summary** and the run log (no inline comments, no review submitted, no `GITHUB_TOKEN` write access required). Unlike PR review — which only flags issues a diff introduces — a whole-repo review deliberately flags **pre-existing** issues, since that is the point.
+
+Trigger it manually with `workflow_dispatch` and an optional `SCOPE` to focus the review:
+
+```yaml
+name: AI Whole-Repo Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Optional focus, e.g. 'the auth layer'. Leave blank for a broad review."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Whole-repo review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Whole-repo review
+        uses: brandon-fryslie/zai-coding-agent-review@v1
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          MODE: repo
+          SCOPE: ${{ inputs.scope }}
+```
+
+Engine/provider selection (`PROVIDER`, `OPENAI_*`/`ZAI_*`, `CONFIG_FILE`), `EXCLUDE_PATTERNS`, and cost reporting work exactly as in PR mode (per-PR config selection by label/body has no effect without a PR; use the `CONFIG` input to pick a named config). The run is informational and exits 0 regardless of findings.
+
+> **Scale limit:** the review is a single tool-driven agent run, so a broad pass over a very large repository can exceed the agent's context. For large repos, pass a `SCOPE` to focus the review on one subsystem at a time.
 
 ## Fork pull requests are not reviewed
 
