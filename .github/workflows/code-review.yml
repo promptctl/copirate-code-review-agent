@@ -21,8 +21,9 @@ jobs:
 
       - name: Code Review
         uses: ./
+        env:
+          # The codex/openai config in .github/review-agents.yml resolves its key from
+          # this env var (config.endpoint.apiKeyEnv: OPENAI_API_KEY).
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          ZAI_MODEL: ${{ vars.ZAI_MODEL }}
-          ZAI_SYSTEM_PROMPT: ${{ vars.ZAI_SYSTEM_PROMPT }}
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}

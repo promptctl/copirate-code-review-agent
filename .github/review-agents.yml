@@ -1,0 +1,13 @@
+version: 1
+
+# Default reviewer engine. Single source of truth for which engine runs.
+default: codex
+
+configs:
+  codex:
+    engine: codex
+    model: gpt-5.5
+    endpoint:
+      kind: openai-responses
+      baseUrl: https://api.openai.com/v1
+      apiKeyEnv: OPENAI_API_KEY
