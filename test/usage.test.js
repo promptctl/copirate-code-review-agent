@@ -2,8 +2,8 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { codexAdapter } = require('../src/engine/codex');
-const { claudeCodeAdapter } = require('../src/engine/claude-code');
+const { extractUsage: codexExtractUsage } = require('../src/engine/codex');
+const { extractUsage: claudeExtractUsage } = require('../src/engine/claude-code');
 const {
   computeOpenAiCostUsd,
   renderCostLine,
@@ -55,15 +55,15 @@ describe('computeOpenAiCostUsd', () => {
   });
 });
 
-// --- codexAdapter.extractUsage (real codex exec --json shape) ---
+// --- codexExtractUsage (real codex exec --json shape) ---
 
-describe('codexAdapter.extractUsage', () => {
+describe('codexExtractUsage', () => {
   test('reads usage from the final turn.completed and computes USD from the price table', () => {
     const stdout = [
       '{"type":"thread.started","thread_id":"abc"}',
       '{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":1000,"output_tokens":500,"reasoning_output_tokens":200}}',
     ].join('\n');
-    const usage = codexAdapter.extractUsage(stdout, CODEX_CONFIG);
+    const usage = codexExtractUsage(stdout, CODEX_CONFIG);
     assert.equal(usage.inputTokens, 5000);
     assert.equal(usage.outputTokens, 500);
     assert.equal(usage.cost.available, true);
@@ -76,32 +76,32 @@ describe('codexAdapter.extractUsage', () => {
       '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}',
       '{"type":"turn.completed","usage":{"input_tokens":9000,"output_tokens":300}}',
     ].join('\n');
-    const usage = codexAdapter.extractUsage(stdout, CODEX_CONFIG);
+    const usage = codexExtractUsage(stdout, CODEX_CONFIG);
     assert.equal(usage.inputTokens, 9000);
     assert.equal(usage.outputTokens, 300);
   });
 
   test('cost is unavailable with reason no-price (tokens still reported) when the model has no price', () => {
     const stdout = '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}';
-    const usage = codexAdapter.extractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' });
+    const usage = codexExtractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' });
     assert.equal(usage.inputTokens, 100);
     assert.deepEqual(usage.cost, { available: false, reason: 'no-price' });
   });
 
   test('returns null when no turn.completed carries usage', () => {
     const stdout = '{"type":"thread.started","thread_id":"abc"}';
-    assert.equal(codexAdapter.extractUsage(stdout, CODEX_CONFIG), null);
+    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG), null);
   });
 
   test('an empty usage object is reported as no usage, not a $0.00 run', () => {
     const stdout = '{"type":"turn.completed","usage":{}}';
-    assert.equal(codexAdapter.extractUsage(stdout, CODEX_CONFIG), null);
+    assert.equal(codexExtractUsage(stdout, CODEX_CONFIG), null);
   });
 });
 
-// --- claudeCodeAdapter.extractUsage (real -p --output-format json envelope) ---
+// --- claudeExtractUsage (real -p --output-format json envelope) ---
 
-describe('claudeCodeAdapter.extractUsage', () => {
+describe('claudeExtractUsage', () => {
   test('reads provider-reported total_cost_usd and sums all input-side token fields', () => {
     const stdout = JSON.stringify({
       type: 'result',
@@ -116,7 +116,7 @@ describe('claudeCodeAdapter.extractUsage', () => {
         cache_creation_input_tokens: 250,
       },
     });
-    const usage = claudeCodeAdapter.extractUsage(stdout);
+    const usage = claudeExtractUsage(stdout);
     assert.equal(usage.inputTokens, 1000 + 4000 + 250);
     assert.equal(usage.outputTokens, 500);
     assert.deepEqual(usage.cost, { available: true, usd: 0.0123 });
@@ -124,17 +124,17 @@ describe('claudeCodeAdapter.extractUsage', () => {
 
   test('cost is unavailable with reason not-reported when the envelope omits total_cost_usd', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
-    const usage = claudeCodeAdapter.extractUsage(stdout);
+    const usage = claudeExtractUsage(stdout);
     assert.equal(usage.inputTokens, 10);
     assert.deepEqual(usage.cost, { available: false, reason: 'not-reported' });
   });
 
   test('returns null when the envelope has no usage', () => {
-    assert.equal(claudeCodeAdapter.extractUsage('{"type":"result","result":"x"}'), null);
+    assert.equal(claudeExtractUsage('{"type":"result","result":"x"}'), null);
   });
 
   test('returns null when stdout is not a parseable envelope', () => {
-    assert.equal(claudeCodeAdapter.extractUsage('not json at all'), null);
+    assert.equal(claudeExtractUsage('not json at all'), null);
   });
 });
 

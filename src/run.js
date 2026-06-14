@@ -8,11 +8,9 @@ const { filterFiles, buildReviewAnchors } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = require('./transport');
 const { buildReviewInput, buildRepoReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
-const { createReviewCollector, readCollectedReview } = require('./collector');
 const { produceReview, buildAttributionFooter } = require('./failover');
 const { renderCostLine, costWarning } = require('./usage');
 const { renderRepoReport } = require('./report');
-const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
 const { synthesizeProviderConfig } = require('./provider');
@@ -23,33 +21,18 @@ const { selectConfig } = require('./selection');
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
-// [LAW:decomposition] The shared ENGINE attempt: run one engine against a prompt and read back
-// a validated review + usage. It knows nothing about pull requests, diff anchors, or the host —
-// both review modes (PR diff, whole repo) compose it. buildPromptFor(toolNames) is called here so
-// each engine in a failover chain gets the MCP tool identifiers its own adapter registers, not
-// chain[0]'s. [LAW:types-are-the-program]
-// Nested try/finally guarantees cleanup even when materializeHome throws: the outer finally cleans
-// collector.dir unconditionally; the inner finally cleans home only once materializeHome returned.
-// [LAW:no-silent-failure]
-async function collectReviewOnce(config, buildPromptFor) {
-  const adapter = registry.get(config.engine);
-  const prompt = buildPromptFor(adapter.toolNames);
-  const collector = createReviewCollector();
-  try {
-    const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
-    try {
-      const output = await runEngine(adapter, config, prompt, home, collector);
-      // [LAW:dataflow-not-control-flow] Usage is a value extracted from the engine's own output
-      // and carried to the footer sink alongside the findings — never recomputed at the boundary.
-      const usage = adapter.extractUsage(output, config);
-      const review = readCollectedReview(collector.recordsPath);
-      return { summary: review.summary, findings: review.findings, usage };
-    } finally {
-      fs.rmSync(home, { recursive: true });
-    }
-  } finally {
-    fs.rmSync(collector.dir, { recursive: true });
-  }
+// [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
+// runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
+// pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
+// collector dance is private to the CLI adapters); it only chooses the adapter and supplies the
+// shared review context. buildPromptFor(toolNames) is applied inside the adapter with its own MCP
+// tool identifiers, so a failover chain gives each engine the right names. [LAW:types-are-the-program]
+function runOneReview(config, buildPromptFor) {
+  return registry.get(config.engine).produceReview({
+    config,
+    buildPromptFor,
+    instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
+  });
 }
 
 // PR-mode attempt: the shared engine plus diff-anchor reconciliation. [LAW:dataflow-not-control-flow]
@@ -58,7 +41,7 @@ async function collectReviewOnce(config, buildPromptFor) {
 // [LAW:no-silent-failure] each unanchored finding is logged here at the boundary so it is visible
 // in the run, never dropped silently.
 async function produceReviewOnce(config, buildPromptFor, anchors) {
-  const { summary, findings, usage } = await collectReviewOnce(config, buildPromptFor);
+  const { summary, findings, usage } = await runOneReview(config, buildPromptFor);
   const { anchored, unanchored } = partitionFindings(findings, anchors);
   for (const f of unanchored) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
@@ -70,7 +53,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
 // every file:line the agent cites is valid — findings flow through unchanged. produceReview passes
 // anchors as the third argument for every mode; this attempt ignores it. [LAW:composability]
 async function produceRepoReviewOnce(config, buildPromptFor) {
-  return collectReviewOnce(config, buildPromptFor);
+  return runOneReview(config, buildPromptFor);
 }
 
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its

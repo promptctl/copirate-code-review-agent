@@ -4,6 +4,7 @@ const path = require('path');
 const os = require('os');
 const { TransientError } = require('../failover');
 const { computeOpenAiCostUsd } = require('../usage');
+const { makeCliAdapter } = require('./cli');
 
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
@@ -194,8 +195,9 @@ function classifyError(err, text) {
   return err;
 }
 
-// [LAW:one-type-per-behavior] One adapter object per engine CLI.
-const codexAdapter = {
+// [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
+// from the shared makeCliAdapter factory; this module supplies only the spawn primitives (the spec).
+const codexAdapter = makeCliAdapter({
   name: 'codex',
   timeoutMs: CODEX_TIMEOUT_MS,
   capabilities: {
@@ -204,7 +206,6 @@ const codexAdapter = {
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
     reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
     endpointKinds: ['openai-responses'],
-    findingsChannels: ['mcp-collector'],
   },
   toolNames: TOOL_NAMES,
   materializeHome,
@@ -212,6 +213,18 @@ const codexAdapter = {
   assertSucceeded,
   classifyError,
   extractUsage,
-};
+});
 
-module.exports = { codexAdapter, buildConfigToml, extractUsage, OPENAI_RESPONSES_BASE_URL };
+// The spawn primitives are exported as pure functions for direct unit testing of their behavior —
+// they are NOT part of the public adapter interface. [LAW:behavior-not-structure]
+module.exports = {
+  codexAdapter,
+  CODEX_TIMEOUT_MS,
+  buildConfigToml,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+  extractUsage,
+  OPENAI_RESPONSES_BASE_URL,
+};

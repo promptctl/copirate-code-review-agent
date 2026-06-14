@@ -4,6 +4,7 @@ const path = require('path');
 const os = require('os');
 const { TransientError, parseRetryAfterMs } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail } = require('./run');
+const { makeCliAdapter } = require('./cli');
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -144,9 +145,10 @@ function classifyError(err, text) {
 // from src/index.js for test compatibility; classifyError is the adapter interface name.
 const classifyClaudeError = classifyError;
 
-// [LAW:one-type-per-behavior] One adapter object per engine CLI; adapters compose with
-// the generic runEngine via the declared interface contract.
-const claudeCodeAdapter = {
+// [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
+// from the shared makeCliAdapter factory; this module supplies only the spawn primitives (the spec).
+// The factory exposes the lifted produceReview seam; the spec's primitives stay CLI-internal.
+const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
   capabilities: {
@@ -155,7 +157,6 @@ const claudeCodeAdapter = {
     // time via these declarations, never discovered at spawn time.
     reasoningEfforts: ['low', 'medium', 'high', 'max'],
     endpointKinds: ['anthropic-messages'],
-    findingsChannels: ['mcp-collector'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,
@@ -164,11 +165,19 @@ const claudeCodeAdapter = {
   assertSucceeded,
   classifyError,
   extractUsage,
-};
+});
 
+// The spawn primitives are exported as pure functions for direct unit testing of their behavior
+// (byte-identical args/env, error classification, usage parsing) — they are NOT part of the public
+// adapter interface. [LAW:behavior-not-structure]
 module.exports = {
   ZAI_ANTHROPIC_BASE_URL,
+  CLAUDE_TIMEOUT_MS,
   classifyClaudeError,
   claudeCodeAdapter,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
   extractUsage,
 };
