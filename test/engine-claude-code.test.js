@@ -1,7 +1,13 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { claudeCodeAdapter, ZAI_ANTHROPIC_BASE_URL } = require('../src/engine/claude-code');
+const {
+  claudeCodeAdapter,
+  ZAI_ANTHROPIC_BASE_URL,
+  CLAUDE_TIMEOUT_MS,
+  buildCommand,
+  classifyError,
+} = require('../src/engine/claude-code');
 
 // [LAW:verifiable-goals] AC for T3: existing ZAI_* inputs produce a byte-identical
 // claude invocation (args + env) to the pre-refactor runClaudeCode + buildClaudeArgs.
@@ -20,9 +26,9 @@ const BASE_CONFIG = {
   },
 };
 
-describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaudeArgs', () => {
+describe('buildCommand — args match pre-refactor buildClaudeArgs', () => {
   test('command is always "npx"', () => {
-    const { command } = claudeCodeAdapter.buildCommand({
+    const { command } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -31,7 +37,7 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 
   test('args match the exact pre-refactor order and values', () => {
-    const { args } = claudeCodeAdapter.buildCommand({
+    const { args } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -63,7 +69,7 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 
   test('omits --model when model is empty string', () => {
-    const { args } = claudeCodeAdapter.buildCommand({
+    const { args } = buildCommand({
       config: { ...BASE_CONFIG, model: '' },
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -73,7 +79,7 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 
   test('omits --append-system-prompt when systemPrompt is absent', () => {
-    const { args } = claudeCodeAdapter.buildCommand({
+    const { args } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -82,7 +88,7 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 
   test('--append-system-prompt appears before the prompt string when set', () => {
-    const { args } = claudeCodeAdapter.buildCommand({
+    const { args } = buildCommand({
       config: { ...BASE_CONFIG, systemPrompt: 'Focus on security.' },
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -94,7 +100,7 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 
   test('mcp-config arg uses collector.mcpConfigPath', () => {
-    const { args } = claudeCodeAdapter.buildCommand({
+    const { args } = buildCommand({
       config: BASE_CONFIG,
       collector: { mcpConfigPath: '/custom/path/mcp.json' },
       home: MOCK_HOME,
@@ -105,9 +111,9 @@ describe('claudeCodeAdapter.buildCommand — args match pre-refactor buildClaude
   });
 });
 
-describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeCode env', () => {
+describe('buildCommand — env matches pre-refactor runClaudeCode env', () => {
   test('HOME is set to the provided home directory', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: '/custom/home/dir',
@@ -116,7 +122,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('ANTHROPIC_AUTH_TOKEN comes from config.endpoint.apiKey', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -125,7 +131,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('ANTHROPIC_BASE_URL comes from config.endpoint.baseUrl (ZAI URL for compat shim)', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -134,7 +140,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('ANTHROPIC_MODEL is set to config.model', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -143,7 +149,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('API_TIMEOUT_MS is set to the string form of CLAUDE_TIMEOUT_MS (3000000)', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -152,7 +158,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('CLAUDE_CODE_SKIP_PROMPT_HISTORY is "1"', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -161,7 +167,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('NO_COLOR is "1"', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -170,7 +176,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('CLAUDE_CODE_EFFORT_LEVEL is absent when reasoning is not set', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -179,7 +185,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('CLAUDE_CODE_EFFORT_LEVEL is set from config.reasoning when present', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: { ...BASE_CONFIG, reasoning: 'high' },
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -188,7 +194,7 @@ describe('claudeCodeAdapter.buildCommand — env matches pre-refactor runClaudeC
   });
 
   test('env inherits process.env entries', () => {
-    const { env } = claudeCodeAdapter.buildCommand({
+    const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
@@ -203,16 +209,12 @@ describe('claudeCodeAdapter interface declarations', () => {
     assert.equal(claudeCodeAdapter.name, 'claude-code');
   });
 
-  test('timeoutMs is 3000000 (50 minutes)', () => {
-    assert.equal(claudeCodeAdapter.timeoutMs, 3_000_000);
+  test('CLAUDE_TIMEOUT_MS is 3000000 (50 minutes)', () => {
+    assert.equal(CLAUDE_TIMEOUT_MS, 3_000_000);
   });
 
   test('endpointKinds contains only "anthropic-messages"', () => {
     assert.deepEqual(claudeCodeAdapter.capabilities.endpointKinds, ['anthropic-messages']);
-  });
-
-  test('findingsChannels contains only "mcp-collector"', () => {
-    assert.deepEqual(claudeCodeAdapter.capabilities.findingsChannels, ['mcp-collector']);
   });
 
   test('reasoningEfforts contains the four claude effort levels', () => {
@@ -224,33 +226,35 @@ describe('claudeCodeAdapter interface declarations', () => {
     assert.equal(claudeCodeAdapter.toolNames.finishReview, 'mcp__review_collector__finish_review');
   });
 
-  test('adapter exposes all required interface methods', () => {
-    assert.equal(typeof claudeCodeAdapter.materializeHome, 'function');
-    assert.equal(typeof claudeCodeAdapter.buildCommand, 'function');
-    assert.equal(typeof claudeCodeAdapter.assertSucceeded, 'function');
-    assert.equal(typeof claudeCodeAdapter.classifyError, 'function');
+  // [LAW:behavior-not-structure] The lifted seam: the public adapter exposes produceReview, not the
+  // subprocess primitives (buildCommand/materializeHome/...), which are now CLI-internal and tested
+  // directly as exported functions above.
+  test('adapter exposes the lifted produceReview interface, not subprocess primitives', () => {
+    assert.equal(typeof claudeCodeAdapter.produceReview, 'function');
+    assert.equal(claudeCodeAdapter.materializeHome, undefined);
+    assert.equal(claudeCodeAdapter.buildCommand, undefined);
   });
 });
 
-describe('claudeCodeAdapter.classifyError', () => {
+describe('classifyError', () => {
   const base = new Error('spawn failed');
 
   test('429 text produces TransientError', () => {
     const { TransientError } = require('../src/failover');
-    const result = claudeCodeAdapter.classifyError(base, 'HTTP 429 Too Many Requests');
+    const result = classifyError(base, 'HTTP 429 Too Many Requests');
     assert.ok(result instanceof TransientError);
     assert.ok(result.message.includes('rate-limited'));
   });
 
   test('529 text produces TransientError with null retryAfterMs', () => {
     const { TransientError } = require('../src/failover');
-    const result = claudeCodeAdapter.classifyError(base, 'HTTP 529 overloaded');
+    const result = classifyError(base, 'HTTP 529 overloaded');
     assert.ok(result instanceof TransientError);
     assert.equal(result.retryAfterMs, null);
   });
 
   test('unrelated error is returned unchanged', () => {
-    const result = claudeCodeAdapter.classifyError(base, 'unexpected token at line 42');
+    const result = classifyError(base, 'unexpected token at line 42');
     assert.equal(result, base);
   });
 });

@@ -1,7 +1,14 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { codexAdapter, buildConfigToml } = require('../src/engine/codex');
+const {
+  codexAdapter,
+  buildConfigToml,
+  CODEX_TIMEOUT_MS,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+} = require('../src/engine/codex');
 const { TransientError } = require('../src/failover');
 
 // Minimal config matching the ReviewConfig shape used by codex configs.
@@ -131,25 +138,25 @@ describe('buildConfigToml — generated config.toml content', () => {
 
 // --- buildCommand ---
 
-describe('codexAdapter.buildCommand', () => {
+describe('buildCommand', () => {
   test('command is "npx"', () => {
-    const { command } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { command } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.equal(command, 'npx');
   });
 
   test('args include @openai/codex@latest', () => {
-    const { args } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.ok(args.some(a => a.includes('@openai/codex')), 'codex package not in args');
   });
 
   test('args include exec --json', () => {
-    const { args } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.ok(args.includes('exec'), 'exec subcommand missing');
     assert.ok(args.includes('--json'), '--json flag missing');
   });
 
   test('args include --dangerously-bypass-approvals-and-sandbox for CI MCP execution', () => {
-    const { args } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.ok(
       args.includes('--dangerously-bypass-approvals-and-sandbox'),
       'bypass flag missing — required for MCP tool calls in non-interactive (--json) mode',
@@ -157,29 +164,29 @@ describe('codexAdapter.buildCommand', () => {
   });
 
   test('CODEX_HOME is set to the provided home directory', () => {
-    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: '/custom/home' });
+    const { env } = buildCommand({ config: BASE_CONFIG, home: '/custom/home' });
     assert.equal(env.CODEX_HOME, '/custom/home');
   });
 
   test('the credential is NOT injected via env — it lives in auth.json', () => {
-    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.equal(env.OPENAI_API_KEY, undefined);
   });
 
   test('PATH is passed through for npx resolution', () => {
-    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.equal(env.PATH, process.env.PATH);
   });
 
   test('HOME is passed through for system tools', () => {
-    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.equal(env.HOME, process.env.HOME);
   });
 
   test('env is an explicit allowlist — does not contain arbitrary process.env vars', () => {
     // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
     // Only PATH, HOME, CODEX_HOME, and the apiKeyEnv credential are permitted.
-    const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    const { env } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME']);
     for (const key of Object.keys(env)) {
       assert.ok(allowedKeys.has(key), `unexpected env var leaked into subprocess: ${key}`);
@@ -189,7 +196,7 @@ describe('codexAdapter.buildCommand', () => {
 
 // --- assertSucceeded ---
 
-describe('codexAdapter.assertSucceeded', () => {
+describe('assertSucceeded', () => {
   test('does not throw when turn.completed is present', () => {
     const stdout = [
       '{"type":"thread.started","thread_id":"abc"}',
@@ -197,7 +204,7 @@ describe('codexAdapter.assertSucceeded', () => {
       '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
       '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}',
     ].join('\n');
-    assert.doesNotThrow(() => codexAdapter.assertSucceeded(stdout));
+    assert.doesNotThrow(() => assertSucceeded(stdout));
   });
 
   test('throws when turn.failed is present with error message', () => {
@@ -206,7 +213,7 @@ describe('codexAdapter.assertSucceeded', () => {
       '{"type":"turn.failed","error":{"message":"401 Unauthorized"}}',
     ].join('\n');
     assert.throws(
-      () => codexAdapter.assertSucceeded(stdout),
+      () => assertSucceeded(stdout),
       /Codex review failed.*401 Unauthorized/,
     );
   });
@@ -214,7 +221,7 @@ describe('codexAdapter.assertSucceeded', () => {
   test('throws when turn.failed has no error.message (unknown error)', () => {
     const stdout = '{"type":"turn.failed","error":{}}';
     assert.throws(
-      () => codexAdapter.assertSucceeded(stdout),
+      () => assertSucceeded(stdout),
       /unknown error/,
     );
   });
@@ -224,14 +231,14 @@ describe('codexAdapter.assertSucceeded', () => {
       '2026-06-12T08:30:28Z ERROR codex_core: something went wrong',
       '{"type":"turn.completed","usage":{}}',
     ].join('\n');
-    assert.doesNotThrow(() => codexAdapter.assertSucceeded(stdout));
+    assert.doesNotThrow(() => assertSucceeded(stdout));
   });
 
   test('throws on empty output — turn.completed was never emitted', () => {
     // Codex can exit 0 mid-turn (interrupted, internal timeout, buffering error) without
     // emitting turn.completed. Treating this as success would silently produce no findings.
     assert.throws(
-      () => codexAdapter.assertSucceeded(''),
+      () => assertSucceeded(''),
       /did not complete.*turn\.completed/,
     );
   });
@@ -243,7 +250,7 @@ describe('codexAdapter.assertSucceeded', () => {
       '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}',
     ].join('\n');
     assert.throws(
-      () => codexAdapter.assertSucceeded(stdout),
+      () => assertSucceeded(stdout),
       /did not complete/,
     );
   });
@@ -251,50 +258,50 @@ describe('codexAdapter.assertSucceeded', () => {
 
 // --- classifyError ---
 
-describe('codexAdapter.classifyError', () => {
+describe('classifyError', () => {
   const base = new Error('spawn failed');
 
   test('429 text produces TransientError with rate-limited message', () => {
-    const result = codexAdapter.classifyError(base, 'HTTP 429 Too Many Requests');
+    const result = classifyError(base, 'HTTP 429 Too Many Requests');
     assert.ok(result instanceof TransientError);
     assert.ok(result.message.includes('rate-limited'));
   });
 
   test('rate_limit text produces TransientError', () => {
-    const result = codexAdapter.classifyError(base, 'rate_limit exceeded');
+    const result = classifyError(base, 'rate_limit exceeded');
     assert.ok(result instanceof TransientError);
   });
 
   test('rate-limit (hyphen variant) produces TransientError', () => {
-    const result = codexAdapter.classifyError(base, 'error: rate-limit hit');
+    const result = classifyError(base, 'error: rate-limit hit');
     assert.ok(result instanceof TransientError);
   });
 
   test('insufficient_quota produces TransientError', () => {
-    const result = codexAdapter.classifyError(base, 'insufficient_quota for model');
+    const result = classifyError(base, 'insufficient_quota for model');
     assert.ok(result instanceof TransientError);
     assert.ok(result.message.includes('quota exceeded'));
   });
 
   test('quota_exceeded produces TransientError', () => {
-    const result = codexAdapter.classifyError(base, 'quota.exceeded for this key');
+    const result = classifyError(base, 'quota.exceeded for this key');
     assert.ok(result instanceof TransientError);
   });
 
   test('simulated 429 classifies as transient (T7 AC)', () => {
     const err = new Error('codex exited with status 1. stderr: 429 rate limit');
-    const result = codexAdapter.classifyError(err, '429 rate limit exceeded');
+    const result = classifyError(err, '429 rate limit exceeded');
     assert.ok(result instanceof TransientError, 'expected TransientError for simulated 429');
   });
 
   test('TransientError has null retryAfterMs (Responses API does not echo Retry-After)', () => {
-    const result = codexAdapter.classifyError(base, 'HTTP 429 Too Many Requests');
+    const result = classifyError(base, 'HTTP 429 Too Many Requests');
     assert.ok(result instanceof TransientError);
     assert.equal(result.retryAfterMs, null);
   });
 
   test('unrelated error is returned unchanged', () => {
-    const result = codexAdapter.classifyError(base, 'unexpected JSON at line 5');
+    const result = classifyError(base, 'unexpected JSON at line 5');
     assert.equal(result, base);
   });
 });
@@ -306,16 +313,12 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(codexAdapter.name, 'codex');
   });
 
-  test('timeoutMs is 3000000', () => {
-    assert.equal(codexAdapter.timeoutMs, 3_000_000);
+  test('CODEX_TIMEOUT_MS is 3000000', () => {
+    assert.equal(CODEX_TIMEOUT_MS, 3_000_000);
   });
 
   test('endpointKinds contains only "openai-responses"', () => {
     assert.deepEqual(codexAdapter.capabilities.endpointKinds, ['openai-responses']);
-  });
-
-  test('findingsChannels contains only "mcp-collector"', () => {
-    assert.deepEqual(codexAdapter.capabilities.findingsChannels, ['mcp-collector']);
   });
 
   test('reasoningEfforts contains the five codex effort levels', () => {
@@ -330,11 +333,12 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(codexAdapter.toolNames.finishReview, 'mcp__review_collector__finish_review');
   });
 
-  test('adapter exposes all required interface methods', () => {
-    assert.equal(typeof codexAdapter.materializeHome, 'function');
-    assert.equal(typeof codexAdapter.buildCommand, 'function');
-    assert.equal(typeof codexAdapter.assertSucceeded, 'function');
-    assert.equal(typeof codexAdapter.classifyError, 'function');
+  // [LAW:behavior-not-structure] The lifted seam: the public adapter exposes produceReview, not the
+  // subprocess primitives, which are now CLI-internal and tested directly as exported functions above.
+  test('adapter exposes the lifted produceReview interface, not subprocess primitives', () => {
+    assert.equal(typeof codexAdapter.produceReview, 'function');
+    assert.equal(codexAdapter.materializeHome, undefined);
+    assert.equal(codexAdapter.buildCommand, undefined);
   });
 });
 
