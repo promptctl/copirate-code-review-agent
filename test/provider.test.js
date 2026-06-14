@@ -1,0 +1,126 @@
+'use strict';
+const { test, describe } = require('node:test');
+const assert = require('node:assert');
+
+const { synthesizeProviderConfig, PROVIDER_NAMES } = require('../src/provider');
+
+// [LAW:verifiable-goals] AC: in simple mode the PROVIDER value alone selects the engine;
+// credential presence never steers it; the selected provider's missing key fails loud;
+// model/baseUrl/reasoning overrides are honored and validated against adapter capabilities.
+
+// Stub registry so reasoning validation does not depend on the real adapters.
+const MOCK_REGISTRY = {
+  get(name) {
+    const adapters = {
+      codex: { capabilities: { reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'] } },
+      'claude-code': { capabilities: { reasoningEfforts: ['low', 'medium', 'high', 'max'] } },
+    };
+    return adapters[name];
+  },
+};
+
+describe('synthesizeProviderConfig — defaults', () => {
+  test('codex provider with only a key uses the canonical endpoint and default model', () => {
+    const config = synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY);
+    assert.equal(config.engine, 'codex');
+    assert.equal(config.model, 'gpt-5.4-mini');
+    assert.equal(config.endpoint.kind, 'openai-responses');
+    assert.equal(config.endpoint.baseUrl, 'https://api.openai.com/v1');
+    assert.equal(config.endpoint.apiKey, 'sk-openai');
+    assert.equal(config.reasoning, undefined);
+  });
+
+  test('zai provider with only a key uses the z.ai endpoint and default model', () => {
+    const config = synthesizeProviderConfig({ provider: 'zai', zaiApiKey: 'zai-key' }, MOCK_REGISTRY);
+    assert.equal(config.engine, 'claude-code');
+    assert.equal(config.model, 'glm-5.1');
+    assert.equal(config.endpoint.kind, 'anthropic-messages');
+    assert.equal(config.endpoint.baseUrl, 'https://api.z.ai/api/anthropic');
+    assert.equal(config.endpoint.apiKey, 'zai-key');
+  });
+});
+
+describe('synthesizeProviderConfig — provider is chosen only by PROVIDER, never by key presence', () => {
+  test('provider=codex with a z.ai key but no OpenAI key fails for OPENAI_API_KEY (key presence does not switch provider)', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'codex', zaiApiKey: 'zai-key' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/OPENAI_API_KEY/.test(err.message), `expected OPENAI_API_KEY in: ${err.message}`);
+        assert.ok(!/glm|z\.ai/i.test(err.message));
+        return true;
+      },
+    );
+  });
+
+  test('provider=zai with an OpenAI key but no z.ai key fails for ZAI_API_KEY', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'zai', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/ZAI_API_KEY/.test(err.message), `expected ZAI_API_KEY in: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test('both keys present, provider=codex → codex engine (z.ai key ignored)', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'codex', openaiApiKey: 'sk-openai', zaiApiKey: 'zai-key' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.engine, 'codex');
+    assert.equal(config.endpoint.apiKey, 'sk-openai');
+  });
+});
+
+describe('synthesizeProviderConfig — overrides', () => {
+  test('explicit model overrides the provider default', () => {
+    const config = synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'k', openaiModel: 'gpt-5.5' }, MOCK_REGISTRY);
+    assert.equal(config.model, 'gpt-5.5');
+  });
+
+  test('explicit baseUrl overrides the canonical endpoint', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'codex', openaiApiKey: 'k', openaiBaseUrl: 'https://gateway.example/v1' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.endpoint.baseUrl, 'https://gateway.example/v1');
+  });
+
+  test('valid reasoning effort passes through', () => {
+    const config = synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'k', openaiReasoning: 'high' }, MOCK_REGISTRY);
+    assert.equal(config.reasoning, 'high');
+  });
+
+  test('invalid reasoning effort fails loud naming allowed values', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'codex', openaiApiKey: 'k', openaiReasoning: 'ultra' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/reasoning 'ultra' is not valid/.test(err.message), err.message);
+        assert.ok(/minimal, low, medium, high, xhigh/.test(err.message));
+        return true;
+      },
+    );
+  });
+
+  test('zai system prompt is carried onto the config', () => {
+    const config = synthesizeProviderConfig({ provider: 'zai', zaiApiKey: 'k', zaiSystemPrompt: 'Be strict.' }, MOCK_REGISTRY);
+    assert.equal(config.systemPrompt, 'Be strict.');
+  });
+});
+
+describe('synthesizeProviderConfig — unknown provider', () => {
+  test('throws naming the invalid value and the valid providers', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'gemini', openaiApiKey: 'k' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/Unknown PROVIDER "gemini"/.test(err.message), err.message);
+        assert.ok(new RegExp(PROVIDER_NAMES.join(', ')).test(err.message));
+        return true;
+      },
+    );
+  });
+
+  test('empty provider also fails as unknown', () => {
+    assert.throws(() => synthesizeProviderConfig({ provider: '', openaiApiKey: 'k' }, MOCK_REGISTRY));
+  });
+});

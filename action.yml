@@ -1,20 +1,42 @@
 name: "Z.ai Coding Agent Review"
-description: "AI-powered code review using Claude Code with Z.ai Coding Plan credentials"
+description: "AI-powered code review. Defaults to the Codex/OpenAI engine; the provider is selected explicitly via PROVIDER, never inferred from which credential is set."
 inputs:
   CONFIG_FILE:
-    description: "Path to the review-agents config file (default: .github/review-agents.yml). When present, overrides ZAI_* inputs."
+    description: "Path to the review-agents config file (default: .github/review-agents.yml). When this file exists it owns engine selection and the simple-mode PROVIDER/key inputs are ignored."
     required: false
     default: ".github/review-agents.yml"
   CONFIG:
     description: "Select a named config from the config file. Overrides the file's 'default' field."
     required: false
+  PROVIDER:
+    description: "Which engine to run in simple mode (no CONFIG_FILE): 'codex' (OpenAI Responses, default) or 'zai' (Claude Code against Z.ai). The provider is chosen by this value alone — setting a credential does not switch it."
+    required: false
+    default: "codex"
+  OPENAI_API_KEY:
+    description: "OpenAI API key. Required when PROVIDER is 'codex' (the default)."
+    required: false
+  OPENAI_MODEL:
+    description: "Model for the 'codex' provider."
+    required: false
+    default: "gpt-5.4-mini"
+  OPENAI_REASONING_EFFORT:
+    description: "Reasoning effort for the 'codex' provider: minimal, low, medium, high, or xhigh. Omit for the model default."
+    required: false
+  OPENAI_BASE_URL:
+    description: "Base URL for the 'codex' provider's OpenAI-Responses-compatible endpoint (e.g. Azure OpenAI or a gateway)."
+    required: false
+    default: "https://api.openai.com/v1"
   ZAI_API_KEY:
-    description: "Z.ai API key (legacy single-engine mode). Mutually exclusive with CONFIG_FILE."
+    description: "Z.ai API key. Required when PROVIDER is 'zai'. Setting it does not by itself select the Z.ai engine."
     required: false
   ZAI_MODEL:
-    description: "Model passed to Claude Code"
+    description: "Model for the 'zai' provider (Claude Code)."
     required: false
     default: "glm-5.1"
+  ZAI_BASE_URL:
+    description: "Base URL for the 'zai' provider's Anthropic-compatible endpoint."
+    required: false
+    default: "https://api.z.ai/api/anthropic"
   ZAI_SYSTEM_PROMPT:
     description: "Additional system prompt appended to Claude Code"
     required: false

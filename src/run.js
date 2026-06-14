@@ -12,31 +12,14 @@ const { createReviewCollector, readCollectedReview } = require('./collector');
 const { produceReview, buildAttributionFooter } = require('./failover');
 const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
-const { ZAI_ANTHROPIC_BASE_URL } = require('./engine/claude-code');
-const { loadConfig, assertNoLegacyConflict, peekConfigNames } = require('./config');
+const { loadConfig, peekConfigNames } = require('./config');
+const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
-
-// [LAW:types-are-the-program] The ReviewConfig typed value is the single representation
-// of what engine, endpoint, and model are being invoked. [LAW:one-source-of-truth]
-// This compat shim synthesizes one from legacy ZAI_* inputs for v1 workflows.
-function synthesizeZaiConfig(apiKey, model, systemPrompt) {
-  return {
-    name: 'zai-compat',
-    engine: 'claude-code',
-    model,
-    systemPrompt: systemPrompt || undefined,
-    endpoint: {
-      kind: 'anthropic-messages',
-      baseUrl: ZAI_ANTHROPIC_BASE_URL,
-      apiKey,
-    },
-  };
-}
 
 // One attempt at producing a validated review against a fresh collector and home.
 // buildPromptFor(toolNames) is called here so each engine gets the MCP tool identifiers
@@ -67,17 +50,7 @@ async function run() {
   // [LAW:one-source-of-truth] Default path is declared in action.yml; do not duplicate it here.
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
-  const apiKey = core.getInput('ZAI_API_KEY');
   const hasConfigFile = fs.existsSync(configFilePath);
-
-  // [LAW:one-source-of-truth] [LAW:no-silent-failure] Two config sources = two sources
-  // of truth for the same fact. Fail loud before touching anything else.
-  try {
-    assertNoLegacyConflict(configFilePath, hasConfigFile, apiKey);
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
 
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
@@ -154,17 +127,29 @@ async function run() {
     }
     chain.forEach(c => core.setSecret(c.endpoint.apiKey));
   } else {
-    if (!apiKey) {
-      core.setFailed(
-        `No configuration found. '${configFilePath}' does not exist and ZAI_API_KEY is not set. ` +
-        'Provide a valid CONFIG_FILE path or ZAI_API_KEY.',
-      );
+    // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the
+    // engine — credential presence never steers it. The chosen provider's key is then
+    // required, and its absence fails loud naming the input to set. [LAW:no-silent-failure]
+    let config;
+    try {
+      config = synthesizeProviderConfig({
+        provider: core.getInput('PROVIDER'),
+        openaiApiKey: core.getInput('OPENAI_API_KEY'),
+        openaiModel: core.getInput('OPENAI_MODEL'),
+        openaiReasoning: core.getInput('OPENAI_REASONING_EFFORT'),
+        openaiBaseUrl: core.getInput('OPENAI_BASE_URL'),
+        zaiApiKey: core.getInput('ZAI_API_KEY'),
+        zaiModel: core.getInput('ZAI_MODEL'),
+        zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
+        zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
+      });
+    } catch (e) {
+      core.setFailed(e.message);
       return;
     }
-    core.setSecret(apiKey);
-    const model = core.getInput('ZAI_MODEL');
-    const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
-    chain = [synthesizeZaiConfig(apiKey, model, systemPrompt)];
+    core.setSecret(config.endpoint.apiKey);
+    core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
+    chain = [config];
   }
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);

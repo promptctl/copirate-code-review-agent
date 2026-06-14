@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { validateFile, resolveChain, resolveSecrets, loadConfig, assertNoLegacyConflict } = require('../src/config');
+const { validateFile, resolveChain, resolveSecrets, loadConfig } = require('../src/config');
 
 // [LAW:verifiable-goals] AC for T4: table-driven validation matrix covering every
 // rejection case named in the acceptance criteria, plus happy-path chain resolution
@@ -350,30 +350,6 @@ describe('resolveSecrets — env resolution', () => {
       () => resolveSecrets(chain, { ZAI_API_KEY: '' }),
       { message: /ZAI_API_KEY.*not set or empty/ },
     );
-  });
-});
-
-// ─── assertNoLegacyConflict ───────────────────────────────────────────────────
-
-describe('assertNoLegacyConflict — ZAI_* + CONFIG_FILE mutual exclusion', () => {
-  test('config file present + ZAI_API_KEY present = loud failure', () => {
-    assert.throws(
-      () => assertNoLegacyConflict('.github/review-agents.yml', true, 'sk-some-key'),
-      err => {
-        assert.ok(/Cannot use both CONFIG_FILE/.test(err.message), `missing conflict message in: ${err.message}`);
-        assert.ok(/ZAI_API_KEY/.test(err.message));
-        assert.ok(/\.github\/review-agents\.yml/.test(err.message));
-        return true;
-      },
-    );
-  });
-
-  test('config file absent + ZAI_API_KEY present = no conflict', () => {
-    assert.doesNotThrow(() => assertNoLegacyConflict('.github/review-agents.yml', false, 'sk-some-key'));
-  });
-
-  test('config file present + ZAI_API_KEY absent = no conflict', () => {
-    assert.doesNotThrow(() => assertNoLegacyConflict('.github/review-agents.yml', true, ''));
   });
 });
 

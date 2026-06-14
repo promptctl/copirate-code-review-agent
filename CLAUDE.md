@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A GitHub Action that runs Claude Code (pointed at Z.ai's Anthropic-compatible endpoint) as a PR reviewer. It feeds the PR diff to Claude Code, which records required changes through a private MCP "collector" tool, then the action turns those records into inline GitHub review comments and submits a `REQUEST_CHANGES` or `APPROVE` review.
+A GitHub Action that runs an AI coding agent as a PR reviewer. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against Z.ai's Anthropic-compatible endpoint. The engine is chosen explicitly by the `PROVIDER` input (default `codex`) in `src/provider.js` — never inferred from which credential happens to be set. Whichever engine runs, it records required changes through a private MCP "collector" tool, then the action turns those records into inline GitHub review comments and submits a `REQUEST_CHANGES` or `APPROVE` review.
+
+In simple mode (no `CONFIG_FILE`), `src/provider.js` is the single seam that turns the `PROVIDER` value plus its provider-specific inputs (`OPENAI_*` / `ZAI_*`) into a typed `ReviewConfig`. A committed `.github/review-agents.yml` config file is the advanced path: when it exists it owns engine selection (incl. per-PR selection and failover chains) and the simple-mode inputs are ignored.
 
 ## Build and release
 

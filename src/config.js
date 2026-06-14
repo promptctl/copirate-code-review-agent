@@ -145,17 +145,6 @@ function resolveSecrets(chain, env) {
   });
 }
 
-// [LAW:single-enforcer] Conflict between CONFIG_FILE and legacy ZAI_* inputs is
-// a type error: two sources of truth for the same fact. Checked here, not inline.
-function assertNoLegacyConflict(configFilePath, hasConfigFile, zaiApiKey) {
-  if (hasConfigFile && zaiApiKey) {
-    throw new Error(
-      `Cannot use both CONFIG_FILE (${configFilePath}) and ZAI_API_KEY together. ` +
-      'Use CONFIG_FILE for multi-engine configuration, or ZAI_API_KEY for legacy single-engine use.',
-    );
-  }
-}
-
 // Load, parse, validate, and resolve a config file into an ordered chain of ReviewConfig
 // values with apiKey populated. Throws on any schema error, unknown selected name, or
 // missing env var in the chain.
@@ -210,4 +199,4 @@ function peekConfigNames(filePath) {
   return { configNames, defaultName };
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict, peekConfigNames };
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames };

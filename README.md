@@ -1,6 +1,6 @@
 # Z.ai Coding Agent Review
 
-AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Plan credentials. The action runs Claude Code in the GitHub Actions runner, then submits a pull request review with inline review threads.
+AI-powered GitHub Pull Request code review. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against the Z.ai Coding Plan. The engine is chosen explicitly via the `PROVIDER` input — never inferred from which credential you set. The action runs in the GitHub Actions runner, then submits a pull request review with inline review threads.
 
 ## Features
 
@@ -17,7 +17,7 @@ AI-powered GitHub Pull Request code review using Claude Code with Z.ai Coding Pl
 Add this to your `.github/workflows/code-review.yml`:
 
 ```yaml
-name: AI Code Review with Z.ai
+name: AI Code Review
 
 on:
   pull_request:
@@ -39,9 +39,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
+        uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          # PROVIDER defaults to 'codex' (OpenAI). Set PROVIDER: zai to run Claude Code
+          # against Z.ai instead (and pass ZAI_API_KEY rather than OPENAI_API_KEY).
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
 ## Agent install instructions
@@ -51,7 +53,7 @@ Copy and paste this into the target repository to install the action:
 ```bash
 mkdir -p .github/workflows
 cat > .github/workflows/code-review.yml <<'YAML'
-name: AI Code Review with Z.ai
+name: AI Code Review
 
 on:
   pull_request:
@@ -73,16 +75,16 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
+        uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 YAML
 ```
 
 If the repository does not already have the secret, set it with GitHub CLI:
 
 ```bash
-gh secret set ZAI_API_KEY --body "$ZAI_API_KEY"
+gh secret set OPENAI_API_KEY --body "$OPENAI_API_KEY"
 ```
 
 Then commit the workflow:
@@ -96,14 +98,24 @@ git commit -m "Install Z.ai coding agent review action"
 
 ## Inputs
 
+The engine is selected by `PROVIDER` alone. Each provider needs its own credential; the **presence** of a credential never selects the provider.
+
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `ZAI_API_KEY` | Yes | — | Your Z.ai API key |
-| `ZAI_MODEL` | No | `glm-5.1` | Model passed to Claude Code |
-| `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code |
+| `PROVIDER` | No | `codex` | Engine in simple mode: `codex` (OpenAI) or `zai` (Claude Code against Z.ai). Ignored when a `CONFIG_FILE` exists. |
+| `OPENAI_API_KEY` | When `PROVIDER=codex` | — | OpenAI API key for the default `codex` provider |
+| `OPENAI_MODEL` | No | `gpt-5.4-mini` | Model for the `codex` provider |
+| `OPENAI_REASONING_EFFORT` | No | — | `minimal`, `low`, `medium`, `high`, or `xhigh` for the `codex` provider |
+| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-Responses-compatible endpoint (e.g. Azure OpenAI or a gateway) |
+| `ZAI_API_KEY` | When `PROVIDER=zai` | — | Z.ai API key for the `zai` provider |
+| `ZAI_MODEL` | No | `glm-5.1` | Model for the `zai` provider |
+| `ZAI_BASE_URL` | No | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for the `zai` provider |
+| `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code (`zai` provider) |
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
+| `CONFIG_FILE` | No | `.github/review-agents.yml` | Multi-engine config file. When it exists it owns engine selection and the `PROVIDER`/key inputs above are ignored. |
+| `CONFIG` | No | — | Select a named config from the config file, overriding its `default` |
 | `EXCLUDE_PATTERNS` | No | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude from review |
-| `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to Claude Code |
+| `MAX_DIFF_CHARS` | No | `0` (unlimited) | Maximum total characters for the diff sent to the engine |
 | `GITHUB_REVIEW_TOKEN` | No | — | Optional token for submitting reviews when `GITHUB_TOKEN` cannot approve pull requests |
 | `PR_NUMBER` | No | from `pull_request` event | Pull request number to review. Auto-detected on `pull_request` events; pass explicitly on other events (e.g. `workflow_run`) |
 | `HEAD_SHA` | No | from `pull_request` event | Head commit SHA the review is anchored to. Auto-detected on `pull_request` events; pass explicitly on other events |
@@ -114,11 +126,13 @@ The action installs its bundled reviewer instructions as Claude Code's user-glob
 
 ## Configuration
 
-To use this action, add your Z.ai API key as a GitHub secret. The action maps it to Claude Code's Anthropic-compatible environment variables for the Z.ai Coding Plan endpoint.
+The default provider is `codex`: add an `OPENAI_API_KEY` secret and the action runs the Codex engine against OpenAI. To run Claude Code against the Z.ai Coding Plan instead, set `PROVIDER: zai` and supply `ZAI_API_KEY`. Having both keys set is harmless — only `PROVIDER` decides which engine runs.
+
+To run a different provider per pull request (by label or PR-body directive) or to chain failover engines, commit a `.github/review-agents.yml` config file; when present it owns engine selection and the `PROVIDER`/key inputs are ignored.
 
 ## Operation
 
-This action will provide code reviews for your PRs using z.ai coding plan.  
+This action provides code reviews for your PRs using the Codex/OpenAI engine by default, or Claude Code against the Z.ai Coding Plan when `PROVIDER: zai` is set.  
 
 By default, the agent will use the standard non-privileged GITHUB_TOKEN which does not provide write access to the repo, and therefore cannot mark a PR as approved.
 
@@ -128,9 +142,9 @@ In either case, if there are no findings, it will print an approval message.
 
 If there are findings, it will mark the PR with CHANGES_REQUESTED.  Have your agent resolve the review threads and dismiss the review to continue.
 
-### 1. Get your Z.ai API key
+### 1. Get your API key
 
-Generate an API key from your Z.ai dashboard.
+For the default `codex` provider, generate an OpenAI API key. For `PROVIDER: zai`, generate an API key from your Z.ai dashboard.
 
 ### 2. Add the API key to your repository
 
@@ -139,7 +153,7 @@ Generate an API key from your Z.ai dashboard.
 3. Navigate to **Secrets and variables → Actions**  
 4. Click **New repository secret** and add:
 
-   - **Name:** `ZAI_API_KEY` — **Value:** your Z.ai API key
+   - **Name:** `OPENAI_API_KEY` — **Value:** your OpenAI API key (or `ZAI_API_KEY` for the `zai` provider)
 
 ## Claude Code configuration
 
@@ -183,7 +197,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 
 ## Reviewing fork pull requests safely
 
-The quickstart workflow triggers on `pull_request` and works for branches pushed to your own repository. It does **not** review pull requests opened from forks: GitHub withholds repository secrets (including `ZAI_API_KEY`) from `pull_request` runs triggered by a fork, so the review step has no key.
+The quickstart workflow triggers on `pull_request` and works for branches pushed to your own repository. It does **not** review pull requests opened from forks: GitHub withholds repository secrets (including `OPENAI_API_KEY`) from `pull_request` runs triggered by a fork, so the review step has no key.
 
 The wrong way to fix this is `pull_request_target` with a checkout of the fork's head — that runs untrusted code in a job that holds your secret, the classic Actions exfiltration footgun. Do not do that.
 
@@ -249,7 +263,7 @@ jobs:
       - name: Code Review
         uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
 ```

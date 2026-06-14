@@ -30259,17 +30259,6 @@ function resolveSecrets(chain, env) {
   });
 }
 
-// [LAW:single-enforcer] Conflict between CONFIG_FILE and legacy ZAI_* inputs is
-// a type error: two sources of truth for the same fact. Checked here, not inline.
-function assertNoLegacyConflict(configFilePath, hasConfigFile, zaiApiKey) {
-  if (hasConfigFile && zaiApiKey) {
-    throw new Error(
-      `Cannot use both CONFIG_FILE (${configFilePath}) and ZAI_API_KEY together. ` +
-      'Use CONFIG_FILE for multi-engine configuration, or ZAI_API_KEY for legacy single-engine use.',
-    );
-  }
-}
-
 // Load, parse, validate, and resolve a config file into an ordered chain of ReviewConfig
 // values with apiKey populated. Throws on any schema error, unknown selected name, or
 // missing env var in the chain.
@@ -30324,7 +30313,7 @@ function peekConfigNames(filePath) {
   return { configNames, defaultName };
 }
 
-module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, assertNoLegacyConflict, peekConfigNames };
+module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekConfigNames };
 
 
 /***/ }),
@@ -30610,6 +30599,11 @@ const { TransientError } = __nccwpck_require__(2887);
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
 
+// [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
+// targets. Declared here next to the adapter; src/provider.js references this constant
+// rather than re-spelling the URL, mirroring ZAI_ANTHROPIC_BASE_URL in claude-code.js.
+const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1';
+
 // Internal provider name used in config.toml. Codex requires an explicit 'name' field
 // inside each [model_providers.<key>] section — without it, config load fails with
 // "provider name must not be empty". Must be alphanumeric, no underscores or hyphens.
@@ -30782,7 +30776,7 @@ const codexAdapter = {
   classifyError,
 };
 
-module.exports = { codexAdapter, buildConfigToml };
+module.exports = { codexAdapter, buildConfigToml, OPENAI_RESPONSES_BASE_URL };
 
 
 /***/ }),
@@ -31200,6 +31194,104 @@ module.exports = { buildReviewInput };
 
 /***/ }),
 
+/***/ 3676:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
+const { OPENAI_RESPONSES_BASE_URL } = __nccwpck_require__(5363);
+const defaultRegistry = __nccwpck_require__(25);
+
+// [LAW:dataflow-not-control-flow] The provider is an explicit value, never inferred from
+// which credential happens to be set. [LAW:single-enforcer] This module is the one place
+// that turns the simple-mode (no CONFIG_FILE) action inputs into a typed ReviewConfig.
+//
+// [LAW:one-source-of-truth] Each provider spec names its engine, endpoint, credential input,
+// default model, and how to pull its fields from the flat action-input bag. Adding a provider
+// is one entry here — every consumer (validation, error messages, config synthesis) derives
+// from this table, so none of them branches on a hardcoded provider name.
+const PROVIDERS = {
+  codex: {
+    engine: 'codex',
+    endpointKind: 'openai-responses',
+    defaultBaseUrl: OPENAI_RESPONSES_BASE_URL,
+    apiKeyInput: 'OPENAI_API_KEY',
+    defaultModel: 'gpt-5.4-mini',
+    fields: i => ({ apiKey: i.openaiApiKey, model: i.openaiModel, reasoning: i.openaiReasoning, baseUrl: i.openaiBaseUrl }),
+  },
+  zai: {
+    engine: 'claude-code',
+    endpointKind: 'anthropic-messages',
+    defaultBaseUrl: ZAI_ANTHROPIC_BASE_URL,
+    apiKeyInput: 'ZAI_API_KEY',
+    defaultModel: 'glm-5.1',
+    fields: i => ({ apiKey: i.zaiApiKey, model: i.zaiModel, systemPrompt: i.zaiSystemPrompt, baseUrl: i.zaiBaseUrl }),
+  },
+};
+
+const PROVIDER_NAMES = Object.keys(PROVIDERS);
+
+// [LAW:effects-at-boundaries] Pure: maps inputs to a ReviewConfig, touches nothing external.
+// [LAW:no-silent-failure] Throws — naming the input to fix — when the provider is unknown,
+// the selected provider's credential is absent, or the reasoning effort is unsupported.
+// reg is injectable for testing; defaults to the real adapter registry.
+function synthesizeProviderConfig(inputs, reg) {
+  const registry = reg || defaultRegistry;
+  const provider = inputs.provider;
+  const spec = PROVIDERS[provider];
+  if (!spec) {
+    throw new Error(
+      `Unknown PROVIDER ${JSON.stringify(provider)}. Valid providers: ${PROVIDER_NAMES.join(', ')}.`,
+    );
+  }
+
+  const f = spec.fields(inputs);
+
+  if (!f.apiKey) {
+    throw new Error(
+      `PROVIDER '${provider}' requires a credential, but the '${spec.apiKeyInput}' input is not set or empty. ` +
+      `Set '${spec.apiKeyInput}', or choose a different provider via the PROVIDER input (valid: ${PROVIDER_NAMES.join(', ')}).`,
+    );
+  }
+
+  const config = {
+    name: `${provider}-default`,
+    engine: spec.engine,
+    model: f.model || spec.defaultModel,
+    endpoint: {
+      kind: spec.endpointKind,
+      baseUrl: f.baseUrl || spec.defaultBaseUrl,
+      apiKey: f.apiKey,
+    },
+  };
+
+  if (f.reasoning) {
+    // [LAW:single-enforcer] Reasoning validity is owned by the adapter's capability
+    // declaration — the same source the CONFIG_FILE path validates against — so simple
+    // mode and config-file mode reject the same illegal values.
+    const allowed = registry.get(spec.engine).capabilities.reasoningEfforts;
+    if (!allowed.includes(f.reasoning)) {
+      throw new Error(
+        `PROVIDER '${provider}': reasoning '${f.reasoning}' is not valid for engine '${spec.engine}'. ` +
+        `Allowed: ${allowed.join(', ')}.`,
+      );
+    }
+    config.reasoning = f.reasoning;
+  }
+
+  if (f.systemPrompt) {
+    config.systemPrompt = f.systemPrompt;
+  }
+
+  return config;
+}
+
+module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_NAMES };
+
+
+/***/ }),
+
 /***/ 1565:
 /***/ ((module) => {
 
@@ -31286,31 +31378,14 @@ const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290)
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
-const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
-const { loadConfig, assertNoLegacyConflict, peekConfigNames } = __nccwpck_require__(1283);
+const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
+const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
-
-// [LAW:types-are-the-program] The ReviewConfig typed value is the single representation
-// of what engine, endpoint, and model are being invoked. [LAW:one-source-of-truth]
-// This compat shim synthesizes one from legacy ZAI_* inputs for v1 workflows.
-function synthesizeZaiConfig(apiKey, model, systemPrompt) {
-  return {
-    name: 'zai-compat',
-    engine: 'claude-code',
-    model,
-    systemPrompt: systemPrompt || undefined,
-    endpoint: {
-      kind: 'anthropic-messages',
-      baseUrl: ZAI_ANTHROPIC_BASE_URL,
-      apiKey,
-    },
-  };
-}
 
 // One attempt at producing a validated review against a fresh collector and home.
 // buildPromptFor(toolNames) is called here so each engine gets the MCP tool identifiers
@@ -31341,17 +31416,7 @@ async function run() {
   // [LAW:one-source-of-truth] Default path is declared in action.yml; do not duplicate it here.
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
-  const apiKey = core.getInput('ZAI_API_KEY');
   const hasConfigFile = fs.existsSync(configFilePath);
-
-  // [LAW:one-source-of-truth] [LAW:no-silent-failure] Two config sources = two sources
-  // of truth for the same fact. Fail loud before touching anything else.
-  try {
-    assertNoLegacyConflict(configFilePath, hasConfigFile, apiKey);
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
 
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
@@ -31428,17 +31493,29 @@ async function run() {
     }
     chain.forEach(c => core.setSecret(c.endpoint.apiKey));
   } else {
-    if (!apiKey) {
-      core.setFailed(
-        `No configuration found. '${configFilePath}' does not exist and ZAI_API_KEY is not set. ` +
-        'Provide a valid CONFIG_FILE path or ZAI_API_KEY.',
-      );
+    // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the
+    // engine — credential presence never steers it. The chosen provider's key is then
+    // required, and its absence fails loud naming the input to set. [LAW:no-silent-failure]
+    let config;
+    try {
+      config = synthesizeProviderConfig({
+        provider: core.getInput('PROVIDER'),
+        openaiApiKey: core.getInput('OPENAI_API_KEY'),
+        openaiModel: core.getInput('OPENAI_MODEL'),
+        openaiReasoning: core.getInput('OPENAI_REASONING_EFFORT'),
+        openaiBaseUrl: core.getInput('OPENAI_BASE_URL'),
+        zaiApiKey: core.getInput('ZAI_API_KEY'),
+        zaiModel: core.getInput('ZAI_MODEL'),
+        zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
+        zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
+      });
+    } catch (e) {
+      core.setFailed(e.message);
       return;
     }
-    core.setSecret(apiKey);
-    const model = core.getInput('ZAI_MODEL');
-    const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
-    chain = [synthesizeZaiConfig(apiKey, model, systemPrompt)];
+    core.setSecret(config.endpoint.apiKey);
+    core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
+    chain = [config];
   }
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);

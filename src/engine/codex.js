@@ -7,6 +7,11 @@ const { TransientError } = require('../failover');
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
 
+// [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
+// targets. Declared here next to the adapter; src/provider.js references this constant
+// rather than re-spelling the URL, mirroring ZAI_ANTHROPIC_BASE_URL in claude-code.js.
+const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1';
+
 // Internal provider name used in config.toml. Codex requires an explicit 'name' field
 // inside each [model_providers.<key>] section — without it, config load fails with
 // "provider name must not be empty". Must be alphanumeric, no underscores or hyphens.
@@ -179,4 +184,4 @@ const codexAdapter = {
   classifyError,
 };
 
-module.exports = { codexAdapter, buildConfigToml };
+module.exports = { codexAdapter, buildConfigToml, OPENAI_RESPONSES_BASE_URL };
