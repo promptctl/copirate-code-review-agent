@@ -30442,6 +30442,7 @@ const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { TransientError, parseRetryAfterMs } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
+const { makeCliAdapter } = __nccwpck_require__(2890);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -30582,9 +30583,10 @@ function classifyError(err, text) {
 // from src/index.js for test compatibility; classifyError is the adapter interface name.
 const classifyClaudeError = classifyError;
 
-// [LAW:one-type-per-behavior] One adapter object per engine CLI; adapters compose with
-// the generic runEngine via the declared interface contract.
-const claudeCodeAdapter = {
+// [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
+// from the shared makeCliAdapter factory; this module supplies only the spawn primitives (the spec).
+// The factory exposes the lifted produceReview seam; the spec's primitives stay CLI-internal.
+const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
   capabilities: {
@@ -30593,7 +30595,6 @@ const claudeCodeAdapter = {
     // time via these declarations, never discovered at spawn time.
     reasoningEfforts: ['low', 'medium', 'high', 'max'],
     endpointKinds: ['anthropic-messages'],
-    findingsChannels: ['mcp-collector'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
   toolNames: TOOL_NAMES,
@@ -30602,14 +30603,83 @@ const claudeCodeAdapter = {
   assertSucceeded,
   classifyError,
   extractUsage,
-};
+});
 
+// The spawn primitives are exported as pure functions for direct unit testing of their behavior
+// (byte-identical args/env, error classification, usage parsing) — they are NOT part of the public
+// adapter interface. [LAW:behavior-not-structure]
 module.exports = {
   ZAI_ANTHROPIC_BASE_URL,
+  CLAUDE_TIMEOUT_MS,
   classifyClaudeError,
   claudeCodeAdapter,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
   extractUsage,
 };
+
+
+/***/ }),
+
+/***/ 2890:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const fs = __nccwpck_require__(9896);
+const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
+const { runEngine } = __nccwpck_require__(8861);
+
+// [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
+// subprocess that returns findings out-of-band through the MCP collector. They differ only in
+// their spawn primitives (the spec: materializeHome/buildCommand/assertSucceeded/extractUsage/...),
+// never in the lifecycle that drives them. This factory holds that single produceReview
+// implementation; each engine module supplies its spec.
+//
+// [FRAMING:parts-and-seams] The adapter contract is lifted to the judgment-vs-transport seam:
+// produceReview({config, buildPromptFor, instructionsPath}) -> {summary, findings, usage}. The whole
+// MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview) is a
+// PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
+// mechanics. A direct-API engine implements produceReview with one HTTPS call and never touches this
+// factory. [LAW:carrying-cost]
+function makeCliAdapter(spec) {
+  return {
+    // [LAW:single-enforcer] The shared adapter interface: exactly what registry/run.js depend on.
+    // The spawn primitives in `spec` are deliberately NOT re-exposed here — they are CLI-internal.
+    name: spec.name,
+    toolNames: spec.toolNames,
+    capabilities: spec.capabilities,
+
+    // buildPromptFor(toolNames) is applied with THIS engine's tool identifiers, so a failover chain
+    // gives each engine its own MCP tool names in the prompt. [LAW:types-are-the-program]
+    // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering: the outer finally
+    // removes the collector dir unconditionally; the inner removes home only once materializeHome
+    // returned. [LAW:no-silent-failure] cleanup runs even when the engine throws.
+    // [LAW:dataflow-not-control-flow] usage is a value extracted from the engine's own output and
+    // returned alongside the findings — never recomputed downstream at the cost footer.
+    async produceReview({ config, buildPromptFor, instructionsPath }) {
+      const prompt = buildPromptFor(spec.toolNames);
+      const collector = createReviewCollector();
+      try {
+        const home = spec.materializeHome({ config, instructionsPath, collector });
+        try {
+          const output = await runEngine(spec, config, prompt, home, collector);
+          const usage = spec.extractUsage(output, config);
+          const review = readCollectedReview(collector.recordsPath);
+          return { summary: review.summary, findings: review.findings, usage };
+        } finally {
+          fs.rmSync(home, { recursive: true });
+        }
+      } finally {
+        fs.rmSync(collector.dir, { recursive: true });
+      }
+    },
+  };
+}
+
+module.exports = { makeCliAdapter };
 
 
 /***/ }),
@@ -30624,6 +30694,7 @@ const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { TransientError } = __nccwpck_require__(2887);
 const { computeOpenAiCostUsd } = __nccwpck_require__(9614);
+const { makeCliAdapter } = __nccwpck_require__(2890);
 
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
@@ -30814,8 +30885,9 @@ function classifyError(err, text) {
   return err;
 }
 
-// [LAW:one-type-per-behavior] One adapter object per engine CLI.
-const codexAdapter = {
+// [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
+// from the shared makeCliAdapter factory; this module supplies only the spawn primitives (the spec).
+const codexAdapter = makeCliAdapter({
   name: 'codex',
   timeoutMs: CODEX_TIMEOUT_MS,
   capabilities: {
@@ -30824,7 +30896,6 @@ const codexAdapter = {
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
     reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
     endpointKinds: ['openai-responses'],
-    findingsChannels: ['mcp-collector'],
   },
   toolNames: TOOL_NAMES,
   materializeHome,
@@ -30832,9 +30903,21 @@ const codexAdapter = {
   assertSucceeded,
   classifyError,
   extractUsage,
-};
+});
 
-module.exports = { codexAdapter, buildConfigToml, extractUsage, OPENAI_RESPONSES_BASE_URL };
+// The spawn primitives are exported as pure functions for direct unit testing of their behavior —
+// they are NOT part of the public adapter interface. [LAW:behavior-not-structure]
+module.exports = {
+  codexAdapter,
+  CODEX_TIMEOUT_MS,
+  buildConfigToml,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+  extractUsage,
+  OPENAI_RESPONSES_BASE_URL,
+};
 
 
 /***/ }),
@@ -31609,11 +31692,9 @@ const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
 const { buildReviewInput, buildRepoReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
-const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { renderCostLine, costWarning } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
-const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
@@ -31624,33 +31705,18 @@ const { selectConfig } = __nccwpck_require__(675);
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
-// [LAW:decomposition] The shared ENGINE attempt: run one engine against a prompt and read back
-// a validated review + usage. It knows nothing about pull requests, diff anchors, or the host —
-// both review modes (PR diff, whole repo) compose it. buildPromptFor(toolNames) is called here so
-// each engine in a failover chain gets the MCP tool identifiers its own adapter registers, not
-// chain[0]'s. [LAW:types-are-the-program]
-// Nested try/finally guarantees cleanup even when materializeHome throws: the outer finally cleans
-// collector.dir unconditionally; the inner finally cleans home only once materializeHome returned.
-// [LAW:no-silent-failure]
-async function collectReviewOnce(config, buildPromptFor) {
-  const adapter = registry.get(config.engine);
-  const prompt = buildPromptFor(adapter.toolNames);
-  const collector = createReviewCollector();
-  try {
-    const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
-    try {
-      const output = await runEngine(adapter, config, prompt, home, collector);
-      // [LAW:dataflow-not-control-flow] Usage is a value extracted from the engine's own output
-      // and carried to the footer sink alongside the findings — never recomputed at the boundary.
-      const usage = adapter.extractUsage(output, config);
-      const review = readCollectedReview(collector.recordsPath);
-      return { summary: review.summary, findings: review.findings, usage };
-    } finally {
-      fs.rmSync(home, { recursive: true });
-    }
-  } finally {
-    fs.rmSync(collector.dir, { recursive: true });
-  }
+// [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
+// runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
+// pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
+// collector dance is private to the CLI adapters); it only chooses the adapter and supplies the
+// shared review context. buildPromptFor(toolNames) is applied inside the adapter with its own MCP
+// tool identifiers, so a failover chain gives each engine the right names. [LAW:types-are-the-program]
+function runOneReview(config, buildPromptFor) {
+  return registry.get(config.engine).produceReview({
+    config,
+    buildPromptFor,
+    instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
+  });
 }
 
 // PR-mode attempt: the shared engine plus diff-anchor reconciliation. [LAW:dataflow-not-control-flow]
@@ -31659,7 +31725,7 @@ async function collectReviewOnce(config, buildPromptFor) {
 // [LAW:no-silent-failure] each unanchored finding is logged here at the boundary so it is visible
 // in the run, never dropped silently.
 async function produceReviewOnce(config, buildPromptFor, anchors) {
-  const { summary, findings, usage } = await collectReviewOnce(config, buildPromptFor);
+  const { summary, findings, usage } = await runOneReview(config, buildPromptFor);
   const { anchored, unanchored } = partitionFindings(findings, anchors);
   for (const f of unanchored) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
@@ -31671,7 +31737,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
 // every file:line the agent cites is valid — findings flow through unchanged. produceReview passes
 // anchors as the third argument for every mode; this attempt ignores it. [LAW:composability]
 async function produceRepoReviewOnce(config, buildPromptFor) {
-  return collectReviewOnce(config, buildPromptFor);
+  return runOneReview(config, buildPromptFor);
 }
 
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
