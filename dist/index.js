@@ -30922,6 +30922,255 @@ module.exports = {
 
 /***/ }),
 
+/***/ 2599:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
+const os = __nccwpck_require__(857);
+const { TransientError } = __nccwpck_require__(2887);
+const { makeCliAdapter } = __nccwpck_require__(2890);
+
+const OPENCODE_PACKAGE = 'opencode-ai@latest';
+const OPENCODE_TIMEOUT_MS = 3_000_000;
+
+// [LAW:one-source-of-truth] The MCP server key as registered in opencode.json. OpenCode derives
+// the tool identifier it surfaces to the model as `<serverKey>_<toolName>` — so this key and the
+// collector's own tool names (request_change / finish_review) together determine TOOL_NAMES below.
+// Both the opencode.json `mcp` block and the prompt (via toolNames) reference this one constant.
+const MCP_SERVER_NAME = 'review_collector';
+
+// [LAW:one-source-of-truth] The exact MCP tool identifiers OpenCode exposes to the model, pinned
+// via a live handshake (2026-06-14): OpenCode joins server key + tool name with a single
+// underscore and adds NO `mcp__` prefix, so codex/claude-code's `mcp__review_collector__*` names
+// are WRONG here. The running model self-reported these exact strings. [LAW:types-are-the-program]
+const TOOL_NAMES = {
+  requestChange: `${MCP_SERVER_NAME}_request_change`,
+  finishReview: `${MCP_SERVER_NAME}_finish_review`,
+};
+
+// [LAW:effects-at-boundaries] Pure: builds the opencode.json object from values, touches no
+// filesystem. JSON is the serialization (JSON.stringify owns all escaping) so — unlike codex's
+// TOML — there is no injection surface to hand-escape.
+//
+// Provider selection: OpenCode resolves the provider from the model's `<provider>/<model>` prefix
+// and we override that provider's endpoint (baseURL + apiKey) here. The credential is written into
+// the config rather than referenced as `{env:VAR}` so the spawned process needs no secret in its
+// env — mirroring how the codex adapter writes the key into auth.json instead of leaking it as an
+// env var the AI subprocess could read. [LAW:single-enforcer]
+//
+// Read-only is enforced by the permission block: every mutating capability is denied and only the
+// read-side tools are allowed. An empty reasoningEfforts capability (declared on the adapter) means
+// `reasoning:` is rejected at config load, so nothing reasoning-related reaches this builder.
+function buildOpencodeConfig(config, collectorSpawn, agentsPath) {
+  const providerId = config.model.split('/')[0];
+  return {
+    $schema: 'https://opencode.ai/config.json',
+    model: config.model,
+    // [LAW:single-enforcer] The one shared instruction source, included by absolute path so it
+    // loads regardless of the working directory (the repo under review, which we never write to).
+    instructions: [agentsPath],
+    permission: {
+      edit: 'deny',
+      bash: 'deny',
+      webfetch: 'deny',
+      websearch: 'deny',
+      read: 'allow',
+      grep: 'allow',
+      glob: 'allow',
+      list: 'allow',
+    },
+    provider: {
+      [providerId]: {
+        options: {
+          baseURL: config.endpoint.baseUrl,
+          apiKey: config.endpoint.apiKey,
+        },
+      },
+    },
+    mcp: {
+      [MCP_SERVER_NAME]: {
+        type: 'local',
+        // The collector's already-computed spawn argv: [nodeBinary, distEntry, collectorArg].
+        command: [collectorSpawn.command, ...collectorSpawn.args],
+        environment: {
+          REVIEW_COLLECTOR_RECORDS: collectorSpawn.env.REVIEW_COLLECTOR_RECORDS,
+        },
+        enabled: true,
+      },
+    },
+  };
+}
+
+// [LAW:effects-at-boundaries] The only effect in this adapter: writing the config home. Returns the
+// temp dir, which becomes XDG_CONFIG_HOME for the spawned process; OpenCode reads its global config
+// from $XDG_CONFIG_HOME/opencode/opencode.json (verified live, 2026-06-14).
+function materializeHome({ config, instructionsPath, collector }) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-opencode-home-'));
+  const cfgDir = path.join(home, 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+
+  // [LAW:single-enforcer] Instructions are copied from the one shared source, as AGENTS.md.
+  const agentsPath = path.join(cfgDir, 'AGENTS.md');
+  fs.copyFileSync(instructionsPath, agentsPath);
+
+  // [LAW:one-source-of-truth] createReviewCollector owns the spawn argv and records path; read its
+  // computed spec rather than recomputing the node binary / dist entry reference.
+  const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
+  const collectorSpawn = mcpCfg.mcpServers.review_collector;
+
+  fs.writeFileSync(
+    path.join(cfgDir, 'opencode.json'),
+    JSON.stringify(buildOpencodeConfig(config, collectorSpawn, agentsPath), null, 2),
+    'utf8',
+  );
+  return home;
+}
+
+// [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.
+// The prompt is delivered on stdin (runEngine pipes it) — `opencode run` reads stdin when given no
+// message arg (verified live), so no message positional is appended. Model/endpoint/auth all live
+// in the config home, so they are not repeated here.
+//
+// Env is an explicit allowlist — never a process.env spread. OpenCode is an AI agent that can read
+// env vars; spreading process.env would expose GITHUB_TOKEN and repo secrets to a prompt-injection
+// payload in the diff under review. Only the minimum is passed: PATH (npx resolution), HOME (system
+// tools), and XDG_CONFIG_HOME/XDG_DATA_HOME pointing at the isolated config home (so neither the
+// developer's real opencode config nor their credentials are read). [LAW:effects-at-boundaries]
+//
+// OPENCODE_DISABLE_PROJECT_CONFIG isolates the subprocess from the REVIEWED REPO. The review runs
+// with cwd = the checked-out repo (the agent reads its working tree), and opencode otherwise walks
+// up from cwd loading `./opencode.json` and `.opencode/` — so a malicious PR could plant a project
+// config that overrides the model, permission denies, MCP servers, or plugins of the reviewer
+// itself (verified: a planted `./opencode.json` took over the run). This flag gates exactly that
+// cwd walk, leaving only the isolated XDG_CONFIG_HOME global config in effect. [LAW:effects-at-boundaries]
+function buildCommand({ home }) {
+  return {
+    command: 'npx',
+    args: ['-y', OPENCODE_PACKAGE, 'run', '--format', 'json'],
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      XDG_CONFIG_HOME: home,
+      XDG_DATA_HOME: home,
+      OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+    },
+  };
+}
+
+// [LAW:no-silent-failure] OpenCode's exit code is NOT a reliable success signal — a model-not-found
+// error exits 0 with empty stdout, and a persistent auth/network failure retries internally and
+// hangs (caught by the engine timeout), never emitting a clean error. The only trustworthy success
+// signal is a terminal `step_finish` event with `reason: "stop"` in the JSONL stream. Its absence —
+// empty output, an interrupted turn, or a non-stop terminal reason (length/error) — is surfaced as
+// a failure rather than passing as a review with no findings. The "exactly one finish_review"
+// invariant downstream (readCollectedReview) is the separate gate on the findings themselves.
+function assertSucceeded(stdout) {
+  let stopped = false;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (event.type === 'step_finish' && event.part && event.part.reason === 'stop') {
+      stopped = true;
+    }
+  }
+  if (!stopped) {
+    throw new Error('OpenCode review did not complete: no step_finish event with reason "stop" was emitted.');
+  }
+}
+
+// [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns a
+// Usage value, or null when no usage was reported. OpenCode emits one `step_finish` per step (a
+// tool-call round is its own step), each carrying its own `tokens` and `cost` — so usage is SUMMED
+// across steps, never read from a single event (the values are per-step, not cumulative).
+//
+// [LAW:dataflow-not-control-flow] OpenCode self-reports USD (its own models.dev price estimate),
+// like claude-code and unlike codex — so cost needs no local price table. A run with at least one
+// usage-bearing step reports cost {available:true, usd}; a run that emitted no token counts at all
+// is reported as no usage (null), not a $0.00 run. The reported USD is OpenCode's estimate (0 for
+// subscription/unpriced providers), so the renderer marks every cost line "est." [FRAMING:representation]
+function extractUsage(stdout) {
+  let sawTokens = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let usd = 0;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (event.type !== 'step_finish' || !event.part) continue;
+    const { tokens, cost } = event.part;
+    if (tokens) {
+      sawTokens = true;
+      const cache = tokens.cache || {};
+      // All input-side counts (fresh + cache read + cache write) sum into inputTokens; reasoning
+      // tokens are generated output, so they sum into outputTokens alongside the visible output.
+      inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
+      outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
+    }
+    if (typeof cost === 'number') usd += cost;
+  }
+  if (!sawTokens) return null;
+  return { inputTokens, outputTokens, cost: { available: true, usd } };
+}
+
+// [LAW:single-enforcer] Transient-error classification happens once, here. OpenCode retries many
+// transient API errors internally, so these signals fire mainly when a failure escapes to the
+// captured output text; the shared 429/overloaded regex set is the starting point. [LAW:one-source-of-truth]
+function classifyError(err, text) {
+  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
+  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  return err;
+}
+
+// [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
+// from the shared makeCliAdapter factory; this module supplies only the spawn primitives (the spec).
+// The factory exposes the lifted produceReview seam; the spec's primitives stay CLI-internal.
+const opencodeAdapter = makeCliAdapter({
+  name: 'opencode',
+  timeoutMs: OPENCODE_TIMEOUT_MS,
+  capabilities: {
+    // [LAW:types-are-the-program] Capability declarations are the single source of truth for config
+    // validation in src/config.js. An EMPTY reasoningEfforts set is a deliberate, accurate theorem:
+    // OpenCode exposes no normalized reasoning-effort control on the `reasoning:` axis (its
+    // provider-specific `--variant` flag is a different axis, out of scope), so any `reasoning:` on
+    // an opencode config is rejected at load — never silently ignored. [LAW:no-silent-failure]
+    reasoningEfforts: [],
+    // The OpenAI/Anthropic-compatible provider protocols OpenCode can front via an endpoint override.
+    endpointKinds: ['openai-chat', 'openai-responses', 'anthropic-messages'],
+  },
+  // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
+  toolNames: TOOL_NAMES,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+  extractUsage,
+});
+
+// The spawn primitives are exported as pure functions for direct unit testing of their behavior
+// (generated opencode.json, success parse, usage parse, error classification) — they are NOT part
+// of the public adapter interface. [LAW:behavior-not-structure]
+module.exports = {
+  opencodeAdapter,
+  OPENCODE_TIMEOUT_MS,
+  MCP_SERVER_NAME,
+  buildOpencodeConfig,
+  materializeHome,
+  buildCommand,
+  assertSucceeded,
+  classifyError,
+  extractUsage,
+};
+
+
+/***/ }),
+
 /***/ 25:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -30929,12 +31178,14 @@ module.exports = {
 
 const { claudeCodeAdapter } = __nccwpck_require__(3048);
 const { codexAdapter } = __nccwpck_require__(5363);
+const { opencodeAdapter } = __nccwpck_require__(2599);
 
 // [LAW:single-enforcer] The only enumeration of engine adapters.
 // To support a new engine, add it here and implement the adapter contract.
 const adapters = new Map([
   ['claude-code', claudeCodeAdapter],
   ['codex', codexAdapter],
+  ['opencode', opencodeAdapter],
 ]);
 
 function get(name) {
@@ -34333,7 +34584,7 @@ var identity = __nccwpck_require__(1127);
 var composeCollection = __nccwpck_require__(7349);
 var composeScalar = __nccwpck_require__(5413);
 var resolveEnd = __nccwpck_require__(7788);
-var utilEmptyScalarPosition = __nccwpck_require__(2599);
+var utilEmptyScalarPosition = __nccwpck_require__(4980);
 
 const CN = { composeNode, composeEmptyNode };
 function composeNode(ctx, token, props, onError) {
@@ -35861,7 +36112,7 @@ exports.containsNewline = containsNewline;
 
 /***/ }),
 
-/***/ 2599:
+/***/ 4980:
 /***/ ((__unused_webpack_module, exports) => {
 
 "use strict";
