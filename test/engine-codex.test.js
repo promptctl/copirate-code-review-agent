@@ -74,6 +74,11 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.equal(toml.includes('env_key'), false, 'env_key must not be emitted; Codex 0.139 ignores it and 401s');
   });
 
+  test('provider explicitly opts into OpenAI API-key auth', () => {
+    const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
+    assert.ok(toml.includes('requires_openai_auth = true'), 'requires_openai_auth opt-in missing');
+  });
+
   test('mcp_servers.review_collector uses command from collector spawn spec', () => {
     const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
     assert.ok(toml.includes('[mcp_servers.review_collector]'), 'mcp_servers section missing');
