@@ -62,6 +62,9 @@ function buildConfigToml(config, collectorSpawn) {
     `[model_providers.${INTERNAL_PROVIDER}]`,
     `name = ${q(INTERNAL_PROVIDER)}`,
     `base_url = ${q(config.endpoint.baseUrl)}`,
+    // Explicitly opt the custom provider into OpenAI API-key auth so Codex uses the
+    // auth.json credential, rather than relying on implicit fallback. [LAW:types-are-the-program]
+    `requires_openai_auth = true`,
     '',
     '[mcp_servers.review_collector]',
     `command = ${q(command)}`,
