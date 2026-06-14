@@ -6,7 +6,7 @@ default: codex
 configs:
   codex:
     engine: codex
-    model: gpt-5.5
+    model: gpt-5.4-mini
     endpoint:
       kind: openai-responses
       baseUrl: https://api.openai.com/v1
