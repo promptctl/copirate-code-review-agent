@@ -68,8 +68,13 @@ function renderCostLine(usage, config) {
   if (!usage.cost.available) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
-  const caveat = isZaiEndpoint(config) ? ' · est. (Anthropic pricing, not z.ai billing)' : '';
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+  // [FRAMING:representation] Every cost this action renders is an ESTIMATE, never a billed charge:
+  // codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own client-side
+  // estimate. So every line is marked "est." rather than implying exactness. The z.ai case carries
+  // the stronger caveat because there the estimate is priced against the wrong provider (Anthropic
+  // prices, z.ai billing) — a genuine fidelity difference, derived from config, not an extra value.
+  const estimate = isZaiEndpoint(config) ? 'est. (Anthropic pricing, not z.ai billing)' : 'est.';
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · ${estimate}_`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost

@@ -30545,10 +30545,12 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
 // or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
-// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report. The input
-// count sums all input-side fields (fresh + cache read + cache write) so it reflects the total
-// prompt tokens the run actually processed. Against the z.ai endpoint this cost is Anthropic-priced
-// and may not equal z.ai's billing — the renderer marks that caveat. [FRAMING:representation]
+// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report.
+// total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled price table), not a
+// billed charge — so the renderer marks every cost line "est.". The input count sums all input-side
+// fields (fresh + cache read + cache write) so it reflects the total prompt tokens the run processed.
+// Against the z.ai endpoint the estimate is priced against the wrong provider (Anthropic prices, z.ai
+// billing), so the renderer adds a stronger caveat there. [FRAMING:representation]
 function extractUsage(stdout) {
   const env = parseJsonEnvelope(stdout);
   if (!env || !env.usage) return null;
@@ -32000,8 +32002,13 @@ function renderCostLine(usage, config) {
   if (!usage.cost.available) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
-  const caveat = isZaiEndpoint(config) ? ' · est. (Anthropic pricing, not z.ai billing)' : '';
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+  // [FRAMING:representation] Every cost this action renders is an ESTIMATE, never a billed charge:
+  // codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own client-side
+  // estimate. So every line is marked "est." rather than implying exactness. The z.ai case carries
+  // the stronger caveat because there the estimate is priced against the wrong provider (Anthropic
+  // prices, z.ai billing) — a genuine fidelity difference, derived from config, not an extra value.
+  const estimate = isZaiEndpoint(config) ? 'est. (Anthropic pricing, not z.ai billing)' : 'est.';
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · ${estimate}_`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost

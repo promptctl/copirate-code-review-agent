@@ -148,9 +148,21 @@ describe('renderCostLine', () => {
     assert.match(line, /codex\/gpt-5\.4-mini/);
   });
 
-  test('marks the z.ai endpoint cost as an Anthropic-priced estimate', () => {
+  test('marks every cost as an estimate — codex (list-price table) included, not just claude', () => {
+    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, CODEX_CONFIG);
+    assert.match(line, /· est\.$|· est\._$/);
+  });
+
+  test('a non-z.ai claude-code run is still marked an estimate (total_cost_usd is client-side)', () => {
+    const anthropicConfig = { engine: 'claude-code', model: 'claude-x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
+    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, anthropicConfig);
+    assert.match(line, /· est\._$/);
+    assert.doesNotMatch(line, /z\.ai/);
+  });
+
+  test('marks the z.ai endpoint cost as an Anthropic-priced estimate (stronger caveat)', () => {
     const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, ZAI_CONFIG);
-    assert.match(line, /Anthropic pricing, not z\.ai billing/);
+    assert.match(line, /est\. \(Anthropic pricing, not z\.ai billing\)/);
   });
 
   test('shows cost as "unknown" (tokens still rendered) when cost is unavailable', () => {

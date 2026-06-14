@@ -107,10 +107,12 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
 // or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
-// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report. The input
-// count sums all input-side fields (fresh + cache read + cache write) so it reflects the total
-// prompt tokens the run actually processed. Against the z.ai endpoint this cost is Anthropic-priced
-// and may not equal z.ai's billing — the renderer marks that caveat. [FRAMING:representation]
+// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report.
+// total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled price table), not a
+// billed charge — so the renderer marks every cost line "est.". The input count sums all input-side
+// fields (fresh + cache read + cache write) so it reflects the total prompt tokens the run processed.
+// Against the z.ai endpoint the estimate is priced against the wrong provider (Anthropic prices, z.ai
+// billing), so the renderer adds a stronger caveat there. [FRAMING:representation]
 function extractUsage(stdout) {
   const env = parseJsonEnvelope(stdout);
   if (!env || !env.usage) return null;
