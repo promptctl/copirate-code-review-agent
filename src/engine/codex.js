@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { TransientError } = require('../failover');
+const { computeOpenAiCostUsd } = require('../usage');
 
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
@@ -156,6 +157,34 @@ function assertSucceeded(stdout) {
   }
 }
 
+// [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
+// a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
+// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); a model absent from the
+// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// The cumulative turn usage rides on the final turn.completed event; later events overwrite
+// earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
+// no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
+function extractUsage(stdout, config) {
+  let usage = null;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (event.type === 'turn.completed' && event.usage) usage = event.usage;
+  }
+  if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
+  const inputTokens = usage.input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
+  const cachedInputTokens = usage.cached_input_tokens ?? 0;
+  const costUsd = computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
+  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
+  // here means exactly one thing — the model is absent from the price table — and the adapter
+  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
+  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  return { inputTokens, outputTokens, cost };
+}
+
 // [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.
 // 429 + rate_limit are rate-limiting; insufficient_quota is a billing limit (also transient
 // in the sense that exhaustion clears with time or a new quota window). [LAW:one-source-of-truth]
@@ -182,6 +211,7 @@ const codexAdapter = {
   buildCommand,
   assertSucceeded,
   classifyError,
+  extractUsage,
 };
 
-module.exports = { codexAdapter, buildConfigToml, OPENAI_RESPONSES_BASE_URL };
+module.exports = { codexAdapter, buildConfigToml, extractUsage, OPENAI_RESPONSES_BASE_URL };

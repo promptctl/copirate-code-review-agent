@@ -31,6 +31,7 @@ function formatOutputTail(label, value) {
 
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
 // All engine-specific logic (args, env, success check, error classification) lives in the adapter.
+// Resolves with the child's captured stdout so the caller can extract usage/cost from it.
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 function runEngine(adapter, config, prompt, home, collector) {
@@ -91,7 +92,10 @@ function runEngine(adapter, config, prompt, home, collector) {
         }
         try {
           adapter.assertSucceeded(stdout);
-          resolve();
+          // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
+          // the caller derives usage/cost from it via the adapter's extractUsage. Findings
+          // still flow out-of-band through the MCP collector — stdout carries only usage.
+          resolve(stdout);
         } catch (err) {
           reject(adapter.classifyError(err, stdout));
         }
