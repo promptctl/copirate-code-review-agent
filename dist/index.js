@@ -30625,8 +30625,11 @@ const TOOL_NAMES = {
 };
 
 // [LAW:effects-at-boundaries] Pure: produces TOML text from values, touches no filesystem.
-// Codex requires: explicit `name` field in each model_provider entry; model formatted as
-// "<provider>/<model>"; REVIEW_COLLECTOR_RECORDS in mcp_servers env sub-table.
+// Codex 0.139 requires: explicit `name` field in each model_provider entry; the bare model
+// name in `model` with the provider selected by `model_provider` (the old "<provider>/<model>"
+// form is sent verbatim to the API and 400s as model_not_found); REVIEW_COLLECTOR_RECORDS in
+// the mcp_servers env sub-table. The credential is NOT carried by a provider env_key — Codex
+// authenticates the Responses transport from auth.json (written in materializeHome).
 // --dangerously-bypass-approvals-and-sandbox is required in the spawn invocation because
 // approval_policy = "never" only covers shell commands; MCP tool calls have a separate
 // approval gate that requires this flag in non-interactive (--json) mode.
@@ -30650,7 +30653,8 @@ function buildConfigToml(config, collectorSpawn) {
   const lines = [
     `approval_policy = "never"`,
     `sandbox_mode = "read-only"`,
-    `model = ${q(INTERNAL_PROVIDER + '/' + config.model)}`,
+    `model = ${q(config.model)}`,
+    `model_provider = ${q(INTERNAL_PROVIDER)}`,
   ];
   if (config.reasoning) {
     lines.push(`model_reasoning_effort = ${q(config.reasoning)}`);
@@ -30661,7 +30665,6 @@ function buildConfigToml(config, collectorSpawn) {
     `[model_providers.${INTERNAL_PROVIDER}]`,
     `name = ${q(INTERNAL_PROVIDER)}`,
     `base_url = ${q(config.endpoint.baseUrl)}`,
-    `env_key = ${q(config.endpoint.apiKeyEnv)}`,
     '',
     '[mcp_servers.review_collector]',
     `command = ${q(command)}`,
@@ -30682,6 +30685,15 @@ function materializeHome({ config, instructionsPath, collector }) {
   // [LAW:single-enforcer] Instructions are copied from the one shared source.
   fs.copyFileSync(instructionsPath, path.join(home, 'AGENTS.md'));
 
+  // [LAW:single-enforcer] auth.json is the one credential channel Codex 0.139 reads for the
+  // Responses transport; a provider env_key is ignored there and yields 401 missing-bearer.
+  // The key name is Codex's fixed API-key slot, independent of config.endpoint.apiKeyEnv.
+  fs.writeFileSync(
+    path.join(home, 'auth.json'),
+    JSON.stringify({ OPENAI_API_KEY: config.endpoint.apiKey }),
+    'utf8',
+  );
+
   // Read the collector's already-computed spawn spec rather than recomputing it.
   // [LAW:one-source-of-truth] createReviewCollector owns these paths and the node binary ref.
   const mcpCfg = JSON.parse(fs.readFileSync(collector.mcpConfigPath, 'utf8'));
@@ -30692,8 +30704,8 @@ function materializeHome({ config, instructionsPath, collector }) {
 }
 
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from the validated ReviewConfig.
-// [LAW:single-enforcer] Auth translation happens exactly once: the apiKeyEnv env var is
-// injected here, referenced by model_providers in config.toml.
+// The credential is not passed via env — it lives in CODEX_HOME/auth.json (materializeHome),
+// the one channel Codex reads for the Responses transport. [LAW:single-enforcer]
 // --dangerously-bypass-approvals-and-sandbox is intentional for CI: GitHub Actions is an
 // externally sandboxed environment (per Codex docs: "Intended solely for running in
 // environments that are externally sandboxed"). MCP tool calls do not auto-execute in
@@ -30702,9 +30714,9 @@ function materializeHome({ config, instructionsPath, collector }) {
 // Env is an explicit allowlist — never process.env spread. Codex is an AI agent that can
 // read env vars via shell expressions; spreading process.env would expose GITHUB_TOKEN and
 // all repo secrets to prompt-injection payloads in the diff under review. Only the minimum
-// required variables are passed: PATH (npx resolution), HOME (system tools), CODEX_HOME
-// (config isolation), and the single apiKeyEnv credential. [LAW:effects-at-boundaries]
-function buildCommand({ config, home }) {
+// required variables are passed: PATH (npx resolution), HOME (system tools), and CODEX_HOME
+// (config + credential isolation). [LAW:effects-at-boundaries]
+function buildCommand({ home }) {
   return {
     command: 'npx',
     args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox'],
@@ -30712,7 +30724,6 @@ function buildCommand({ config, home }) {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
       CODEX_HOME: home,
-      [config.endpoint.apiKeyEnv]: config.endpoint.apiKey,
     },
   };
 }
