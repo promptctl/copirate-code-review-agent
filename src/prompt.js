@@ -74,4 +74,60 @@ Review this pull request. Use the repository working tree for context and the di
   };
 }
 
-module.exports = { buildReviewInput };
+// [LAW:decomposition] The full-repo material: there is no diff, so this prompt carries no
+// annotated LINE grid and produces no anchors — it instructs the engine to explore the working
+// tree itself with its allowed Read/Grep/Glob tools. Unlike buildReviewInput (a pull-request
+// diff, where only diff-introduced violations are request_change material), a whole-repo review
+// deliberately flags PRE-EXISTING issues — that is the point of the mode.
+// scope is free text that focuses the review; '' means a broad whole-repo pass.
+// excludePatterns is a value the prompt forwards as "do not review these"; with no diff to
+// filter, the agent honors it while exploring. [LAW:dataflow-not-control-flow] empty scope and
+// empty excludePatterns are distinct values with distinct renderings, not skipped branches.
+function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
+  const focus = scope
+    ? `Focus this review on the following scope, named by the maintainer: ${scope}. Start from the files and modules that scope points to, and follow the code from there.`
+    : `Give a broad review across the whole repository. Start from the entry points and the modules most central to the project, and read the actual source before judging it.`;
+  const exclude = excludePatterns.length > 0
+    ? `\n\n    Do NOT review files matching these excluded patterns: ${excludePatterns.join(', ')}.`
+    : '';
+
+  return {
+    prompt: `
+Review this repository against the LAWS in your guidance. There is no diff — explore the working tree yourself
+    using your Read, Grep, and Glob tools and judge the code you find. ${focus}${exclude}
+
+    Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
+    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
+    ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
+
+    This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.
+    You flag violations; you do not fix them. Flag the most important LAW violations, correctness bugs, security flaws,
+    invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal
+    coupling, or missing behavior tests that you find.
+
+    Each ${toolNames.requestChange} body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow];
+    (2) one sentence naming the specific violation at that path:line; (3) the concrete fix. Keep it short. One comment
+    per distinct issue — do not repeat the same finding across many lines; flag the clearest instance and note the
+    pattern once in the body.
+
+    Priorities, highest first:
+    - [LAW:dataflow-not-control-flow] — the most common and most important violation to catch. Flag: an \`if\`/\`switch\`
+      that selects WHICH operation runs rather than letting data decide the result; a guard that makes an operation
+      sometimes-run, sometimes-skip (especially \`if (x) { ...work... }\` with no else — that is [LAW:no-defensive-null-guards]
+      too); branching on a mode/flag instead of passing a value.
+    - [LAW:decomposition] / [LAW:composability] — a function that does more than one thing (needs "and" to describe), or
+      hardcodes a caller-specific choice that should be a parameter.
+    - [LAW:types-are-the-program] — a type that admits illegal states (\`any\`, \`string\` for an enum, fields that must
+      agree but aren't tied), or a body that branches/guards to compensate for a too-loose type.
+    - [LAW:effects-at-boundaries] — code mixing computation with IO/mutation/network/clock/randomness in the same unit.
+    - [LAW:no-silent-failure] — swallowed errors, \`|| true\`, \`2>/dev/null\`, empty catches, or meaning-changing fallbacks.
+    - [LAW:one-source-of-truth] / [LAW:single-enforcer] — a second home for an existing fact, or a duplicated enforcement check.
+    - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag clear violations.
+
+    Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns.
+    When unsure whether something rises to must-change, leave it for the summary instead. Do NOT state an overall verdict
+    or approval status — this is an informational report, not a merge gate.`,
+  };
+}
+
+module.exports = { buildReviewInput, buildRepoReviewInput };

@@ -31252,7 +31252,63 @@ Review this pull request. Use the repository working tree for context and the di
   };
 }
 
-module.exports = { buildReviewInput };
+// [LAW:decomposition] The full-repo material: there is no diff, so this prompt carries no
+// annotated LINE grid and produces no anchors — it instructs the engine to explore the working
+// tree itself with its allowed Read/Grep/Glob tools. Unlike buildReviewInput (a pull-request
+// diff, where only diff-introduced violations are request_change material), a whole-repo review
+// deliberately flags PRE-EXISTING issues — that is the point of the mode.
+// scope is free text that focuses the review; '' means a broad whole-repo pass.
+// excludePatterns is a value the prompt forwards as "do not review these"; with no diff to
+// filter, the agent honors it while exploring. [LAW:dataflow-not-control-flow] empty scope and
+// empty excludePatterns are distinct values with distinct renderings, not skipped branches.
+function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
+  const focus = scope
+    ? `Focus this review on the following scope, named by the maintainer: ${scope}. Start from the files and modules that scope points to, and follow the code from there.`
+    : `Give a broad review across the whole repository. Start from the entry points and the modules most central to the project, and read the actual source before judging it.`;
+  const exclude = excludePatterns.length > 0
+    ? `\n\n    Do NOT review files matching these excluded patterns: ${excludePatterns.join(', ')}.`
+    : '';
+
+  return {
+    prompt: `
+Review this repository against the LAWS in your guidance. There is no diff — explore the working tree yourself
+    using your Read, Grep, and Glob tools and judge the code you find. ${focus}${exclude}
+
+    Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
+    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
+    ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
+
+    This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.
+    You flag violations; you do not fix them. Flag the most important LAW violations, correctness bugs, security flaws,
+    invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal
+    coupling, or missing behavior tests that you find.
+
+    Each ${toolNames.requestChange} body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow];
+    (2) one sentence naming the specific violation at that path:line; (3) the concrete fix. Keep it short. One comment
+    per distinct issue — do not repeat the same finding across many lines; flag the clearest instance and note the
+    pattern once in the body.
+
+    Priorities, highest first:
+    - [LAW:dataflow-not-control-flow] — the most common and most important violation to catch. Flag: an \`if\`/\`switch\`
+      that selects WHICH operation runs rather than letting data decide the result; a guard that makes an operation
+      sometimes-run, sometimes-skip (especially \`if (x) { ...work... }\` with no else — that is [LAW:no-defensive-null-guards]
+      too); branching on a mode/flag instead of passing a value.
+    - [LAW:decomposition] / [LAW:composability] — a function that does more than one thing (needs "and" to describe), or
+      hardcodes a caller-specific choice that should be a parameter.
+    - [LAW:types-are-the-program] — a type that admits illegal states (\`any\`, \`string\` for an enum, fields that must
+      agree but aren't tied), or a body that branches/guards to compensate for a too-loose type.
+    - [LAW:effects-at-boundaries] — code mixing computation with IO/mutation/network/clock/randomness in the same unit.
+    - [LAW:no-silent-failure] — swallowed errors, \`|| true\`, \`2>/dev/null\`, empty catches, or meaning-changing fallbacks.
+    - [LAW:one-source-of-truth] / [LAW:single-enforcer] — a second home for an existing fact, or a duplicated enforcement check.
+    - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag clear violations.
+
+    Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns.
+    When unsure whether something rises to must-change, leave it for the summary instead. Do NOT state an overall verdict
+    or approval status — this is an informational report, not a merge gate.`,
+  };
+}
+
+module.exports = { buildReviewInput, buildRepoReviewInput };
 
 
 /***/ }),
@@ -31351,6 +31407,78 @@ function synthesizeProviderConfig(inputs, reg) {
 }
 
 module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_NAMES };
+
+
+/***/ }),
+
+/***/ 8959:
+/***/ ((module) => {
+
+"use strict";
+
+
+// The printed sink for full-repo review mode. There is no pull request to comment on, so
+// findings are rendered as a single Markdown report written to the GitHub Step Summary and
+// the run log. [LAW:effects-at-boundaries] This renderer is PURE — it returns the report
+// string from values; the run boundary owns the actual write. [LAW:decomposition] It mirrors
+// transport.submitReview (the PR sink) but produces text instead of a host review.
+
+// Group findings by file path, preserving first-seen path order, lines ascending within a file.
+// [LAW:dataflow-not-control-flow] An empty findings array is a value that renders as the
+// "No findings" section — not a skipped branch.
+function groupByPath(findings) {
+  const byPath = new Map();
+  for (const finding of findings) {
+    if (!byPath.has(finding.path)) byPath.set(finding.path, []);
+    byPath.get(finding.path).push(finding);
+  }
+  for (const list of byPath.values()) {
+    list.sort((a, b) => a.line - b.line);
+  }
+  return byPath;
+}
+
+// One finding rendered as a list item; the body is flattened to a single line so the grouped
+// list stays scannable in the Step Summary.
+function renderFinding(finding) {
+  const body = finding.body.replace(/\s*\n\s*/g, ' ').trim();
+  return `- **line ${finding.line}:** ${body}`;
+}
+
+function renderFindingsSection(findings) {
+  if (findings.length === 0) {
+    return ['**No findings.**'];
+  }
+  const lines = [`### Findings (${findings.length})`];
+  for (const [path, list] of groupByPath(findings)) {
+    lines.push('', `#### ${path}`, ...list.map(renderFinding));
+  }
+  return lines;
+}
+
+// [LAW:effects-at-boundaries] Pure: render the full-repo review report from values. scope is
+// free text ('' = whole repository); footer is the already-built attribution + cost line ('' =
+// none). The summary is the engine's finish_review summary, carried through unchanged.
+function renderRepoReport({ reviewerName, scope, review, footer }) {
+  const scopeLine = scope
+    ? `**Scope:** ${scope}`
+    : '**Scope:** whole repository';
+  const lines = [
+    `## ${reviewerName} — Full-repository review`,
+    '',
+    scopeLine,
+    '',
+    review.summary,
+    '',
+    ...renderFindingsSection(review.findings),
+  ];
+  if (footer) {
+    lines.push('', footer);
+  }
+  return lines.join('\n');
+}
+
+module.exports = { renderRepoReport, groupByPath };
 
 
 /***/ }),
@@ -31479,11 +31607,12 @@ const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
-const { buildReviewInput } = __nccwpck_require__(3479);
+const { buildReviewInput, buildRepoReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { renderCostLine, costWarning } = __nccwpck_require__(9614);
+const { renderRepoReport } = __nccwpck_require__(8959);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -31495,13 +31624,15 @@ const { selectConfig } = __nccwpck_require__(675);
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
-// One attempt at producing a validated review against a fresh collector and home.
-// buildPromptFor(toolNames) is called here so each engine gets the MCP tool identifiers
-// its adapter registers, not chain[0]'s identifiers. [LAW:types-are-the-program]
-// Nested try/finally guarantees cleanup even when materializeHome throws: the
-// outer finally cleans collector.dir unconditionally; the inner finally cleans
-// home only when materializeHome succeeded and home is defined. [LAW:no-silent-failure]
-async function produceReviewOnce(config, buildPromptFor, anchors) {
+// [LAW:decomposition] The shared ENGINE attempt: run one engine against a prompt and read back
+// a validated review + usage. It knows nothing about pull requests, diff anchors, or the host —
+// both review modes (PR diff, whole repo) compose it. buildPromptFor(toolNames) is called here so
+// each engine in a failover chain gets the MCP tool identifiers its own adapter registers, not
+// chain[0]'s. [LAW:types-are-the-program]
+// Nested try/finally guarantees cleanup even when materializeHome throws: the outer finally cleans
+// collector.dir unconditionally; the inner finally cleans home only once materializeHome returned.
+// [LAW:no-silent-failure]
+async function collectReviewOnce(config, buildPromptFor) {
   const adapter = registry.get(config.engine);
   const prompt = buildPromptFor(adapter.toolNames);
   const collector = createReviewCollector();
@@ -31513,15 +31644,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
       // and carried to the footer sink alongside the findings — never recomputed at the boundary.
       const usage = adapter.extractUsage(output, config);
       const review = readCollectedReview(collector.recordsPath);
-      // [LAW:dataflow-not-control-flow] Reconcile findings with the diff anchors as a value:
-      // anchored (incl. snapped) post inline; unanchored are surfaced in the summary. A
-      // mis-anchored finding never aborts the review. [LAW:no-silent-failure] each unanchored
-      // finding is logged here at the boundary so it is visible in the run, never dropped silently.
-      const { anchored, unanchored } = partitionFindings(review.findings, anchors);
-      for (const f of unanchored) {
-        core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-      }
-      return { summary: review.summary, findings: anchored, unanchored, usage };
+      return { summary: review.summary, findings: review.findings, usage };
     } finally {
       fs.rmSync(home, { recursive: true });
     }
@@ -31530,17 +31653,80 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
   }
 }
 
-async function run() {
+// PR-mode attempt: the shared engine plus diff-anchor reconciliation. [LAW:dataflow-not-control-flow]
+// Reconcile findings with the diff anchors as a value: anchored (incl. snapped) post inline;
+// unanchored are surfaced in the summary. A mis-anchored finding never aborts the review.
+// [LAW:no-silent-failure] each unanchored finding is logged here at the boundary so it is visible
+// in the run, never dropped silently.
+async function produceReviewOnce(config, buildPromptFor, anchors) {
+  const { summary, findings, usage } = await collectReviewOnce(config, buildPromptFor);
+  const { anchored, unanchored } = partitionFindings(findings, anchors);
+  for (const f of unanchored) {
+    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
+  }
+  return { summary, findings: anchored, unanchored, usage };
+}
+
+// Repo-mode attempt: the shared engine, with no anchor reconciliation. There is no diff grid, so
+// every file:line the agent cites is valid — findings flow through unchanged. produceReview passes
+// anchors as the third argument for every mode; this attempt ignores it. [LAW:composability]
+async function produceRepoReviewOnce(config, buildPromptFor) {
+  return collectReviewOnce(config, buildPromptFor);
+}
+
+// [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
+// secrets. selection is the value PR/repo modes differ on: a PR run passes its labels + body so a
+// config file can pick a per-PR reviewer; a repo run has no PR, so it passes empty selectors and
+// per-PR rules fall through to the explicit CONFIG input or the file default. [LAW:dataflow-not-control-flow]
+// Throws on any config error so the single caller boundary reports it via setFailed.
+function buildConfigChain(selection) {
   // [LAW:one-source-of-truth] Default path is declared in action.yml; do not duplicate it here.
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
-  const hasConfigFile = fs.existsSync(configFilePath);
 
-  const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
-  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
-    .split(',')
-    .map(p => p.trim())
-    .filter(p => p.length > 0);
+  if (fs.existsSync(configFilePath)) {
+    const { configNames, defaultName } = peekConfigNames(configFilePath);
+    const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
+    core.info(`Selected reviewer config: '${selectedName}'`);
+    const chain = loadConfig(configFilePath, selectedName, process.env);
+    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
+    return chain;
+  }
+
+  // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the engine —
+  // credential presence never steers it. The chosen provider's key is then required, and its
+  // absence fails loud naming the input to set. [LAW:no-silent-failure]
+  const config = synthesizeProviderConfig({
+    provider: core.getInput('PROVIDER'),
+    openaiApiKey: core.getInput('OPENAI_API_KEY'),
+    openaiModel: core.getInput('OPENAI_MODEL'),
+    openaiReasoning: core.getInput('OPENAI_REASONING_EFFORT'),
+    openaiBaseUrl: core.getInput('OPENAI_BASE_URL'),
+    zaiApiKey: core.getInput('ZAI_API_KEY'),
+    zaiModel: core.getInput('ZAI_MODEL'),
+    zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
+    zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
+  });
+  core.setSecret(config.endpoint.apiKey);
+  core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
+  return [config];
+}
+
+// [LAW:effects-at-boundaries] The cost-reporting boundary, shared by both sinks: renderCostLine
+// and costWarning are pure; this is the one place the "loud, not silent" signal is emitted, and it
+// returns the full attribution + cost footer. [LAW:no-silent-failure] costWarning names the actual
+// cause (carried in usage.cost.reason), so the boundary never re-derives why cost is absent.
+function buildReviewFooter(usage, configUsed) {
+  const warning = costWarning(usage, configUsed);
+  if (warning) core.warning(warning);
+  const costLine = renderCostLine(usage, configUsed);
+  if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
+  return [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
+}
+
+// PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
+// chain, and submit an inline GitHub review.
+async function runPrReview(reviewerName, excludePatterns) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -31560,7 +31746,8 @@ async function run() {
   if (!Number.isInteger(pullNumber) || pullNumber <= 0 || !headSha) {
     core.setFailed(
       'Could not determine which pull request to review. On pull_request events this is '
-      + 'detected automatically; on other events (e.g. workflow_run) pass PR_NUMBER and HEAD_SHA explicitly.',
+      + 'detected automatically; on other events (e.g. workflow_run) pass PR_NUMBER and HEAD_SHA explicitly. '
+      + 'For an on-demand whole-repo review with no PR, set MODE: repo.',
     );
     return;
   }
@@ -31568,8 +31755,8 @@ async function run() {
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
 
-  // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR
-  // object also feeds config-file label/body selection below, so it is fetched once here.
+  // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR object
+  // also feeds config-file label/body selection below, so it is fetched once here.
   let pr;
   try {
     ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
@@ -31578,11 +31765,11 @@ async function run() {
     return;
   }
 
-  // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode:
-  // the action never reviews a fork PR (its diff is untrusted and would spend the host's
-  // own AI credits on outside contributors). Skipping is an intentional clean no-op — logged,
-  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced;
-  // malformed PR data (no base repo) throws here and surfaces as a loud failure, never a skip.
+  // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode: the
+  // action never reviews a fork PR (its diff is untrusted and would spend the host's own AI credits
+  // on outside contributors). Skipping is an intentional clean no-op — logged, exit 0, no review
+  // posted, no engine spawned. [LAW:no-silent-failure] the skip is announced; malformed PR data (no
+  // base repo) throws here and surfaces as a loud failure, never a skip.
   let isFork;
   try {
     isFork = prIsFromFork(pr);
@@ -31598,63 +31785,12 @@ async function run() {
     return;
   }
 
-  // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
-  // a validated multi-config chain; the PROVIDER inputs synthesize a single-entry chain.
   let chain;
-  if (hasConfigFile) {
-    // peekConfigNames is a fast read so config names are available for selection.
-    let configNames, defaultName;
-    try {
-      ({ configNames, defaultName } = peekConfigNames(configFilePath));
-    } catch (e) {
-      core.setFailed(e.message);
-      return;
-    }
-
-    let selectedName;
-    try {
-      selectedName = selectConfig(
-        { labels: pr.labels, body: pr.body },
-        { configInput: configNameInput, configNames, defaultName },
-      );
-    } catch (e) {
-      core.setFailed(e.message);
-      return;
-    }
-
-    core.info(`Selected reviewer config: '${selectedName}'`);
-
-    try {
-      chain = loadConfig(configFilePath, selectedName, process.env);
-    } catch (e) {
-      core.setFailed(e.message);
-      return;
-    }
-    chain.forEach(c => core.setSecret(c.endpoint.apiKey));
-  } else {
-    // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the
-    // engine — credential presence never steers it. The chosen provider's key is then
-    // required, and its absence fails loud naming the input to set. [LAW:no-silent-failure]
-    let config;
-    try {
-      config = synthesizeProviderConfig({
-        provider: core.getInput('PROVIDER'),
-        openaiApiKey: core.getInput('OPENAI_API_KEY'),
-        openaiModel: core.getInput('OPENAI_MODEL'),
-        openaiReasoning: core.getInput('OPENAI_REASONING_EFFORT'),
-        openaiBaseUrl: core.getInput('OPENAI_BASE_URL'),
-        zaiApiKey: core.getInput('ZAI_API_KEY'),
-        zaiModel: core.getInput('ZAI_MODEL'),
-        zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
-        zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
-      });
-    } catch (e) {
-      core.setFailed(e.message);
-      return;
-    }
-    core.setSecret(config.endpoint.apiKey);
-    core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
-    chain = [config];
+  try {
+    chain = buildConfigChain({ labels: pr.labels, body: pr.body });
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
   }
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
@@ -31680,29 +31816,78 @@ async function run() {
     return;
   }
 
-  // buildPromptFor(toolNames) is called per-attempt in produceReviewOnce so each engine gets
-  // the MCP tool identifiers its adapter registers. Anchors are engine-agnostic (purely
-  // diff-line based), so they are computed once here from any toolNames. [LAW:types-are-the-program]
-  // [LAW:no-ambient-temporal-coupling] produceReview owns all retry/failover timing.
+  // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
+  // toolNames; buildPromptFor is called per-attempt so each engine gets its own tool identifiers.
+  // [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] produceReview owns retry timing.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames);
   const anchors = buildReviewAnchors(anchorInput.files);
   const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames).prompt;
 
-  // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
+  // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
 
-  // [LAW:effects-at-boundaries] renderCostLine and costWarning are pure; this boundary is the only
-  // place the "loud, not silent" signal is emitted. [LAW:no-silent-failure] costWarning names the
-  // actual cause (carried in usage.cost.reason), so the orchestrator never re-derives why cost is
-  // absent. Either way the review still submits — cost reporting never blocks a review.
-  const { usage } = review;
-  const warning = costWarning(usage, configUsed);
-  if (warning) core.warning(warning);
-  const costLine = renderCostLine(usage, configUsed);
-  if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
-  const footer = [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
+  const footer = buildReviewFooter(review.usage, configUsed);
   await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
+}
+
+// Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
+// (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
+async function runRepoReview(reviewerName, excludePatterns) {
+  const scope = core.getInput('SCOPE').trim();
+
+  let chain;
+  try {
+    // [LAW:dataflow-not-control-flow] No PR means no per-PR selectors; the same selectConfig runs
+    // with empty labels/body, so the file default or explicit CONFIG input decides the engine.
+    chain = buildConfigChain({ labels: [], body: '' });
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+
+  // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
+  // engine so each gets its own tool identifiers. [LAW:composability]
+  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames }).prompt;
+
+  core.info(
+    `Running whole-repo review with ${chain.length} config(s) in chain`
+    + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
+  );
+  const { review, configUsed } = await produceReview(chain, buildPromptFor, null, produceRepoReviewOnce);
+
+  const footer = buildReviewFooter(review.usage, configUsed);
+  const report = renderRepoReport({ reviewerName, scope, review, footer });
+
+  // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
+  // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
+  // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
+  // is written first so findings are never lost if the Step Summary write fails (e.g. an
+  // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
+  core.info(report);
+  core.info(`Whole-repo review complete: ${review.findings.length} finding(s).`);
+  await core.summary.addRaw(report).write();
+}
+
+async function run() {
+  const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
+  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
+    .split(',')
+    .map(p => p.trim())
+    .filter(p => p.length > 0);
+
+  // [LAW:types-are-the-program] MODE is the explicit discriminator between the two review materials
+  // and sinks. It is read as a value, never inferred from "is a PR present" — inferring would turn a
+  // misconfigured PR run into an accidental whole-repo audit. [LAW:no-silent-failure] an unknown
+  // value fails loud rather than defaulting silently.
+  const mode = (core.getInput('MODE') || 'pr').trim();
+  if (mode === 'pr') {
+    await runPrReview(reviewerName, excludePatterns);
+  } else if (mode === 'repo') {
+    await runRepoReview(reviewerName, excludePatterns);
+  } else {
+    core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
+  }
 }
 
 module.exports = { run };
