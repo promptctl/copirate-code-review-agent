@@ -31345,18 +31345,62 @@ function parseFindingValue(finding, index) {
   }, `Review collector finding ${index + 1}`).findings[0];
 }
 
-// [LAW:single-enforcer] validateFindings is the one place that checks every finding
-// against the visible diff anchors; nothing else re-implements this check.
-function validateFindings(findings, anchors) {
-  for (const finding of findings) {
-    const anchor = `${finding.path}:${finding.line}`;
-    if (!anchors.has(anchor)) {
-      throw new Error(`Claude Code finding references a line outside the review diff: ${anchor}`);
-    }
+// A finding cited a line within this many lines of a real anchorable line is snapped to
+// that line rather than dropped: the model named a line just outside the diff hunk, but the
+// comment body is specific enough that a small offset still lands on the right change and the
+// reader can place it. Beyond this window the line reference is too far off to trust, so the
+// finding is surfaced in the summary instead. [LAW:no-mode-explosion] one documented constant.
+const MAX_ANCHOR_SNAP_DISTANCE = 10;
+
+// [LAW:effects-at-boundaries] Pure: given a cited line and the anchorable lines for its file,
+// return the nearest line within the snap window, or null when none is close enough.
+function nearestAnchorableLine(line, fileLines) {
+  if (!fileLines || fileLines.length === 0) return null;
+  let best = fileLines[0];
+  for (const candidate of fileLines) {
+    if (Math.abs(candidate - line) < Math.abs(best - line)) best = candidate;
   }
+  return Math.abs(best - line) <= MAX_ANCHOR_SNAP_DISTANCE ? best : null;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, validateFindings };
+// [LAW:single-enforcer] partitionFindings is the one place that reconciles model findings
+// with the visible diff anchors; nothing else re-implements this check.
+// [LAW:dataflow-not-control-flow] The reconciliation is a value, not a throw: a finding the
+// model anchored outside the diff is not a fatal error that aborts the whole review (which
+// would discard every valid finding and red the run). Each finding flows to exactly one of:
+//   - anchored: already on the grid, or snapped to the nearest reviewed line (body annotated
+//     so the adjustment is explicit — [LAW:no-silent-failure]).
+//   - unanchored: too far from any reviewed line; the caller surfaces it in the summary and
+//     logs it, never silently dropping it.
+function partitionFindings(findings, anchors) {
+  const linesByPath = new Map();
+  for (const { path, line } of anchors.values()) {
+    if (!linesByPath.has(path)) linesByPath.set(path, []);
+    linesByPath.get(path).push(line);
+  }
+
+  const anchored = [];
+  const unanchored = [];
+  for (const finding of findings) {
+    if (anchors.has(`${finding.path}:${finding.line}`)) {
+      anchored.push({ ...finding });
+      continue;
+    }
+    const snapped = nearestAnchorableLine(finding.line, linesByPath.get(finding.path));
+    if (snapped === null) {
+      unanchored.push(finding);
+      continue;
+    }
+    anchored.push({
+      ...finding,
+      line: snapped,
+      body: `${finding.body}\n\n_(Anchored to line ${snapped}; the review referenced line ${finding.line}, just outside the diff.)_`,
+    });
+  }
+  return { anchored, unanchored };
+}
+
+module.exports = { parseReviewValue, parseFindingValue, partitionFindings, nearestAnchorableLine };
 
 
 /***/ }),
@@ -31374,7 +31418,7 @@ const path = __nccwpck_require__(6928);
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
-const { validateFindings } = __nccwpck_require__(1565);
+const { partitionFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
 const { runEngine } = __nccwpck_require__(8861);
@@ -31403,8 +31447,15 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
     try {
       await runEngine(adapter, config, prompt, home, collector);
       const review = readCollectedReview(collector.recordsPath);
-      validateFindings(review.findings, anchors);
-      return review;
+      // [LAW:dataflow-not-control-flow] Reconcile findings with the diff anchors as a value:
+      // anchored (incl. snapped) post inline; unanchored are surfaced in the summary. A
+      // mis-anchored finding never aborts the review. [LAW:no-silent-failure] each unanchored
+      // finding is logged here at the boundary so it is visible in the run, never dropped silently.
+      const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+      for (const f of unanchored) {
+        core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
+      }
+      return { summary: review.summary, findings: anchored, unanchored };
     } finally {
       fs.rmSync(home, { recursive: true });
     }
@@ -31719,14 +31770,27 @@ function reviewEvent(requestsChanges, canApprove) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
 }
 
+// [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
+// summary section. They still carry their path:line so the reader can locate them.
+function renderUnanchoredSection(unanchored) {
+  if (!unanchored || unanchored.length === 0) return '';
+  const items = unanchored
+    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .join('\n');
+  return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
+}
+
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
-  // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
-  // rendered verdict, so they cannot disagree. The model never states the verdict.
-  const requestsChanges = review.findings.length > 0;
+  // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
+  // verdict, so they cannot disagree. The model never states the verdict. An unanchored
+  // finding is still a finding: it counts toward "request changes" so a mis-anchored real
+  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  const unanchored = review.unanchored || [];
+  const requestsChanges = review.findings.length + unanchored.length > 0;
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
-  const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.

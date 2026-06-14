@@ -63,14 +63,27 @@ function reviewEvent(requestsChanges, canApprove) {
   return requestsChanges ? 'REQUEST_CHANGES' : (canApprove ? 'APPROVE' : 'COMMENT');
 }
 
+// [LAW:effects-at-boundaries] Pure: render the findings that could not be posted inline as a
+// summary section. They still carry their path:line so the reader can locate them.
+function renderUnanchoredSection(unanchored) {
+  if (!unanchored || unanchored.length === 0) return '';
+  const items = unanchored
+    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .join('\n');
+  return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
+}
+
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
-  // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the
-  // rendered verdict, so they cannot disagree. The model never states the verdict.
-  const requestsChanges = review.findings.length > 0;
+  // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
+  // verdict, so they cannot disagree. The model never states the verdict. An unanchored
+  // finding is still a finding: it counts toward "request changes" so a mis-anchored real
+  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  const unanchored = review.unanchored || [];
+  const requestsChanges = review.findings.length + unanchored.length > 0;
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
-  const body = `## ${reviewerName}\n\n${review.summary}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment(finding));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.

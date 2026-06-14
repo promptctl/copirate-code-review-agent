@@ -65,10 +65,10 @@ This boundary is why findings flow through an MCP tool rather than being parsed 
 A finding anchors to a **new-file line number**, defined **once** in `patchLines` (`src/index.js`): each `@@` hunk header resets the new-side counter; only added (`+`) and context (` `) lines advance it and are anchorable (deletions have no new-side line). Three consumers derive from it and must never reimplement it:
 
 - `annotatePatchWithLines` — labels each anchorable diff line `LINE N` in the prompt so the model cites the right line.
-- `buildReviewAnchors` — the `path:line` set used by `validateFindings` to reject any finding outside the visible diff.
+- `buildReviewAnchors` — the `path:line` set used by `partitionFindings` to reconcile each finding with the visible diff.
 - `transport.toComment` — maps a finding's `line` to the host's comment anchor.
 
-The two-way contract: the model can only comment on lines it was shown as `LINE N`, and the action rejects anything else.
+The two-way contract: the model is shown lines as `LINE N` and should comment on those. When it anchors slightly off (a line just outside the hunk), `partitionFindings` (`src/review.js`) does **not** abort the review — that would discard every valid finding and red the run for one model slip. Instead it reconciles each finding as a value: a line within `MAX_ANCHOR_SNAP_DISTANCE` of a reviewed line is snapped to that line (body annotated so the move is explicit); a line too far from any reviewed line becomes an *unanchored* finding that `submitReview` renders in the review summary and `run` logs as a warning. Either way the finding still counts toward the `REQUEST_CHANGES` verdict, so a mis-anchored real issue can never silently downgrade to APPROVE. [LAW:no-silent-failure]
 
 ### Host transport (GitHub + Gitea)
 

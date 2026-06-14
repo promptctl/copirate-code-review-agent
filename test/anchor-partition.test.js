@@ -1,0 +1,192 @@
+'use strict';
+const { test, describe } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { partitionFindings, nearestAnchorableLine } = require('../src/review');
+const { submitReview, gitHubTransport } = require('../src/transport');
+const { buildReviewAnchors } = require('../src/diff');
+
+// [LAW:verifiable-goals] AC: a finding the model anchors outside the diff never aborts the
+// review. It is snapped to the nearest reviewed line when close, or surfaced in the summary
+// when far — and either way still counts toward the REQUEST_CHANGES verdict.
+
+// anchors: Map<"path:line", {path, line}> — the shape buildReviewAnchors produces.
+function anchorsFor(entries) {
+  return new Map(entries.map(([path, line]) => [`${path}:${line}`, { path, line }]));
+}
+
+describe('nearestAnchorableLine', () => {
+  test('returns null for an empty or missing file-line list', () => {
+    assert.equal(nearestAnchorableLine(10, []), null);
+    assert.equal(nearestAnchorableLine(10, undefined), null);
+  });
+
+  test('returns the nearest line when within the snap window', () => {
+    assert.equal(nearestAnchorableLine(79, [70, 78, 90]), 78);
+  });
+
+  test('exactly at the window edge (distance 10) snaps; one past it does not', () => {
+    assert.equal(nearestAnchorableLine(80, [70]), 70); // distance 10
+    assert.equal(nearestAnchorableLine(81, [70]), null); // distance 11
+  });
+
+  test('picks the closest among several candidates', () => {
+    assert.equal(nearestAnchorableLine(79, [76, 84]), 76); // 3 vs 5
+    assert.equal(nearestAnchorableLine(81, [76, 84]), 84); // 5 vs 3
+  });
+});
+
+describe('partitionFindings', () => {
+  test('a finding exactly on an anchor is kept unchanged (no body annotation)', () => {
+    const anchors = anchorsFor([['a.js', 10]]);
+    const { anchored, unanchored } = partitionFindings([{ path: 'a.js', line: 10, body: 'fix' }], anchors);
+    assert.equal(unanchored.length, 0);
+    assert.deepEqual(anchored, [{ path: 'a.js', line: 10, body: 'fix' }]);
+  });
+
+  test('a finding just outside the hunk is snapped to the nearest line and annotated', () => {
+    const anchors = anchorsFor([['s.astro', 78], ['s.astro', 84]]);
+    const { anchored, unanchored } = partitionFindings([{ path: 's.astro', line: 79, body: 'stale comment' }], anchors);
+    assert.equal(unanchored.length, 0);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 78);
+    assert.match(anchored[0].body, /^stale comment/);
+    assert.match(anchored[0].body, /Anchored to line 78; the review referenced line 79/);
+  });
+
+  test('a finding far from any reviewed line is surfaced as unanchored, not snapped, not dropped', () => {
+    const anchors = anchorsFor([['a.js', 10]]);
+    const { anchored, unanchored } = partitionFindings([{ path: 'a.js', line: 200, body: 'far' }], anchors);
+    assert.equal(anchored.length, 0);
+    assert.deepEqual(unanchored, [{ path: 'a.js', line: 200, body: 'far' }]);
+  });
+
+  test('a finding on a file with no reviewed lines is unanchored', () => {
+    const anchors = anchorsFor([['a.js', 10]]);
+    const { anchored, unanchored } = partitionFindings([{ path: 'other.js', line: 5, body: 'x' }], anchors);
+    assert.equal(anchored.length, 0);
+    assert.equal(unanchored.length, 1);
+  });
+
+  test('mixed batch: exact + snapped + unanchored each routed correctly', () => {
+    const anchors = anchorsFor([['a.js', 10], ['a.js', 12], ['b.js', 50]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'exact' },
+      { path: 'a.js', line: 14, body: 'near' },      // snaps to 12 (distance 2)
+      { path: 'b.js', line: 999, body: 'far' },       // unanchored
+    ];
+    const { anchored, unanchored } = partitionFindings(findings, anchors);
+    assert.deepEqual(anchored.map(f => [f.path, f.line]), [['a.js', 10], ['a.js', 12]]);
+    assert.deepEqual(unanchored.map(f => [f.path, f.line]), [['b.js', 999]]);
+  });
+
+  test('snapping never reuses across files (same line number, different file stays unanchored)', () => {
+    const anchors = anchorsFor([['a.js', 79]]);
+    const { anchored, unanchored } = partitionFindings([{ path: 'b.js', line: 79, body: 'x' }], anchors);
+    assert.equal(anchored.length, 0);
+    assert.equal(unanchored.length, 1);
+  });
+});
+
+describe('integration: real anchor pipeline (patchLines → buildReviewAnchors → partitionFindings)', () => {
+  // New-side numbering starts at +70: ctx70, ctx71, +72, +73, ctx74 → anchorable 70..74.
+  const patch = [
+    '@@ -70,3 +70,5 @@',
+    ' ctxLine70',
+    ' ctxLine71',
+    '+addedLine72',
+    '+addedLine73',
+    ' ctxLine74',
+  ].join('\n');
+  const anchors = buildReviewAnchors([{ filename: 'src/pages/[slug].astro', patch }]);
+
+  test('the anchorable set is exactly the new-side added + context lines', () => {
+    assert.deepEqual(
+      [...anchors.keys()].sort(),
+      ['src/pages/[slug].astro:70', 'src/pages/[slug].astro:71', 'src/pages/[slug].astro:72',
+        'src/pages/[slug].astro:73', 'src/pages/[slug].astro:74'].sort(),
+    );
+  });
+
+  test('the reported failure case: a finding at :79 (just past the hunk) snaps to :74 instead of aborting', () => {
+    const { anchored, unanchored } = partitionFindings(
+      [{ path: 'src/pages/[slug].astro', line: 79, body: 'stale comment: renderTurns → renderDialogueHtml' }],
+      anchors,
+    );
+    assert.equal(unanchored.length, 0);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 74); // distance 5, within window
+  });
+
+  test('a finding far past the hunk (:90) is surfaced as unanchored rather than snapped', () => {
+    const { anchored, unanchored } = partitionFindings(
+      [{ path: 'src/pages/[slug].astro', line: 90, body: 'far off' }],
+      anchors,
+    );
+    assert.equal(anchored.length, 0);
+    assert.equal(unanchored.length, 1);
+  });
+});
+
+// submitReview: a fake octokit captures the createReview payload so the verdict/body/comment
+// behavior is asserted without network I/O.
+function fakeOctokit() {
+  const calls = [];
+  return {
+    calls,
+    rest: { pulls: { createReview: async args => { calls.push(args); } } },
+  };
+}
+
+describe('submitReview — unanchored findings', () => {
+  test('only unanchored findings still REQUEST_CHANGES and render in the body, with no inline comments', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'Summary text.',
+      findings: [],
+      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment' }],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'REQUEST_CHANGES');
+    assert.equal(arg.comments, undefined); // no inline comments posted
+    assert.match(arg.body, /Findings outside the reviewed diff/);
+    assert.match(arg.body, /`s\.astro:79`/);
+    assert.match(arg.body, /stale doc comment/);
+    assert.match(arg.body, /❌ Request Changes/);
+  });
+
+  test('anchored findings post inline and add no unanchored section', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'Summary.',
+      findings: [{ path: 'a.js', line: 10, body: 'fix' }],
+      unanchored: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'REQUEST_CHANGES');
+    assert.equal(arg.comments.length, 1);
+    assert.equal(arg.comments[0].line, 10);
+    assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
+  });
+
+  test('no findings at all approves (canApprove) and posts no comments', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'Clean.', findings: [], unanchored: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'APPROVE');
+    assert.equal(arg.comments, undefined);
+    assert.match(arg.body, /✅ Approved/);
+  });
+
+  test('review without an unanchored field behaves as before (back-compat)', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 'Clean.', findings: [] }; // no `unanchored` key
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
+    assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
+  });
+});

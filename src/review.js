@@ -46,15 +46,59 @@ function parseFindingValue(finding, index) {
   }, `Review collector finding ${index + 1}`).findings[0];
 }
 
-// [LAW:single-enforcer] validateFindings is the one place that checks every finding
-// against the visible diff anchors; nothing else re-implements this check.
-function validateFindings(findings, anchors) {
-  for (const finding of findings) {
-    const anchor = `${finding.path}:${finding.line}`;
-    if (!anchors.has(anchor)) {
-      throw new Error(`Claude Code finding references a line outside the review diff: ${anchor}`);
-    }
+// A finding cited a line within this many lines of a real anchorable line is snapped to
+// that line rather than dropped: the model named a line just outside the diff hunk, but the
+// comment body is specific enough that a small offset still lands on the right change and the
+// reader can place it. Beyond this window the line reference is too far off to trust, so the
+// finding is surfaced in the summary instead. [LAW:no-mode-explosion] one documented constant.
+const MAX_ANCHOR_SNAP_DISTANCE = 10;
+
+// [LAW:effects-at-boundaries] Pure: given a cited line and the anchorable lines for its file,
+// return the nearest line within the snap window, or null when none is close enough.
+function nearestAnchorableLine(line, fileLines) {
+  if (!fileLines || fileLines.length === 0) return null;
+  let best = fileLines[0];
+  for (const candidate of fileLines) {
+    if (Math.abs(candidate - line) < Math.abs(best - line)) best = candidate;
   }
+  return Math.abs(best - line) <= MAX_ANCHOR_SNAP_DISTANCE ? best : null;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, validateFindings };
+// [LAW:single-enforcer] partitionFindings is the one place that reconciles model findings
+// with the visible diff anchors; nothing else re-implements this check.
+// [LAW:dataflow-not-control-flow] The reconciliation is a value, not a throw: a finding the
+// model anchored outside the diff is not a fatal error that aborts the whole review (which
+// would discard every valid finding and red the run). Each finding flows to exactly one of:
+//   - anchored: already on the grid, or snapped to the nearest reviewed line (body annotated
+//     so the adjustment is explicit — [LAW:no-silent-failure]).
+//   - unanchored: too far from any reviewed line; the caller surfaces it in the summary and
+//     logs it, never silently dropping it.
+function partitionFindings(findings, anchors) {
+  const linesByPath = new Map();
+  for (const { path, line } of anchors.values()) {
+    if (!linesByPath.has(path)) linesByPath.set(path, []);
+    linesByPath.get(path).push(line);
+  }
+
+  const anchored = [];
+  const unanchored = [];
+  for (const finding of findings) {
+    if (anchors.has(`${finding.path}:${finding.line}`)) {
+      anchored.push({ ...finding });
+      continue;
+    }
+    const snapped = nearestAnchorableLine(finding.line, linesByPath.get(finding.path));
+    if (snapped === null) {
+      unanchored.push(finding);
+      continue;
+    }
+    anchored.push({
+      ...finding,
+      line: snapped,
+      body: `${finding.body}\n\n_(Anchored to line ${snapped}; the review referenced line ${finding.line}, just outside the diff.)_`,
+    });
+  }
+  return { anchored, unanchored };
+}
+
+module.exports = { parseReviewValue, parseFindingValue, partitionFindings, nearestAnchorableLine };

@@ -7,7 +7,7 @@ const path = require('path');
 const { filterFiles, buildReviewAnchors } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = require('./transport');
 const { buildReviewInput } = require('./prompt');
-const { validateFindings } = require('./review');
+const { partitionFindings } = require('./review');
 const { createReviewCollector, readCollectedReview } = require('./collector');
 const { produceReview, buildAttributionFooter } = require('./failover');
 const { runEngine } = require('./engine/run');
@@ -36,8 +36,15 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
     try {
       await runEngine(adapter, config, prompt, home, collector);
       const review = readCollectedReview(collector.recordsPath);
-      validateFindings(review.findings, anchors);
-      return review;
+      // [LAW:dataflow-not-control-flow] Reconcile findings with the diff anchors as a value:
+      // anchored (incl. snapped) post inline; unanchored are surfaced in the summary. A
+      // mis-anchored finding never aborts the review. [LAW:no-silent-failure] each unanchored
+      // finding is logged here at the boundary so it is visible in the run, never dropped silently.
+      const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+      for (const f of unanchored) {
+        core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
+      }
+      return { summary: review.summary, findings: anchored, unanchored };
     } finally {
       fs.rmSync(home, { recursive: true });
     }
