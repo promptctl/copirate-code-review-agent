@@ -8,6 +8,8 @@ A GitHub Action that runs an AI coding agent as a PR reviewer. By default it run
 
 In simple mode (no `CONFIG_FILE`), `src/provider.js` is the single seam that turns the `PROVIDER` value plus its provider-specific inputs (`OPENAI_*` / `ZAI_*`) into a typed `ReviewConfig`. A committed `.github/review-agents.yml` config file is the advanced path: when it exists it owns engine selection (incl. per-PR selection and failover chains) and the simple-mode inputs are ignored.
 
+**Fork PRs are never reviewed.** `run` fetches the PR once up front and gates on `prIsFromFork` (`src/transport.js`: head repo id ≠ base repo id, or a deleted/absent head repo) — a fork PR is skipped cleanly (logged, exit 0, no engine spawned) before any credential is read. This is unconditional with no opt-in input, so an outside contributor's PR can never spend the host's AI credits.
+
 ## Build and release
 
 ```bash

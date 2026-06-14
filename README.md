@@ -120,7 +120,7 @@ The engine is selected by `PROVIDER` alone. Each provider needs its own credenti
 | `PR_NUMBER` | No | from `pull_request` event | Pull request number to review. Auto-detected on `pull_request` events; pass explicitly on other events (e.g. `workflow_run`) |
 | `HEAD_SHA` | No | from `pull_request` event | Head commit SHA the review is anchored to. Auto-detected on `pull_request` events; pass explicitly on other events |
 
-The action fetches the changed files and posts the review through the GitHub API, keyed by `PR_NUMBER` — it does **not** require the pull request's code to be checked out (the checkout only gives the review agent surrounding context). That property is what makes the [fork-safe pattern](#reviewing-fork-pull-requests-safely) below possible.
+The action fetches the changed files and posts the review through the GitHub API, keyed by `PR_NUMBER` — it does **not** require the pull request's code to be checked out (the checkout only gives the review agent surrounding context). Pull requests from forks are [never reviewed](#fork-pull-requests-are-not-reviewed).
 
 The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project.
 
@@ -195,80 +195,11 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
           GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
 ```
 
-## Reviewing fork pull requests safely
+## Fork pull requests are not reviewed
 
-The quickstart workflow triggers on `pull_request` and works for branches pushed to your own repository. It does **not** review pull requests opened from forks: GitHub withholds repository secrets (including `OPENAI_API_KEY`) from `pull_request` runs triggered by a fork, so the review step has no key.
+The action **never reviews pull requests opened from a fork** — i.e. any PR whose head repository differs from the base repository. Such a run is skipped cleanly (logged, exit 0, no review posted, no AI engine spawned), so untrusted outside contributions never spend the host repository's AI credits and the secret never meets fork-controlled diff content. This is unconditional: there is no input to enable fork review. Fork contributors review their own changes (or run their own reviewer with their own credentials).
 
-The wrong way to fix this is `pull_request_target` with a checkout of the fork's head — that runs untrusted code in a job that holds your secret, the classic Actions exfiltration footgun. Do not do that.
-
-The safe pattern is a two-workflow split. An untrusted job (no secret) records *which* PR to review; a trusted job (with the secret) does the review without ever checking out fork code. The action never needs the PR's code on disk — it reads the diff and posts the review through the API, keyed by `PR_NUMBER` — so the secret only ever meets inert data.
-
-**1. Collector — `.github/workflows/code-review-collect.yml`** (runs untrusted, holds no secret):
-
-```yaml
-name: Collect PR coordinates
-
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-jobs:
-  collect:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Record PR coordinates
-        run: |
-          mkdir -p pr
-          echo "${{ github.event.pull_request.number }}" > pr/number
-          echo "${{ github.event.pull_request.head.sha }}" > pr/head_sha
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pr-coordinates
-          path: pr/
-```
-
-**2. Reviewer — `.github/workflows/code-review.yml`** (runs trusted from the default branch, holds the secret, never checks out fork code):
-
-```yaml
-name: AI Code Review with Z.ai
-
-on:
-  workflow_run:
-    workflows: ["Collect PR coordinates"]
-    types: [completed]
-
-permissions:
-  contents: read
-  actions: read          # read the collector run's artifact
-  pull-requests: write   # post the review
-
-jobs:
-  review:
-    if: github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download PR coordinates
-        uses: actions/download-artifact@v4
-        with:
-          name: pr-coordinates
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Read coordinates
-        id: pr
-        run: |
-          echo "number=$(cat number)" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(cat head_sha)" >> "$GITHUB_OUTPUT"
-
-      - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@v1
-        with:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-```
-
-The reviewer runs in the trusted base context (`workflow_run` always uses the workflow file and secrets of the default branch), so it has the key — but because it checks out nothing and receives only the PR number and head SHA as plain text, fork code never lands on the secret-bearing runner. Both workflow files must be on the default branch for `workflow_run` to fire. The review appears as its own "AI Code Review with Z.ai" run rather than inline in the PR's checks list — the standard `workflow_run` trade-off.
+For your own branches (head and base in the same repository), reviews run normally.
 
 ## Contributing
 
