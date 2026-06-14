@@ -30543,6 +30543,32 @@ function assertSucceeded(stdout) {
   }
 }
 
+// [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
+// or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
+// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report.
+// total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled price table), not a
+// billed charge — so the renderer marks every cost line "est.". The input count sums all input-side
+// fields (fresh + cache read + cache write) so it reflects the total prompt tokens the run processed.
+// Against the z.ai endpoint the estimate is priced against the wrong provider (Anthropic prices, z.ai
+// billing), so the renderer adds a stronger caveat there. [FRAMING:representation]
+function extractUsage(stdout) {
+  const env = parseJsonEnvelope(stdout);
+  if (!env || !env.usage) return null;
+  const u = env.usage;
+  const inputTokens =
+    (u.input_tokens ?? 0) +
+    (u.cache_read_input_tokens ?? 0) +
+    (u.cache_creation_input_tokens ?? 0);
+  const outputTokens = u.output_tokens ?? 0;
+  // [LAW:types-are-the-program] cost is a discriminated value. Claude Code self-reports USD, so a
+  // missing total_cost_usd means the engine did not report a cost ('not-reported') — distinct from
+  // codex's 'no-price', and unrelated to the price table. The adapter declares its own reason.
+  const cost = typeof env.total_cost_usd === 'number'
+    ? { available: true, usd: env.total_cost_usd }
+    : { available: false, reason: 'not-reported' };
+  return { inputTokens, outputTokens, cost };
+}
+
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
 // once, here at the engine boundary. 529/overloaded has no hint header;
 // 429/rate-limited attaches it when the CLI echoes it. [LAW:one-source-of-truth]
@@ -30575,12 +30601,14 @@ const claudeCodeAdapter = {
   buildCommand,
   assertSucceeded,
   classifyError,
+  extractUsage,
 };
 
 module.exports = {
   ZAI_ANTHROPIC_BASE_URL,
   classifyClaudeError,
   claudeCodeAdapter,
+  extractUsage,
 };
 
 
@@ -30595,6 +30623,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { TransientError } = __nccwpck_require__(2887);
+const { computeOpenAiCostUsd } = __nccwpck_require__(9614);
 
 const CODEX_PACKAGE = '@openai/codex@latest';
 const CODEX_TIMEOUT_MS = 3_000_000;
@@ -30748,6 +30777,34 @@ function assertSucceeded(stdout) {
   }
 }
 
+// [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
+// a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
+// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); a model absent from the
+// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
+// The cumulative turn usage rides on the final turn.completed event; later events overwrite
+// earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
+// no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
+function extractUsage(stdout, config) {
+  let usage = null;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (event.type === 'turn.completed' && event.usage) usage = event.usage;
+  }
+  if (!usage || (usage.input_tokens == null && usage.output_tokens == null)) return null;
+  const inputTokens = usage.input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
+  const cachedInputTokens = usage.cached_input_tokens ?? 0;
+  const costUsd = computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
+  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
+  // here means exactly one thing — the model is absent from the price table — and the adapter
+  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
+  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  return { inputTokens, outputTokens, cost };
+}
+
 // [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.
 // 429 + rate_limit are rate-limiting; insufficient_quota is a billing limit (also transient
 // in the sense that exhaustion clears with time or a new quota window). [LAW:one-source-of-truth]
@@ -30774,9 +30831,10 @@ const codexAdapter = {
   buildCommand,
   assertSucceeded,
   classifyError,
+  extractUsage,
 };
 
-module.exports = { codexAdapter, buildConfigToml, OPENAI_RESPONSES_BASE_URL };
+module.exports = { codexAdapter, buildConfigToml, extractUsage, OPENAI_RESPONSES_BASE_URL };
 
 
 /***/ }),
@@ -30846,6 +30904,7 @@ function formatOutputTail(label, value) {
 
 // [LAW:decomposition] Generic spawn runner: owns timeout, size-cap, and process lifecycle.
 // All engine-specific logic (args, env, success check, error classification) lives in the adapter.
+// Resolves with the child's captured stdout so the caller can extract usage/cost from it.
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
 function runEngine(adapter, config, prompt, home, collector) {
@@ -30906,7 +30965,10 @@ function runEngine(adapter, config, prompt, home, collector) {
         }
         try {
           adapter.assertSucceeded(stdout);
-          resolve();
+          // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
+          // the caller derives usage/cost from it via the adapter's extractUsage. Findings
+          // still flow out-of-band through the MCP collector — stdout carries only usage.
+          resolve(stdout);
         } catch (err) {
           reject(adapter.classifyError(err, stdout));
         }
@@ -31421,6 +31483,7 @@ const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
+const { renderCostLine, costWarning } = __nccwpck_require__(9614);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -31445,7 +31508,10 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
   try {
     const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
     try {
-      await runEngine(adapter, config, prompt, home, collector);
+      const output = await runEngine(adapter, config, prompt, home, collector);
+      // [LAW:dataflow-not-control-flow] Usage is a value extracted from the engine's own output
+      // and carried to the footer sink alongside the findings — never recomputed at the boundary.
+      const usage = adapter.extractUsage(output, config);
       const review = readCollectedReview(collector.recordsPath);
       // [LAW:dataflow-not-control-flow] Reconcile findings with the diff anchors as a value:
       // anchored (incl. snapped) post inline; unanchored are surfaced in the summary. A
@@ -31455,7 +31521,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
       for (const f of unanchored) {
         core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
       }
-      return { summary: review.summary, findings: anchored, unanchored };
+      return { summary: review.summary, findings: anchored, unanchored, usage };
     } finally {
       fs.rmSync(home, { recursive: true });
     }
@@ -31625,7 +31691,17 @@ async function run() {
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
-  const footer = buildAttributionFooter(configUsed);
+
+  // [LAW:effects-at-boundaries] renderCostLine and costWarning are pure; this boundary is the only
+  // place the "loud, not silent" signal is emitted. [LAW:no-silent-failure] costWarning names the
+  // actual cause (carried in usage.cost.reason), so the orchestrator never re-derives why cost is
+  // absent. Either way the review still submits — cost reporting never blocks a review.
+  const { usage } = review;
+  const warning = costWarning(usage, configUsed);
+  if (warning) core.warning(warning);
+  const costLine = renderCostLine(usage, configUsed);
+  if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
+  const footer = [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
   await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
 }
 
@@ -31847,6 +31923,117 @@ module.exports = {
   submitReview,
   resolveReviewTarget,
   prIsFromFork,
+};
+
+
+/***/ }),
+
+/***/ 9614:
+/***/ ((module) => {
+
+"use strict";
+
+
+// Per-run token/cost reporting.
+//
+// [LAW:decomposition] Two cohesive concerns live here: the OpenAI price table (a
+// representation that drifts from OpenAI's real prices and must be hand-maintained) and the
+// pure renderer that formats an already-extracted Usage value into the review footer line.
+// Extraction is engine-specific and lives in each adapter (engine/codex.js, engine/claude-code.js);
+// this module only computes the Codex cost (from tokens x price) and formats the footer.
+// [LAW:single-enforcer] Codex cost is computed in exactly one place: computeOpenAiCostUsd.
+
+// [LAW:one-source-of-truth] The OpenAI price table. Dollars per ONE MILLION tokens, matching
+// OpenAI's published per-1M figures so the numbers can be eyeballed against the pricing page.
+// PRICE-SENSITIVE: these drift whenever OpenAI changes prices and have no machine source —
+// they MUST be updated by hand. Last verified 2026-06-14 against https://openai.com/api/pricing/
+// cachedInput is the discounted prompt-cache rate: across the GPT-5 family that is a 90% discount
+// (cached = 10% of input), so each cachedInput is one-tenth of its input — keep that ratio when
+// adding or updating a model unless OpenAI publishes a different cache discount for it.
+const OPENAI_PRICES_PER_MILLION = {
+  'gpt-5.5': { input: 5.00, cachedInput: 0.50, output: 30.00 },
+  'gpt-5.4': { input: 2.50, cachedInput: 0.25, output: 15.00 },
+  'gpt-5.4-mini': { input: 0.75, cachedInput: 0.075, output: 4.50 },
+};
+
+// [LAW:effects-at-boundaries] Pure: tokens + model -> USD, no IO. Returns null (cost unknown)
+// when the model has no price-table entry — never a fabricated zero, so a missing price surfaces
+// as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
+// input_tokens from the OpenAI/Codex usage event is the FULL prompt count (cached included);
+// the cached subset is billed at the discounted cachedInput rate, the remainder at input rate.
+// output_tokens already includes reasoning tokens, so they are priced once at the output rate.
+function computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, model) {
+  const price = OPENAI_PRICES_PER_MILLION[model];
+  if (!price) return null;
+  const nonCachedInput = Math.max(0, inputTokens - cachedInputTokens);
+  const total =
+    nonCachedInput * price.input +
+    cachedInputTokens * price.cachedInput +
+    outputTokens * price.output;
+  return total / 1_000_000;
+}
+
+// Z.ai exposes an Anthropic-compatible endpoint, so Claude Code reports total_cost_usd using
+// Anthropic's pricing — which is NOT what z.ai actually bills. Detect that endpoint so the
+// rendered cost can be marked as an estimate. [FRAMING:representation] the cost is honest about
+// being an Anthropic-priced estimate rather than silently claiming to be z.ai's real charge.
+function isZaiEndpoint(config) {
+  return Boolean(config.endpoint && config.endpoint.baseUrl && config.endpoint.baseUrl.includes('z.ai'));
+}
+
+function formatTokenCount(n) {
+  return n.toLocaleString('en-US');
+}
+
+function reviewerTag(config) {
+  return `${config.engine}/${config.model || '(default model)'}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
+// there is no usage to report. The "loud" warning for missing usage/price is an effect and
+// belongs at the run boundary (src/run.js); costWarning below produces its text, also purely.
+// [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
+// distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
+// tokens with cost "unknown".
+function renderCostLine(usage, config) {
+  if (!usage) return '';
+  const tag = reviewerTag(config);
+  const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
+  if (!usage.cost.available) {
+    return `_Cost: unknown · ${tokens} · ${tag}_`;
+  }
+  // [FRAMING:representation] Every cost this action renders is an ESTIMATE, never a billed charge:
+  // codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own client-side
+  // estimate. So every line is marked "est." rather than implying exactness. The z.ai case carries
+  // the stronger caveat because there the estimate is priced against the wrong provider (Anthropic
+  // prices, z.ai billing) — a genuine fidelity difference, derived from config, not an extra value.
+  const estimate = isZaiEndpoint(config) ? 'est. (Anthropic pricing, not z.ai billing)' : 'est.';
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · ${estimate}_`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
+// is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
+// reason VALUE the adapter carried — never re-derived by branching on engine at the boundary. This
+// is why the reason lives in usage.cost: run.js stays ignorant of which engines are table-priced.
+function costWarning(usage, config) {
+  if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
+  if (usage.cost.available) return null;
+  const tag = reviewerTag(config);
+  if (usage.cost.reason === 'no-price') {
+    return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
+      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.';
+  }
+  return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
+    + 'the review footer shows cost as "unknown".';
+}
+
+module.exports = {
+  OPENAI_PRICES_PER_MILLION,
+  computeOpenAiCostUsd,
+  renderCostLine,
+  costWarning,
+  formatTokenCount,
+  isZaiEndpoint,
 };
 
 

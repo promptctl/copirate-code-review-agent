@@ -10,6 +10,7 @@ const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { createReviewCollector, readCollectedReview } = require('./collector');
 const { produceReview, buildAttributionFooter } = require('./failover');
+const { renderCostLine, costWarning } = require('./usage');
 const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
@@ -34,7 +35,10 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
   try {
     const home = adapter.materializeHome({ config, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, collector });
     try {
-      await runEngine(adapter, config, prompt, home, collector);
+      const output = await runEngine(adapter, config, prompt, home, collector);
+      // [LAW:dataflow-not-control-flow] Usage is a value extracted from the engine's own output
+      // and carried to the footer sink alongside the findings — never recomputed at the boundary.
+      const usage = adapter.extractUsage(output, config);
       const review = readCollectedReview(collector.recordsPath);
       // [LAW:dataflow-not-control-flow] Reconcile findings with the diff anchors as a value:
       // anchored (incl. snapped) post inline; unanchored are surfaced in the summary. A
@@ -44,7 +48,7 @@ async function produceReviewOnce(config, buildPromptFor, anchors) {
       for (const f of unanchored) {
         core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
       }
-      return { summary: review.summary, findings: anchored, unanchored };
+      return { summary: review.summary, findings: anchored, unanchored, usage };
     } finally {
       fs.rmSync(home, { recursive: true });
     }
@@ -214,7 +218,17 @@ async function run() {
   // [LAW:one-source-of-truth] Claude Code owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
-  const footer = buildAttributionFooter(configUsed);
+
+  // [LAW:effects-at-boundaries] renderCostLine and costWarning are pure; this boundary is the only
+  // place the "loud, not silent" signal is emitted. [LAW:no-silent-failure] costWarning names the
+  // actual cause (carried in usage.cost.reason), so the orchestrator never re-derives why cost is
+  // absent. Either way the review still submits — cost reporting never blocks a review.
+  const { usage } = review;
+  const warning = costWarning(usage, configUsed);
+  if (warning) core.warning(warning);
+  const costLine = renderCostLine(usage, configUsed);
+  if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
+  const footer = [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
   await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
 }
 
