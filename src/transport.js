@@ -100,10 +100,23 @@ function resolveReviewTarget(numberInput, headShaInput, payload) {
   };
 }
 
+// [LAW:effects-at-boundaries] Pure: a PR is from a fork when its head repository is not
+// the base repository, compared by stable numeric repo id (rename-safe). A head repo of
+// null — the source fork was deleted — is treated as a fork: there is no trusted same-repo
+// source to review, so the only correct answer is "fork". [LAW:no-defensive-null-guards]
+// the null branch is a real domain state with a meaningful outcome, not a guard that skips work.
+function prIsFromFork(pr) {
+  const headRepo = pr.head?.repo;
+  const baseRepo = pr.base?.repo;
+  if (!headRepo || !baseRepo) return true;
+  return headRepo.id !== baseRepo.id;
+}
+
 module.exports = {
   gitHubTransport,
   giteaTransport,
   selectTransport,
   submitReview,
   resolveReviewTarget,
+  prIsFromFork,
 };

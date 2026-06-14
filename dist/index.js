@@ -31088,7 +31088,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
-const { gitHubTransport, giteaTransport, resolveReviewTarget } = __nccwpck_require__(7228);
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
 
@@ -31100,6 +31100,7 @@ module.exports = {
   gitHubTransport,
   giteaTransport,
   resolveReviewTarget,
+  prIsFromFork,
   TransientError,
   classifyClaudeError,
   parseRetryAfterMs,
@@ -31371,7 +31372,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { validateFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
@@ -31450,25 +31451,38 @@ async function run() {
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
 
+  // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR
+  // object also feeds config-file label/body selection below, so it is fetched once here.
+  let pr;
+  try {
+    ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
+  } catch (e) {
+    core.setFailed(`Failed to fetch PR #${pullNumber}: ${e.message}`);
+    return;
+  }
+
+  // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode:
+  // the action never reviews a fork PR (its diff is untrusted and would spend the host's
+  // own AI credits on outside contributors). Skipping is an intentional clean no-op — logged,
+  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced.
+  if (prIsFromFork(pr)) {
+    core.info(
+      `Skipping review: PR #${pullNumber} is from a fork. Fork pull requests are not reviewed `
+      + 'by this action.',
+    );
+    return;
+  }
+
   // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
-  // a validated multi-config chain; ZAI_* inputs synthesize a single-entry compat chain.
+  // a validated multi-config chain; the PROVIDER inputs synthesize a single-entry chain.
   let chain;
   if (hasConfigFile) {
-    // [LAW:one-source-of-truth] One pulls.get call for both label and body provenance.
-    // peekConfigNames is a fast read so config names are available before the API call.
+    // peekConfigNames is a fast read so config names are available for selection.
     let configNames, defaultName;
     try {
       ({ configNames, defaultName } = peekConfigNames(configFilePath));
     } catch (e) {
       core.setFailed(e.message);
-      return;
-    }
-
-    let pr;
-    try {
-      ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
-    } catch (e) {
-      core.setFailed(`Failed to fetch PR #${pullNumber}: ${e.message}`);
       return;
     }
 
@@ -31734,12 +31748,25 @@ function resolveReviewTarget(numberInput, headShaInput, payload) {
   };
 }
 
+// [LAW:effects-at-boundaries] Pure: a PR is from a fork when its head repository is not
+// the base repository, compared by stable numeric repo id (rename-safe). A head repo of
+// null — the source fork was deleted — is treated as a fork: there is no trusted same-repo
+// source to review, so the only correct answer is "fork". [LAW:no-defensive-null-guards]
+// the null branch is a real domain state with a meaningful outcome, not a guard that skips work.
+function prIsFromFork(pr) {
+  const headRepo = pr.head?.repo;
+  const baseRepo = pr.base?.repo;
+  if (!headRepo || !baseRepo) return true;
+  return headRepo.id !== baseRepo.id;
+}
+
 module.exports = {
   gitHubTransport,
   giteaTransport,
   selectTransport,
   submitReview,
   resolveReviewTarget,
+  prIsFromFork,
 };
 
 

@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork } = require('../src/index.js');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
@@ -35,6 +35,33 @@ describe('giteaTransport.toComment', () => {
     const comment = transport.toComment({ path: 'f.js', line: 5, body: 'x' });
     assert.equal('line' in comment, false);
     assert.equal(comment.new_position, 5);
+  });
+});
+
+describe('prIsFromFork', () => {
+  test('same-repo branch PR (head id == base id) is not a fork', () => {
+    const pr = { head: { repo: { id: 100 } }, base: { repo: { id: 100 } } };
+    assert.equal(prIsFromFork(pr), false);
+  });
+
+  test('cross-repo PR (head id != base id) is a fork', () => {
+    const pr = { head: { repo: { id: 200 } }, base: { repo: { id: 100 } } };
+    assert.equal(prIsFromFork(pr), true);
+  });
+
+  test('deleted fork head (head.repo null) is treated as a fork', () => {
+    const pr = { head: { repo: null }, base: { repo: { id: 100 } } };
+    assert.equal(prIsFromFork(pr), true);
+  });
+
+  test('missing head object entirely is treated as a fork', () => {
+    const pr = { base: { repo: { id: 100 } } };
+    assert.equal(prIsFromFork(pr), true);
+  });
+
+  test('missing base repo is treated as a fork (no trusted base to compare)', () => {
+    const pr = { head: { repo: { id: 100 } }, base: {} };
+    assert.equal(prIsFromFork(pr), true);
   });
 });
 

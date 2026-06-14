@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { validateFindings } = require('./review');
 const { createReviewCollector, readCollectedReview } = require('./collector');
@@ -84,25 +84,38 @@ async function run() {
   const octokit = github.getOctokit(token);
   const reviewOctokit = github.getOctokit(reviewToken || token);
 
+  // [LAW:single-enforcer] One PR fetch, one place that decides fork eligibility. The PR
+  // object also feeds config-file label/body selection below, so it is fetched once here.
+  let pr;
+  try {
+    ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
+  } catch (e) {
+    core.setFailed(`Failed to fetch PR #${pullNumber}: ${e.message}`);
+    return;
+  }
+
+  // [LAW:dataflow-not-control-flow] Fork eligibility is read from the PR data, not a mode:
+  // the action never reviews a fork PR (its diff is untrusted and would spend the host's
+  // own AI credits on outside contributors). Skipping is an intentional clean no-op — logged,
+  // exit 0, no review posted, no engine spawned. [LAW:no-silent-failure] the skip is announced.
+  if (prIsFromFork(pr)) {
+    core.info(
+      `Skipping review: PR #${pullNumber} is from a fork. Fork pull requests are not reviewed `
+      + 'by this action.',
+    );
+    return;
+  }
+
   // [LAW:types-are-the-program] Build a typed ReviewConfig chain. Config file produces
-  // a validated multi-config chain; ZAI_* inputs synthesize a single-entry compat chain.
+  // a validated multi-config chain; the PROVIDER inputs synthesize a single-entry chain.
   let chain;
   if (hasConfigFile) {
-    // [LAW:one-source-of-truth] One pulls.get call for both label and body provenance.
-    // peekConfigNames is a fast read so config names are available before the API call.
+    // peekConfigNames is a fast read so config names are available for selection.
     let configNames, defaultName;
     try {
       ({ configNames, defaultName } = peekConfigNames(configFilePath));
     } catch (e) {
       core.setFailed(e.message);
-      return;
-    }
-
-    let pr;
-    try {
-      ({ data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber }));
-    } catch (e) {
-      core.setFailed(`Failed to fetch PR #${pullNumber}: ${e.message}`);
       return;
     }
 
