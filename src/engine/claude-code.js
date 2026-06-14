@@ -107,7 +107,7 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
 // or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
-// needed); it is null only if the envelope omits it, in which case tokens still report. The input
+// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report. The input
 // count sums all input-side fields (fresh + cache read + cache write) so it reflects the total
 // prompt tokens the run actually processed. Against the z.ai endpoint this cost is Anthropic-priced
 // and may not equal z.ai's billing — the renderer marks that caveat. [FRAMING:representation]
@@ -120,8 +120,13 @@ function extractUsage(stdout) {
     (u.cache_read_input_tokens ?? 0) +
     (u.cache_creation_input_tokens ?? 0);
   const outputTokens = u.output_tokens ?? 0;
-  const costUsd = typeof env.total_cost_usd === 'number' ? env.total_cost_usd : null;
-  return { inputTokens, outputTokens, costUsd };
+  // [LAW:types-are-the-program] cost is a discriminated value. Claude Code self-reports USD, so a
+  // missing total_cost_usd means the engine did not report a cost ('not-reported') — distinct from
+  // codex's 'no-price', and unrelated to the price table. The adapter declares its own reason.
+  const cost = typeof env.total_cost_usd === 'number'
+    ? { available: true, usd: env.total_cost_usd }
+    : { available: false, reason: 'not-reported' };
+  return { inputTokens, outputTokens, cost };
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly

@@ -30545,7 +30545,7 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
 // or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
-// needed); it is null only if the envelope omits it, in which case tokens still report. The input
+// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report. The input
 // count sums all input-side fields (fresh + cache read + cache write) so it reflects the total
 // prompt tokens the run actually processed. Against the z.ai endpoint this cost is Anthropic-priced
 // and may not equal z.ai's billing — the renderer marks that caveat. [FRAMING:representation]
@@ -30558,8 +30558,13 @@ function extractUsage(stdout) {
     (u.cache_read_input_tokens ?? 0) +
     (u.cache_creation_input_tokens ?? 0);
   const outputTokens = u.output_tokens ?? 0;
-  const costUsd = typeof env.total_cost_usd === 'number' ? env.total_cost_usd : null;
-  return { inputTokens, outputTokens, costUsd };
+  // [LAW:types-are-the-program] cost is a discriminated value. Claude Code self-reports USD, so a
+  // missing total_cost_usd means the engine did not report a cost ('not-reported') — distinct from
+  // codex's 'no-price', and unrelated to the price table. The adapter declares its own reason.
+  const cost = typeof env.total_cost_usd === 'number'
+    ? { available: true, usd: env.total_cost_usd }
+    : { available: false, reason: 'not-reported' };
+  return { inputTokens, outputTokens, cost };
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
@@ -30772,8 +30777,8 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
-// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); costUsd is null when the
-// model has no price-table entry, never a fabricated zero. [LAW:no-silent-failure]
+// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); a model absent from the
+// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
@@ -30791,7 +30796,11 @@ function extractUsage(stdout, config) {
   const outputTokens = usage.output_tokens ?? 0;
   const cachedInputTokens = usage.cached_input_tokens ?? 0;
   const costUsd = computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
-  return { inputTokens, outputTokens, costUsd };
+  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
+  // here means exactly one thing — the model is absent from the price table — and the adapter
+  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
+  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  return { inputTokens, outputTokens, cost };
 }
 
 // [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.
@@ -31472,7 +31481,7 @@ const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
-const { renderCostLine } = __nccwpck_require__(9614);
+const { renderCostLine, costWarning } = __nccwpck_require__(9614);
 const { runEngine } = __nccwpck_require__(8861);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -31681,18 +31690,13 @@ async function run() {
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
 
-  // [LAW:effects-at-boundaries] The renderer is pure; the "loud, not silent" signal for missing
-  // usage or a missing price lives here at the boundary, where effects belong. [LAW:no-silent-failure]
-  // Either way the review still submits — cost reporting never blocks a review.
+  // [LAW:effects-at-boundaries] renderCostLine and costWarning are pure; this boundary is the only
+  // place the "loud, not silent" signal is emitted. [LAW:no-silent-failure] costWarning names the
+  // actual cause (carried in usage.cost.reason), so the orchestrator never re-derives why cost is
+  // absent. Either way the review still submits — cost reporting never blocks a review.
   const { usage } = review;
-  if (!usage) {
-    core.warning('Engine reported no token usage; the review footer omits the cost line.');
-  } else if (usage.costUsd == null) {
-    core.warning(
-      `No price-table entry for ${configUsed.engine}/${configUsed.model}; the review footer shows cost as "unknown". `
-      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.',
-    );
-  }
+  const warning = costWarning(usage, configUsed);
+  if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
   const footer = [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
@@ -31979,26 +31983,48 @@ function formatTokenCount(n) {
   return n.toLocaleString('en-US');
 }
 
+function reviewerTag(config) {
+  return `${config.engine}/${config.model || '(default model)'}`;
+}
+
 // [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
 // there is no usage to report. The "loud" warning for missing usage/price is an effect and
-// belongs at the run boundary (src/run.js), not in this renderer. [LAW:dataflow-not-control-flow]
-// usage === null and usage.costUsd === null are distinct values with distinct renderings, not
-// branches that skip work: no usage -> no line; usage without a price -> tokens with cost "unknown".
+// belongs at the run boundary (src/run.js); costWarning below produces its text, also purely.
+// [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
+// distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
+// tokens with cost "unknown".
 function renderCostLine(usage, config) {
   if (!usage) return '';
-  const tag = `${config.engine}/${config.model || '(default model)'}`;
+  const tag = reviewerTag(config);
   const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
-  if (usage.costUsd == null) {
+  if (!usage.cost.available) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
   const caveat = isZaiEndpoint(config) ? ' · est. (Anthropic pricing, not z.ai billing)' : '';
-  return `_Cost: $${usage.costUsd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
+// is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
+// reason VALUE the adapter carried — never re-derived by branching on engine at the boundary. This
+// is why the reason lives in usage.cost: run.js stays ignorant of which engines are table-priced.
+function costWarning(usage, config) {
+  if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
+  if (usage.cost.available) return null;
+  const tag = reviewerTag(config);
+  if (usage.cost.reason === 'no-price') {
+    return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
+      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.';
+  }
+  return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
+    + 'the review footer shows cost as "unknown".';
 }
 
 module.exports = {
   OPENAI_PRICES_PER_MILLION,
   computeOpenAiCostUsd,
   renderCostLine,
+  costWarning,
   formatTokenCount,
   isZaiEndpoint,
 };

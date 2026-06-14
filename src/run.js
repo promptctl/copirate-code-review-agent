@@ -10,7 +10,7 @@ const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { createReviewCollector, readCollectedReview } = require('./collector');
 const { produceReview, buildAttributionFooter } = require('./failover');
-const { renderCostLine } = require('./usage');
+const { renderCostLine, costWarning } = require('./usage');
 const { runEngine } = require('./engine/run');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
@@ -219,18 +219,13 @@ async function run() {
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
 
-  // [LAW:effects-at-boundaries] The renderer is pure; the "loud, not silent" signal for missing
-  // usage or a missing price lives here at the boundary, where effects belong. [LAW:no-silent-failure]
-  // Either way the review still submits — cost reporting never blocks a review.
+  // [LAW:effects-at-boundaries] renderCostLine and costWarning are pure; this boundary is the only
+  // place the "loud, not silent" signal is emitted. [LAW:no-silent-failure] costWarning names the
+  // actual cause (carried in usage.cost.reason), so the orchestrator never re-derives why cost is
+  // absent. Either way the review still submits — cost reporting never blocks a review.
   const { usage } = review;
-  if (!usage) {
-    core.warning('Engine reported no token usage; the review footer omits the cost line.');
-  } else if (usage.costUsd == null) {
-    core.warning(
-      `No price-table entry for ${configUsed.engine}/${configUsed.model}; the review footer shows cost as "unknown". `
-      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.',
-    );
-  }
+  const warning = costWarning(usage, configUsed);
+  if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
   const footer = [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');

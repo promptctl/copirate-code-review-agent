@@ -7,6 +7,7 @@ const { claudeCodeAdapter } = require('../src/engine/claude-code');
 const {
   computeOpenAiCostUsd,
   renderCostLine,
+  costWarning,
   formatTokenCount,
   OPENAI_PRICES_PER_MILLION,
 } = require('../src/usage');
@@ -65,8 +66,9 @@ describe('codexAdapter.extractUsage', () => {
     const usage = codexAdapter.extractUsage(stdout, CODEX_CONFIG);
     assert.equal(usage.inputTokens, 5000);
     assert.equal(usage.outputTokens, 500);
+    assert.equal(usage.cost.available, true);
     // (4000*0.75 + 1000*0.075 + 500*4.50)/1e6 = (3000 + 75 + 2250)/1e6 = 0.005325
-    assert.ok(Math.abs(usage.costUsd - 0.005325) < 1e-9, `got ${usage.costUsd}`);
+    assert.ok(Math.abs(usage.cost.usd - 0.005325) < 1e-9, `got ${usage.cost.usd}`);
   });
 
   test('the last turn.completed wins when several are emitted', () => {
@@ -79,11 +81,11 @@ describe('codexAdapter.extractUsage', () => {
     assert.equal(usage.outputTokens, 300);
   });
 
-  test('costUsd is null (tokens still reported) when the model has no price', () => {
+  test('cost is unavailable with reason no-price (tokens still reported) when the model has no price', () => {
     const stdout = '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}';
     const usage = codexAdapter.extractUsage(stdout, { ...CODEX_CONFIG, model: 'gpt-future' });
     assert.equal(usage.inputTokens, 100);
-    assert.equal(usage.costUsd, null);
+    assert.deepEqual(usage.cost, { available: false, reason: 'no-price' });
   });
 
   test('returns null when no turn.completed carries usage', () => {
@@ -117,14 +119,14 @@ describe('claudeCodeAdapter.extractUsage', () => {
     const usage = claudeCodeAdapter.extractUsage(stdout);
     assert.equal(usage.inputTokens, 1000 + 4000 + 250);
     assert.equal(usage.outputTokens, 500);
-    assert.equal(usage.costUsd, 0.0123);
+    assert.deepEqual(usage.cost, { available: true, usd: 0.0123 });
   });
 
-  test('costUsd is null when the envelope omits total_cost_usd', () => {
+  test('cost is unavailable with reason not-reported when the envelope omits total_cost_usd', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
     const usage = claudeCodeAdapter.extractUsage(stdout);
     assert.equal(usage.inputTokens, 10);
-    assert.equal(usage.costUsd, null);
+    assert.deepEqual(usage.cost, { available: false, reason: 'not-reported' });
   });
 
   test('returns null when the envelope has no usage', () => {
@@ -140,25 +142,47 @@ describe('claudeCodeAdapter.extractUsage', () => {
 
 describe('renderCostLine', () => {
   test('renders dollars, comma-grouped tokens, and the engine/model tag', () => {
-    const line = renderCostLine({ inputTokens: 12345, outputTokens: 6789, costUsd: 0.0123 }, CODEX_CONFIG);
+    const line = renderCostLine({ inputTokens: 12345, outputTokens: 6789, cost: { available: true, usd: 0.0123 } }, CODEX_CONFIG);
     assert.match(line, /\$0\.0123/);
     assert.match(line, /12,345 in \/ 6,789 out tokens/);
     assert.match(line, /codex\/gpt-5\.4-mini/);
   });
 
   test('marks the z.ai endpoint cost as an Anthropic-priced estimate', () => {
-    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, costUsd: 0.5 }, ZAI_CONFIG);
+    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, ZAI_CONFIG);
     assert.match(line, /Anthropic pricing, not z\.ai billing/);
   });
 
-  test('shows cost as "unknown" (tokens still rendered) when costUsd is null', () => {
-    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, costUsd: null }, CODEX_CONFIG);
+  test('shows cost as "unknown" (tokens still rendered) when cost is unavailable', () => {
+    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: false, reason: 'no-price' } }, CODEX_CONFIG);
     assert.match(line, /Cost: unknown/);
     assert.match(line, /100 in \/ 50 out tokens/);
   });
 
   test('returns empty string when there is no usage at all', () => {
     assert.equal(renderCostLine(null, CODEX_CONFIG), '');
+  });
+});
+
+describe('costWarning', () => {
+  test('null when cost is reported — no warning for a fully-priced run', () => {
+    assert.equal(costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: true, usd: 0.1 } }, CODEX_CONFIG), null);
+  });
+
+  test('no-price names the price table and the model to add', () => {
+    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'no-price' } }, { ...CODEX_CONFIG, model: 'gpt-future' });
+    assert.match(w, /price-table entry for codex\/gpt-future/);
+    assert.match(w, /OPENAI_PRICES_PER_MILLION/);
+  });
+
+  test('not-reported names the engine, never the price table — the codex/claude causes do not conflate', () => {
+    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'not-reported' } }, ZAI_CONFIG);
+    assert.match(w, /claude-code reported no cost/);
+    assert.doesNotMatch(w, /price-table|OPENAI_PRICES_PER_MILLION/);
+  });
+
+  test('no usage at all warns that the cost line is omitted', () => {
+    assert.match(costWarning(null, CODEX_CONFIG), /no token usage/);
   });
 });
 

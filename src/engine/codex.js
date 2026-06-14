@@ -159,8 +159,8 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
-// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); costUsd is null when the
-// model has no price-table entry, never a fabricated zero. [LAW:no-silent-failure]
+// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); a model absent from the
+// table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
 // no usage (null), not as a $0.00 run. [LAW:dataflow-not-control-flow]
@@ -178,7 +178,11 @@ function extractUsage(stdout, config) {
   const outputTokens = usage.output_tokens ?? 0;
   const cachedInputTokens = usage.cached_input_tokens ?? 0;
   const costUsd = computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
-  return { inputTokens, outputTokens, costUsd };
+  // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
+  // here means exactly one thing — the model is absent from the price table — and the adapter
+  // declares that reason at the point it knows it, rather than the boundary re-deriving it.
+  const cost = costUsd == null ? { available: false, reason: 'no-price' } : { available: true, usd: costUsd };
+  return { inputTokens, outputTokens, cost };
 }
 
 // [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.

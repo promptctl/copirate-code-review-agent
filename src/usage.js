@@ -51,26 +51,48 @@ function formatTokenCount(n) {
   return n.toLocaleString('en-US');
 }
 
+function reviewerTag(config) {
+  return `${config.engine}/${config.model || '(default model)'}`;
+}
+
 // [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
 // there is no usage to report. The "loud" warning for missing usage/price is an effect and
-// belongs at the run boundary (src/run.js), not in this renderer. [LAW:dataflow-not-control-flow]
-// usage === null and usage.costUsd === null are distinct values with distinct renderings, not
-// branches that skip work: no usage -> no line; usage without a price -> tokens with cost "unknown".
+// belongs at the run boundary (src/run.js); costWarning below produces its text, also purely.
+// [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
+// distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
+// tokens with cost "unknown".
 function renderCostLine(usage, config) {
   if (!usage) return '';
-  const tag = `${config.engine}/${config.model || '(default model)'}`;
+  const tag = reviewerTag(config);
   const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
-  if (usage.costUsd == null) {
+  if (!usage.cost.available) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
   const caveat = isZaiEndpoint(config) ? ' · est. (Anthropic pricing, not z.ai billing)' : '';
-  return `_Cost: $${usage.costUsd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag}${caveat}_`;
+}
+
+// [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
+// is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
+// reason VALUE the adapter carried — never re-derived by branching on engine at the boundary. This
+// is why the reason lives in usage.cost: run.js stays ignorant of which engines are table-priced.
+function costWarning(usage, config) {
+  if (!usage) return 'Engine reported no token usage; the review footer omits the cost line.';
+  if (usage.cost.available) return null;
+  const tag = reviewerTag(config);
+  if (usage.cost.reason === 'no-price') {
+    return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
+      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.';
+  }
+  return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
+    + 'the review footer shows cost as "unknown".';
 }
 
 module.exports = {
   OPENAI_PRICES_PER_MILLION,
   computeOpenAiCostUsd,
   renderCostLine,
+  costWarning,
   formatTokenCount,
   isZaiEndpoint,
 };
