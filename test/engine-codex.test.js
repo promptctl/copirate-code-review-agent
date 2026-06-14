@@ -40,9 +40,12 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.ok(toml.includes('sandbox_mode = "read-only"'), 'sandbox_mode = "read-only" not found');
   });
 
-  test('model is formatted as internal_provider/model', () => {
+  test('model is the bare name with the provider selected separately', () => {
     const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
-    assert.ok(toml.includes('model = "api/gpt-5.5"'), `model line not found in:\n${toml}`);
+    // Codex 0.139 sends `model` verbatim to the API; the old "api/gpt-5.5" form 400s.
+    assert.ok(toml.includes('model = "gpt-5.5"'), `bare model line not found in:\n${toml}`);
+    assert.ok(toml.includes('model_provider = "api"'), `model_provider not found in:\n${toml}`);
+    assert.equal(toml.includes('model = "api/gpt-5.5"'), false, 'legacy provider/model prefix must not appear');
   });
 
   test('model_reasoning_effort is set when reasoning is provided', () => {
@@ -66,9 +69,14 @@ describe('buildConfigToml — generated config.toml content', () => {
     assert.ok(toml.includes('base_url = "https://api.openai.com/v1"'), 'base_url not found');
   });
 
-  test('env_key comes from config.endpoint.apiKeyEnv', () => {
+  test('no env_key — credentials come from auth.json, not a provider env var', () => {
     const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
-    assert.ok(toml.includes('env_key = "OPENAI_API_KEY"'), 'env_key not found');
+    assert.equal(toml.includes('env_key'), false, 'env_key must not be emitted; Codex 0.139 ignores it and 401s');
+  });
+
+  test('provider explicitly opts into OpenAI API-key auth', () => {
+    const toml = buildConfigToml(BASE_CONFIG, MOCK_COLLECTOR_SPAWN);
+    assert.ok(toml.includes('requires_openai_auth = true'), 'requires_openai_auth opt-in missing');
   });
 
   test('mcp_servers.review_collector uses command from collector spawn spec', () => {
@@ -153,9 +161,9 @@ describe('codexAdapter.buildCommand', () => {
     assert.equal(env.CODEX_HOME, '/custom/home');
   });
 
-  test('API key env var is injected under the config.endpoint.apiKeyEnv name', () => {
+  test('the credential is NOT injected via env — it lives in auth.json', () => {
     const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    assert.equal(env.OPENAI_API_KEY, 'sk-test-key-xyz');
+    assert.equal(env.OPENAI_API_KEY, undefined);
   });
 
   test('PATH is passed through for npx resolution', () => {
@@ -172,7 +180,7 @@ describe('codexAdapter.buildCommand', () => {
     // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
     // Only PATH, HOME, CODEX_HOME, and the apiKeyEnv credential are permitted.
     const { env } = codexAdapter.buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
-    const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME', BASE_CONFIG.endpoint.apiKeyEnv]);
+    const allowedKeys = new Set(['PATH', 'HOME', 'CODEX_HOME']);
     for (const key of Object.keys(env)) {
       assert.ok(allowedKeys.has(key), `unexpected env var leaked into subprocess: ${key}`);
     }
