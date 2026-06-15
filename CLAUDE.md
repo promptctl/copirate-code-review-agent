@@ -23,8 +23,8 @@ npm install
 npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.txt)
 ```
 
-- **`dist/` MUST be committed.** The Actions runner executes `dist/index.js` directly — it never runs `npm install` or a build step. Every change to `src/index.js` requires `npm run build` and committing both `src/` and `dist/`.
-- **`npm test`** runs the `node:test` suite in `test/`. Tests cover the exported pure functions in `src/index.js` and a dist smoke test that spawns `dist/index.js --review-collector-server` and performs a full MCP handshake. CI also asserts that committed `dist/` matches a fresh build (`npm run build` + `git diff --exit-code dist/`).
+- **`dist/` MUST be committed.** The Actions runner executes `dist/index.js` directly — it never runs `npm install` or a build step. Every change under `src/` requires `npm run build` and committing both `src/` and `dist/`.
+- **`npm test`** runs the `node:test` suite in `test/`. Tests cover the exported pure functions across the `src/` modules (`config`, `diff`, `provider`, `selection`, `failover`, `review`, `transport`, `usage`, and the engine adapters) plus a dist smoke test that spawns `dist/index.js --review-collector-server` and performs a full MCP handshake. CI also asserts that committed `dist/` matches a fresh build (`npm run build` + `git diff --exit-code dist/`).
 - Keep PRs to one fix/feature each, against `main`.
 
 ### Cutting a release
@@ -54,17 +54,28 @@ Versioning is split into two parts, deliberately:
 
 ## Architecture
 
-The source is split into focused modules under `src/` (orchestrator `run.js`, engine adapters under `engine/`, `prompt.js`, `transport.js`, `review.js`, `usage.js`, `report.js`, etc.); `src/index.js` is the thin entry point that bundles to `dist/index.js`. It has **two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
+The source is split into focused modules under `src/` (orchestrator `run.js`; the config-file path `config.js` / `provider.js` / `selection.js` / `failover.js`; engine adapters under `engine/`; `prompt.js`, `transport.js`, `diff.js`, `review.js`, `collector.js`, `usage.js`, `report.js`); `src/index.js` is the thin entry point that bundles to `dist/index.js`. It has **two entry points**, selected at the bottom (the `COLLECTOR_SERVER_ARG` check):
 
 1. **Action orchestrator** (`run` in `src/run.js`) — the default mode the runner invokes.
 2. **MCP collector server** (`runReviewCollectorServer` in `src/collector-server.js`) — the *same bundled binary* re-spawned as a stdio MCP subprocess by the engine. The MCP config (`createReviewCollector`) wires `command: node, args: [__filename, '--review-collector-server']`, so the binary is self-referential.
 
 The central design seam is **judgment vs. transport**:
 
-- **Claude Code owns review judgment.** It runs in non-interactive print mode (`-p --output-format json`), read-only (allowed: `Read`/`Grep`/`Glob` + the two collector tools; disallowed: `Bash`/`Edit`/`Write`/`Web*`). Its *only* output channel is the collector tools — it cannot post to GitHub itself.
+- **The engine owns review judgment.** Whichever engine runs (claude-code, codex, opencode) does so read-only — its only output channel is the MCP collector tools, so it cannot post to GitHub itself. For example claude-code runs in non-interactive print mode (`-p --output-format json`) with `Read`/`Grep`/`Glob` + the two collector tools allowed and `Bash`/`Edit`/`Write`/`Web*` disallowed; each adapter enforces the equivalent read-only posture its own way (codex: read-only sandbox; opencode: `permission: {edit/bash/webfetch: deny}`).
 - **The transport owns host I/O.** It reads the collector's records, validates them, and calls the review API of whichever host the runner reports.
 
-This boundary is why findings flow through an MCP tool rather than being parsed from Claude's prose: `request_change` / `finish_review` produce typed, schema-validated records (`records.jsonl`), and `readCollectedReview` enforces "exactly one `finish_review`" before anything reaches the host.
+This boundary is why findings flow through an MCP tool rather than being parsed from the engine's prose: `request_change` / `finish_review` produce typed, schema-validated records (`records.jsonl`), and `readCollectedReview` enforces "exactly one `finish_review`" before anything reaches the host.
+
+### Engine adapters and configuration
+
+An engine is reached only through an **adapter** (`src/engine/{claude-code,codex,opencode}.js`), registered by name in `src/engine/registry.js` — the single enumeration of engines. claude-code and codex share one CLI lifecycle via `makeCliAdapter` (`src/engine/cli.js`): `createReviewCollector → materializeHome → runEngine spawn → readCollectedReview`, with nested `try/finally` owning home + collector teardown. Each adapter supplies only its spawn primitives (`materializeHome`/`buildCommand`/`assertSucceeded`/`extractUsage`/`classifyError`) and a `capabilities` declaration (`endpointKinds`, `reasoningEfforts`). [LAW:decomposition]
+
+Those capability declarations are the **single source of truth for config validation** [LAW:single-enforcer] — both config paths derive from them, so an illegal combination is rejected identically whichever path it came through:
+
+- **Simple mode** (no `CONFIG_FILE`): `src/provider.js` turns the `PROVIDER` value + its provider-specific inputs into one typed `ReviewConfig`. `PROVIDERS` is the one table of concrete providers (`codex`/`zai`/`deepseek`); `PROVIDER_ALIASES` (`auto → deepseek`) is the one place to retarget every `PROVIDER: auto` consumer via a release. The provider is chosen by the explicit value alone — never inferred from which credential is set.
+- **Config-file mode** (`.github/review-agents.yml` present): `src/config.js` parses, validates against the adapter capabilities, and resolves an ordered failover **chain** of `ReviewConfig` values; every `apiKeyEnv` in the chain must be set at startup. `src/selection.js` resolves the per-PR config name (label `review:<name>` > body trailer `Review-Config:` > `CONFIG` input > file `default`), failing loud on ambiguity or an unknown name.
+
+`src/failover.js` (`produceReview`) is the single owner of retry timing and walks the chain: transient errors (classified at the adapter) retry ≤3× per config then advance; non-transient throw immediately (no failover); `buildAttributionFooter` names the config that actually produced the review.
 
 ### The line-anchor invariant (most fragile part)
 
@@ -87,7 +98,9 @@ Everything downstream (`patchLines`, anchors, validation, the prompt) is host-ag
 
 ### Auth and environment
 
-Z.ai credentials are translated to Claude Code's env exactly once in `runClaudeCode`: `ZAI_API_KEY` → `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`, plus a per-run temp `HOME` (`createReviewerHome`) holding the bundled `review-agent/CLAUDE.md` as the reviewer's user-global instructions. Temp `HOME` and collector dirs are created and torn down by the same owner (the `try/finally` in `run`).
+Each adapter translates the resolved `ReviewConfig` credential into the engine's own auth channel exactly once, in its `materializeHome`/`buildCommand`. The claude-code adapter (`src/engine/claude-code.js`) maps the config's `apiKey`/`baseUrl` to `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` (so the `zai` and `deepseek` providers differ only in base URL) and writes a per-run temp `HOME` holding the bundled `review-agent/instructions.md` as the reviewer's user-global `~/.claude/CLAUDE.md`. codex writes the key to `CODEX_HOME/auth.json` + a `config.toml`; opencode writes `XDG_CONFIG_HOME/opencode/opencode.json` with `OPENCODE_DISABLE_PROJECT_CONFIG=1`. The per-run temp home and collector dir are created and torn down by the shared `makeCliAdapter` (`src/engine/cli.js`) nested `try/finally`, so cleanup runs even when the engine throws.
+
+**Config isolation is a security boundary.** Each engine runs against an isolated config home, so the *reviewed repo* cannot hijack the engine's model, endpoint, credential, or MCP servers. codex/opencode pass an explicit env allowlist (never a `process.env` spread) so a prompt-injection payload in the diff cannot read `GITHUB_TOKEN` or other secrets via a shell expression. One residual surface is **project instructions**: no adapter sets `cwd`, so the engine spawns in the reviewed working tree and layers in a repo-committed `AGENTS.md` (codex) / `CLAUDE.md` (claude-code) as instructions — an instruction-injection vector gated behind the unconditional fork check (fork PRs are never reviewed). Hardening this is tracked separately.
 
 ### Cost reporting
 
@@ -102,4 +115,4 @@ The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`, a 
 ## Two CLAUDE.md files — do not confuse them
 
 - **This file** (`/CLAUDE.md`) — guidance for working *on* this repo.
-- **`review-agent/CLAUDE.md`** — a runtime artifact: the reviewer's instructions, copied into the spawned reviewer's `~/.claude/CLAUDE.md`. Editing it changes *how reviews are conducted*, not how you develop here. The review task prompt itself (the law priorities, the `request_change` rules) is the big template literal in `buildReviewInput`.
+- **`review-agent/instructions.md`** — a runtime artifact: the reviewer's instructions, copied by each adapter's `materializeHome` into the spawned reviewer's engine-global instructions file (`~/.claude/CLAUDE.md` for claude-code, `AGENTS.md` for codex/opencode). Editing it changes *how reviews are conducted*, not how you develop here. The review task prompt itself (the law priorities, the `request_change` rules) is the big template literal in `buildReviewInput`.

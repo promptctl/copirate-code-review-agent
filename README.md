@@ -135,7 +135,152 @@ The default provider is `codex`: add an `OPENAI_API_KEY` secret and the action r
 
 Set `PROVIDER: auto` to delegate the choice to the action: `auto` forwards to whichever provider the action currently points it at (`deepseek` today). Pinning `PROVIDER: auto` lets the maintainer retarget every consumer at once — by releasing a new action version that points `auto` elsewhere — without any consumer editing their workflow. Supply the key for whichever provider `auto` currently resolves to.
 
-To run a different provider per pull request (by label or PR-body directive) or to chain failover engines, commit a `.github/review-agents.yml` config file; when present it owns engine selection and the `PROVIDER`/key inputs are ignored.
+**Simple mode covers a single engine.** To run a *different* provider per pull request (by label or PR-body directive), or to chain failover engines so a rate-limited provider hands off to another, commit a [`.github/review-agents.yml` config file](#multi-engine-configuration-githubreview-agentsyml). When that file exists it owns engine selection and the `PROVIDER`/key inputs above are ignored.
+
+## Multi-engine configuration (`.github/review-agents.yml`)
+
+Simple mode (the `PROVIDER` input) runs one engine. For the three things `PROVIDER` can't express — **a failover chain**, **per-pull-request engine selection**, and **arbitrary engine/endpoint/model/reasoning combinations** — commit a config file. Its presence switches the action into config-file mode: the file is the single source of every reviewer configuration, and the simple-mode `PROVIDER`/`OPENAI_*`/`ZAI_*`/`DEEPSEEK_*` inputs are ignored.
+
+### The file
+
+```yaml
+version: 1                       # schema version; an unknown version fails the run loudly
+default: zai-glm                 # which config reviews when nothing else selects one
+fallback:                        # optional ordered failover chain (see "Failover" below)
+  - zai-glm
+  - codex-gpt55
+
+configs:
+  zai-glm:
+    engine: claude-code          # claude-code | codex | opencode
+    model: glm-5.1
+    reasoning: high              # validated against the engine's declared efforts (see matrix)
+    endpoint:
+      kind: anthropic-messages   # must be one the engine supports (see matrix)
+      baseUrl: https://api.z.ai/api/anthropic
+      apiKeyEnv: ZAI_API_KEY     # the NAME of an env var — NEVER a secret value
+
+  codex-gpt55:
+    engine: codex
+    model: gpt-5.5
+    reasoning: xhigh
+    endpoint:
+      kind: openai-responses
+      baseUrl: https://api.openai.com/v1
+      apiKeyEnv: OPENAI_API_KEY
+
+  oc-mini:
+    engine: opencode
+    model: openai/gpt-5.4-mini   # opencode models are "<provider>/<model>"
+    endpoint:
+      kind: openai-chat
+      baseUrl: https://api.openai.com/v1
+      apiKeyEnv: OPENAI_API_KEY
+    # reasoning: high            # ← would FAIL at load: opencode supports no reasoning efforts
+```
+
+Every field is validated **once, at startup** against the chosen engine's declared capabilities — an illegal combination (codex with an `anthropic-messages` endpoint, a `reasoning:` on opencode, an unknown engine, a `default`/`fallback` naming a config that isn't defined, or an `apiKeyEnv` whose variable is unset) fails the run with a message naming the config, the field, and the allowed values. Nothing is discovered mid-review.
+
+### Engine capability matrix
+
+A config is rejected at load unless its `endpoint.kind` and `reasoning` are listed for its `engine`:
+
+| Engine | `endpoint.kind` | `reasoning` efforts | Notes |
+|---|---|---|---|
+| `claude-code` | `anthropic-messages` | `low`, `medium`, `high`, `max` | Any Anthropic-compatible endpoint (Z.ai, DeepSeek, Anthropic). |
+| `codex` | `openai-responses` | `minimal`, `low`, `medium`, `high`, `xhigh` | OpenAI Responses API only — it cannot speak an Anthropic endpoint. |
+| `opencode` | `openai-chat`, `openai-responses`, `anthropic-messages` | *(none — setting `reasoning` is a config error)* | `model` is `<provider>/<model>`; the `endpoint.baseUrl` overrides the provider's URL. |
+
+The same provider can be reached through more than one engine — e.g. DeepSeek via `claude-code` (`anthropic-messages`, `https://api.deepseek.com/anthropic`) or via `opencode` (`openai-chat`, `https://api.deepseek.com`).
+
+### Secrets via env
+
+A config never holds a secret; `apiKeyEnv` names an environment variable that the **workflow** maps from a GitHub secret. Map each one in the action step's `env:` block:
+
+```yaml
+      - name: Code Review
+        uses: brandon-fryslie/zai-coding-agent-review@v1
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
+```
+
+Every `apiKeyEnv` reachable in the resolved chain must be present and non-empty at startup, or the run fails fast (it is not discovered later when failover reaches that config). Resolved keys are registered as masked secrets in the run log.
+
+### Per-pull-request selection
+
+Which config reviews a given PR is resolved in this precedence order (first match wins):
+
+1. **Label** `review:<config-name>` on the PR — e.g. `review:codex-gpt55`. More than one `review:` label is ambiguous and fails the run.
+2. **PR-body trailer** `Review-Config: <config-name>` (case-insensitive, on its own line).
+3. **`CONFIG` action input** — a fixed choice in the workflow.
+4. The file's **`default`**.
+
+Want a `review:gpt-5.5` label to "just work"? Name a config `gpt-5.5`. Selection is **by config name only** — never a bare model string, because a model alone underdetermines the engine, endpoint, and credential.
+
+**Security property.** Selection only ever picks among configs the maintainer committed to the file. A pull-request author can *steer* the review toward another configured provider (via a label or body trailer), but can never introduce a new config, endpoint, or secret — those live only in the repo file and the workflow's `env:`. Combined with the [fork gate](#fork-pull-requests-are-not-reviewed) (fork PRs are never reviewed at all) and per-engine config isolation (each engine runs against an isolated config home — `CODEX_HOME` / a temp `HOME` / `XDG_CONFIG_HOME` with `OPENCODE_DISABLE_PROJECT_CONFIG=1` — so the reviewed repo cannot hijack the engine's model, endpoint, credential, or MCP servers), an untrusted contribution can neither spend nor redirect the host's credentials.
+
+### Failover
+
+When the file declares a `fallback` list, the selected config plus the rest of that list (minus the selected one, in order) form the **failover chain**. `produceReview` is the single owner of retry timing:
+
+- A **transient** error (HTTP 429 / rate-limit / quota / 529-overloaded, classified by that engine's adapter) is retried on the same config up to 3 attempts total, honoring a `Retry-After` hint when the provider sends one, otherwise exponential backoff.
+- Still failing → advance to the next config in the chain **immediately** (a different provider; waiting buys nothing).
+- Chain exhausted → back off (cap 60s) and sweep the chain again, until a 60-minute budget is spent, then fail.
+- A **non-transient** error (bad output envelope, validation failure, spawn error) throws immediately with **no failover** — hopping providers would only mask a real bug.
+
+The submitted review's footer names the config that actually produced it — `_Reviewed by config \`codex-gpt55\` / codex / gpt-5.5 / reasoning \`xhigh\`._` — so a failover is always visible after the fact.
+
+### Full example workflow
+
+```yaml
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Code Review
+        uses: brandon-fryslie/zai-coding-agent-review@v1
+        env:
+          # One entry per apiKeyEnv referenced in .github/review-agents.yml
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          GITHUB_REVIEW_TOKEN: ${{ secrets.GITHUB_REVIEW_TOKEN }}
+```
+
+(The `labeled` event type lets a freshly added `review:<name>` label trigger a re-review.) With `.github/review-agents.yml` committed, this one workflow serves every config in the file; authors pick one per PR by label or body trailer, and the `fallback` list handles provider outages automatically.
+
+## Selecting Z.ai (the default is now Codex)
+
+**The default engine is `codex` (OpenAI), not Claude Code against Z.ai.** The engine is chosen by `PROVIDER` alone and never inferred from which credential is present, so a workflow that relied on Z.ai by simply setting `ZAI_API_KEY` must name the provider explicitly — add one line:
+
+```yaml
+      - uses: brandon-fryslie/zai-coding-agent-review@v1
+        with:
+          PROVIDER: zai
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+```
+
+All `ZAI_*` inputs (`ZAI_API_KEY`, `ZAI_MODEL`, `ZAI_BASE_URL`, `ZAI_SYSTEM_PROMPT`, `ZAI_REVIEWER_NAME`) work exactly as before once `PROVIDER: zai` is set. Nothing else needs to change. When you outgrow a single engine, adopt a [config file](#multi-engine-configuration-githubreview-agentsyml).
 
 ## Operation
 
@@ -193,7 +338,7 @@ Instead of using default values for `ZAI_MODEL`, `ZAI_SYSTEM_PROMPT`, and `ZAI_R
 
 ```yaml
       - name: Code Review
-        uses: brandon-fryslie/zai-coding-agent-review@0.1.1
+        uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: ${{ vars.ZAI_MODEL }}
