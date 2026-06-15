@@ -102,7 +102,7 @@ The engine is selected by `PROVIDER` alone. Each provider needs its own credenti
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `PROVIDER` | No | `codex` | Engine in simple mode: `codex` (OpenAI) or `zai` (Claude Code against Z.ai). Ignored when a `CONFIG_FILE` exists. |
+| `PROVIDER` | No | `codex` | Engine in simple mode: `codex` (OpenAI), `zai` (Claude Code against Z.ai), `deepseek` (Claude Code against DeepSeek), or `auto` (forwards to whichever provider `auto` currently points at — `deepseek` today). Ignored when a `CONFIG_FILE` exists. |
 | `OPENAI_API_KEY` | When `PROVIDER=codex` | — | OpenAI API key for the default `codex` provider |
 | `OPENAI_MODEL` | No | `gpt-5.4-mini` | Model for the `codex` provider |
 | `OPENAI_REASONING_EFFORT` | No | — | `minimal`, `low`, `medium`, `high`, or `xhigh` for the `codex` provider |
@@ -110,6 +110,9 @@ The engine is selected by `PROVIDER` alone. Each provider needs its own credenti
 | `ZAI_API_KEY` | When `PROVIDER=zai` | — | Z.ai API key for the `zai` provider |
 | `ZAI_MODEL` | No | `glm-5.1` | Model for the `zai` provider |
 | `ZAI_BASE_URL` | No | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for the `zai` provider |
+| `DEEPSEEK_API_KEY` | When `PROVIDER=deepseek` or `auto` | — | DeepSeek API key for the `deepseek` provider |
+| `DEEPSEEK_MODEL` | No | `deepseek-v4-pro` | Model for the `deepseek` provider |
+| `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for the `deepseek` provider |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code (`zai` provider) |
 | `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
 | `MODE` | No | `pr` | Review material: `pr` (review a pull request diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review-mode-on-demand), prints a report to the Step Summary, needs no PR). |
@@ -128,7 +131,9 @@ The action installs its bundled reviewer instructions as Claude Code's user-glob
 
 ## Configuration
 
-The default provider is `codex`: add an `OPENAI_API_KEY` secret and the action runs the Codex engine against OpenAI. To run Claude Code against the Z.ai Coding Plan instead, set `PROVIDER: zai` and supply `ZAI_API_KEY`. Having both keys set is harmless — only `PROVIDER` decides which engine runs.
+The default provider is `codex`: add an `OPENAI_API_KEY` secret and the action runs the Codex engine against OpenAI. To run Claude Code against the Z.ai Coding Plan instead, set `PROVIDER: zai` and supply `ZAI_API_KEY`; for DeepSeek, set `PROVIDER: deepseek` and supply `DEEPSEEK_API_KEY` (DeepSeek runs on the Claude Code engine against its Anthropic-compatible endpoint). Having multiple keys set is harmless — only `PROVIDER` decides which engine runs.
+
+Set `PROVIDER: auto` to delegate the choice to the action: `auto` forwards to whichever provider the action currently points it at (`deepseek` today). Pinning `PROVIDER: auto` lets the maintainer retarget every consumer at once — by releasing a new action version that points `auto` elsewhere — without any consumer editing their workflow. Supply the key for whichever provider `auto` currently resolves to.
 
 To run a different provider per pull request (by label or PR-body directive) or to chain failover engines, commit a `.github/review-agents.yml` config file; when present it owns engine selection and the `PROVIDER`/key inputs are ignored.
 

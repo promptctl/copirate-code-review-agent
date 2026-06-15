@@ -17,7 +17,7 @@ inputs:
     description: "Select a named config from the config file. Overrides the file's 'default' field."
     required: false
   PROVIDER:
-    description: "Which engine to run in simple mode (no CONFIG_FILE): 'codex' (OpenAI Responses, default) or 'zai' (Claude Code against Z.ai). The provider is chosen by this value alone — setting a credential does not switch it."
+    description: "Which engine to run in simple mode (no CONFIG_FILE): 'codex' (OpenAI Responses, default), 'zai' (Claude Code against Z.ai), 'deepseek' (Claude Code against DeepSeek's Anthropic endpoint), or 'auto' (forwards to whichever provider the action currently points 'auto' at — DeepSeek today — so you can pin PROVIDER: auto and be retargeted centrally). The provider is chosen by this value alone — setting a credential does not switch it."
     required: false
     default: "codex"
   OPENAI_API_KEY:
@@ -49,6 +49,17 @@ inputs:
     description: "Additional system prompt appended to Claude Code"
     required: false
     default: "Review according to the LAWS. Request changes for blocking issues: LAW VIOLATIONS, bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests."
+  DEEPSEEK_API_KEY:
+    description: "DeepSeek API key. Required when PROVIDER is 'deepseek' (or 'auto', which resolves to deepseek). Setting it does not by itself select the provider."
+    required: false
+  DEEPSEEK_MODEL:
+    description: "Model for the 'deepseek' provider (Claude Code against DeepSeek)."
+    required: false
+    default: "deepseek-v4-pro"
+  DEEPSEEK_BASE_URL:
+    description: "Base URL for the 'deepseek' provider's Anthropic-compatible endpoint."
+    required: false
+    default: "https://api.deepseek.com/anthropic"
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header"
     required: false

@@ -108,6 +108,64 @@ describe('synthesizeProviderConfig — overrides', () => {
   });
 });
 
+describe('synthesizeProviderConfig — deepseek provider', () => {
+  test('deepseek with only a key uses the DeepSeek Anthropic endpoint and default model on the claude-code engine', () => {
+    const config = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'sk-deepseek' }, MOCK_REGISTRY);
+    assert.equal(config.engine, 'claude-code');
+    assert.equal(config.model, 'deepseek-v4-pro');
+    assert.equal(config.endpoint.kind, 'anthropic-messages');
+    assert.equal(config.endpoint.baseUrl, 'https://api.deepseek.com/anthropic');
+    assert.equal(config.endpoint.apiKey, 'sk-deepseek');
+    assert.equal(config.name, 'deepseek-default');
+  });
+
+  test('missing DEEPSEEK_API_KEY fails loud naming the input', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'deepseek', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/DEEPSEEK_API_KEY/.test(err.message), err.message);
+        return true;
+      },
+    );
+  });
+
+  test('explicit deepseek model and baseUrl override the defaults', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'deepseek', deepseekApiKey: 'k', deepseekModel: 'deepseek-v4-flash', deepseekBaseUrl: 'https://gw.example/anthropic' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.model, 'deepseek-v4-flash');
+    assert.equal(config.endpoint.baseUrl, 'https://gw.example/anthropic');
+  });
+});
+
+describe("synthesizeProviderConfig — 'auto' alias", () => {
+  test('auto resolves to deepseek and runs identically, with the resolution shown in the config name', () => {
+    const viaAuto = synthesizeProviderConfig({ provider: 'auto', deepseekApiKey: 'k' }, MOCK_REGISTRY);
+    const viaDeepseek = synthesizeProviderConfig({ provider: 'deepseek', deepseekApiKey: 'k' }, MOCK_REGISTRY);
+    assert.equal(viaAuto.engine, viaDeepseek.engine);
+    assert.equal(viaAuto.model, viaDeepseek.model);
+    assert.deepEqual(viaAuto.endpoint, viaDeepseek.endpoint);
+    assert.equal(viaAuto.name, 'auto→deepseek');
+  });
+
+  test('auto with no DeepSeek key fails naming the resolved provider and its input', () => {
+    assert.throws(
+      () => synthesizeProviderConfig({ provider: 'auto', openaiApiKey: 'sk-openai' }, MOCK_REGISTRY),
+      err => {
+        assert.ok(/DEEPSEEK_API_KEY/.test(err.message), err.message);
+        assert.ok(/auto.*deepseek/.test(err.message), `expected auto→deepseek in: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test("'auto' and 'deepseek' are both listed among valid PROVIDER values", () => {
+    assert.ok(PROVIDER_NAMES.includes('auto'));
+    assert.ok(PROVIDER_NAMES.includes('deepseek'));
+  });
+});
+
 describe('synthesizeProviderConfig — unknown provider', () => {
   test('throws naming the invalid value and the valid providers', () => {
     assert.throws(
