@@ -31656,6 +31656,10 @@ const { ZAI_ANTHROPIC_BASE_URL } = __nccwpck_require__(3048);
 const { OPENAI_RESPONSES_BASE_URL } = __nccwpck_require__(5363);
 const defaultRegistry = __nccwpck_require__(25);
 
+// DeepSeek exposes an Anthropic-compatible endpoint, so it runs on the claude-code engine
+// exactly like z.ai — same auth translation, different base URL. [LAW:one-type-per-behavior]
+const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+
 // [LAW:dataflow-not-control-flow] The provider is an explicit value, never inferred from
 // which credential happens to be set. [LAW:single-enforcer] This module is the one place
 // that turns the simple-mode (no CONFIG_FILE) action inputs into a typed ReviewConfig.
@@ -31681,9 +31685,25 @@ const PROVIDERS = {
     defaultModel: 'glm-5.1',
     fields: i => ({ apiKey: i.zaiApiKey, model: i.zaiModel, systemPrompt: i.zaiSystemPrompt, baseUrl: i.zaiBaseUrl }),
   },
+  deepseek: {
+    engine: 'claude-code',
+    endpointKind: 'anthropic-messages',
+    defaultBaseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
+    apiKeyInput: 'DEEPSEEK_API_KEY',
+    defaultModel: 'deepseek-v4-pro',
+    fields: i => ({ apiKey: i.deepseekApiKey, model: i.deepseekModel, systemPrompt: i.deepseekSystemPrompt, baseUrl: i.deepseekBaseUrl }),
+  },
 };
 
-const PROVIDER_NAMES = Object.keys(PROVIDERS);
+// [LAW:one-type-per-behavior] 'auto' has no behavior of its own — it forwards to whichever
+// concrete provider every client should currently use, so the maintainer can retarget all
+// clients pinned to PROVIDER=auto without them editing their workflow. [LAW:one-source-of-truth]
+// This single mapping is the one place to retarget it.
+const PROVIDER_ALIASES = { auto: 'deepseek' };
+
+// Every accepted PROVIDER input value: the concrete providers plus the aliases. The order
+// matters only for the "valid providers" message in the unknown-PROVIDER error.
+const PROVIDER_NAMES = [...Object.keys(PROVIDERS), ...Object.keys(PROVIDER_ALIASES)];
 
 // [LAW:effects-at-boundaries] Pure: maps inputs to a ReviewConfig, touches nothing external.
 // [LAW:no-silent-failure] Throws — naming the input to fix — when the provider is unknown,
@@ -31691,25 +31711,33 @@ const PROVIDER_NAMES = Object.keys(PROVIDERS);
 // reg is injectable for testing; defaults to the real adapter registry.
 function synthesizeProviderConfig(inputs, reg) {
   const registry = reg || defaultRegistry;
-  const provider = inputs.provider;
+  const requested = inputs.provider;
+  // [LAW:dataflow-not-control-flow] Resolve the alias to a concrete provider value before any
+  // synthesis; everything downstream sees only a real provider, never the alias.
+  const provider = PROVIDER_ALIASES[requested] || requested;
   const spec = PROVIDERS[provider];
   if (!spec) {
     throw new Error(
-      `Unknown PROVIDER ${JSON.stringify(provider)}. Valid providers: ${PROVIDER_NAMES.join(', ')}.`,
+      `Unknown PROVIDER ${JSON.stringify(requested)}. Valid providers: ${PROVIDER_NAMES.join(', ')}.`,
     );
   }
 
   const f = spec.fields(inputs);
 
+  // [LAW:no-silent-failure] When 'auto' was used, name both it and what it resolved to so the
+  // operator knows which input to set.
+  const label = requested === provider ? `'${provider}'` : `'${requested}' (→ '${provider}')`;
   if (!f.apiKey) {
     throw new Error(
-      `PROVIDER '${provider}' requires a credential, but the '${spec.apiKeyInput}' input is not set or empty. ` +
+      `PROVIDER ${label} requires a credential, but the '${spec.apiKeyInput}' input is not set or empty. ` +
       `Set '${spec.apiKeyInput}', or choose a different provider via the PROVIDER input (valid: ${PROVIDER_NAMES.join(', ')}).`,
     );
   }
 
   const config = {
-    name: `${provider}-default`,
+    // [FRAMING:representation] The config name reflects what actually ran; an alias is shown as
+    // 'auto→deepseek' so the run log and attribution footer stay honest about the resolution.
+    name: requested === provider ? `${provider}-default` : `${requested}→${provider}`,
     engine: spec.engine,
     model: f.model || spec.defaultModel,
     endpoint: {
@@ -31740,7 +31768,7 @@ function synthesizeProviderConfig(inputs, reg) {
   return config;
 }
 
-module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_NAMES };
+module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVIDER_NAMES };
 
 
 /***/ }),
@@ -32023,6 +32051,9 @@ function buildConfigChain(selection) {
     zaiModel: core.getInput('ZAI_MODEL'),
     zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
     zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
+    deepseekApiKey: core.getInput('DEEPSEEK_API_KEY'),
+    deepseekModel: core.getInput('DEEPSEEK_MODEL'),
+    deepseekBaseUrl: core.getInput('DEEPSEEK_BASE_URL'),
   });
   core.setSecret(config.endpoint.apiKey);
   core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);

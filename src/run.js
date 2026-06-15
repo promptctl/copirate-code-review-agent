@@ -88,6 +88,9 @@ function buildConfigChain(selection) {
     zaiModel: core.getInput('ZAI_MODEL'),
     zaiSystemPrompt: core.getInput('ZAI_SYSTEM_PROMPT'),
     zaiBaseUrl: core.getInput('ZAI_BASE_URL'),
+    deepseekApiKey: core.getInput('DEEPSEEK_API_KEY'),
+    deepseekModel: core.getInput('DEEPSEEK_MODEL'),
+    deepseekBaseUrl: core.getInput('DEEPSEEK_BASE_URL'),
   });
   core.setSecret(config.endpoint.apiKey);
   core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
