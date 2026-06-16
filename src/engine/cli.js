@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs');
+const path = require('path');
 const { createReviewCollector, readCollectedReview } = require('../collector');
 const { runEngine } = require('./run');
 
@@ -30,13 +31,23 @@ function makeCliAdapter(spec) {
     // returned. [LAW:no-silent-failure] cleanup runs even when the engine throws.
     // [LAW:dataflow-not-control-flow] usage is a value extracted from the engine's own output and
     // returned alongside the findings — never recomputed downstream at the cost footer.
-    async produceReview({ config, buildPromptFor, instructionsPath }) {
+    async produceReview({ config, buildPromptFor, instructionsPath, reviewedRepoRoot }) {
       const prompt = buildPromptFor(spec.toolNames);
+      // [LAW:single-enforcer] The engine spawns with its working directory set to the PARENT of the
+      // reviewed repo, never the repo itself. Every engine discovers project instructions
+      // (CLAUDE.md/AGENTS.md/opencode.json) by walking UPWARD from cwd — and a repo-committed file
+      // lives INSIDE the repo, so from the parent it is unreachable. This closes the instruction-
+      // injection surface for all engines at once, structurally, rather than via brittle per-engine
+      // "disable project config" switches (claude-code has none that spares its own instructions).
+      // The repo stays UNDER cwd, so the engine reads it by absolute path with no extra grant; the
+      // reviewer's own instructions load from the isolated home (HOME/CODEX_HOME/XDG), not cwd, so
+      // they are untouched. [LAW:effects-at-boundaries] [LAW:no-ambient-temporal-coupling]
+      const cwd = path.dirname(reviewedRepoRoot);
       const collector = createReviewCollector();
       try {
         const home = spec.materializeHome({ config, instructionsPath, collector });
         try {
-          const output = await runEngine(spec, config, prompt, home, collector);
+          const output = await runEngine(spec, config, prompt, home, collector, cwd);
           const usage = spec.extractUsage(output, config);
           const review = readCollectedReview(collector.recordsPath);
           return { summary: review.summary, findings: review.findings, usage };
