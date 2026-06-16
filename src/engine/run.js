@@ -1,7 +1,27 @@
 'use strict';
 const { spawn } = require('child_process');
+const core = require('@actions/core');
 
-const MAX_RESPONSE_SIZE = 1024 * 1024;
+// [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
+// stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
+// so a dense, law-comment-heavy diff easily produces many megabytes. What we RETAIN is bounded
+// to a trailing window so memory stays flat on a big review; the engine is NOT killed for being
+// verbose. "The process never terminates" is owned by the per-invocation timeout below — never
+// by output volume. The events the caller needs (turn.completed / turn.failed and the cumulative
+// usage that rides the terminal event) are the LAST emitted, so a tail preserves exactly them.
+const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
+
+// [LAW:one-type-per-behavior] stdout and stderr are the same behavior — captured child output
+// bounded to a trailing window. Append, then clip to the last MAX_RETAINED_OUTPUT bytes. A clip
+// can sever the first retained line mid-JSON; every consumer parses line-by-line and skips
+// unparseable lines, so a severed leading fragment is harmlessly dropped. `clipped` reports
+// whether bytes were dropped, so the caller can announce the information loss rather than let a
+// stream-summed usage silently undercount. [LAW:no-silent-failure]
+function appendBounded(buffer, chunk) {
+  const next = buffer + chunk;
+  if (next.length > MAX_RETAINED_OUTPUT) return { text: next.slice(-MAX_RETAINED_OUTPUT), clipped: true };
+  return { text: next, clipped: false };
+}
 
 function parseJsonEnvelope(stdout) {
   try {
@@ -43,6 +63,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
     let stdout = '';
     let stderr = '';
+    let truncated = false;
     let settled = false;
 
     const finish = result => {
@@ -59,22 +80,18 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
       });
     }, timeoutMs);
 
+    // [LAW:no-silent-failure] A verbose-but-complete review must finish and be parsed, not be
+    // aborted for tripping a byte ceiling — that turned every substantial review into a crash.
+    // Retention is bounded (appendBounded); completion is judged by adapter.assertSucceeded on
+    // close, which throws loud when the terminal event is absent. An oversized stream is never
+    // laundered into a clean pass. When stdout is clipped, `truncated` records it so close can
+    // announce that a stream-summed usage (e.g. OpenCode) may undercount — never a silent drop.
     child.stdout.on('data', chunk => {
-      stdout += chunk;
-      if (stdout.length > MAX_RESPONSE_SIZE) {
-        finish(() => {
-          child.kill('SIGTERM');
-          reject(new Error(`${adapter.name} response exceeded size limit.`));
-        });
-      }
+      const { text, clipped } = appendBounded(stdout, chunk);
+      stdout = text;
+      truncated = truncated || clipped;
     });
-
-    child.stderr.on('data', chunk => {
-      stderr += chunk;
-      if (stderr.length > MAX_RESPONSE_SIZE) {
-        stderr = stderr.slice(-MAX_RESPONSE_SIZE);
-      }
-    });
+    child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk).text; });
 
     child.on('error', err => {
       finish(() => reject(adapter.classifyError(err, '')));
@@ -94,6 +111,17 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
         }
         try {
           adapter.assertSucceeded(stdout);
+          // [LAW:no-silent-failure] The trailing window holds the terminal completion event and
+          // last-event usage (codex/claude), so completion and their usage are exact. A stream-
+          // summed usage (OpenCode adds per-event tokens/cost) loses the dropped prefix, so the
+          // loss is announced here rather than reported as an exact figure.
+          if (truncated) {
+            core.warning(
+              `${adapter.name} output exceeded the ${MAX_RETAINED_OUTPUT} byte retention window; ` +
+              'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
+              'usage/cost for this run may be a lower bound.',
+            );
+          }
           // [LAW:dataflow-not-control-flow] The captured stdout is the engine's output value;
           // the caller derives usage/cost from it via the adapter's extractUsage. Findings
           // still flow out-of-band through the MCP collector — stdout carries only usage.
@@ -108,4 +136,4 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
   });
 }
 
-module.exports = { parseJsonEnvelope, formatOutputTail, runEngine };
+module.exports = { parseJsonEnvelope, formatOutputTail, runEngine, appendBounded, MAX_RETAINED_OUTPUT };
