@@ -126,10 +126,10 @@ function materializeHome({ config, instructionsPath, collector }) {
 function buildCommand({ home }) {
   return {
     command: 'npx',
-    // --skip-git-repo-check: the engine's cwd is the reviewed repo's PARENT (an instruction-
-    // injection guard owned in cli.js), which is NOT a git repo. Without this flag `codex exec`
-    // refuses to run outside a git repo and hangs waiting on stdin. The repo itself is read by
-    // absolute path; the sandbox bypass already permits reads anywhere. [LAW:no-silent-failure]
+    // --skip-git-repo-check: the engine's cwd is an isolated scratch dir (an instruction-injection
+    // guard owned in cli.js), which is NOT a git repo. Without this flag `codex exec` refuses to run
+    // outside a git repo and hangs waiting on stdin. The repo itself is read by absolute path; the
+    // sandbox bypass already permits reads anywhere. [LAW:no-silent-failure]
     args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'],
     env: {
       PATH: process.env.PATH,
