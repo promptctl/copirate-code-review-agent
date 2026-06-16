@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { createReviewCollector, readCollectedReview } = require('../collector');
 const { runEngine } = require('./run');
@@ -16,6 +17,17 @@ const { runEngine } = require('./run');
 // PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
 // mechanics. A direct-API engine implements produceReview with one HTTPS call and never touches this
 // factory. [LAW:carrying-cost]
+//
+// [LAW:single-enforcer] Instruction-injection guard: the engine spawns with its working directory
+// set to a fresh ISOLATED temp dir that is NOT an ancestor of the reviewed repo. Every engine
+// discovers project instructions (CLAUDE.md/AGENTS.md/opencode.json) from its cwd — by walking
+// UPWARD, and (claude-code) by loading nested CLAUDE.md from subtrees UNDER cwd when it reads files
+// there. A scratch cwd outside the repo tree defeats BOTH paths: nothing is found upward, and the
+// repo — read only by absolute path, never under cwd — never triggers nested-memory loading. This
+// is why the cwd must NOT be the repo's parent (that would put the repo under cwd and re-open the
+// nested-memory vector for claude-code). The reviewer's own instructions load from the isolated home
+// (HOME/CODEX_HOME/XDG), keyed to env not cwd, so they are untouched. The repo stays readable by
+// absolute path (no per-engine read grant needed). [LAW:effects-at-boundaries]
 function makeCliAdapter(spec) {
   return {
     // [LAW:single-enforcer] The shared adapter interface: exactly what registry/run.js depend on.
@@ -26,33 +38,30 @@ function makeCliAdapter(spec) {
 
     // buildPromptFor(toolNames) is applied with THIS engine's tool identifiers, so a failover chain
     // gives each engine its own MCP tool names in the prompt. [LAW:types-are-the-program]
-    // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering: the outer finally
-    // removes the collector dir unconditionally; the inner removes home only once materializeHome
-    // returned. [LAW:no-silent-failure] cleanup runs even when the engine throws.
     // [LAW:dataflow-not-control-flow] usage is a value extracted from the engine's own output and
     // returned alongside the findings — never recomputed downstream at the cost footer.
-    async produceReview({ config, buildPromptFor, instructionsPath, reviewedRepoRoot }) {
+    // [LAW:no-ambient-temporal-coupling] Nested try/finally owns cleanup ordering (LIFO): cwd and
+    // home are created inside the collector's scope and torn down before it, each by its own finally,
+    // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
+    async produceReview({ config, buildPromptFor, instructionsPath }) {
       const prompt = buildPromptFor(spec.toolNames);
-      // [LAW:single-enforcer] The engine spawns with its working directory set to the PARENT of the
-      // reviewed repo, never the repo itself. Every engine discovers project instructions
-      // (CLAUDE.md/AGENTS.md/opencode.json) by walking UPWARD from cwd — and a repo-committed file
-      // lives INSIDE the repo, so from the parent it is unreachable. This closes the instruction-
-      // injection surface for all engines at once, structurally, rather than via brittle per-engine
-      // "disable project config" switches (claude-code has none that spares its own instructions).
-      // The repo stays UNDER cwd, so the engine reads it by absolute path with no extra grant; the
-      // reviewer's own instructions load from the isolated home (HOME/CODEX_HOME/XDG), not cwd, so
-      // they are untouched. [LAW:effects-at-boundaries] [LAW:no-ambient-temporal-coupling]
-      const cwd = path.dirname(reviewedRepoRoot);
       const collector = createReviewCollector();
       try {
-        const home = spec.materializeHome({ config, instructionsPath, collector });
+        // The isolated scratch working directory (see the factory header). Empty and outside the
+        // reviewed repo tree, so no repo-committed project-instruction file is auto-loaded.
+        const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-cwd-'));
         try {
-          const output = await runEngine(spec, config, prompt, home, collector, cwd);
-          const usage = spec.extractUsage(output, config);
-          const review = readCollectedReview(collector.recordsPath);
-          return { summary: review.summary, findings: review.findings, usage };
+          const home = spec.materializeHome({ config, instructionsPath, collector });
+          try {
+            const output = await runEngine(spec, config, prompt, home, collector, cwd);
+            const usage = spec.extractUsage(output, config);
+            const review = readCollectedReview(collector.recordsPath);
+            return { summary: review.summary, findings: review.findings, usage };
+          } finally {
+            fs.rmSync(home, { recursive: true });
+          }
         } finally {
-          fs.rmSync(home, { recursive: true });
+          fs.rmSync(cwd, { recursive: true });
         }
       } finally {
         fs.rmSync(collector.dir, { recursive: true });

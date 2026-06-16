@@ -34,8 +34,8 @@ function formatOutputTail(label, value) {
 // Resolves with the child's captured stdout so the caller can extract usage/cost from it.
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
-// cwd is the engine's working directory — set to the reviewed repo's PARENT (see cli.js) so no
-// repo-committed project-instruction file is auto-loaded as reviewer directives.
+// cwd is the engine's working directory — an isolated scratch dir outside the reviewed repo tree
+// (see cli.js) so no repo-committed project-instruction file is auto-loaded as reviewer directives.
 function runEngine(adapter, config, prompt, home, collector, cwd) {
   return new Promise((resolve, reject) => {
     const { command, args, env } = adapter.buildCommand({ config, collector, home });

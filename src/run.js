@@ -22,11 +22,11 @@ const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..')
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
 // [LAW:one-source-of-truth] The absolute path of the REVIEWED repo (the checked-out working tree),
-// resolved once at the boundary. The engine spawns with a working directory outside this tree so a
-// repo-committed CLAUDE.md/AGENTS.md can never be auto-loaded as reviewer instructions (instruction
-// injection); the repo is reached only by this explicit path, carried into the prompt and used by
-// the CLI adapter to derive the isolated cwd. GITHUB_WORKSPACE is set by GitHub Actions and Gitea's
-// act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
+// resolved once at the boundary. The engine spawns with an isolated working directory OUTSIDE this
+// tree (owned by the CLI adapter), so a repo-committed CLAUDE.md/AGENTS.md can never be auto-loaded
+// as reviewer instructions; the repo is reached only by this explicit path, which the prompt hands
+// to the agent for absolute-path Read/Grep/Glob. GITHUB_WORKSPACE is set by GitHub Actions and
+// Gitea's act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
 const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 
 // [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
@@ -40,7 +40,6 @@ function runOneReview(config, buildPromptFor) {
     config,
     buildPromptFor,
     instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
-    reviewedRepoRoot: REVIEWED_REPO_ROOT,
   });
 }
 
