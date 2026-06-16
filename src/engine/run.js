@@ -34,11 +34,13 @@ function formatOutputTail(label, value) {
 // Resolves with the child's captured stdout so the caller can extract usage/cost from it.
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
-function runEngine(adapter, config, prompt, home, collector) {
+// cwd is the engine's working directory — set to the reviewed repo's PARENT (see cli.js) so no
+// repo-committed project-instruction file is auto-loaded as reviewer directives.
+function runEngine(adapter, config, prompt, home, collector, cwd) {
   return new Promise((resolve, reject) => {
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
     const timeoutMs = adapter.timeoutMs ?? 3_000_000;
-    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
     let stdout = '';
     let stderr = '';
     let settled = false;

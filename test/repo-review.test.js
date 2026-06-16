@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { buildRepoReviewInput } = require('../src/prompt');
+const { buildReviewInput, buildRepoReviewInput } = require('../src/prompt');
 const { renderRepoReport, groupByPath } = require('../src/report');
 
 const TOOL_NAMES = {
@@ -10,47 +10,67 @@ const TOOL_NAMES = {
   finishReview: 'mcp__review_collector__finish_review',
 };
 
+const REPO_ROOT = '/home/runner/work/acme/acme';
+
 // --- buildRepoReviewInput (the full-repo MATERIAL) ---
 
 describe('buildRepoReviewInput', () => {
   test('injects a non-empty scope as a focus instruction', () => {
-    const { prompt } = buildRepoReviewInput({ scope: 'the auth layer', excludePatterns: [], toolNames: TOOL_NAMES });
+    const { prompt } = buildRepoReviewInput({ scope: 'the auth layer', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /Focus this review on the following scope[^]*the auth layer/);
     assert.doesNotMatch(prompt, /broad review across the whole repository/);
   });
 
   test('empty scope renders the broad whole-repo instruction, not an empty focus', () => {
-    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES });
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /broad review across the whole repository/);
     assert.doesNotMatch(prompt, /Focus this review on the following scope/);
   });
 
   test('forwards the engine tool identifiers, never hardcoded names', () => {
     const custom = { requestChange: 'tool_rc', finishReview: 'tool_fr' };
-    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: custom });
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: custom, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /tool_rc/);
     assert.match(prompt, /tool_fr/);
     assert.doesNotMatch(prompt, /mcp__review_collector__request_change/);
   });
 
   test('lists exclude patterns when present and omits the line when empty', () => {
-    const withExcludes = buildRepoReviewInput({ scope: '', excludePatterns: ['*.lock', 'dist/**'], toolNames: TOOL_NAMES }).prompt;
+    const withExcludes = buildRepoReviewInput({ scope: '', excludePatterns: ['*.lock', 'dist/**'], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
     assert.match(withExcludes, /Do NOT review files matching these excluded patterns: \*\.lock, dist\/\*\*\./);
 
-    const noExcludes = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES }).prompt;
+    const noExcludes = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
     assert.doesNotMatch(noExcludes, /excluded patterns/);
   });
 
   test('frames pre-existing issues as in scope (the inverse of PR-diff review) and carries no diff grid', () => {
-    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES });
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /PRE-EXISTING issues in any file ARE in scope/);
     assert.match(prompt, /any line is valid/);
     assert.doesNotMatch(prompt, /LINE N/);
   });
 
+  test('names the reviewed repo by absolute path and states cwd is outside it (instruction-injection guard)', () => {
+    const { prompt } = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    assert.match(prompt, /checked out\s+at \/home\/runner\/work\/acme\/acme/);
+    assert.match(prompt, /working directory is intentionally outside the repository/);
+  });
+
   test('returns no files/anchors surface — only a prompt', () => {
-    const result = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES });
+    const result = buildRepoReviewInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.deepEqual(Object.keys(result), ['prompt']);
+  });
+});
+
+// --- buildReviewInput (the PR-diff MATERIAL) — repo-root anchoring ---
+
+describe('buildReviewInput repo-root anchoring', () => {
+  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+
+  test('names the reviewed repo by absolute path and states cwd is outside it', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT);
+    assert.match(prompt, /checked out at \/home\/runner\/work\/acme\/acme/);
+    assert.match(prompt, /working directory is intentionally outside the repository/);
   });
 });
 

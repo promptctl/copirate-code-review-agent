@@ -21,6 +21,14 @@ const { selectConfig } = require('./selection');
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
+// [LAW:one-source-of-truth] The absolute path of the REVIEWED repo (the checked-out working tree),
+// resolved once at the boundary. The engine spawns with a working directory outside this tree so a
+// repo-committed CLAUDE.md/AGENTS.md can never be auto-loaded as reviewer instructions (instruction
+// injection); the repo is reached only by this explicit path, carried into the prompt and used by
+// the CLI adapter to derive the isolated cwd. GITHUB_WORKSPACE is set by GitHub Actions and Gitea's
+// act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
+const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
+
 // [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
 // runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
 // pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
@@ -32,6 +40,7 @@ function runOneReview(config, buildPromptFor) {
     config,
     buildPromptFor,
     instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
+    reviewedRepoRoot: REVIEWED_REPO_ROOT,
   });
 }
 
@@ -204,9 +213,9 @@ async function runPrReview(reviewerName, excludePatterns) {
   // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
   // toolNames; buildPromptFor is called per-attempt so each engine gets its own tool identifiers.
   // [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] produceReview owns retry timing.
-  const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames);
+  const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames).prompt;
+  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames, REVIEWED_REPO_ROOT).prompt;
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -233,7 +242,7 @@ async function runRepoReview(reviewerName, excludePatterns) {
 
   // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
   // engine so each gets its own tool identifiers. [LAW:composability]
-  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames }).prompt;
+  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT }).prompt;
 
   core.info(
     `Running whole-repo review with ${chain.length} config(s) in chain`
