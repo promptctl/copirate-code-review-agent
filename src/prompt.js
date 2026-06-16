@@ -3,7 +3,11 @@ const { annotatePatchWithLines } = require('./diff');
 
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
 // MCP tool identifiers are interpolated into the prompt. [LAW:composability]
-function buildReviewInput(files, maxDiffChars, toolNames) {
+// reviewedRepoRoot is the absolute path of the checked-out repo. The engine spawns with a
+// working directory OUTSIDE that tree (so no repo-committed CLAUDE.md/AGENTS.md is auto-loaded
+// as reviewer instructions), so the repo is named here as an explicit value and the agent reads
+// it by absolute path — never via cwd-relative discovery. [LAW:effects-at-boundaries]
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -31,7 +35,9 @@ function buildReviewInput(files, maxDiffChars, toolNames) {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
     prompt: `
-Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
+Review this pull request. The repository under review is checked out at ${reviewedRepoRoot} — read it for context with
+    your Read, Grep, and Glob tools using that absolute path (your working directory is intentionally outside the repository).
+    Use the diff below as the authoritative changed surface.
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
     call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
@@ -83,7 +89,10 @@ Review this pull request. Use the repository working tree for context and the di
 // excludePatterns is a value the prompt forwards as "do not review these"; with no diff to
 // filter, the agent honors it while exploring. [LAW:dataflow-not-control-flow] empty scope and
 // empty excludePatterns are distinct values with distinct renderings, not skipped branches.
-function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
+// reviewedRepoRoot is the absolute path of the checked-out repo, named explicitly because the
+// engine's working directory is OUTSIDE the tree (so no repo-committed AGENTS.md/CLAUDE.md loads
+// as reviewer instructions); the agent explores the repo by that absolute path. [LAW:effects-at-boundaries]
+function buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }) {
   const focus = scope
     ? `Focus this review on the following scope, named by the maintainer: ${scope}. Start from the files and modules that scope points to, and follow the code from there.`
     : `Give a broad review across the whole repository. Start from the entry points and the modules most central to the project, and read the actual source before judging it.`;
@@ -93,8 +102,9 @@ function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
 
   return {
     prompt: `
-Review this repository against the LAWS in your guidance. There is no diff — explore the working tree yourself
-    using your Read, Grep, and Glob tools and judge the code you find. ${focus}${exclude}
+Review this repository against the LAWS in your guidance. There is no diff — the repository under review is checked out
+    at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
+    working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
 
     Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), and a body. When the review is complete, call

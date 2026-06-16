@@ -30629,6 +30629,7 @@ module.exports = {
 "use strict";
 
 const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
 const { createReviewCollector, readCollectedReview } = __nccwpck_require__(7290);
 const { runEngine } = __nccwpck_require__(8861);
 
@@ -30659,13 +30660,23 @@ function makeCliAdapter(spec) {
     // returned. [LAW:no-silent-failure] cleanup runs even when the engine throws.
     // [LAW:dataflow-not-control-flow] usage is a value extracted from the engine's own output and
     // returned alongside the findings — never recomputed downstream at the cost footer.
-    async produceReview({ config, buildPromptFor, instructionsPath }) {
+    async produceReview({ config, buildPromptFor, instructionsPath, reviewedRepoRoot }) {
       const prompt = buildPromptFor(spec.toolNames);
+      // [LAW:single-enforcer] The engine spawns with its working directory set to the PARENT of the
+      // reviewed repo, never the repo itself. Every engine discovers project instructions
+      // (CLAUDE.md/AGENTS.md/opencode.json) by walking UPWARD from cwd — and a repo-committed file
+      // lives INSIDE the repo, so from the parent it is unreachable. This closes the instruction-
+      // injection surface for all engines at once, structurally, rather than via brittle per-engine
+      // "disable project config" switches (claude-code has none that spares its own instructions).
+      // The repo stays UNDER cwd, so the engine reads it by absolute path with no extra grant; the
+      // reviewer's own instructions load from the isolated home (HOME/CODEX_HOME/XDG), not cwd, so
+      // they are untouched. [LAW:effects-at-boundaries] [LAW:no-ambient-temporal-coupling]
+      const cwd = path.dirname(reviewedRepoRoot);
       const collector = createReviewCollector();
       try {
         const home = spec.materializeHome({ config, instructionsPath, collector });
         try {
-          const output = await runEngine(spec, config, prompt, home, collector);
+          const output = await runEngine(spec, config, prompt, home, collector, cwd);
           const usage = spec.extractUsage(output, config);
           const review = readCollectedReview(collector.recordsPath);
           return { summary: review.summary, findings: review.findings, usage };
@@ -30816,7 +30827,11 @@ function materializeHome({ config, instructionsPath, collector }) {
 function buildCommand({ home }) {
   return {
     command: 'npx',
-    args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+    // --skip-git-repo-check: the engine's cwd is the reviewed repo's PARENT (an instruction-
+    // injection guard owned in cli.js), which is NOT a git repo. Without this flag `codex exec`
+    // refuses to run outside a git repo and hangs waiting on stdin. The repo itself is read by
+    // absolute path; the sandbox bypass already permits reads anywhere. [LAW:no-silent-failure]
+    args: ['-y', CODEX_PACKAGE, 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'],
     env: {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -31241,11 +31256,13 @@ function formatOutputTail(label, value) {
 // Resolves with the child's captured stdout so the caller can extract usage/cost from it.
 // [LAW:no-ambient-temporal-coupling] The per-invocation timeout is owned here, not in callers.
 // [LAW:effects-at-boundaries] This is the only place that spawns a child process.
-function runEngine(adapter, config, prompt, home, collector) {
+// cwd is the engine's working directory — set to the reviewed repo's PARENT (see cli.js) so no
+// repo-committed project-instruction file is auto-loaded as reviewer directives.
+function runEngine(adapter, config, prompt, home, collector, cwd) {
   return new Promise((resolve, reject) => {
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
     const timeoutMs = adapter.timeoutMs ?? 3_000_000;
-    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -31515,7 +31532,11 @@ const { annotatePatchWithLines } = __nccwpck_require__(9898);
 
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
 // MCP tool identifiers are interpolated into the prompt. [LAW:composability]
-function buildReviewInput(files, maxDiffChars, toolNames) {
+// reviewedRepoRoot is the absolute path of the checked-out repo. The engine spawns with a
+// working directory OUTSIDE that tree (so no repo-committed CLAUDE.md/AGENTS.md is auto-loaded
+// as reviewer instructions), so the repo is named here as an explicit value and the agent reads
+// it by absolute path — never via cwd-relative discovery. [LAW:effects-at-boundaries]
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -31543,7 +31564,9 @@ function buildReviewInput(files, maxDiffChars, toolNames) {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
     prompt: `
-Review this pull request. Use the repository working tree for context and the diff below as the authoritative changed surface.
+Review this pull request. The repository under review is checked out at ${reviewedRepoRoot} — read it for context with
+    your Read, Grep, and Glob tools using that absolute path (your working directory is intentionally outside the repository).
+    Use the diff below as the authoritative changed surface.
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
     call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
@@ -31595,7 +31618,10 @@ Review this pull request. Use the repository working tree for context and the di
 // excludePatterns is a value the prompt forwards as "do not review these"; with no diff to
 // filter, the agent honors it while exploring. [LAW:dataflow-not-control-flow] empty scope and
 // empty excludePatterns are distinct values with distinct renderings, not skipped branches.
-function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
+// reviewedRepoRoot is the absolute path of the checked-out repo, named explicitly because the
+// engine's working directory is OUTSIDE the tree (so no repo-committed AGENTS.md/CLAUDE.md loads
+// as reviewer instructions); the agent explores the repo by that absolute path. [LAW:effects-at-boundaries]
+function buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }) {
   const focus = scope
     ? `Focus this review on the following scope, named by the maintainer: ${scope}. Start from the files and modules that scope points to, and follow the code from there.`
     : `Give a broad review across the whole repository. Start from the entry points and the modules most central to the project, and read the actual source before judging it.`;
@@ -31605,8 +31631,9 @@ function buildRepoReviewInput({ scope, excludePatterns, toolNames }) {
 
   return {
     prompt: `
-Review this repository against the LAWS in your guidance. There is no diff — explore the working tree yourself
-    using your Read, Grep, and Glob tools and judge the code you find. ${focus}${exclude}
+Review this repository against the LAWS in your guidance. There is no diff — the repository under review is checked out
+    at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
+    working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
 
     Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
     there is no diff grid here, so any line is valid), and a body. When the review is complete, call
@@ -31984,6 +32011,14 @@ const { selectConfig } = __nccwpck_require__(675);
 const ACTION_ROOT = process.env.GITHUB_ACTION_PATH || path.join(__dirname, '..');
 const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'instructions.md');
 
+// [LAW:one-source-of-truth] The absolute path of the REVIEWED repo (the checked-out working tree),
+// resolved once at the boundary. The engine spawns with a working directory outside this tree so a
+// repo-committed CLAUDE.md/AGENTS.md can never be auto-loaded as reviewer instructions (instruction
+// injection); the repo is reached only by this explicit path, carried into the prompt and used by
+// the CLI adapter to derive the isolated cwd. GITHUB_WORKSPACE is set by GitHub Actions and Gitea's
+// act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
+const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
+
 // [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
 // runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
 // pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
@@ -31995,6 +32030,7 @@ function runOneReview(config, buildPromptFor) {
     config,
     buildPromptFor,
     instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
+    reviewedRepoRoot: REVIEWED_REPO_ROOT,
   });
 }
 
@@ -32167,9 +32203,9 @@ async function runPrReview(reviewerName, excludePatterns) {
   // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
   // toolNames; buildPromptFor is called per-attempt so each engine gets its own tool identifiers.
   // [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] produceReview owns retry timing.
-  const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames);
+  const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames).prompt;
+  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames, REVIEWED_REPO_ROOT).prompt;
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -32196,7 +32232,7 @@ async function runRepoReview(reviewerName, excludePatterns) {
 
   // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
   // engine so each gets its own tool identifiers. [LAW:composability]
-  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames }).prompt;
+  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT }).prompt;
 
   core.info(
     `Running whole-repo review with ${chain.length} config(s) in chain`

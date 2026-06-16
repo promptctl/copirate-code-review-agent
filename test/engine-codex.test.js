@@ -163,6 +163,14 @@ describe('buildCommand', () => {
     );
   });
 
+  test('args include --skip-git-repo-check (cwd is the reviewed repo parent, not a git repo)', () => {
+    const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
+    assert.ok(
+      args.includes('--skip-git-repo-check'),
+      'skip-git-repo-check missing — codex exec hangs outside a git repo, and cwd is the non-git parent dir',
+    );
+  });
+
   test('CODEX_HOME is set to the provided home directory', () => {
     const { env } = buildCommand({ config: BASE_CONFIG, home: '/custom/home' });
     assert.equal(env.CODEX_HOME, '/custom/home');
