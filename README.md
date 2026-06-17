@@ -1,6 +1,6 @@
 # Z.ai Coding Agent Review
 
-AI-powered GitHub Pull Request code review. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against the Z.ai Coding Plan. The engine is chosen explicitly via the `PROVIDER` input — never inferred from which credential you set. The action runs in the GitHub Actions runner, then submits a pull request review with inline review threads.
+AI-powered GitHub Pull Request code review. The engine is chosen by the `PROVIDER` input, which defaults to `auto` — the action's own choice, today Claude Code against DeepSeek. It can also run the Codex engine against OpenAI or Claude Code against the Z.ai Coding Plan. The action runs in the GitHub Actions runner, then submits a pull request review with inline review threads.
 
 ## Features
 
@@ -41,9 +41,9 @@ jobs:
       - name: Code Review
         uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
-          # PROVIDER defaults to 'codex' (OpenAI). Set PROVIDER: zai to run Claude Code
-          # against Z.ai instead (and pass ZAI_API_KEY rather than OPENAI_API_KEY).
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # PROVIDER defaults to 'auto' (today DeepSeek). Set PROVIDER: codex or
+          # PROVIDER: zai to pick another engine, and pass that provider's key.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 ```
 
 ## Agent install instructions
@@ -77,14 +77,14 @@ jobs:
       - name: Code Review
         uses: brandon-fryslie/zai-coding-agent-review@v1
         with:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 YAML
 ```
 
 If the repository does not already have the secret, set it with GitHub CLI:
 
 ```bash
-gh secret set OPENAI_API_KEY --body "$OPENAI_API_KEY"
+gh secret set DEEPSEEK_API_KEY --body "$DEEPSEEK_API_KEY"
 ```
 
 Then commit the workflow:
@@ -98,12 +98,12 @@ git commit -m "Install Z.ai coding agent review action"
 
 ## Inputs
 
-The engine is selected by `PROVIDER` alone. Each provider needs its own credential; the **presence** of a credential never selects the provider.
+The engine is selected by `PROVIDER`. Each provider needs its own credential.
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `PROVIDER` | No | `codex` | Engine in simple mode: `codex` (OpenAI), `zai` (Claude Code against Z.ai), `deepseek` (Claude Code against DeepSeek), or `auto` (forwards to whichever provider `auto` currently points at — `deepseek` today). Ignored when a `CONFIG_FILE` exists. |
-| `OPENAI_API_KEY` | When `PROVIDER=codex` | — | OpenAI API key for the default `codex` provider |
+| `PROVIDER` | No | `auto` | Engine in simple mode: `auto` (the action picks — `deepseek` today), `codex` (OpenAI), `zai` (Claude Code against Z.ai), or `deepseek` (Claude Code against DeepSeek). Ignored when a `CONFIG_FILE` exists. |
+| `OPENAI_API_KEY` | When `PROVIDER=codex` | — | OpenAI API key for the `codex` provider |
 | `OPENAI_MODEL` | No | `gpt-5.4-mini` | Model for the `codex` provider |
 | `OPENAI_REASONING_EFFORT` | No | — | `minimal`, `low`, `medium`, `high`, or `xhigh` for the `codex` provider |
 | `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-Responses-compatible endpoint (e.g. Azure OpenAI or a gateway) |
@@ -127,11 +127,11 @@ The engine is selected by `PROVIDER` alone. Each provider needs its own credenti
 
 The action fetches the changed files and posts the review through the GitHub API, keyed by `PR_NUMBER` — it does **not** require the pull request's code to be checked out (the checkout only gives the review agent surrounding context). Pull requests from forks are [never reviewed](#fork-pull-requests-are-not-reviewed).
 
-The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. Claude Code also loads repository instructions from the checked-out pull request project.
+The action installs its bundled reviewer instructions as Claude Code's user-global `CLAUDE.md` for each review run. The reviewed repository's own instruction files (`CLAUDE.md`/`AGENTS.md`) are not auto-loaded — each engine runs in an isolated working directory so a committed instruction file cannot redirect the reviewer (it stays readable as context).
 
 ## Configuration
 
-The default provider is `codex`: add an `OPENAI_API_KEY` secret and the action runs the Codex engine against OpenAI. To run Claude Code against the Z.ai Coding Plan instead, set `PROVIDER: zai` and supply `ZAI_API_KEY`; for DeepSeek, set `PROVIDER: deepseek` and supply `DEEPSEEK_API_KEY` (DeepSeek runs on the Claude Code engine against its Anthropic-compatible endpoint). Having multiple keys set is harmless — only `PROVIDER` decides which engine runs.
+The default provider is `auto`, which today runs Claude Code against DeepSeek: add a `DEEPSEEK_API_KEY` secret and reviews run on DeepSeek. To run Codex against OpenAI instead, set `PROVIDER: codex` and supply `OPENAI_API_KEY`; for the Z.ai Coding Plan, set `PROVIDER: zai` and supply `ZAI_API_KEY` (both `zai` and `deepseek` run on the Claude Code engine against an Anthropic-compatible endpoint).
 
 Set `PROVIDER: auto` to delegate the choice to the action: `auto` forwards to whichever provider the action currently points it at (`deepseek` today). Pinning `PROVIDER: auto` lets the maintainer retarget every consumer at once — by releasing a new action version that points `auto` elsewhere — without any consumer editing their workflow. Supply the key for whichever provider `auto` currently resolves to.
 
@@ -269,9 +269,9 @@ jobs:
 
 (The `labeled` event type lets a freshly added `review:<name>` label trigger a re-review.) With `.github/review-agents.yml` committed, this one workflow serves every config in the file; authors pick one per PR by label or body trailer, and the `fallback` list handles provider outages automatically.
 
-## Selecting Z.ai (the default is now Codex)
+## Selecting a specific engine
 
-**The default engine is `codex` (OpenAI), not Claude Code against Z.ai.** The engine is chosen by `PROVIDER` alone and never inferred from which credential is present, so a workflow that relied on Z.ai by simply setting `ZAI_API_KEY` must name the provider explicitly — add one line:
+`auto` (the default) runs Claude Code against DeepSeek today. To pin a specific engine, set `PROVIDER` and supply that provider's key — for example, Z.ai:
 
 ```yaml
       - uses: brandon-fryslie/zai-coding-agent-review@v1
@@ -280,11 +280,11 @@ jobs:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
 
-All `ZAI_*` inputs (`ZAI_API_KEY`, `ZAI_MODEL`, `ZAI_BASE_URL`, `ZAI_SYSTEM_PROMPT`, `ZAI_REVIEWER_NAME`) work exactly as before once `PROVIDER: zai` is set. Nothing else needs to change. When you outgrow a single engine, adopt a [config file](#multi-engine-configuration-githubreview-agentsyml).
+All `ZAI_*` inputs (`ZAI_API_KEY`, `ZAI_MODEL`, `ZAI_BASE_URL`, `ZAI_SYSTEM_PROMPT`, `ZAI_REVIEWER_NAME`) apply once `PROVIDER: zai` is set. When you outgrow a single engine, adopt a [config file](#multi-engine-configuration-githubreview-agentsyml).
 
 ## Operation
 
-This action provides code reviews for your PRs using the Codex/OpenAI engine by default, or Claude Code against the Z.ai Coding Plan when `PROVIDER: zai` is set.  
+This action reviews your PRs with whichever engine `PROVIDER` selects — by default `auto` (Claude Code against DeepSeek today).  
 
 By default, the agent will use the standard non-privileged GITHUB_TOKEN which does not provide write access to the repo, and therefore cannot mark a PR as approved.
 
@@ -296,7 +296,7 @@ If there are findings, it will mark the PR with CHANGES_REQUESTED.  Have your ag
 
 ### 1. Get your API key
 
-For the default `codex` provider, generate an OpenAI API key. For `PROVIDER: zai`, generate an API key from your Z.ai dashboard.
+For the default (`auto`, DeepSeek today), generate a DeepSeek API key. For `PROVIDER: codex`, generate an OpenAI key; for `PROVIDER: zai`, a Z.ai key.
 
 ### 2. Add the API key to your repository
 
@@ -305,7 +305,7 @@ For the default `codex` provider, generate an OpenAI API key. For `PROVIDER: zai
 3. Navigate to **Secrets and variables → Actions**  
 4. Click **New repository secret** and add:
 
-   - **Name:** `OPENAI_API_KEY` — **Value:** your OpenAI API key (or `ZAI_API_KEY` for the `zai` provider)
+   - **Name:** `DEEPSEEK_API_KEY` — **Value:** your DeepSeek API key (or `OPENAI_API_KEY` for `codex`, `ZAI_API_KEY` for `zai`)
 
 ## Claude Code configuration
 
@@ -377,13 +377,13 @@ jobs:
       - name: Whole-repo review
         uses: brandon-fryslie/zai-coding-agent-review@v1
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         with:
           MODE: repo
           SCOPE: ${{ inputs.scope }}
 ```
 
-Engine/provider selection (`PROVIDER`, `OPENAI_*`/`ZAI_*`, `CONFIG_FILE`), `EXCLUDE_PATTERNS`, and cost reporting work exactly as in PR mode (per-PR config selection by label/body has no effect without a PR; use the `CONFIG` input to pick a named config). The run is informational and exits 0 regardless of findings.
+Engine/provider selection (`PROVIDER`, `OPENAI_*`/`ZAI_*`/`DEEPSEEK_*`, `CONFIG_FILE`), `EXCLUDE_PATTERNS`, and cost reporting work exactly as in PR mode (per-PR config selection by label/body has no effect without a PR; use the `CONFIG` input to pick a named config). The run is informational and exits 0 regardless of findings.
 
 > **Scale limit:** the review is a single tool-driven agent run, so a broad pass over a very large repository can exceed the agent's context. For large repos, pass a `SCOPE` to focus the review on one subsystem at a time.
 
