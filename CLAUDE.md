@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A GitHub Action that runs an AI coding agent as a code reviewer. By default it runs the **Codex engine against OpenAI**; it can also run Claude Code against Z.ai's Anthropic-compatible endpoint. The engine is chosen explicitly by the `PROVIDER` input (default `codex`) in `src/provider.js` — never inferred from which credential happens to be set. Whichever engine runs, it records required changes through a private MCP "collector" tool.
+A GitHub Action that runs an AI coding agent as a code reviewer. The engine is chosen by the `PROVIDER` input in `src/provider.js`, which defaults to `auto` — the action's own choice, today Claude Code against DeepSeek's Anthropic-compatible endpoint. It can also run the Codex engine against OpenAI (`PROVIDER: codex`) or Claude Code against Z.ai (`PROVIDER: zai`). Whichever engine runs, it records required changes through a private MCP "collector" tool.
 
-**Two review modes, selected by the `MODE` input (`src/run.js`).** `MODE` is the explicit discriminator between two *materials* and two *sinks*, never inferred from "is a PR present":
+**Two review modes, selected by the `MODE` input (`src/run.js`).** `MODE` is the explicit discriminator between two *materials* and two *sinks*:
 - **`pr`** (default) — review a pull request diff and submit an inline `REQUEST_CHANGES`/`APPROVE` GitHub review (`runPrReview`).
 - **`repo`** — an on-demand whole-repo review (typically `workflow_dispatch`) with an optional free-text `SCOPE` injected into the prompt; the engine explores the working tree with Read/Grep/Glob (no diff, no anchors), and findings are printed as a Markdown report to the GitHub Step Summary + run log — no PR, no host review, no GitHub write token (`runRepoReview`). Pre-existing issues are in scope here, the inverse of PR mode.
 
@@ -72,7 +72,7 @@ An engine is reached only through an **adapter** (`src/engine/{claude-code,codex
 
 Those capability declarations are the **single source of truth for config validation** [LAW:single-enforcer] — both config paths derive from them, so an illegal combination is rejected identically whichever path it came through:
 
-- **Simple mode** (no `CONFIG_FILE`): `src/provider.js` turns the `PROVIDER` value + its provider-specific inputs into one typed `ReviewConfig`. `PROVIDERS` is the one table of concrete providers (`codex`/`zai`/`deepseek`); `PROVIDER_ALIASES` (`auto → deepseek`) is the one place to retarget every `PROVIDER: auto` consumer via a release. The provider is chosen by the explicit value alone — never inferred from which credential is set.
+- **Simple mode** (no `CONFIG_FILE`): `src/provider.js` turns the `PROVIDER` value + its provider-specific inputs into one typed `ReviewConfig`. `PROVIDERS` is the one table of concrete providers (`codex`/`zai`/`deepseek`); `PROVIDER_ALIASES` (`auto → deepseek`) is the one place to retarget every `PROVIDER: auto` consumer via a release, and `auto` is the default — a consumer that names no provider is retargeted centrally.
 - **Config-file mode** (`.github/review-agents.yml` present): `src/config.js` parses, validates against the adapter capabilities, and resolves an ordered failover **chain** of `ReviewConfig` values; every `apiKeyEnv` in the chain must be set at startup. `src/selection.js` resolves the per-PR config name (label `review:<name>` > body trailer `Review-Config:` > `CONFIG` input > file `default`), failing loud on ambiguity or an unknown name.
 
 `src/failover.js` (`produceReview`) is the single owner of retry timing and walks the chain: transient errors (classified at the adapter) retry ≤3× per config then advance; non-transient throw immediately (no failover); `buildAttributionFooter` names the config that actually produced the review.
