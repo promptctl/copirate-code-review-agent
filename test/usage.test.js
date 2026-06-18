@@ -5,11 +5,11 @@ const assert = require('node:assert/strict');
 const { extractUsage: codexExtractUsage } = require('../src/engine/codex');
 const { extractUsage: claudeExtractUsage } = require('../src/engine/claude-code');
 const {
-  computeOpenAiCostUsd,
+  computeCostUsd,
   renderCostLine,
   costWarning,
   formatTokenCount,
-  OPENAI_PRICES_PER_MILLION,
+  PRICES_PER_MILLION,
 } = require('../src/usage');
 
 const CODEX_CONFIG = {
@@ -41,13 +41,13 @@ const ANTHROPIC_CONFIG = {
   endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', apiKey: 'k' },
 };
 
-// --- computeOpenAiCostUsd ---
+// --- computeCostUsd ---
 
-describe('computeOpenAiCostUsd', () => {
+describe('computeCostUsd', () => {
   test('prices non-cached input, cached input, and output at their distinct rates', () => {
     // gpt-5.4-mini: input 0.75, cachedInput 0.075, output 4.50 (per 1M).
     // 6,000 non-cached in @0.75 + 4,000 cached @0.075 + 2,000 out @4.50 = 13,800 / 1e6.
-    const cost = computeOpenAiCostUsd(
+    const cost = computeCostUsd(
       { inputTokens: 10_000, outputTokens: 2_000, cachedInputTokens: 4_000 },
       'gpt-5.4-mini',
     );
@@ -55,17 +55,27 @@ describe('computeOpenAiCostUsd', () => {
   });
 
   test('treats absent cached tokens as zero (all input billed at full rate)', () => {
-    const cost = computeOpenAiCostUsd({ inputTokens: 1_000_000, outputTokens: 0 }, 'gpt-5.5');
+    const cost = computeCostUsd({ inputTokens: 1_000_000, outputTokens: 0 }, 'gpt-5.5');
     assert.equal(cost, 5.00);
   });
 
-  test('returns null for a model with no price-table entry — never a fabricated zero', () => {
-    assert.equal(computeOpenAiCostUsd({ inputTokens: 100, outputTokens: 100 }, 'gpt-unknown'), null);
+  test('prices deepseek and glm models from the same table (one mechanism, every provider)', () => {
+    // deepseek-v4-pro: input 0.435, output 0.87. 1M in + 1M out = 0.435 + 0.87 = 1.305.
+    const ds = computeCostUsd({ inputTokens: 1_000_000, outputTokens: 1_000_000 }, 'deepseek-v4-pro');
+    assert.ok(Math.abs(ds - 1.305) < 1e-9, `deepseek: got ${ds}`);
+    // glm-5.1: input 1.40, cachedInput 0.26, output 4.40. 800k non-cached @1.40 + 200k @0.26 + 100k out @4.40.
+    const glm = computeCostUsd({ inputTokens: 1_000_000, cachedInputTokens: 200_000, outputTokens: 100_000 }, 'glm-5.1');
+    const expected = (800_000 * 1.40 + 200_000 * 0.26 + 100_000 * 4.40) / 1e6;
+    assert.ok(Math.abs(glm - expected) < 1e-9, `glm: got ${glm}`);
   });
 
-  test('every codex-supported model has a price-table entry', () => {
-    for (const model of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']) {
-      assert.ok(OPENAI_PRICES_PER_MILLION[model], `missing price for ${model}`);
+  test('returns null for a model with no price-table entry — never a fabricated zero', () => {
+    assert.equal(computeCostUsd({ inputTokens: 100, outputTokens: 100 }, 'gpt-unknown'), null);
+  });
+
+  test('every default model the providers ship has a price-table entry', () => {
+    for (const model of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'deepseek-v4-pro', 'glm-5.1']) {
+      assert.ok(PRICES_PER_MILLION[model], `missing price for ${model}`);
     }
   });
 });
@@ -144,28 +154,45 @@ describe('claudeExtractUsage', () => {
     assert.deepEqual(usage.cost, { available: false, reason: 'not-reported' });
   });
 
-  test('cost is withheld as foreign-endpoint for a non-Anthropic endpoint, even when total_cost_usd is present', () => {
-    // [LAW:no-silent-failure] claude-code prices total_cost_usd against Anthropic; for z.ai/deepseek
-    // that is the wrong vendor, so the figure must never become a rendered cost — tokens still report.
+  test('a non-Anthropic endpoint is priced from its own table entry — Anthropic total_cost_usd is ignored', () => {
+    // [LAW:no-silent-failure] claude-code prices total_cost_usd against Anthropic; for deepseek that
+    // is the wrong vendor, so it is discarded and cost is computed from deepseek's own price entry.
+    // Anthropic-style buckets: fresh + cache_creation at full rate, cache_read at the cached rate.
     const stdout = JSON.stringify({
       type: 'result',
-      total_cost_usd: 0.5,
-      usage: { input_tokens: 1000, output_tokens: 500 },
+      total_cost_usd: 0.5, // wrong-vendor figure — must NOT appear in the result
+      usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
     });
-    for (const cfg of [ZAI_CONFIG, DEEPSEEK_CONFIG]) {
-      const usage = claudeExtractUsage(stdout, cfg);
-      assert.equal(usage.inputTokens, 1000);
-      assert.equal(usage.outputTokens, 500);
-      assert.deepEqual(usage.cost, { available: false, reason: 'foreign-endpoint' });
-    }
+    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG);
+    assert.equal(usage.inputTokens, 1_000_000);
+    assert.equal(usage.cost.available, true);
+    // deepseek-v4-pro: 1M in @0.435 + 1M out @0.87 = 1.305 — not the 0.5 Anthropic figure.
+    assert.ok(Math.abs(usage.cost.usd - 1.305) < 1e-9, `got ${usage.cost.usd}`);
+  });
+
+  test('cache reads bill at the discounted cached rate, fresh + cache writes at the full rate', () => {
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: { input_tokens: 1_000_000, cache_read_input_tokens: 500_000, cache_creation_input_tokens: 250_000, output_tokens: 100_000 },
+    });
+    const usage = claudeExtractUsage(stdout, DEEPSEEK_CONFIG);
+    // full-rate = fresh(1M) + cache_creation(250k) = 1.25M @0.435; cached = cache_read(500k) @0.003625; out 100k @0.87.
+    const expected = (1_250_000 * 0.435 + 500_000 * 0.003625 + 100_000 * 0.87) / 1e6;
+    assert.ok(Math.abs(usage.cost.usd - expected) < 1e-9, `got ${usage.cost.usd}, expected ${expected}`);
+  });
+
+  test('a foreign endpoint whose model is not in the table reports no-price (tokens still shown)', () => {
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
+    const unlisted = { engine: 'claude-code', model: 'glm-unreleased', endpoint: { baseUrl: 'https://api.z.ai/api/anthropic' } };
+    assert.deepEqual(claudeExtractUsage(stdout, unlisted).cost, { available: false, reason: 'no-price' });
   });
 
   test('a lookalike host (notanthropic.com) is classified foreign, not trusted as Anthropic', () => {
     // [LAW:types-are-the-program] regression: endsWith('anthropic.com') wrongly accepted this host.
+    // model not in the table → no-price (proves total_cost_usd was NOT used); genuine host → total_cost_usd.
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
     const lookalike = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.notanthropic.com' } };
-    assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { available: false, reason: 'foreign-endpoint' });
-    // a genuine subdomain still classifies as Anthropic
+    assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { available: false, reason: 'no-price' });
     const sub = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
     assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { available: true, usd: 0.5 });
   });
@@ -201,13 +228,15 @@ describe('renderCostLine', () => {
     assert.doesNotMatch(line, /z\.ai/);
   });
 
-  test('a z.ai/deepseek (foreign) claude-code run renders cost as unknown, never a wrong-vendor dollar figure', () => {
-    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 100, output_tokens: 50 } });
-    for (const cfg of [ZAI_CONFIG, DEEPSEEK_CONFIG]) {
-      const line = renderCostLine(claudeExtractUsage(stdout, cfg), cfg);
-      assert.match(line, /Cost: unknown/);
-      assert.doesNotMatch(line, /\$0\.5/);
-    }
+  test('a z.ai/deepseek (foreign) claude-code run renders its own table-priced cost, never the Anthropic figure', () => {
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
+    const dsLine = renderCostLine(claudeExtractUsage(stdout, DEEPSEEK_CONFIG), DEEPSEEK_CONFIG);
+    assert.match(dsLine, /\$1\.3050/);          // deepseek-priced, not $0.5000
+    assert.doesNotMatch(dsLine, /\$0\.5000/);
+    assert.match(dsLine, /· est\._$/);
+    const glmLine = renderCostLine(claudeExtractUsage(stdout, ZAI_CONFIG), ZAI_CONFIG);
+    assert.match(glmLine, /Cost: \$/);          // glm-5.1 priced
+    assert.doesNotMatch(glmLine, /unknown/);
   });
 
   test('shows cost as "unknown" (tokens still rendered) when cost is unavailable', () => {
@@ -229,20 +258,13 @@ describe('costWarning', () => {
   test('no-price names the price table and the model to add', () => {
     const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'no-price' } }, { ...CODEX_CONFIG, model: 'gpt-future' });
     assert.match(w, /price-table entry for codex\/gpt-future/);
-    assert.match(w, /OPENAI_PRICES_PER_MILLION/);
+    assert.match(w, /PRICES_PER_MILLION/);
   });
 
   test('not-reported names the engine, never the price table — the codex/claude causes do not conflate', () => {
-    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'not-reported' } }, ZAI_CONFIG);
+    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'not-reported' } }, ANTHROPIC_CONFIG);
     assert.match(w, /claude-code reported no cost/);
-    assert.doesNotMatch(w, /price-table|OPENAI_PRICES_PER_MILLION/);
-  });
-
-  test('foreign-endpoint names the non-Anthropic host and explains the withheld cost', () => {
-    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'foreign-endpoint' } }, DEEPSEEK_CONFIG);
-    assert.match(w, /non-Anthropic endpoint \(api\.deepseek\.com\)/);
-    assert.match(w, /Anthropic prices/);
-    assert.doesNotMatch(w, /OPENAI_PRICES_PER_MILLION/);
+    assert.doesNotMatch(w, /price-table|PRICES_PER_MILLION/);
   });
 
   test('no usage at all warns that the cost line is omitted', () => {
