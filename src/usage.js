@@ -49,7 +49,11 @@ function isAnthropicEndpoint(config) {
   const baseUrl = config.endpoint && config.endpoint.baseUrl;
   if (!baseUrl) return true;
   try {
-    return new URL(baseUrl).hostname.endsWith('anthropic.com');
+    // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
+    // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like
+    // `notanthropic.com` would satisfy and be wrongly trusted as Anthropic's billing basis.
+    const host = new URL(baseUrl).hostname;
+    return host === 'anthropic.com' || host.endsWith('.anthropic.com');
   } catch {
     return false;
   }

@@ -160,6 +160,16 @@ describe('claudeExtractUsage', () => {
     }
   });
 
+  test('a lookalike host (notanthropic.com) is classified foreign, not trusted as Anthropic', () => {
+    // [LAW:types-are-the-program] regression: endsWith('anthropic.com') wrongly accepted this host.
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
+    const lookalike = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.notanthropic.com' } };
+    assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { available: false, reason: 'foreign-endpoint' });
+    // a genuine subdomain still classifies as Anthropic
+    const sub = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
+    assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { available: true, usd: 0.5 });
+  });
+
   test('returns null when the envelope has no usage', () => {
     assert.equal(claudeExtractUsage('{"type":"result","result":"x"}', ANTHROPIC_CONFIG), null);
   });
