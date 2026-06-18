@@ -26,6 +26,21 @@ const ZAI_CONFIG = {
   endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.z.ai/api/anthropic', apiKey: 'k' },
 };
 
+const DEEPSEEK_CONFIG = {
+  name: 'deepseek',
+  engine: 'claude-code',
+  model: 'deepseek-v4-pro',
+  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' },
+};
+
+// A genuine Anthropic endpoint — the only case where claude-code's total_cost_usd is a usable cost.
+const ANTHROPIC_CONFIG = {
+  name: 'anthropic',
+  engine: 'claude-code',
+  model: 'claude-x',
+  endpoint: { kind: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', apiKey: 'k' },
+};
+
 // --- computeOpenAiCostUsd ---
 
 describe('computeOpenAiCostUsd', () => {
@@ -116,25 +131,51 @@ describe('claudeExtractUsage', () => {
         cache_creation_input_tokens: 250,
       },
     });
-    const usage = claudeExtractUsage(stdout);
+    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG);
     assert.equal(usage.inputTokens, 1000 + 4000 + 250);
     assert.equal(usage.outputTokens, 500);
     assert.deepEqual(usage.cost, { available: true, usd: 0.0123 });
   });
 
-  test('cost is unavailable with reason not-reported when the envelope omits total_cost_usd', () => {
+  test('cost is unavailable with reason not-reported when a genuine Anthropic envelope omits total_cost_usd', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
-    const usage = claudeExtractUsage(stdout);
+    const usage = claudeExtractUsage(stdout, ANTHROPIC_CONFIG);
     assert.equal(usage.inputTokens, 10);
     assert.deepEqual(usage.cost, { available: false, reason: 'not-reported' });
   });
 
+  test('cost is withheld as foreign-endpoint for a non-Anthropic endpoint, even when total_cost_usd is present', () => {
+    // [LAW:no-silent-failure] claude-code prices total_cost_usd against Anthropic; for z.ai/deepseek
+    // that is the wrong vendor, so the figure must never become a rendered cost — tokens still report.
+    const stdout = JSON.stringify({
+      type: 'result',
+      total_cost_usd: 0.5,
+      usage: { input_tokens: 1000, output_tokens: 500 },
+    });
+    for (const cfg of [ZAI_CONFIG, DEEPSEEK_CONFIG]) {
+      const usage = claudeExtractUsage(stdout, cfg);
+      assert.equal(usage.inputTokens, 1000);
+      assert.equal(usage.outputTokens, 500);
+      assert.deepEqual(usage.cost, { available: false, reason: 'foreign-endpoint' });
+    }
+  });
+
+  test('a lookalike host (notanthropic.com) is classified foreign, not trusted as Anthropic', () => {
+    // [LAW:types-are-the-program] regression: endsWith('anthropic.com') wrongly accepted this host.
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 10, output_tokens: 5 } });
+    const lookalike = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.notanthropic.com' } };
+    assert.deepEqual(claudeExtractUsage(stdout, lookalike).cost, { available: false, reason: 'foreign-endpoint' });
+    // a genuine subdomain still classifies as Anthropic
+    const sub = { engine: 'claude-code', model: 'x', endpoint: { baseUrl: 'https://api.anthropic.com' } };
+    assert.deepEqual(claudeExtractUsage(stdout, sub).cost, { available: true, usd: 0.5 });
+  });
+
   test('returns null when the envelope has no usage', () => {
-    assert.equal(claudeExtractUsage('{"type":"result","result":"x"}'), null);
+    assert.equal(claudeExtractUsage('{"type":"result","result":"x"}', ANTHROPIC_CONFIG), null);
   });
 
   test('returns null when stdout is not a parseable envelope', () => {
-    assert.equal(claudeExtractUsage('not json at all'), null);
+    assert.equal(claudeExtractUsage('not json at all', ANTHROPIC_CONFIG), null);
   });
 });
 
@@ -160,9 +201,13 @@ describe('renderCostLine', () => {
     assert.doesNotMatch(line, /z\.ai/);
   });
 
-  test('marks the z.ai endpoint cost as an Anthropic-priced estimate (stronger caveat)', () => {
-    const line = renderCostLine({ inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.5 } }, ZAI_CONFIG);
-    assert.match(line, /est\. \(Anthropic pricing, not z\.ai billing\)/);
+  test('a z.ai/deepseek (foreign) claude-code run renders cost as unknown, never a wrong-vendor dollar figure', () => {
+    const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.5, usage: { input_tokens: 100, output_tokens: 50 } });
+    for (const cfg of [ZAI_CONFIG, DEEPSEEK_CONFIG]) {
+      const line = renderCostLine(claudeExtractUsage(stdout, cfg), cfg);
+      assert.match(line, /Cost: unknown/);
+      assert.doesNotMatch(line, /\$0\.5/);
+    }
   });
 
   test('shows cost as "unknown" (tokens still rendered) when cost is unavailable', () => {
@@ -191,6 +236,13 @@ describe('costWarning', () => {
     const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'not-reported' } }, ZAI_CONFIG);
     assert.match(w, /claude-code reported no cost/);
     assert.doesNotMatch(w, /price-table|OPENAI_PRICES_PER_MILLION/);
+  });
+
+  test('foreign-endpoint names the non-Anthropic host and explains the withheld cost', () => {
+    const w = costWarning({ inputTokens: 1, outputTokens: 1, cost: { available: false, reason: 'foreign-endpoint' } }, DEEPSEEK_CONFIG);
+    assert.match(w, /non-Anthropic endpoint \(api\.deepseek\.com\)/);
+    assert.match(w, /Anthropic prices/);
+    assert.doesNotMatch(w, /OPENAI_PRICES_PER_MILLION/);
   });
 
   test('no usage at all warns that the cost line is omitted', () => {

@@ -30443,6 +30443,7 @@ const os = __nccwpck_require__(857);
 const { TransientError, parseRetryAfterMs } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
+const { isAnthropicEndpoint } = __nccwpck_require__(9614);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -30545,14 +30546,11 @@ function assertSucceeded(stdout) {
 }
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the JSON envelope and returns a Usage value,
-// or null when usage is absent. total_cost_usd is the real, provider-reported cost (no price table
-// needed); a missing one yields cost {available:false, reason:'not-reported'}, tokens still report.
-// total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled price table), not a
-// billed charge — so the renderer marks every cost line "est.". The input count sums all input-side
-// fields (fresh + cache read + cache write) so it reflects the total prompt tokens the run processed.
-// Against the z.ai endpoint the estimate is priced against the wrong provider (Anthropic prices, z.ai
-// billing), so the renderer adds a stronger caveat there. [FRAMING:representation]
-function extractUsage(stdout) {
+// or null when usage is absent. The input count sums all input-side fields (fresh + cache read +
+// cache write) so it reflects the total prompt tokens the run processed.
+// total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
+// table), not a billed charge — so the renderer marks every available cost line "est.".
+function extractUsage(stdout, config) {
   const env = parseJsonEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
@@ -30561,13 +30559,18 @@ function extractUsage(stdout) {
     (u.cache_read_input_tokens ?? 0) +
     (u.cache_creation_input_tokens ?? 0);
   const outputTokens = u.output_tokens ?? 0;
-  // [LAW:types-are-the-program] cost is a discriminated value. Claude Code self-reports USD, so a
-  // missing total_cost_usd means the engine did not report a cost ('not-reported') — distinct from
-  // codex's 'no-price', and unrelated to the price table. The adapter declares its own reason.
-  const cost = typeof env.total_cost_usd === 'number'
-    ? { available: true, usd: env.total_cost_usd }
-    : { available: false, reason: 'not-reported' };
-  return { inputTokens, outputTokens, cost };
+  return { inputTokens, outputTokens, cost: costFromEnvelope(env, config) };
+}
+
+// [LAW:types-are-the-program] cost is a discriminated value, and total_cost_usd is a usable cost
+// ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE endpoint (z.ai,
+// deepseek, …) the figure is priced for the wrong vendor, so cost is withheld as 'foreign-endpoint'
+// rather than rendered as a confident wrong dollar amount — tokens still report. [LAW:no-silent-failure]
+// A genuine Anthropic run with no total_cost_usd is the distinct 'not-reported' case.
+function costFromEnvelope(env, config) {
+  if (!isAnthropicEndpoint(config)) return { available: false, reason: 'foreign-endpoint' };
+  if (typeof env.total_cost_usd === 'number') return { available: true, usd: env.total_cost_usd };
+  return { available: false, reason: 'not-reported' };
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
@@ -32578,12 +32581,36 @@ function computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0
   return total / 1_000_000;
 }
 
-// Z.ai exposes an Anthropic-compatible endpoint, so Claude Code reports total_cost_usd using
-// Anthropic's pricing — which is NOT what z.ai actually bills. Detect that endpoint so the
-// rendered cost can be marked as an estimate. [FRAMING:representation] the cost is honest about
-// being an Anthropic-priced estimate rather than silently claiming to be z.ai's real charge.
-function isZaiEndpoint(config) {
-  return Boolean(config.endpoint && config.endpoint.baseUrl && config.endpoint.baseUrl.includes('z.ai'));
+// Claude Code self-reports total_cost_usd using Anthropic's price table, so that figure is this
+// run's billing basis ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE
+// endpoint (z.ai, deepseek, …) it is priced for the wrong vendor and is not a usable cost.
+// [LAW:types-are-the-program] Whitelist the genuine endpoint rather than blacklisting known
+// impostors: default to "not Anthropic" so every foreign endpoint is excluded by construction, not
+// one vendor at a time. An absent baseUrl means Claude Code's built-in default — Anthropic's own API.
+function isAnthropicEndpoint(config) {
+  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  if (!baseUrl) return true;
+  try {
+    // [LAW:types-are-the-program] Match the anthropic.com domain exactly — the apex or a true
+    // subdomain — never a bare `endsWith('anthropic.com')`, which a lookalike host like
+    // `notanthropic.com` would satisfy and be wrongly trusted as Anthropic's billing basis.
+    const host = new URL(baseUrl).hostname;
+    return host === 'anthropic.com' || host.endsWith('.anthropic.com');
+  } catch {
+    return false;
+  }
+}
+
+// The endpoint host, for the "cost unknown — foreign endpoint" warning. Falls back to the raw
+// baseUrl if it does not parse, and to Anthropic's host when there is no override.
+function endpointHost(config) {
+  const baseUrl = config.endpoint && config.endpoint.baseUrl;
+  if (!baseUrl) return 'api.anthropic.com';
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return baseUrl;
+  }
 }
 
 function formatTokenCount(n) {
@@ -32607,13 +32634,12 @@ function renderCostLine(usage, config) {
   if (!usage.cost.available) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
-  // [FRAMING:representation] Every cost this action renders is an ESTIMATE, never a billed charge:
-  // codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own client-side
-  // estimate. So every line is marked "est." rather than implying exactness. The z.ai case carries
-  // the stronger caveat because there the estimate is priced against the wrong provider (Anthropic
-  // prices, z.ai billing) — a genuine fidelity difference, derived from config, not an extra value.
-  const estimate = isZaiEndpoint(config) ? 'est. (Anthropic pricing, not z.ai billing)' : 'est.';
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · ${estimate}_`;
+  // [FRAMING:representation] Every available cost this action renders is an ESTIMATE, never a billed
+  // charge: codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own
+  // client-side estimate. So every line is marked "est." rather than implying exactness. A foreign
+  // (non-Anthropic) claude-code endpoint never reaches here: its cost is unavailable upstream
+  // (reason 'foreign-endpoint'), so a wrong-vendor figure is never rendered as a dollar amount.
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est._`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
@@ -32628,6 +32654,14 @@ function costWarning(usage, config) {
     return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
       + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.';
   }
+  // [LAW:no-silent-failure] claude-code's self-reported cost is Anthropic-priced; against a
+  // non-Anthropic endpoint that figure is the wrong vendor's, so it is withheld and the cause is
+  // named loudly rather than rendered as a confident, wrong dollar amount.
+  if (usage.cost.reason === 'foreign-endpoint') {
+    return `${tag} ran against a non-Anthropic endpoint (${endpointHost(config)}); claude-code `
+      + 'self-reports cost using Anthropic prices, which is not this provider\'s billing, so the '
+      + 'review footer shows cost as "unknown" (tokens still shown).';
+  }
   return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".';
 }
@@ -32638,7 +32672,7 @@ module.exports = {
   renderCostLine,
   costWarning,
   formatTokenCount,
-  isZaiEndpoint,
+  isAnthropicEndpoint,
 };
 
 
