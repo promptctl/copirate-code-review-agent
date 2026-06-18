@@ -30443,7 +30443,7 @@ const os = __nccwpck_require__(857);
 const { TransientError, parseRetryAfterMs } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
-const { isAnthropicEndpoint } = __nccwpck_require__(9614);
+const { isAnthropicEndpoint, computeCostUsd } = __nccwpck_require__(9614);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -30554,23 +30554,31 @@ function extractUsage(stdout, config) {
   const env = parseJsonEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
-  const inputTokens =
-    (u.input_tokens ?? 0) +
-    (u.cache_read_input_tokens ?? 0) +
-    (u.cache_creation_input_tokens ?? 0);
+  const freshInput = u.input_tokens ?? 0;
+  const cacheRead = u.cache_read_input_tokens ?? 0;
+  const cacheWrite = u.cache_creation_input_tokens ?? 0;
+  const inputTokens = freshInput + cacheRead + cacheWrite;
   const outputTokens = u.output_tokens ?? 0;
-  return { inputTokens, outputTokens, cost: costFromEnvelope(env, config) };
+  // [LAW:types-are-the-program] Anthropic-style buckets → the price-table shape: cache reads bill at
+  // the discounted cached rate, fresh + cache writes at the full input rate. cachedInputTokens is the
+  // cached subset of inputTokens, exactly what computeCostUsd expects.
+  const cost = costFromEnvelope(env, config, { inputTokens, cachedInputTokens: cacheRead, outputTokens });
+  return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:types-are-the-program] cost is a discriminated value, and total_cost_usd is a usable cost
-// ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE endpoint (z.ai,
-// deepseek, …) the figure is priced for the wrong vendor, so cost is withheld as 'foreign-endpoint'
-// rather than rendered as a confident wrong dollar amount — tokens still report. [LAW:no-silent-failure]
-// A genuine Anthropic run with no total_cost_usd is the distinct 'not-reported' case.
-function costFromEnvelope(env, config) {
-  if (!isAnthropicEndpoint(config)) return { available: false, reason: 'foreign-endpoint' };
-  if (typeof env.total_cost_usd === 'number') return { available: true, usd: env.total_cost_usd };
-  return { available: false, reason: 'not-reported' };
+// [LAW:types-are-the-program] cost is a discriminated value, resolved by the one fact that decides
+// the cost basis: is the endpoint genuinely Anthropic? If so, total_cost_usd is Claude Code's own
+// Anthropic-priced estimate (or 'not-reported' when absent). If not (z.ai, deepseek, …), that figure
+// is the wrong vendor's, so it is ignored entirely and the cost is computed from the provider's own
+// entry in the price table — 'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+function costFromEnvelope(env, config, buckets) {
+  if (isAnthropicEndpoint(config)) {
+    return typeof env.total_cost_usd === 'number'
+      ? { available: true, usd: env.total_cost_usd }
+      : { available: false, reason: 'not-reported' };
+  }
+  const usd = computeCostUsd(buckets, config.model);
+  return usd == null ? { available: false, reason: 'no-price' } : { available: true, usd };
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
@@ -30716,7 +30724,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const { TransientError } = __nccwpck_require__(2887);
-const { computeOpenAiCostUsd } = __nccwpck_require__(9614);
+const { computeCostUsd } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
 const CODEX_PACKAGE = '@openai/codex@latest';
@@ -30877,7 +30885,7 @@ function assertSucceeded(stdout) {
 
 // [LAW:effects-at-boundaries] Pure: reads usage from the engine's own JSONL output and returns
 // a Usage value, or null when no usage was reported. Codex emits NO USD — 'actual USD' is
-// tokens x the centralized OpenAI price table (computeOpenAiCostUsd); a model absent from the
+// tokens x the centralized price table (computeCostUsd); a model absent from the
 // table yields cost {available:false, reason:'no-price'}, never a fabricated zero. [LAW:no-silent-failure]
 // The cumulative turn usage rides on the final turn.completed event; later events overwrite
 // earlier ones so the last wins. An absent/empty usage object (no token fields) is reported as
@@ -30895,7 +30903,7 @@ function extractUsage(stdout, config) {
   const inputTokens = usage.input_tokens ?? 0;
   const outputTokens = usage.output_tokens ?? 0;
   const cachedInputTokens = usage.cached_input_tokens ?? 0;
-  const costUsd = computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
+  const costUsd = computeCostUsd({ inputTokens, outputTokens, cachedInputTokens }, config.model);
   // [LAW:types-are-the-program] cost is a discriminated value. Codex reports no USD, so a null
   // here means exactly one thing — the model is absent from the price table — and the adapter
   // declares that reason at the point it knows it, rather than the boundary re-deriving it.
@@ -32544,34 +32552,41 @@ module.exports = {
 
 // Per-run token/cost reporting.
 //
-// [LAW:decomposition] Two cohesive concerns live here: the OpenAI price table (a
-// representation that drifts from OpenAI's real prices and must be hand-maintained) and the
-// pure renderer that formats an already-extracted Usage value into the review footer line.
-// Extraction is engine-specific and lives in each adapter (engine/codex.js, engine/claude-code.js);
-// this module only computes the Codex cost (from tokens x price) and formats the footer.
-// [LAW:single-enforcer] Codex cost is computed in exactly one place: computeOpenAiCostUsd.
+// [LAW:decomposition] Two cohesive concerns live here: the price table (a representation that
+// drifts from each provider's real prices and must be hand-maintained) and the pure renderer that
+// formats an already-extracted Usage value into the review footer line. Extraction is engine-specific
+// and lives in each adapter (engine/codex.js, engine/claude-code.js); this module computes cost from
+// tokens × price and formats the footer.
+// [LAW:single-enforcer] Token cost is computed in exactly one place: computeCostUsd.
 
-// [LAW:one-source-of-truth] The OpenAI price table. Dollars per ONE MILLION tokens, matching
-// OpenAI's published per-1M figures so the numbers can be eyeballed against the pricing page.
-// PRICE-SENSITIVE: these drift whenever OpenAI changes prices and have no machine source —
-// they MUST be updated by hand. Last verified 2026-06-14 against https://openai.com/api/pricing/
-// cachedInput is the discounted prompt-cache rate: across the GPT-5 family that is a 90% discount
-// (cached = 10% of input), so each cachedInput is one-tenth of its input — keep that ratio when
-// adding or updating a model unless OpenAI publishes a different cache discount for it.
-const OPENAI_PRICES_PER_MILLION = {
+// [LAW:one-source-of-truth] The price table — EVERY priced provider, one table, keyed by the exact
+// model id each engine reports (namespaces don't collide: gpt-*, deepseek-*, glm-*). Dollars per ONE
+// MILLION tokens, matching each vendor's published per-1M figures so they can be eyeballed against
+// the pricing page. PRICE-SENSITIVE: these drift whenever a vendor changes prices and have no machine
+// source — they MUST be updated by hand. `cachedInput` is the discounted prompt-cache rate.
+// Sources / last verified:
+//   OpenAI   2026-06-14 — https://openai.com/api/pricing/
+//   DeepSeek 2026-06-17 — https://api-docs.deepseek.com/quick_start/pricing  (aggressive disk-cache rate)
+//   z.ai GLM 2026-06-17 — https://docs.z.ai/guides/overview/pricing
+const PRICES_PER_MILLION = {
   'gpt-5.5': { input: 5.00, cachedInput: 0.50, output: 30.00 },
   'gpt-5.4': { input: 2.50, cachedInput: 0.25, output: 15.00 },
   'gpt-5.4-mini': { input: 0.75, cachedInput: 0.075, output: 4.50 },
+  'deepseek-v4-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87 },
+  'deepseek-v4-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28 },
+  'glm-5.1': { input: 1.40, cachedInput: 0.26, output: 4.40 },
+  'glm-4.6': { input: 0.60, cachedInput: 0.11, output: 2.20 },
 };
 
 // [LAW:effects-at-boundaries] Pure: tokens + model -> USD, no IO. Returns null (cost unknown)
 // when the model has no price-table entry — never a fabricated zero, so a missing price surfaces
 // as "unknown" rather than a confident-but-wrong $0.00. [LAW:no-silent-failure]
-// input_tokens from the OpenAI/Codex usage event is the FULL prompt count (cached included);
-// the cached subset is billed at the discounted cachedInput rate, the remainder at input rate.
-// output_tokens already includes reasoning tokens, so they are priced once at the output rate.
-function computeOpenAiCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, model) {
-  const price = OPENAI_PRICES_PER_MILLION[model];
+// inputTokens is the FULL input count (cached included); the cached subset (cachedInputTokens) is
+// billed at the discounted cachedInput rate, the remainder at the input rate. Each adapter buckets
+// its own raw usage into this shape (codex: cached_input_tokens; claude-code: cache_read at the
+// cached rate, fresh + cache_creation at the full rate). output_tokens is priced at the output rate.
+function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, model) {
+  const price = PRICES_PER_MILLION[model];
   if (!price) return null;
   const nonCachedInput = Math.max(0, inputTokens - cachedInputTokens);
   const total =
@@ -32601,18 +32616,6 @@ function isAnthropicEndpoint(config) {
   }
 }
 
-// The endpoint host, for the "cost unknown — foreign endpoint" warning. Falls back to the raw
-// baseUrl if it does not parse, and to Anthropic's host when there is no override.
-function endpointHost(config) {
-  const baseUrl = config.endpoint && config.endpoint.baseUrl;
-  if (!baseUrl) return 'api.anthropic.com';
-  try {
-    return new URL(baseUrl).hostname;
-  } catch {
-    return baseUrl;
-  }
-}
-
 function formatTokenCount(n) {
   return n.toLocaleString('en-US');
 }
@@ -32635,10 +32638,9 @@ function renderCostLine(usage, config) {
     return `_Cost: unknown · ${tokens} · ${tag}_`;
   }
   // [FRAMING:representation] Every available cost this action renders is an ESTIMATE, never a billed
-  // charge: codex is price-table × tokens, claude-code's total_cost_usd is Claude Code's own
-  // client-side estimate. So every line is marked "est." rather than implying exactness. A foreign
-  // (non-Anthropic) claude-code endpoint never reaches here: its cost is unavailable upstream
-  // (reason 'foreign-endpoint'), so a wrong-vendor figure is never rendered as a dollar amount.
+  // charge: a table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine
+  // Anthropic run is Claude Code's own client-side total_cost_usd. So every line is marked "est."
+  // rather than implying exactness.
   return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est._`;
 }
 
@@ -32652,23 +32654,15 @@ function costWarning(usage, config) {
   const tag = reviewerTag(config);
   if (usage.cost.reason === 'no-price') {
     return `No price-table entry for ${tag}; the review footer shows cost as "unknown". `
-      + 'Add the model to OPENAI_PRICES_PER_MILLION in src/usage.js.';
-  }
-  // [LAW:no-silent-failure] claude-code's self-reported cost is Anthropic-priced; against a
-  // non-Anthropic endpoint that figure is the wrong vendor's, so it is withheld and the cause is
-  // named loudly rather than rendered as a confident, wrong dollar amount.
-  if (usage.cost.reason === 'foreign-endpoint') {
-    return `${tag} ran against a non-Anthropic endpoint (${endpointHost(config)}); claude-code `
-      + 'self-reports cost using Anthropic prices, which is not this provider\'s billing, so the '
-      + 'review footer shows cost as "unknown" (tokens still shown).';
+      + 'Add the model to PRICES_PER_MILLION in src/usage.js.';
   }
   return `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".';
 }
 
 module.exports = {
-  OPENAI_PRICES_PER_MILLION,
-  computeOpenAiCostUsd,
+  PRICES_PER_MILLION,
+  computeCostUsd,
   renderCostLine,
   costWarning,
   formatTokenCount,

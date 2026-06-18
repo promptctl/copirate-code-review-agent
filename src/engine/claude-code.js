@@ -5,7 +5,7 @@ const os = require('os');
 const { TransientError, parseRetryAfterMs } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail } = require('./run');
 const { makeCliAdapter } = require('./cli');
-const { isAnthropicEndpoint } = require('../usage');
+const { isAnthropicEndpoint, computeCostUsd } = require('../usage');
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -116,23 +116,31 @@ function extractUsage(stdout, config) {
   const env = parseJsonEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
-  const inputTokens =
-    (u.input_tokens ?? 0) +
-    (u.cache_read_input_tokens ?? 0) +
-    (u.cache_creation_input_tokens ?? 0);
+  const freshInput = u.input_tokens ?? 0;
+  const cacheRead = u.cache_read_input_tokens ?? 0;
+  const cacheWrite = u.cache_creation_input_tokens ?? 0;
+  const inputTokens = freshInput + cacheRead + cacheWrite;
   const outputTokens = u.output_tokens ?? 0;
-  return { inputTokens, outputTokens, cost: costFromEnvelope(env, config) };
+  // [LAW:types-are-the-program] Anthropic-style buckets → the price-table shape: cache reads bill at
+  // the discounted cached rate, fresh + cache writes at the full input rate. cachedInputTokens is the
+  // cached subset of inputTokens, exactly what computeCostUsd expects.
+  const cost = costFromEnvelope(env, config, { inputTokens, cachedInputTokens: cacheRead, outputTokens });
+  return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:types-are-the-program] cost is a discriminated value, and total_cost_usd is a usable cost
-// ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE endpoint (z.ai,
-// deepseek, …) the figure is priced for the wrong vendor, so cost is withheld as 'foreign-endpoint'
-// rather than rendered as a confident wrong dollar amount — tokens still report. [LAW:no-silent-failure]
-// A genuine Anthropic run with no total_cost_usd is the distinct 'not-reported' case.
-function costFromEnvelope(env, config) {
-  if (!isAnthropicEndpoint(config)) return { available: false, reason: 'foreign-endpoint' };
-  if (typeof env.total_cost_usd === 'number') return { available: true, usd: env.total_cost_usd };
-  return { available: false, reason: 'not-reported' };
+// [LAW:types-are-the-program] cost is a discriminated value, resolved by the one fact that decides
+// the cost basis: is the endpoint genuinely Anthropic? If so, total_cost_usd is Claude Code's own
+// Anthropic-priced estimate (or 'not-reported' when absent). If not (z.ai, deepseek, …), that figure
+// is the wrong vendor's, so it is ignored entirely and the cost is computed from the provider's own
+// entry in the price table — 'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+function costFromEnvelope(env, config, buckets) {
+  if (isAnthropicEndpoint(config)) {
+    return typeof env.total_cost_usd === 'number'
+      ? { available: true, usd: env.total_cost_usd }
+      : { available: false, reason: 'not-reported' };
+  }
+  const usd = computeCostUsd(buckets, config.model);
+  return usd == null ? { available: false, reason: 'no-price' } : { available: true, usd };
 }
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
