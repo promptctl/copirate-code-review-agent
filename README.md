@@ -1,4 +1,4 @@
-# Z.ai Coding Agent Review
+# Coding Agent Review
 
 AI-powered GitHub Pull Request code review. The engine is chosen by the `PROVIDER` input, which defaults to `auto` — the action's own choice, today Claude Code against DeepSeek. It can also run the Codex engine against OpenAI or Claude Code against the Z.ai Coding Plan. The action runs in the GitHub Actions runner, then submits a pull request review with inline review threads.
 
@@ -114,7 +114,7 @@ The engine is selected by `PROVIDER`. Each provider needs its own credential.
 | `DEEPSEEK_MODEL` | No | `deepseek-v4-pro` | Model for the `deepseek` provider |
 | `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for the `deepseek` provider |
 | `ZAI_SYSTEM_PROMPT` | No | See below | Additional system prompt appended to Claude Code (`zai` provider) |
-| `ZAI_REVIEWER_NAME` | No | `Z.ai Coding Agent Review` | Name shown in the review comment header |
+| `ZAI_REVIEWER_NAME` | No | `Coding Agent Review` | Name shown in the review comment header |
 | `MODE` | No | `pr` | Review material: `pr` (review a pull request diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review-mode-on-demand), prints a report to the Step Summary, needs no PR). |
 | `SCOPE` | No | — | Free-text focus for `MODE=repo`, injected into the review prompt (e.g. `the auth layer`). Empty = broad whole-repo review. Ignored when `MODE=pr`. |
 | `CONFIG_FILE` | No | `.github/review-agents.yml` | Multi-engine config file. When it exists it owns engine selection and the `PROVIDER`/key inputs above are ignored. |

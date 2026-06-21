@@ -1,4 +1,4 @@
-name: "Z.ai Coding Agent Review"
+name: "Coding Agent Review"
 description: "Runs a coding agent as a read-only PR or whole-repo code reviewer."
 inputs:
   MODE:
@@ -63,7 +63,7 @@ inputs:
   ZAI_REVIEWER_NAME:
     description: "Name shown in the review comment header."
     required: false
-    default: "Z.ai Coding Agent Review"
+    default: "Coding Agent Review"
   EXCLUDE_PATTERNS:
     description: "Comma-separated file patterns to exclude from review."
     required: false
