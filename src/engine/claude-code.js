@@ -57,12 +57,20 @@ function materializeHome({ instructionsPath }) {
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
 // [LAW:single-enforcer] Z.ai/Anthropic auth translation happens exactly once, here in the adapter.
 function buildCommand({ config, collector, home }) {
+  // [LAW:dataflow-not-control-flow] The output format is a value chosen by config.debug, not a mode
+  // smeared through the parser: the default `json` envelope carries only the final result (no
+  // reasoning), while debug's `stream-json --verbose` emits every assistant/thinking/tool-use event
+  // as JSONL so the full prompt/response/thinking flow is captured. parseResultEnvelope normalizes
+  // BOTH back to one envelope, so assertSucceeded/extractUsage stay identical. stream-json requires
+  // --verbose; the default path is byte-identical to before.
+  const outputFormatArgs = config.debug
+    ? ['--verbose', '--output-format', 'stream-json']
+    : ['--output-format', 'json'];
   const args = [
     '-y',
     `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
     '-p',
-    '--output-format',
-    'json',
+    ...outputFormatArgs,
     '--no-session-persistence',
     '--tools',
     'Read,Grep,Glob',
@@ -105,8 +113,31 @@ function buildCommand({ config, collector, home }) {
   return { command: 'npx', args, env };
 }
 
+// [LAW:single-enforcer] One envelope-extraction function, robust to BOTH output formats claude-code
+// can emit: the single JSON object of `--output-format json` (default path) and the JSONL event
+// stream of `--output-format stream-json` (debug path). In stream-json the terminal `type:"result"`
+// line carries the SAME fields as the single-object envelope, so callers stay uniform — the format
+// difference is absorbed here as a value, never branched on downstream. [LAW:dataflow-not-control-flow]
+// The default path is unchanged: a single JSON object parses whole and is returned verbatim.
+function parseResultEnvelope(stdout) {
+  const whole = parseJsonEnvelope(stdout);
+  if (whole && whole.type === 'result') return whole;
+  // stream-json: the result envelope is the LAST terminal `result` event in the JSONL stream. The
+  // 8 MiB trailing-window retention (engine/run.js) preserves it because it is emitted last.
+  const lines = stdout.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const obj = parseJsonEnvelope(line);
+    if (obj && obj.type === 'result') return obj;
+  }
+  // Single-object envelope without an explicit type (or truncated output): fall back to whatever the
+  // whole-stdout parse recovered, so behavior on the default path is identical to before.
+  return whole;
+}
+
 function assertSucceeded(stdout) {
-  const parsed = parseJsonEnvelope(stdout);
+  const parsed = parseResultEnvelope(stdout);
   if (!parsed) {
     throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
   }
@@ -121,7 +152,7 @@ function assertSucceeded(stdout) {
 // total_cost_usd is Claude Code's own CLIENT-SIDE estimate (tokens × its bundled ANTHROPIC price
 // table), not a billed charge — so the renderer marks every available cost line "est.".
 function extractUsage(stdout, config) {
-  const env = parseJsonEnvelope(stdout);
+  const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
   const u = env.usage;
   const freshInput = u.input_tokens ?? 0;
@@ -199,4 +230,5 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  parseResultEnvelope,
 };

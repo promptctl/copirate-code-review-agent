@@ -7,6 +7,9 @@ const {
   CLAUDE_TIMEOUT_MS,
   buildCommand,
   classifyError,
+  assertSucceeded,
+  extractUsage,
+  parseResultEnvelope,
 } = require('../src/engine/claude-code');
 
 // [LAW:verifiable-goals] AC for T3: existing ZAI_* inputs produce a byte-identical
@@ -256,5 +259,76 @@ describe('classifyError', () => {
   test('unrelated error is returned unchanged', () => {
     const result = classifyError(base, 'unexpected token at line 42');
     assert.equal(result, base);
+  });
+});
+
+// DEBUG flips claude-code's output format to the streaming JSONL form so the full reasoning/tool
+// flow is captured; the default (no debug) invocation must stay byte-identical.
+describe('buildCommand — DEBUG output format', () => {
+  test('default (no debug) keeps --output-format json and no --verbose', () => {
+    const { args } = buildCommand({ config: BASE_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
+    assert.ok(args.includes('--output-format'));
+    assert.equal(args[args.indexOf('--output-format') + 1], 'json');
+    assert.ok(!args.includes('--verbose'));
+    assert.ok(!args.includes('stream-json'));
+  });
+
+  test('debug switches to --verbose --output-format stream-json', () => {
+    const { args } = buildCommand({
+      config: { ...BASE_CONFIG, debug: true },
+      collector: MOCK_COLLECTOR,
+      home: MOCK_HOME,
+    });
+    assert.ok(args.includes('--verbose'));
+    assert.equal(args[args.indexOf('--output-format') + 1], 'stream-json');
+    assert.ok(!args.includes('json') || args[args.indexOf('--output-format') + 1] !== 'json');
+    // stream-json requires --verbose to precede the format selection
+    assert.ok(args.indexOf('--verbose') < args.indexOf('--output-format'));
+  });
+});
+
+// parseResultEnvelope normalizes BOTH output formats to one envelope so assertSucceeded/extractUsage
+// stay uniform. The single-object (default) path must behave exactly as parseJsonEnvelope did.
+describe('parseResultEnvelope — robust to json and stream-json', () => {
+  const RESULT = { type: 'result', subtype: 'success', is_error: false, result: 'ok', total_cost_usd: 0.01, usage: { input_tokens: 100, output_tokens: 10 } };
+
+  test('single-object json envelope is returned verbatim', () => {
+    assert.deepEqual(parseResultEnvelope(JSON.stringify(RESULT)), RESULT);
+  });
+
+  test('a single-object envelope without an explicit type is still recovered', () => {
+    const env = { is_error: false, result: 'ok', usage: { input_tokens: 1, output_tokens: 1 } };
+    assert.deepEqual(parseResultEnvelope(JSON.stringify(env)), env);
+  });
+
+  test('stream-json JSONL returns the terminal result event', () => {
+    const stream = [
+      JSON.stringify({ type: 'system', subtype: 'init' }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'considering' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__review_collector__request_change' }] } }),
+      JSON.stringify(RESULT),
+    ].join('\n') + '\n';
+    assert.deepEqual(parseResultEnvelope(stream), RESULT);
+  });
+
+  test('assertSucceeded and extractUsage work off a stream-json transcript', () => {
+    const stream = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'x' }] } }),
+      JSON.stringify(RESULT),
+    ].join('\n');
+    assert.doesNotThrow(() => assertSucceeded(stream));
+    const usage = extractUsage(stream, { ...BASE_CONFIG, endpoint: { ...BASE_CONFIG.endpoint, baseUrl: 'https://api.deepseek.com/anthropic' }, model: 'deepseek-v4-pro' });
+    assert.equal(usage.inputTokens, 100);
+    assert.equal(usage.outputTokens, 10);
+  });
+
+  test('a multi-line stream with no terminal result is a failure (assertSucceeded throws)', () => {
+    // A genuine stream-json transcript that never reached a result event: the whole-stdout parse
+    // fails (multi-line) and no `type:"result"` line exists, so the envelope is unrecoverable.
+    const stream = [
+      JSON.stringify({ type: 'system', subtype: 'init' }),
+      JSON.stringify({ type: 'assistant', message: { content: [] } }),
+    ].join('\n');
+    assert.throws(() => assertSucceeded(stream), /invalid JSON/);
   });
 });

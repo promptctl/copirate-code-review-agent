@@ -1,6 +1,7 @@
 'use strict';
 const { spawn } = require('child_process');
 const core = require('@actions/core');
+const { emitTranscript } = require('../debug');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex `exec --json` streams every reasoning delta and tool call as a JSONL line,
@@ -66,10 +67,27 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     let truncated = false;
     let settled = false;
 
+    // [LAW:effects-at-boundaries] The single capture point for the debug transcript: this is the only
+    // place that owns the child's raw streams, and finish() runs on EVERY termination path (success,
+    // non-zero exit, spawn error, timeout), so the transcript is captured exactly when it is most
+    // useful — including a failed run. The prompt (delivered on stdin, never echoed in output) is
+    // joined with the raw stdout/stderr as captured so far. Gated on config.debug; off by default it
+    // is a no-op. [LAW:no-silent-failure] emitTranscript swallows nothing — it warns on its own IO
+    // failures internally and never throws back into the engine lifecycle.
     const finish = result => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (config.debug) {
+        emitTranscript({
+          engine: adapter.name,
+          model: config.model,
+          prompt,
+          stdout,
+          stderr,
+          label: `transcript-${config.name || adapter.name}-${process.hrtime.bigint().toString(36)}`,
+        });
+      }
       result();
     };
 

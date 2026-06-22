@@ -107,3 +107,63 @@ describe('runEngine with an oversized engine stream', () => {
     );
   });
 });
+
+// config.debug surfaces a transcript on the terminal path. The emit lives in the shared finish()
+// helper, so it runs once per attempt regardless of success/failure. Here we assert the success path.
+describe('runEngine debug transcript', () => {
+  const fs = require('node:fs');
+  const { DEBUG_DIR } = require('../src/debug');
+
+  test('with config.debug, opens a log group and writes a transcript file containing the prompt', async () => {
+    const small = {
+      name: 'claude-code',
+      timeoutMs: 30_000,
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    const groups = [];
+    const originalGroup = core.startGroup;
+    core.startGroup = label => groups.push(label);
+    const before = fs.existsSync(DEBUG_DIR) ? new Set(fs.readdirSync(DEBUG_DIR)) : new Set();
+    try {
+      await runEngine(small, { debug: true, name: 'deepseek', model: 'deepseek-v4-pro' }, 'THE-PROMPT', '/tmp', {}, process.cwd());
+    } finally {
+      core.startGroup = originalGroup;
+    }
+    assert.ok(groups.some(g => /Debug transcript/.test(g)), 'a debug transcript log group was opened');
+    const fresh = fs.readdirSync(DEBUG_DIR).filter(f => !before.has(f));
+    assert.ok(fresh.length >= 1, 'a new transcript file was written');
+    const content = fs.readFileSync(`${DEBUG_DIR}/${fresh[0]}`, 'utf8');
+    assert.match(content, /THE-PROMPT/);
+    assert.match(content, /turn\.completed/);
+    fresh.forEach(f => fs.rmSync(`${DEBUG_DIR}/${f}`, { force: true }));
+  });
+
+  test('without config.debug, opens NO log group (default path unchanged)', async () => {
+    const small = {
+      name: 'claude-code',
+      timeoutMs: 30_000,
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
+        env: { PATH: process.env.PATH },
+      }),
+      assertSucceeded: () => {},
+      classifyError: err => err,
+    };
+    const groups = [];
+    const originalGroup = core.startGroup;
+    core.startGroup = label => groups.push(label);
+    try {
+      await runEngine(small, {}, 'prompt', '/tmp', {}, process.cwd());
+    } finally {
+      core.startGroup = originalGroup;
+    }
+    assert.equal(groups.length, 0, 'no debug group when debug is off');
+  });
+});

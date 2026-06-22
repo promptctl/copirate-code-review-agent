@@ -16,6 +16,7 @@ const { loadConfig, peekConfigNames } = require('./config');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
+const { DEBUG_DIR } = require('./debug');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -75,13 +76,28 @@ function buildConfigChain(selection) {
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
 
+  // [LAW:single-enforcer] DEBUG is a run-scoped flag, read once and stamped onto every config in the
+  // chain so it reaches the engine adapter (which already receives the full config) with no new
+  // signature threaded through failover/registry. Plain getInput + compare avoids getBooleanInput's
+  // throw on an unset input in non-action environments. When on, the transcript directory is exposed
+  // as a step output so a workflow can upload it as an artifact without hardcoding the path.
+  const debug = core.getInput('DEBUG').trim().toLowerCase() === 'true';
+  const finalize = chain => {
+    chain.forEach(c => { c.debug = debug; });
+    if (debug) {
+      core.info(`DEBUG on: full session transcript will be echoed to the log and written to ${DEBUG_DIR}.`);
+      core.setOutput('debug-transcript-dir', DEBUG_DIR);
+    }
+    return chain;
+  };
+
   if (fs.existsSync(configFilePath)) {
     const { configNames, defaultName } = peekConfigNames(configFilePath);
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
     chain.forEach(c => core.setSecret(c.endpoint.apiKey));
-    return chain;
+    return finalize(chain);
   }
 
   // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the engine —
@@ -103,7 +119,7 @@ function buildConfigChain(selection) {
   });
   core.setSecret(config.endpoint.apiKey);
   core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
-  return [config];
+  return finalize([config]);
 }
 
 // [LAW:effects-at-boundaries] The preflight boundary: preflight() does the network probe and
