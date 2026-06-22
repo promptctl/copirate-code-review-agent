@@ -393,6 +393,10 @@ The action **never reviews pull requests opened from a fork** — i.e. any PR wh
 
 For your own branches (head and base in the same repository), reviews run normally.
 
+## Preflight diagnostic
+
+Before spawning the engine, the action runs a cheap connectivity + auth probe against the selected provider's endpoint (a single `max_tokens: 1` request, ~1s, negligible cost). If the credential is wrong or expired, or the endpoint is unreachable or misconfigured, the run **fails fast with a precise cause** in the Actions log — e.g. `Preflight failed — no usable review provider. config 'deepseek-default': endpoint rejected the credential (HTTP 401) — the API key is missing, wrong, or expired.` — instead of failing cryptically deep inside the agent. With a failover chain, the run proceeds as long as **any** config is reachable; an unhealthy config is logged as a warning. Endpoint kinds without an observed probe (currently the `codex`/OpenAI-responses path) are reported as skipped rather than guessed at.
+
 ## Contributing
 
 Contributions are welcome. See the [CONTRIBUTING](CONTRIBUTING.md) file for more information.
