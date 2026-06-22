@@ -15,6 +15,7 @@ const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
+const { preflight } = require('./preflight');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -105,6 +106,29 @@ function buildConfigChain(selection) {
   return [config];
 }
 
+// [LAW:effects-at-boundaries] The preflight boundary: preflight() does the network probe and
+// returns data; this renders the verdict to the Actions log and decides the gate. [LAW:no-silent-failure]
+// a hard failure (bad key, unreachable endpoint) stops here with a precise cause, before the
+// expensive engine spawn — a misconfigured run no longer fails cryptically deep inside the agent.
+// Returns true when the chain is usable. [LAW:single-enforcer] both review modes gate through here.
+async function preflightChain(chain) {
+  const { ok, results } = await preflight(chain);
+  for (const r of results) {
+    if (r.skipped) core.info(`Preflight: config '${r.name}' — skipped (${r.hint}).`);
+    else if (r.healthy) core.info(`Preflight: config '${r.name}' — OK${r.reason === 'reachable' ? ` (${r.hint})` : ''}.`);
+    else core.warning(`Preflight: config '${r.name}' — ${r.reason}: ${r.hint}.`);
+  }
+  if (!ok) {
+    const failed = results.filter(r => !r.skipped && !r.healthy);
+    core.setFailed(
+      'Preflight failed — no usable review provider. '
+      + failed.map(r => `config '${r.name}': ${r.hint}`).join('; ')
+      + '. Fix the named cause and re-run; this cheap check runs before the review to surface setup errors fast.',
+    );
+  }
+  return ok;
+}
+
 // [LAW:effects-at-boundaries] The cost-reporting boundary, shared by both sinks: renderCostLine
 // and costWarning are pure; this is the one place the "loud, not silent" signal is emitted, and it
 // returns the full attribution + cost footer. [LAW:no-silent-failure] costWarning names the actual
@@ -186,6 +210,8 @@ async function runPrReview(reviewerName, excludePatterns) {
     return;
   }
 
+  if (!(await preflightChain(chain))) return;
+
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const transport = await selectTransport(octokit, owner, repo, pullNumber);
   const files = transport.files;
@@ -238,6 +264,8 @@ async function runRepoReview(reviewerName, excludePatterns) {
     core.setFailed(e.message);
     return;
   }
+
+  if (!(await preflightChain(chain))) return;
 
   // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
   // engine so each gets its own tool identifiers. [LAW:composability]
