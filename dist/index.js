@@ -30735,7 +30735,11 @@ const { TransientError } = __nccwpck_require__(2887);
 const { computeCostUsd } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
-const CODEX_PACKAGE = '@openai/codex@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; CODEX_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
+const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
@@ -30976,7 +30980,11 @@ const os = __nccwpck_require__(857);
 const { TransientError } = __nccwpck_require__(2887);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
-const OPENCODE_PACKAGE = 'opencode-ai@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; OPENCODE_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const OPENCODE_VERSION = process.env.OPENCODE_VERSION || '1.17.9';
+const OPENCODE_PACKAGE = `opencode-ai@${OPENCODE_VERSION}`;
 const OPENCODE_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The MCP server key as registered in opencode.json. OpenCode derives
