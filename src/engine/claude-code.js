@@ -9,6 +9,14 @@ const { isAnthropicEndpoint, computeCostUsd } = require('../usage');
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
+// [LAW:no-ambient-temporal-coupling] Pin the CLI version — never '@latest'. '@latest' makes every
+// run depend on whatever npm serves at execution time: an unowned, time-varying input no one in this
+// repo controls. claude-code 2.1.185 busy-spins on startup (99% CPU, even `--version`) in some runner
+// images — e.g. Gitea's slim runner-images:ubuntu-latest — hanging every review to the job timeout
+// with nothing here having changed. The pinned default is a known-good release verified end-to-end;
+// CLAUDE_CODE_VERSION lets an operator move to a newer fix without cutting a release.
+// [LAW:one-source-of-truth] One owned version value, defined once here.
+const CLAUDE_CODE_VERSION = process.env.CLAUDE_CODE_VERSION || '2.1.0';
 const CLAUDE_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] Declared first so CLAUDE_ALLOWED_TOOLS can derive its MCP
@@ -51,7 +59,7 @@ function materializeHome({ instructionsPath }) {
 function buildCommand({ config, collector, home }) {
   const args = [
     '-y',
-    `${CLAUDE_CODE_PACKAGE}@latest`,
+    `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
     '-p',
     '--output-format',
     'json',

@@ -30447,6 +30447,14 @@ const { isAnthropicEndpoint, computeCostUsd } = __nccwpck_require__(9614);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
+// [LAW:no-ambient-temporal-coupling] Pin the CLI version — never '@latest'. '@latest' makes every
+// run depend on whatever npm serves at execution time: an unowned, time-varying input no one in this
+// repo controls. claude-code 2.1.185 busy-spins on startup (99% CPU, even `--version`) in some runner
+// images — e.g. Gitea's slim runner-images:ubuntu-latest — hanging every review to the job timeout
+// with nothing here having changed. The pinned default is a known-good release verified end-to-end;
+// CLAUDE_CODE_VERSION lets an operator move to a newer fix without cutting a release.
+// [LAW:one-source-of-truth] One owned version value, defined once here.
+const CLAUDE_CODE_VERSION = process.env.CLAUDE_CODE_VERSION || '2.1.0';
 const CLAUDE_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] Declared first so CLAUDE_ALLOWED_TOOLS can derive its MCP
@@ -30489,7 +30497,7 @@ function materializeHome({ instructionsPath }) {
 function buildCommand({ config, collector, home }) {
   const args = [
     '-y',
-    `${CLAUDE_CODE_PACKAGE}@latest`,
+    `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
     '-p',
     '--output-format',
     'json',
@@ -30727,7 +30735,11 @@ const { TransientError } = __nccwpck_require__(2887);
 const { computeCostUsd } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
-const CODEX_PACKAGE = '@openai/codex@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; CODEX_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
+const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
@@ -30968,7 +30980,11 @@ const os = __nccwpck_require__(857);
 const { TransientError } = __nccwpck_require__(2887);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
-const OPENCODE_PACKAGE = 'opencode-ai@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; OPENCODE_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const OPENCODE_VERSION = process.env.OPENCODE_VERSION || '1.17.9';
+const OPENCODE_PACKAGE = `opencode-ai@${OPENCODE_VERSION}`;
 const OPENCODE_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The MCP server key as registered in opencode.json. OpenCode derives

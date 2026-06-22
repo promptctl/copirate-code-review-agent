@@ -6,7 +6,11 @@ const { TransientError } = require('../failover');
 const { computeCostUsd } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 
-const CODEX_PACKAGE = '@openai/codex@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; CODEX_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
+const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider

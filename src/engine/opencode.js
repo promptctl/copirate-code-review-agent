@@ -5,7 +5,11 @@ const os = require('os');
 const { TransientError } = require('../failover');
 const { makeCliAdapter } = require('./cli');
 
-const OPENCODE_PACKAGE = 'opencode-ai@latest';
+// [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
+// time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
+// to a known-good release; OPENCODE_VERSION overrides it without cutting a release. [LAW:one-source-of-truth]
+const OPENCODE_VERSION = process.env.OPENCODE_VERSION || '1.17.9';
+const OPENCODE_PACKAGE = `opencode-ai@${OPENCODE_VERSION}`;
 const OPENCODE_TIMEOUT_MS = 3_000_000;
 
 // [LAW:one-source-of-truth] The MCP server key as registered in opencode.json. OpenCode derives

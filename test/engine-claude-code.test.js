@@ -46,7 +46,7 @@ describe('buildCommand — args match pre-refactor buildClaudeArgs', () => {
     // Exact pre-refactor arg sequence from buildClaudeArgs (byte-identical contract)
     assert.deepEqual(args, [
       '-y',
-      '@anthropic-ai/claude-code@latest',
+      '@anthropic-ai/claude-code@2.1.0',
       '-p',
       '--output-format',
       'json',

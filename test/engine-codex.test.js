@@ -144,7 +144,7 @@ describe('buildCommand', () => {
     assert.equal(command, 'npx');
   });
 
-  test('args include @openai/codex@latest', () => {
+  test('args include the @openai/codex package', () => {
     const { args } = buildCommand({ config: BASE_CONFIG, home: MOCK_HOME });
     assert.ok(args.some(a => a.includes('@openai/codex')), 'codex package not in args');
   });
