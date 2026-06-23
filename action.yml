@@ -85,13 +85,9 @@ inputs:
   HEAD_SHA:
     description: "Head commit SHA the review is anchored to."
     required: false
-  DEBUG:
-    description: "Capture the full session transcript (prompt, raw engine output incl. thinking/tool calls, stderr) for each engine attempt to the Actions log (collapsible group) and a file under RUNNER_TEMP. Off by default."
-    required: false
-    default: "false"
 outputs:
-  debug-transcript-dir:
-    description: "Directory holding the debug transcript file(s) when DEBUG is true; point actions/upload-artifact at it to download the full session."
+  transcript-dir:
+    description: "Directory holding the full session transcript file(s) — the exact prompt, raw engine output (incl. thinking/tool calls), and stderr for every engine attempt. Always produced; point actions/upload-artifact at it to archive the session on every run."
 runs:
   using: "node24"
   main: "dist/index.js"

@@ -83,7 +83,6 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_REVIEWER_NAME` | `Coding Agent Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
-| `DEBUG` | `false` | Capture the full session transcript — see [Debug transcript](#debug-transcript). |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
 | `HEAD_SHA` | from event | Head SHA the review anchors to. Auto-detected on `pull_request` events. |
@@ -218,28 +217,28 @@ When `fallback` is set, the selected config plus the rest of that list form the 
 
 Before spawning the engine, the action runs a cheap connectivity + auth probe against the selected endpoint (a single `max_tokens: 1` request, ~1s). A wrong/expired credential or unreachable endpoint **fails fast with a precise cause** in the log instead of failing cryptically inside the agent. With a failover chain, the run proceeds as long as *any* config is reachable; unhealthy configs are logged as warnings.
 
-## Debug transcript
+## Session transcript
 
-Set `DEBUG: true` to capture the **full session** of every engine attempt — the exact prompt sent to the engine, the raw output stream (with claude-code switched to `stream-json --verbose` so **thinking and tool calls** are included), and stderr. Each attempt's transcript is surfaced two ways:
+Every review run captures the **full session** of every engine attempt — the exact prompt sent to the engine, the raw output stream (claude-code runs `stream-json --verbose` so **thinking and tool calls** are included), and stderr. There is no flag to enable; it is always on. Each attempt's transcript is surfaced two ways:
 
-- **In the Actions log** — inside a collapsible `🛠️ Debug transcript` group, so you can click into the workflow run and read the entire prompt/response/thinking flow with no extra setup.
-- **As a file** under `$RUNNER_TEMP/agent-review-debug/`, exposed via the action's `debug-transcript-dir` **output** so a workflow can upload it as a downloadable artifact:
+- **In the Actions log** — inside a collapsible `🛠️ Session transcript` group, so you can click into the workflow run and read the entire prompt/response/thinking flow with no extra setup.
+- **As a file** under `$RUNNER_TEMP/agent-review-transcripts/`, exposed via the action's `transcript-dir` **output**. Add one `actions/upload-artifact` step to archive the session as a downloadable artifact on **every** run — including failed attempts (`if: always()`):
 
 ```yaml
       - uses: brandon-fryslie/zai-coding-agent-review@v1
         id: review
         with:
-          DEBUG: true
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 
-      - if: always() && steps.review.outputs.debug-transcript-dir != ''
+      - if: always() && steps.review.outputs.transcript-dir != ''
         uses: actions/upload-artifact@v4
         with:
-          name: review-debug-transcript
-          path: ${{ steps.review.outputs.debug-transcript-dir }}
+          name: review-session-transcript
+          path: ${{ steps.review.outputs.transcript-dir }}
+          if-no-files-found: ignore
 ```
 
-The transcript dumps the engine's own raw streams verbatim — it is not a reconstructed narrative. The API key is never part of a transcript. `DEBUG` is off by default and adds streaming overhead, so leave it off for routine reviews and flip it on to diagnose a specific run.
+The transcript dumps the engine's own raw streams verbatim — it is not a reconstructed narrative. The API key is never part of a transcript. This is the first place to look when a review seems shallow: if the `RAW STDOUT` section shows no `Read`/`Grep`/`Glob` tool calls, the engine reviewed only the inline diff without exploring the repo.
 
 ## Cost reporting
 

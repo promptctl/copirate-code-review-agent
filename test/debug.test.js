@@ -52,20 +52,20 @@ describe('buildTranscript', () => {
 // emitTranscript is an effect; this confirms the file-write half lands a real transcript file in a
 // directory we control, without coupling to the Actions log. RUNNER_TEMP is redirected to a temp dir.
 describe('emitTranscript file output', () => {
-  test('writes a transcript file under RUNNER_TEMP/agent-review-debug', () => {
+  test('writes a transcript file under RUNNER_TEMP/agent-review-transcripts', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'debug-test-runner-temp-'));
     const prevRunnerTemp = process.env.RUNNER_TEMP;
     process.env.RUNNER_TEMP = tmp;
-    // Require fresh so DEBUG_DIR is computed against the redirected RUNNER_TEMP.
+    // Require fresh so TRANSCRIPT_DIR is computed against the redirected RUNNER_TEMP.
     const modPath = require.resolve('../src/debug');
     delete require.cache[modPath];
     try {
-      const { emitTranscript, DEBUG_DIR } = require('../src/debug');
-      assert.equal(DEBUG_DIR, path.join(tmp, 'agent-review-debug'));
+      const { emitTranscript, TRANSCRIPT_DIR } = require('../src/debug');
+      assert.equal(TRANSCRIPT_DIR, path.join(tmp, 'agent-review-transcripts'));
       emitTranscript({
         engine: 'claude-code', model: 'm', prompt: 'P', stdout: 'OUT', stderr: '', label: 'transcript-x',
       });
-      const file = path.join(DEBUG_DIR, 'transcript-x.txt');
+      const file = path.join(TRANSCRIPT_DIR, 'transcript-x.txt');
       assert.ok(fs.existsSync(file), 'transcript file should exist');
       const content = fs.readFileSync(file, 'utf8');
       assert.match(content, /RAW STDOUT/);
