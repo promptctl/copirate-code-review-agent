@@ -20,6 +20,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Code Review
+        id: review
         uses: ./
         env:
           # The codex/openai config in .github/review-agents.yml resolves its key from
@@ -27,3 +28,15 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
+
+      # Archive the full session transcript (prompt + raw engine output incl. thinking/tool
+      # calls + stderr) on every run, success or failure. if: always() guarantees it is captured
+      # even when the review step fails; if-no-files-found: ignore tolerates a run that spawned
+      # no engine (e.g. a fork-PR skip), where the directory is legitimately empty.
+      - name: Archive review transcript
+        if: always() && steps.review.outputs.transcript-dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-session-transcript
+          path: ${{ steps.review.outputs.transcript-dir }}
+          if-no-files-found: ignore

@@ -4,11 +4,11 @@ const os = require('os');
 const path = require('path');
 const core = require('@actions/core');
 
-// [LAW:one-source-of-truth] One well-known location for debug transcripts, defined once. RUNNER_TEMP
+// [LAW:one-source-of-truth] One well-known location for session transcripts, defined once. RUNNER_TEMP
 // is set by GitHub Actions and Gitea's act_runner alike; os.tmpdir() is the local-dev fallback. A
 // workflow points actions/upload-artifact at this directory to download the full session — the
-// action also sets it as the `debug-transcript-dir` output so no path is hardcoded in the workflow.
-const DEBUG_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-debug');
+// action also sets it as the `transcript-dir` output so no path is hardcoded in the workflow.
+const TRANSCRIPT_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-transcripts');
 
 const RULE = '='.repeat(72);
 const section = label => `\n${RULE}\n== ${label}\n${RULE}\n`;
@@ -34,7 +34,7 @@ function buildTranscript({ engine, model, prompt, stdout, stderr }) {
 }
 
 // [LAW:effects-at-boundaries] The surfacing effect, kept entirely out of the engine's judgment path:
-// write the transcript to a file under DEBUG_DIR AND echo it to the Actions log inside a collapsible
+// write the transcript to a file under TRANSCRIPT_DIR AND echo it to the Actions log inside a collapsible
 // group, so the full prompt/response/thinking flow is both clickable in the run and downloadable as an
 // artifact. [LAW:no-silent-failure] a log or write failure is announced as a warning and never aborts
 // the review — debug plumbing must not break the actual review. The file write and the log echo are
@@ -42,20 +42,20 @@ function buildTranscript({ engine, model, prompt, stdout, stderr }) {
 function emitTranscript({ engine, model, prompt, stdout, stderr, label }) {
   const transcript = buildTranscript({ engine, model, prompt, stdout, stderr });
   try {
-    core.startGroup(`🛠️  Debug transcript — ${label}`);
+    core.startGroup(`🛠️  Session transcript — ${label}`);
     core.info(transcript);
     core.endGroup();
   } catch (e) {
-    core.warning(`Debug transcript could not be echoed to the log: ${e.message}`);
+    core.warning(`Session transcript could not be echoed to the log: ${e.message}`);
   }
   try {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const file = path.join(DEBUG_DIR, `${label}.txt`);
+    fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+    const file = path.join(TRANSCRIPT_DIR, `${label}.txt`);
     fs.writeFileSync(file, transcript);
-    core.info(`Debug transcript written to ${file}`);
+    core.info(`Session transcript written to ${file}`);
   } catch (e) {
-    core.warning(`Debug transcript could not be written to a file: ${e.message}`);
+    core.warning(`Session transcript could not be written to a file: ${e.message}`);
   }
 }
 
-module.exports = { DEBUG_DIR, buildTranscript, emitTranscript };
+module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };

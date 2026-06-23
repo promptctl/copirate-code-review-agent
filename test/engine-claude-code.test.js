@@ -29,7 +29,7 @@ const BASE_CONFIG = {
   },
 };
 
-describe('buildCommand — args match pre-refactor buildClaudeArgs', () => {
+describe('buildCommand — canonical claude-code args', () => {
   test('command is always "npx"', () => {
     const { command } = buildCommand({
       config: BASE_CONFIG,
@@ -39,20 +39,21 @@ describe('buildCommand — args match pre-refactor buildClaudeArgs', () => {
     assert.equal(command, 'npx');
   });
 
-  test('args match the exact pre-refactor order and values', () => {
+  test('args match the exact order and values', () => {
     const { args } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
     });
 
-    // Exact pre-refactor arg sequence from buildClaudeArgs (byte-identical contract)
+    // Canonical arg sequence — stream-json --verbose so every transcript carries thinking/tool calls
     assert.deepEqual(args, [
       '-y',
       '@anthropic-ai/claude-code@2.1.0',
       '-p',
+      '--verbose',
       '--output-format',
-      'json',
+      'stream-json',
       '--no-session-persistence',
       '--tools',
       'Read,Grep,Glob',
@@ -262,28 +263,24 @@ describe('classifyError', () => {
   });
 });
 
-// DEBUG flips claude-code's output format to the streaming JSONL form so the full reasoning/tool
-// flow is captured; the default (no debug) invocation must stay byte-identical.
-describe('buildCommand — DEBUG output format', () => {
-  test('default (no debug) keeps --output-format json and no --verbose', () => {
+// claude-code always emits the streaming JSONL form so the full reasoning/tool flow is captured in
+// every session transcript — there is no opt-in flag and no plain-json path.
+describe('buildCommand — canonical stream-json output format', () => {
+  test('always uses --verbose --output-format stream-json (no debug field)', () => {
     const { args } = buildCommand({ config: BASE_CONFIG, collector: MOCK_COLLECTOR, home: MOCK_HOME });
-    assert.ok(args.includes('--output-format'));
-    assert.equal(args[args.indexOf('--output-format') + 1], 'json');
-    assert.ok(!args.includes('--verbose'));
-    assert.ok(!args.includes('stream-json'));
+    assert.ok(args.includes('--verbose'));
+    assert.equal(args[args.indexOf('--output-format') + 1], 'stream-json');
+    // stream-json requires --verbose to precede the format selection
+    assert.ok(args.indexOf('--verbose') < args.indexOf('--output-format'));
   });
 
-  test('debug switches to --verbose --output-format stream-json', () => {
+  test('a debug field on the config does not change the format (mode is gone)', () => {
     const { args } = buildCommand({
-      config: { ...BASE_CONFIG, debug: true },
+      config: { ...BASE_CONFIG, debug: false },
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
     });
-    assert.ok(args.includes('--verbose'));
     assert.equal(args[args.indexOf('--output-format') + 1], 'stream-json');
-    assert.ok(!args.includes('json') || args[args.indexOf('--output-format') + 1] !== 'json');
-    // stream-json requires --verbose to precede the format selection
-    assert.ok(args.indexOf('--verbose') < args.indexOf('--output-format'));
   });
 });
 

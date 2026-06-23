@@ -108,13 +108,14 @@ describe('runEngine with an oversized engine stream', () => {
   });
 });
 
-// config.debug surfaces a transcript on the terminal path. The emit lives in the shared finish()
-// helper, so it runs once per attempt regardless of success/failure. Here we assert the success path.
-describe('runEngine debug transcript', () => {
+// Every engine attempt surfaces a session transcript — capture is unconditional (no opt-in flag).
+// The emit lives in the shared finish() helper, so it runs once per attempt on EVERY termination
+// path: the success path and the failed (non-zero exit) path are both asserted below.
+describe('runEngine session transcript', () => {
   const fs = require('node:fs');
-  const { DEBUG_DIR } = require('../src/debug');
+  const { TRANSCRIPT_DIR } = require('../src/debug');
 
-  test('with config.debug, opens a log group and writes a transcript file containing the prompt', async () => {
+  test('captures a transcript file containing the prompt with no debug flag set', async () => {
     const small = {
       name: 'claude-code',
       timeoutMs: 30_000,
@@ -129,41 +130,42 @@ describe('runEngine debug transcript', () => {
     const groups = [];
     const originalGroup = core.startGroup;
     core.startGroup = label => groups.push(label);
-    const before = fs.existsSync(DEBUG_DIR) ? new Set(fs.readdirSync(DEBUG_DIR)) : new Set();
+    const before = fs.existsSync(TRANSCRIPT_DIR) ? new Set(fs.readdirSync(TRANSCRIPT_DIR)) : new Set();
     try {
-      await runEngine(small, { debug: true, name: 'deepseek', model: 'deepseek-v4-pro' }, 'THE-PROMPT', '/tmp', {}, process.cwd());
+      await runEngine(small, { name: 'deepseek', model: 'deepseek-v4-pro' }, 'THE-PROMPT', '/tmp', {}, process.cwd());
     } finally {
       core.startGroup = originalGroup;
     }
-    assert.ok(groups.some(g => /Debug transcript/.test(g)), 'a debug transcript log group was opened');
-    const fresh = fs.readdirSync(DEBUG_DIR).filter(f => !before.has(f));
+    assert.ok(groups.some(g => /Session transcript/.test(g)), 'a session transcript log group was opened');
+    const fresh = fs.readdirSync(TRANSCRIPT_DIR).filter(f => !before.has(f));
     assert.ok(fresh.length >= 1, 'a new transcript file was written');
-    const content = fs.readFileSync(`${DEBUG_DIR}/${fresh[0]}`, 'utf8');
+    const content = fs.readFileSync(`${TRANSCRIPT_DIR}/${fresh[0]}`, 'utf8');
     assert.match(content, /THE-PROMPT/);
     assert.match(content, /turn\.completed/);
-    fresh.forEach(f => fs.rmSync(`${DEBUG_DIR}/${f}`, { force: true }));
+    fresh.forEach(f => fs.rmSync(`${TRANSCRIPT_DIR}/${f}`, { force: true }));
   });
 
-  test('without config.debug, opens NO log group (default path unchanged)', async () => {
-    const small = {
+  test('captures a transcript even when the attempt fails (non-zero exit)', async () => {
+    const failing = {
       name: 'claude-code',
       timeoutMs: 30_000,
       buildCommand: () => ({
         command: process.execPath,
-        args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
+        args: ['-e', `process.stderr.write('BOOM-STDERR'); process.exit(1);`],
         env: { PATH: process.env.PATH },
       }),
       assertSucceeded: () => {},
       classifyError: err => err,
     };
-    const groups = [];
-    const originalGroup = core.startGroup;
-    core.startGroup = label => groups.push(label);
-    try {
-      await runEngine(small, {}, 'prompt', '/tmp', {}, process.cwd());
-    } finally {
-      core.startGroup = originalGroup;
-    }
-    assert.equal(groups.length, 0, 'no debug group when debug is off');
+    const before = fs.existsSync(TRANSCRIPT_DIR) ? new Set(fs.readdirSync(TRANSCRIPT_DIR)) : new Set();
+    await assert.rejects(
+      runEngine(failing, { name: 'deepseek', model: 'deepseek-v4-pro' }, 'FAILED-PROMPT', '/tmp', {}, process.cwd()),
+    );
+    const fresh = fs.readdirSync(TRANSCRIPT_DIR).filter(f => !before.has(f));
+    assert.ok(fresh.length >= 1, 'a transcript file was written for the failed attempt');
+    const content = fs.readFileSync(`${TRANSCRIPT_DIR}/${fresh[0]}`, 'utf8');
+    assert.match(content, /FAILED-PROMPT/);
+    assert.match(content, /BOOM-STDERR/);
+    fresh.forEach(f => fs.rmSync(`${TRANSCRIPT_DIR}/${f}`, { force: true }));
   });
 });

@@ -30328,11 +30328,11 @@ const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
 
-// [LAW:one-source-of-truth] One well-known location for debug transcripts, defined once. RUNNER_TEMP
+// [LAW:one-source-of-truth] One well-known location for session transcripts, defined once. RUNNER_TEMP
 // is set by GitHub Actions and Gitea's act_runner alike; os.tmpdir() is the local-dev fallback. A
 // workflow points actions/upload-artifact at this directory to download the full session — the
-// action also sets it as the `debug-transcript-dir` output so no path is hardcoded in the workflow.
-const DEBUG_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-debug');
+// action also sets it as the `transcript-dir` output so no path is hardcoded in the workflow.
+const TRANSCRIPT_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-transcripts');
 
 const RULE = '='.repeat(72);
 const section = label => `\n${RULE}\n== ${label}\n${RULE}\n`;
@@ -30358,7 +30358,7 @@ function buildTranscript({ engine, model, prompt, stdout, stderr }) {
 }
 
 // [LAW:effects-at-boundaries] The surfacing effect, kept entirely out of the engine's judgment path:
-// write the transcript to a file under DEBUG_DIR AND echo it to the Actions log inside a collapsible
+// write the transcript to a file under TRANSCRIPT_DIR AND echo it to the Actions log inside a collapsible
 // group, so the full prompt/response/thinking flow is both clickable in the run and downloadable as an
 // artifact. [LAW:no-silent-failure] a log or write failure is announced as a warning and never aborts
 // the review — debug plumbing must not break the actual review. The file write and the log echo are
@@ -30366,23 +30366,23 @@ function buildTranscript({ engine, model, prompt, stdout, stderr }) {
 function emitTranscript({ engine, model, prompt, stdout, stderr, label }) {
   const transcript = buildTranscript({ engine, model, prompt, stdout, stderr });
   try {
-    core.startGroup(`🛠️  Debug transcript — ${label}`);
+    core.startGroup(`🛠️  Session transcript — ${label}`);
     core.info(transcript);
     core.endGroup();
   } catch (e) {
-    core.warning(`Debug transcript could not be echoed to the log: ${e.message}`);
+    core.warning(`Session transcript could not be echoed to the log: ${e.message}`);
   }
   try {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const file = path.join(DEBUG_DIR, `${label}.txt`);
+    fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+    const file = path.join(TRANSCRIPT_DIR, `${label}.txt`);
     fs.writeFileSync(file, transcript);
-    core.info(`Debug transcript written to ${file}`);
+    core.info(`Session transcript written to ${file}`);
   } catch (e) {
-    core.warning(`Debug transcript could not be written to a file: ${e.message}`);
+    core.warning(`Session transcript could not be written to a file: ${e.message}`);
   }
 }
 
-module.exports = { DEBUG_DIR, buildTranscript, emitTranscript };
+module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 /***/ }),
@@ -30564,20 +30564,18 @@ function materializeHome({ instructionsPath }) {
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
 // [LAW:single-enforcer] Z.ai/Anthropic auth translation happens exactly once, here in the adapter.
 function buildCommand({ config, collector, home }) {
-  // [LAW:dataflow-not-control-flow] The output format is a value chosen by config.debug, not a mode
-  // smeared through the parser: the default `json` envelope carries only the final result (no
-  // reasoning), while debug's `stream-json --verbose` emits every assistant/thinking/tool-use event
-  // as JSONL so the full prompt/response/thinking flow is captured. parseResultEnvelope normalizes
-  // BOTH back to one envelope, so assertSucceeded/extractUsage stay identical. stream-json requires
-  // --verbose; the default path is byte-identical to before.
-  const outputFormatArgs = config.debug
-    ? ['--verbose', '--output-format', 'stream-json']
-    : ['--output-format', 'json'];
+  // [LAW:one-type-per-behavior] One canonical output format: `stream-json --verbose` emits every
+  // assistant/thinking/tool-use event as JSONL, so every session transcript carries the full
+  // prompt/response/thinking/tool-call flow (the signal for "did the engine actually read the repo").
+  // parseResultEnvelope normalizes the terminal `result` event back to the same envelope the plain
+  // `json` form produced, so assertSucceeded/extractUsage are unaffected. stream-json requires --verbose.
   const args = [
     '-y',
     `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
     '-p',
-    ...outputFormatArgs,
+    '--verbose',
+    '--output-format',
+    'stream-json',
     '--no-session-persistence',
     '--tools',
     'Read,Grep,Glob',
@@ -31426,27 +31424,25 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     let truncated = false;
     let settled = false;
 
-    // [LAW:effects-at-boundaries] The single capture point for the debug transcript: this is the only
+    // [LAW:effects-at-boundaries] The single capture point for the session transcript: this is the only
     // place that owns the child's raw streams, and finish() runs on EVERY termination path (success,
-    // non-zero exit, spawn error, timeout), so the transcript is captured exactly when it is most
-    // useful — including a failed run. The prompt (delivered on stdin, never echoed in output) is
-    // joined with the raw stdout/stderr as captured so far. Gated on config.debug; off by default it
-    // is a no-op. [LAW:no-silent-failure] emitTranscript swallows nothing — it warns on its own IO
-    // failures internally and never throws back into the engine lifecycle.
+    // non-zero exit, spawn error, timeout), so a transcript is captured for every engine attempt —
+    // including a failed run. The prompt (delivered on stdin, never echoed in output) is joined with
+    // the raw stdout/stderr as captured so far. Capture is unconditional — there is no opt-in flag.
+    // [LAW:no-silent-failure] emitTranscript swallows nothing — it warns on its own IO failures
+    // internally and never throws back into the engine lifecycle.
     const finish = result => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      if (config.debug) {
-        emitTranscript({
-          engine: adapter.name,
-          model: config.model,
-          prompt,
-          stdout,
-          stderr,
-          label: `transcript-${config.name || adapter.name}-${process.hrtime.bigint().toString(36)}`,
-        });
-      }
+      emitTranscript({
+        engine: adapter.name,
+        model: config.model,
+        prompt,
+        stdout,
+        stderr,
+        label: `transcript-${config.name || adapter.name}-${process.hrtime.bigint().toString(36)}`,
+      });
       result();
     };
 
@@ -32310,7 +32306,7 @@ const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
-const { DEBUG_DIR } = __nccwpck_require__(9806);
+const { TRANSCRIPT_DIR } = __nccwpck_require__(9806);
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -32370,28 +32366,13 @@ function buildConfigChain(selection) {
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
 
-  // [LAW:single-enforcer] DEBUG is a run-scoped flag, read once and stamped onto every config in the
-  // chain so it reaches the engine adapter (which already receives the full config) with no new
-  // signature threaded through failover/registry. Plain getInput + compare avoids getBooleanInput's
-  // throw on an unset input in non-action environments. When on, the transcript directory is exposed
-  // as a step output so a workflow can upload it as an artifact without hardcoding the path.
-  const debug = core.getInput('DEBUG').trim().toLowerCase() === 'true';
-  const finalize = chain => {
-    chain.forEach(c => { c.debug = debug; });
-    if (debug) {
-      core.info(`DEBUG on: full session transcript will be echoed to the log and written to ${DEBUG_DIR}.`);
-      core.setOutput('debug-transcript-dir', DEBUG_DIR);
-    }
-    return chain;
-  };
-
   if (fs.existsSync(configFilePath)) {
     const { configNames, defaultName } = peekConfigNames(configFilePath);
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
     chain.forEach(c => core.setSecret(c.endpoint.apiKey));
-    return finalize(chain);
+    return chain;
   }
 
   // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the engine —
@@ -32413,7 +32394,7 @@ function buildConfigChain(selection) {
   });
   core.setSecret(config.endpoint.apiKey);
   core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
-  return finalize([config]);
+  return [config];
 }
 
 // [LAW:effects-at-boundaries] The preflight boundary: preflight() does the network probe and
@@ -32601,6 +32582,13 @@ async function runRepoReview(reviewerName, excludePatterns) {
 }
 
 async function run() {
+  // [LAW:effects-at-boundaries] The transcript directory is a fixed, well-known path (TRANSCRIPT_DIR),
+  // so the step output is set once here at the entry boundary — before any engine spawn, fork-skip, or
+  // failure — guaranteeing an `if: always()` upload step a path to point at on every termination path.
+  // The directory may legitimately be empty (a run that spawned no engine); the upload step's
+  // if-no-files-found handles that. [LAW:no-silent-failure] the path is never conditional on success.
+  core.setOutput('transcript-dir', TRANSCRIPT_DIR);
+
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
     .split(',')

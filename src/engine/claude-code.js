@@ -57,20 +57,18 @@ function materializeHome({ instructionsPath }) {
 // [LAW:effects-at-boundaries] Pure: returns a full spawn spec from a validated ReviewConfig.
 // [LAW:single-enforcer] Z.ai/Anthropic auth translation happens exactly once, here in the adapter.
 function buildCommand({ config, collector, home }) {
-  // [LAW:dataflow-not-control-flow] The output format is a value chosen by config.debug, not a mode
-  // smeared through the parser: the default `json` envelope carries only the final result (no
-  // reasoning), while debug's `stream-json --verbose` emits every assistant/thinking/tool-use event
-  // as JSONL so the full prompt/response/thinking flow is captured. parseResultEnvelope normalizes
-  // BOTH back to one envelope, so assertSucceeded/extractUsage stay identical. stream-json requires
-  // --verbose; the default path is byte-identical to before.
-  const outputFormatArgs = config.debug
-    ? ['--verbose', '--output-format', 'stream-json']
-    : ['--output-format', 'json'];
+  // [LAW:one-type-per-behavior] One canonical output format: `stream-json --verbose` emits every
+  // assistant/thinking/tool-use event as JSONL, so every session transcript carries the full
+  // prompt/response/thinking/tool-call flow (the signal for "did the engine actually read the repo").
+  // parseResultEnvelope normalizes the terminal `result` event back to the same envelope the plain
+  // `json` form produced, so assertSucceeded/extractUsage are unaffected. stream-json requires --verbose.
   const args = [
     '-y',
     `${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}`,
     '-p',
-    ...outputFormatArgs,
+    '--verbose',
+    '--output-format',
+    'stream-json',
     '--no-session-persistence',
     '--tools',
     'Read,Grep,Glob',

@@ -16,7 +16,7 @@ const { loadConfig, peekConfigNames } = require('./config');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
-const { DEBUG_DIR } = require('./debug');
+const { TRANSCRIPT_DIR } = require('./debug');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -76,28 +76,13 @@ function buildConfigChain(selection) {
   const configFilePath = core.getInput('CONFIG_FILE');
   const configNameInput = core.getInput('CONFIG');
 
-  // [LAW:single-enforcer] DEBUG is a run-scoped flag, read once and stamped onto every config in the
-  // chain so it reaches the engine adapter (which already receives the full config) with no new
-  // signature threaded through failover/registry. Plain getInput + compare avoids getBooleanInput's
-  // throw on an unset input in non-action environments. When on, the transcript directory is exposed
-  // as a step output so a workflow can upload it as an artifact without hardcoding the path.
-  const debug = core.getInput('DEBUG').trim().toLowerCase() === 'true';
-  const finalize = chain => {
-    chain.forEach(c => { c.debug = debug; });
-    if (debug) {
-      core.info(`DEBUG on: full session transcript will be echoed to the log and written to ${DEBUG_DIR}.`);
-      core.setOutput('debug-transcript-dir', DEBUG_DIR);
-    }
-    return chain;
-  };
-
   if (fs.existsSync(configFilePath)) {
     const { configNames, defaultName } = peekConfigNames(configFilePath);
     const selectedName = selectConfig(selection, { configInput: configNameInput, configNames, defaultName });
     core.info(`Selected reviewer config: '${selectedName}'`);
     const chain = loadConfig(configFilePath, selectedName, process.env);
     chain.forEach(c => core.setSecret(c.endpoint.apiKey));
-    return finalize(chain);
+    return chain;
   }
 
   // [LAW:dataflow-not-control-flow] Simple mode: the PROVIDER value alone decides the engine —
@@ -119,7 +104,7 @@ function buildConfigChain(selection) {
   });
   core.setSecret(config.endpoint.apiKey);
   core.info(`Using provider '${config.name}' (engine: ${config.engine}, model: ${config.model}).`);
-  return finalize([config]);
+  return [config];
 }
 
 // [LAW:effects-at-boundaries] The preflight boundary: preflight() does the network probe and
@@ -307,6 +292,13 @@ async function runRepoReview(reviewerName, excludePatterns) {
 }
 
 async function run() {
+  // [LAW:effects-at-boundaries] The transcript directory is a fixed, well-known path (TRANSCRIPT_DIR),
+  // so the step output is set once here at the entry boundary — before any engine spawn, fork-skip, or
+  // failure — guaranteeing an `if: always()` upload step a path to point at on every termination path.
+  // The directory may legitimately be empty (a run that spawned no engine); the upload step's
+  // if-no-files-found handles that. [LAW:no-silent-failure] the path is never conditional on success.
+  core.setOutput('transcript-dir', TRANSCRIPT_DIR);
+
   const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
     .split(',')
