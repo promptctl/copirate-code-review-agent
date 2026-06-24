@@ -1,11 +1,12 @@
 {
   "name": "zai-coding-agent-review",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.js -o dist --license licenses.txt",
-    "test": "node --test"
+    "test": "node --test",
+    "review:local": "node scripts/local-review.js"
   },
   "dependencies": {
     "@actions/core": "^1.10.1",

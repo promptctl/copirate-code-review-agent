@@ -24,8 +24,12 @@ npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.t
 ```
 
 - **`dist/` MUST be committed.** The Actions runner executes `dist/index.js` directly — it never runs `npm install` or a build step. Every change under `src/` requires `npm run build` and committing both `src/` and `dist/`.
-- **`npm test`** runs the `node:test` suite in `test/`. Tests cover the exported pure functions across the `src/` modules (`config`, `diff`, `provider`, `selection`, `failover`, `review`, `transport`, `usage`, and the engine adapters) plus a dist smoke test that spawns `dist/index.js --review-collector-server` and performs a full MCP handshake. CI also asserts that committed `dist/` matches a fresh build (`npm run build` + `git diff --exit-code dist/`).
+- **`npm test`** runs the `node:test` suite in `test/`. Tests cover the exported pure functions across the `src/` modules (`config`, `diff`, `provider`, `selection`, `failover`, `review`, `transport`, `usage`, and the engine adapters) plus two collector smoke tests that perform a full MCP handshake against the self-respawned server: one spawning `dist/index.js --review-collector-server` (the bundled entry), one driving the actual `createReviewCollector` config from source (`src/collector.js --review-collector-server`). Both entries must work because `createReviewCollector` self-references `__filename` — the bundle in production, but `src/collector.js` when the engine is driven from source (tests, `scripts/local-review.js`). CI also asserts that committed `dist/` matches a fresh build (`npm run build` + `git diff --exit-code dist/`).
 - Keep PRs to one fix/feature each, against `main`.
+
+### Local review (dev diagnostic)
+
+`scripts/local-review.js` (`npm run review:local`) runs a **faithful review locally** — the real engine, the real prompt, the real MCP collector — against a real diff, with **no GitHub**. It exists to answer "what does the engine actually do?": per engine attempt it reports whether the model **explored the repo** (`Read`/`Grep`/`Glob`) or reviewed the inline diff only, which files it read beyond the changed set, plus the findings, summary, and cost. It reuses the action's own seams (`synthesizeProviderConfig`, `parseUnifiedDiff`, `buildReviewInput`/`buildRepoReviewInput`, the engine adapter), so its behavior matches a production run for the same inputs — it is an instrument, not a second implementation. The provider credential is read from the same env var the action uses (`DEEPSEEK_API_KEY`/`ZAI_API_KEY`/`OPENAI_API_KEY`); see `--help`. This is dev-only tooling (`scripts/`), outside the shipped surface — it does not bump the version.
 
 ### Cutting a release
 
