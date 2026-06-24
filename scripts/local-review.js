@@ -14,23 +14,16 @@
 //
 // The provider credential is read from the same env var the action uses
 // (DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY). See --help.
+//
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + the pure session-stats helper and
+// function definitions. Every world-effect (temp dirs, env mutation, IO) and every engine-stack
+// require lives inside main(), the entry boundary — so importing this file for the pure-helper tests
+// (parseArgs/formatReport) performs no IO, mutates no globals, and loads no engine stack.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-
-// [LAW:no-ambient-temporal-coupling] TRANSCRIPT_DIR is computed from RUNNER_TEMP at debug.js load.
-// Point it at a fresh per-run dir BEFORE any src require, so the directory holds exactly THIS run's
-// transcripts and nothing from a previous invocation — the summary then describes only this review.
-const RUN_TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'local-review-'));
-process.env.RUNNER_TEMP = RUN_TEMP;
-
-const { synthesizeProviderConfig } = require('../src/provider');
-const { parseUnifiedDiff } = require('../src/diff');
-const { buildReviewInput, buildRepoReviewInput } = require('../src/prompt');
-const { TRANSCRIPT_DIR } = require('../src/debug');
-const registry = require('../src/engine/registry');
 const { summarizeSession } = require('./session-stats');
 
 const USAGE = `Run a faithful local review (real engine, real collector, no GitHub) and report whether
@@ -68,28 +61,6 @@ function parseArgs(argv) {
   }
   if (opts.mode !== 'pr' && opts.mode !== 'repo') throw new Error(`--mode must be 'pr' or 'repo' (got '${opts.mode}').`);
   return opts;
-}
-
-// [LAW:single-enforcer] Provider→config resolution is the action's own; this only sources the flat
-// inputs from env + overrides. synthesizeProviderConfig throws a precise error if the key is missing.
-function resolveConfig(opts) {
-  return synthesizeProviderConfig({
-    provider: opts.provider,
-    openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
-    zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
-    deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
-  });
-}
-
-function loadDiffFiles(opts) {
-  const diffText = opts.diff
-    ? fs.readFileSync(opts.diff, 'utf8')
-    : execFileSync('git', ['-C', opts.repo, 'diff', ...opts.range.split(/\s+/).filter(Boolean)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  const files = parseUnifiedDiff(diffText);
-  if (files.length === 0) {
-    throw new Error(`No changed files in the diff (${opts.diff || `git diff ${opts.range}`}). Pick a range with changes, or use --mode repo.`);
-  }
-  return files;
 }
 
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
@@ -142,11 +113,35 @@ function formatReport({ config, mode, files, result, sessions, repo }) {
   return lines.join('\n');
 }
 
-function readSessions() {
-  if (!fs.existsSync(TRANSCRIPT_DIR)) return [];
-  return fs.readdirSync(TRANSCRIPT_DIR)
+// The effectful helpers below lazily require their src deps, so importing this module never loads the
+// engine stack — only main() (or a helper it calls) does, after the run boundary is established.
+function resolveConfig(opts) {
+  const { synthesizeProviderConfig } = require('../src/provider');
+  return synthesizeProviderConfig({
+    provider: opts.provider,
+    openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
+    zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
+    deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
+  });
+}
+
+function loadDiffFiles(opts) {
+  const { parseUnifiedDiff } = require('../src/diff');
+  const diffText = opts.diff
+    ? fs.readFileSync(opts.diff, 'utf8')
+    : execFileSync('git', ['-C', opts.repo, 'diff', ...opts.range.split(/\s+/).filter(Boolean)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const files = parseUnifiedDiff(diffText);
+  if (files.length === 0) {
+    throw new Error(`No changed files in the diff (${opts.diff || `git diff ${opts.range}`}). Pick a range with changes, or use --mode repo.`);
+  }
+  return files;
+}
+
+function readSessions(transcriptDir) {
+  if (!fs.existsSync(transcriptDir)) return [];
+  return fs.readdirSync(transcriptDir)
     .filter(f => f.endsWith('.txt'))
-    .map(f => path.join(TRANSCRIPT_DIR, f))
+    .map(f => path.join(transcriptDir, f))
     .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs)
     .map(file => ({ file, ...summarizeSession(fs.readFileSync(file, 'utf8')) }));
 }
@@ -157,6 +152,16 @@ async function main() {
     process.stdout.write(USAGE);
     return;
   }
+
+  // [LAW:no-ambient-temporal-coupling] main owns the ordering: create an isolated run dir and point
+  // RUNNER_TEMP at it BEFORE the engine stack is required, so debug.js computes TRANSCRIPT_DIR against
+  // this run's dir and readSessions sees exactly this run's transcripts. The effect is here, at the
+  // boundary, never at module load. [LAW:effects-at-boundaries]
+  const runTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'local-review-'));
+  process.env.RUNNER_TEMP = runTemp;
+  const { TRANSCRIPT_DIR } = require('../src/debug');
+  const { buildReviewInput, buildRepoReviewInput } = require('../src/prompt');
+  const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
   const config = resolveConfig(opts);
@@ -170,7 +175,7 @@ async function main() {
   process.stderr.write(`Running ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
   const result = await registry.get(config.engine).produceReview({ config, buildPromptFor, instructionsPath });
 
-  const report = formatReport({ config, mode: opts.mode, files, result, sessions: readSessions(), repo });
+  const report = formatReport({ config, mode: opts.mode, files, result, sessions: readSessions(TRANSCRIPT_DIR), repo });
   process.stdout.write(`\n${report}\n`);
 }
 
@@ -181,4 +186,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, formatReport, resolveConfig, loadDiffFiles };
+module.exports = { parseArgs, formatReport };
