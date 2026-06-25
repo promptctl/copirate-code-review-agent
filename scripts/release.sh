@@ -33,7 +33,16 @@ git fetch --quiet origin main
 
 VERSION="$(node -p "require('./package.json').version")"
 [ -n "$VERSION" ] || die "could not read version from package.json."
-MAJOR_TAG="v${VERSION%%.*}"   # 1.4.2 -> v1   (moving major tag) [LAW:dataflow-not-control-flow]
+MAJOR="${VERSION%%.*}"
+
+# [LAW:single-enforcer] This action ships ONLY on the v1 line. This script is the one gate that can
+# publish, so it is the one place that enforces the policy: refuse any version whose major is not 1.
+# A stray major bump in package.json (how 2.0.0 was cut by mistake) can therefore never reach a tag.
+# [LAW:no-silent-failure] fail loud, naming the offending version and the fix.
+[ "$MAJOR" = "1" ] \
+  || die "this action ships only on the v1 line; refusing to release ${VERSION} (major ${MAJOR}). Set package.json back to a 1.x version."
+
+MAJOR_TAG="v${MAJOR}"   # always v1 — guarded above. The moving tag consumers pin. [LAW:dataflow-not-control-flow]
 
 # Immutable tags never move: refuse to re-release an existing version.
 git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1 \

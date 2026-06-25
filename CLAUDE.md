@@ -33,15 +33,16 @@ npm run build          # ncc bundles src/index.js -> dist/index.js (+ licenses.t
 
 ### Cutting a release
 
-Releases are git tags (`0.1.1`, no `v` prefix). Consumers pin the action by tag — the `dist/index.js` + `action.yml` at the tagged commit are what executes — and most pin the **moving major tag** `v<major>` (e.g. `@v1`), which always points at the latest release in that major line.
+Releases are git tags (`1.19.0`, no `v` prefix). Consumers pin the action by tag — the `dist/index.js` + `action.yml` at the tagged commit are what executes — and most pin the **moving tag `@v1`**, which always points at the latest release.
+
+**This action ships only on the `v1` line.** Every release is a `1.x` version; `scripts/release.sh` refuses anything else (`[LAW:single-enforcer]`); `@v1` is the one moving tag consumers track. There is no `v2` and there will not be one — breaking changes are absorbed into the `1.x` line (see the level guidance below), so a consumer pinned to `@v1` always gets the latest without ever migrating a major.
 
 **Every PR that changes what consumers run bumps the version, in that same PR.** The shipped surface is `src/`, `action.yml`, `review-agent/`, and the `dist/` built from them. A PR touching any of those edits `package.json`'s `version` by the correct semver level and rebuilds `dist/` — so `main`'s `package.json` is *always* the next publishable version, never lagging what's merged (the drift that left `package.json` at `0.1.0` while the tag was `0.1.1`). [LAW:one-source-of-truth] A PR that touches only docs, `scripts/`, or this file does **not** bump — bumping it would cut a release with no consumer-visible change.
 
 Pick the level by what the diff does to the consumer contract:
 
-- **patch** (`1.0.0 → 1.0.1`) — a bug fix or internal change; inputs and observable behavior are unchanged.
-- **minor** (`1.0.0 → 1.1.0`) — a backward-compatible addition: a new optional input, a new capability existing workflows keep working without.
-- **major** (`1.0.0 → 2.0.0`) — a breaking change: a removed/renamed input, a changed default, or behavior existing consumers depend on.
+- **patch** (`1.19.0 → 1.19.1`) — a bug fix or internal change; inputs and observable behavior are unchanged.
+- **minor** (`1.19.0 → 1.20.0`) — any consumer-visible change: a backward-compatible addition (a new optional input) *or* a breaking one (a removed/renamed input, a changed default). The major component never moves past `1` — `release.sh` enforces it — so a break is still a minor bump on the `v1` line and `@v1` consumers receive it. Signal a break in the release notes, not the version's major.
 
 Versioning is split into two parts, deliberately:
 
@@ -52,9 +53,9 @@ Versioning is split into two parts, deliberately:
    git checkout main && git pull && ./scripts/release.sh
    ```
 
-   It reads the version from `package.json` (the single source of truth), refuses to run if the committed `dist/` doesn't match a fresh build, then tags the commit, re-points `v<major>`, pushes the tags, and creates the GitHub Release with generated notes. It never edits or commits anything — the bump already happened in step 1.
+   It reads the version from `package.json` (the single source of truth), **refuses any version whose major is not `1`**, refuses to run if the committed `dist/` doesn't match a fresh build, then tags the commit, re-points `v1`, pushes the tags, and creates the GitHub Release with generated notes. It never edits or commits anything — the bump already happened in step 1.
 
-- A **breaking change** gets a new major (`2.0.0`); `scripts/release.sh` then manages `v2`, leaving `v1` frozen at the last 1.x so existing consumers don't break.
+- There are **no major version bumps.** `release.sh` rejects any non-`1.x` version (`[LAW:single-enforcer]`), so the project can never accidentally cut a `v2` (the way `2.0.0` was cut by mistake); `@v1` is the single moving tag, always pointing at the latest `1.x` release.
 
 ## Architecture
 
