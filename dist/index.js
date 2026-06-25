@@ -31386,9 +31386,13 @@ const MAX_RETAINED_OUTPUT = 8 * 1024 * 1024;
 // unparseable lines, so a severed leading fragment is harmlessly dropped. `clipped` reports
 // whether bytes were dropped, so the caller can announce the information loss rather than let a
 // stream-summed usage silently undercount. [LAW:no-silent-failure]
-function appendBounded(buffer, chunk) {
+// [LAW:dataflow-not-control-flow] The retention window is a VALUE, not a hardcoded constant: `max`
+// defaults to the production cap but is overridable, so the boundary behavior (append, clip, report)
+// can be exercised at any window size — a tiny cap in tests, the real 8 MiB in production — without
+// pushing megabytes through a pipe just to cross the threshold.
+function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
   const next = buffer + chunk;
-  if (next.length > MAX_RETAINED_OUTPUT) return { text: next.slice(-MAX_RETAINED_OUTPUT), clipped: true };
+  if (next.length > max) return { text: next.slice(-max), clipped: true };
   return { text: next, clipped: false };
 }
 
@@ -31429,6 +31433,9 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
   return new Promise((resolve, reject) => {
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
     const timeoutMs = adapter.timeoutMs ?? 3_000_000;
+    // [LAW:dataflow-not-control-flow] The retention window is the adapter's value (default 8 MiB),
+    // mirroring the timeoutMs seam above — so a test can exercise the clip/announce path at a small cap.
+    const maxRetained = adapter.maxRetainedOutput ?? MAX_RETAINED_OUTPUT;
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd });
     let stdout = '';
     let stderr = '';
@@ -31471,11 +31478,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
     // laundered into a clean pass. When stdout is clipped, `truncated` records it so close can
     // announce that a stream-summed usage (e.g. OpenCode) may undercount — never a silent drop.
     child.stdout.on('data', chunk => {
-      const { text, clipped } = appendBounded(stdout, chunk);
+      const { text, clipped } = appendBounded(stdout, chunk, maxRetained);
       stdout = text;
       truncated = truncated || clipped;
     });
-    child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk).text; });
+    child.stderr.on('data', chunk => { stderr = appendBounded(stderr, chunk, maxRetained).text; });
 
     child.on('error', err => {
       finish(() => reject(adapter.classifyError(err, '')));
@@ -31501,7 +31508,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd) {
           // loss is announced here rather than reported as an exact figure.
           if (truncated) {
             core.warning(
-              `${adapter.name} output exceeded the ${MAX_RETAINED_OUTPUT} byte retention window; ` +
+              `${adapter.name} output exceeded the ${maxRetained} byte retention window; ` +
               'kept the trailing window. Completion and last-event usage are intact; a stream-summed ' +
               'usage/cost for this run may be a lower bound.',
             );

@@ -2,28 +2,34 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const core = require('@actions/core');
-const { runEngine, appendBounded, MAX_RETAINED_OUTPUT } = require('../src/engine/run.js');
+const { runEngine, appendBounded } = require('../src/engine/run.js');
+
+// A small retention window for the runEngine integration tests below. The cap is a VALUE the
+// adapter supplies (src defaults to 8 MiB in production), so these tests exercise the identical
+// append→clip→announce path at a tiny window — no megabytes pushed through a pipe just to cross the
+// threshold, which is what made these tests take ~17 minutes each on a constrained CI runner.
+const RETAIN_CAP = 4096;
 
 // appendBounded is the single retention policy shared by stdout and stderr: append, then keep
-// only the trailing MAX_RETAINED_OUTPUT bytes, reporting whether it clipped. These assert the
-// contract directly (fast, pure).
+// only the trailing `max` bytes, reporting whether it clipped. These assert the contract directly
+// at a small cap (fast, pure), plus the default-cap path.
 describe('appendBounded', () => {
-  test('under the cap, retains everything in order and reports no clip', () => {
+  test('omitting max applies the production default cap (no clip on a small input)', () => {
+    // deepEqual covers both the joined text and clipped:false — a small input never clips at the default cap.
     assert.deepEqual(appendBounded('foo', 'bar'), { text: 'foobar', clipped: false });
-    assert.deepEqual(appendBounded('', ''), { text: '', clipped: false });
   });
 
   test('over the cap, retains exactly the trailing window and reports the clip', () => {
-    const out = appendBounded('', 'a'.repeat(MAX_RETAINED_OUTPUT + 10));
-    assert.equal(out.text.length, MAX_RETAINED_OUTPUT);
+    const out = appendBounded('', 'a'.repeat(74), 64);
+    assert.equal(out.text.length, 64);
     assert.equal(out.clipped, true);
   });
 
   test('preserves the NEWEST bytes (tail) and discards the OLDEST (head)', () => {
     // The terminal turn.completed/turn.failed events are emitted LAST, so the tail is what the
     // caller needs; an old head fragment is the safe thing to drop.
-    const out = appendBounded('OLDEST_MARKER', 'b'.repeat(MAX_RETAINED_OUTPUT));
-    assert.equal(out.text.length, MAX_RETAINED_OUTPUT);
+    const out = appendBounded('OLDEST_MARKER', 'b'.repeat(64), 64);
+    assert.equal(out.text.length, 64);
     assert.ok(!out.text.includes('OLDEST_MARKER'));
     assert.ok(out.text.endsWith('b'));
     assert.equal(out.clipped, true);
@@ -44,14 +50,15 @@ async function captureWarnings(fn) {
 // a terminal success line. runEngine reads only stdout (findings flow out-of-band via the
 // collector elsewhere), so the collector argument is irrelevant here.
 function makeAdapter({ emitTerminal }) {
-  const overflow = MAX_RETAINED_OUTPUT + 256 * 1024;
+  const overflow = RETAIN_CAP + 2048;
   const script =
-    `const big='x'.repeat(65536);` +
+    `const big='x'.repeat(512);` +
     `let w=0; while(w<${overflow}){process.stdout.write(big); w+=big.length;}` +
     (emitTerminal ? `process.stdout.write('\\n'+JSON.stringify({type:'turn.completed'})+'\\n');` : ``);
   return {
     name: 'fake',
     timeoutMs: 30_000,
+    maxRetainedOutput: RETAIN_CAP,
     buildCommand: () => ({
       command: process.execPath,
       args: ['-e', script],
@@ -76,7 +83,7 @@ describe('runEngine with an oversized engine stream', () => {
     const warnings = await captureWarnings(async () => {
       stdout = await runEngine(makeAdapter({ emitTerminal: true }), {}, 'prompt', '/tmp', {}, process.cwd());
     });
-    assert.ok(stdout.length <= MAX_RETAINED_OUTPUT, `retained ${stdout.length} exceeds cap ${MAX_RETAINED_OUTPUT}`);
+    assert.ok(stdout.length <= RETAIN_CAP, `retained ${stdout.length} exceeds cap ${RETAIN_CAP}`);
     assert.ok(stdout.includes('turn.completed'), 'the terminal event the caller needs survives in the tail');
     // [LAW:no-silent-failure] the information loss is loud, so a stream-summed usage cannot quietly undercount.
     assert.ok(warnings.some(w => /retention window/.test(w) && /lower bound/.test(w)), 'truncation warning emitted');
