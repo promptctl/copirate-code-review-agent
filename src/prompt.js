@@ -35,9 +35,31 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
     prompt: `
-Review this pull request. The repository under review is checked out at ${reviewedRepoRoot} — read it for context with
-    your Read, Grep, and Glob tools using that absolute path (your working directory is intentionally outside the repository).
-    Use the diff below as the authoritative changed surface.
+Review this pull request. The diff below is the authoritative list of what CHANGED — but a diff is not enough to judge a
+    change. The code it touches lives in a repository checked out at ${reviewedRepoRoot}.
+    Your working directory is intentionally outside the repository, so reach it by that absolute path with your Read,
+    Grep, and Glob tools.
+
+    GROUND THE DIFF IN THE REPOSITORY BEFORE YOU JUDGE IT. This is a required part of the review, not optional context —
+    reading the diff alone is an incomplete review. Concretely, every time:
+    - Read the FULL changed file, not just the hunk — a line is judged in the context of the function and module around it,
+      and the diff shows almost none of that context.
+    - For each symbol the diff adds, renames, or changes — a function, type, constant, or config key — Grep the repository
+      for its definition and its OTHER call sites, and Read those. The most important context for a change is almost always
+      in files the diff does not include.
+    - Several laws are simply unjudgeable from the diff alone; you must look beyond it, and a finding that asserts a
+      cross-file fact is valid ONLY if you actually read that other code — name what you read in the body. Asserting a
+      cross-file claim you did not verify is itself a [LAW:no-silent-failure] violation on your part:
+      • [LAW:one-source-of-truth] / [LAW:single-enforcer] — "a NEW second home for a fact" or "a duplicated check" is a claim
+        about the REST of the repo; Grep for the first home / existing enforcer before you assert it (or clear it).
+      • [LAW:composability] — whether a changed function hardcodes a caller-specific choice can only be judged by reading
+        its callers; Grep for them.
+      • [LAW:types-are-the-program] — the type a changed value must satisfy is usually defined in an unchanged file; Read it
+        before deciding the change admits an illegal state.
+      • [LAW:one-way-deps] — a new import's direction is judged against the module graph, not the single line.
+    You explore to judge THE CHANGE in its real context, not to audit the repository: the scope rules below still bind, so
+    pre-existing issues in unchanged code are not request_change material no matter what your exploration turns up.
+
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
     call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
