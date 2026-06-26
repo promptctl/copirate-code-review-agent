@@ -9,12 +9,6 @@ The core idea in one line: **make each piece of code do one thing, tell the trut
 
 ---
 
-## Reviewing: ground every judgment in the real code
-
-You are handed a diff or a scope, never the whole truth. A diff in particular hides the context a judgment needs — the rest of the changed function, the type a value must satisfy, the other call sites, the enforcer that already exists. So a review that reads only what it was handed is an incomplete review. Before you flag OR clear anything, go get the context: Read the full file around a change, and Grep the repository for each changed symbol's definition and its other uses, then Read those. The laws make this non-negotiable — `[LAW:one-source-of-truth]`/`[LAW:single-enforcer]` ("a *second* home", "a *duplicate* check"), `[LAW:composability]` ("hardcodes a *caller-specific* choice"), and `[LAW:types-are-the-program]` (the type lives elsewhere) are all claims about code the diff does not show; you cannot judge them without looking. A finding that asserts a cross-file fact ("this duplicates X", "callers break", "the type already forbids this") is honest only if you actually read that other code: verify it or do not assert it. `[LAW:no-silent-failure]`
-
----
-
 ## How code is shaped
 
 **`[LAW:decomposition]`** — Each function/module does ONE thing. If you describe what it does and need the word "and," split it.
