@@ -35,9 +35,14 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
     prompt: `
-Review this pull request. The repository under review is checked out at ${reviewedRepoRoot} — read it for context with
-    your Read, Grep, and Glob tools using that absolute path (your working directory is intentionally outside the repository).
-    Use the diff below as the authoritative changed surface.
+Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
+    Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
+
+    BEFORE judging anything, Read the complete content of every changed source file listed in the diff
+    (files under src/ or scripts/ — not dist/, not docs, not test/). The diff shows only the changed
+    hunks; a violation is only visible in the full surrounding context of the function and module. Do
+    not form or report any judgment until you have read each changed source file in full.
+
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
     Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
     call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
