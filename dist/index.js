@@ -31755,24 +31755,50 @@ const {
 // concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
 const DEFAULT_SCOPE_CONCURRENCY = 4;
 
-// Extract the first BALANCED JSON array from text, honoring nested brackets and quoted strings.
-// A greedy /\[[\s\S]*\]/ fails when several arrays share a document (it spans the first '[' to the
-// last ']'); this bracket counter returns just the first complete array. [LAW:no-silent-failure]
-function extractFirstJsonArray(text) {
-  const start = text.indexOf('[');
-  if (start === -1) return null;
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === '"') inString = false;
-    } else {
-      if (ch === '"') { inString = true; continue; }
-      if (ch === '[') depth++;
-      else if (ch === ']') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+// Find every top-level BALANCED [...] array in text, in order, each as {raw, start}. Honors nested
+// brackets and quoted strings. [LAW:single-enforcer] the one bracket scanner; findScopeArray below
+// selects among its results, and nothing else re-implements bracket matching.
+function findBalancedArrays(text) {
+  const arrays = [];
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '[') { i++; continue; }
+    let depth = 0;
+    let inString = false;
+    let end = -1;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (inString) {
+        if (ch === '\\') { j++; continue; }
+        if (ch === '"') inString = false;
+      } else if (ch === '"') {
+        inString = true;
+      } else if (ch === '[') {
+        depth++;
+      } else if (ch === ']') {
+        depth--;
+        if (depth === 0) { end = j; break; }
+      }
     }
+    if (end === -1) break; // no complete array from here onward
+    arrays.push({ raw: text.slice(i, end + 1), start: i });
+    i = end + 1;
+  }
+  return arrays;
+}
+
+// [LAW:types-are-the-program] The scope array is an array of OBJECTS (or empty), placed LAST per the
+// scout contract. Selecting "the last balanced array whose body starts with '{' or ']'" makes prose
+// brackets unrepresentable as false matches: a [LAW:token] citation starts with a letter, a [3] with
+// a digit, a ["s"] with a quote — all skipped, so a bracket in the scout's prose can never be mistaken
+// for the plan (which threw a false "invalid JSON" and reddened a good review). A genuine object array
+// — including a malformed [{...}] or an empty [] — is still selected, so its specific validation error
+// (invalid JSON / non-empty / per-field) still surfaces. [LAW:no-silent-failure]
+function findScopeArray(text) {
+  const arrays = findBalancedArrays(text);
+  for (let k = arrays.length - 1; k >= 0; k--) {
+    const body = arrays[k].raw.slice(1).trimStart();
+    if (body.startsWith('{') || body.startsWith(']')) return arrays[k];
   }
   return null;
 }
@@ -31783,34 +31809,35 @@ function extractFirstJsonArray(text) {
 // [LAW:no-silent-failure] A malformed plan throws loudly here, naming what was wrong, rather than
 // running vacuous workers that would make the whole review succeed having examined nothing.
 function parseScopes(summary) {
-  const raw = extractFirstJsonArray(summary);
-  if (!raw) throw new Error(`Scout did not produce a JSON scope array. Summary was:\n${summary}`);
+  const found = findScopeArray(summary);
+  if (!found) throw new Error(`Scout did not produce a JSON array of scope objects. Summary was:\n${summary}`);
   let scopes;
   try {
-    scopes = JSON.parse(raw);
+    scopes = JSON.parse(found.raw);
   } catch (e) {
-    throw new Error(`Scout scope plan is not valid JSON: ${e.message}\nRaw: ${raw}`);
+    throw new Error(`Scout scope plan is not valid JSON: ${e.message}\nRaw: ${found.raw}`);
   }
   if (!Array.isArray(scopes) || scopes.length === 0) {
-    throw new Error(`Scout scope plan must be a non-empty JSON array. Raw: ${raw}`);
+    throw new Error(`Scout scope plan must be a non-empty JSON array. Raw: ${found.raw}`);
   }
   return scopes.map((s, i) => {
     if (!s || typeof s !== 'object' || Array.isArray(s)) {
-      throw new Error(`Scope ${i + 1} is not an object. Raw: ${raw}`);
+      throw new Error(`Scope ${i + 1} is not an object. Raw: ${found.raw}`);
     }
     const name = typeof s.name === 'string' ? s.name.trim() : '';
     const focus = typeof s.focus === 'string' ? s.focus.trim() : '';
-    if (!name) throw new Error(`Scope ${i + 1} has an invalid or empty name. Raw: ${raw}`);
-    if (!focus) throw new Error(`Scope ${i + 1} ('${name}') has an invalid or empty focus. Raw: ${raw}`);
+    if (!name) throw new Error(`Scope ${i + 1} has an invalid or empty name. Raw: ${found.raw}`);
+    if (!focus) throw new Error(`Scope ${i + 1} ('${name}') has an invalid or empty focus. Raw: ${found.raw}`);
     return { name, focus };
   });
 }
 
-// [LAW:effects-at-boundaries] Pure: the scout's structural prose is everything BEFORE the JSON array.
+// [LAW:effects-at-boundaries] Pure: the scout's structural prose is everything BEFORE the scope array,
+// located by the same finder so a bracket in the prose is kept as context, never treated as the cut.
 // It becomes shared context handed to every worker so each understands how its part fits the whole.
 function structuralProse(scoutSummary) {
-  const bracket = scoutSummary.indexOf('[');
-  return (bracket === -1 ? scoutSummary : scoutSummary.slice(0, bracket)).trim();
+  const found = findScopeArray(scoutSummary);
+  return scoutSummary.slice(0, found ? found.start : scoutSummary.length).trim();
 }
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
@@ -31961,7 +31988,8 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
-  extractFirstJsonArray,
+  findBalancedArrays,
+  findScopeArray,
   parseScopes,
   structuralProse,
   workerFocusText,

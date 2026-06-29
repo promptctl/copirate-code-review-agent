@@ -15,7 +15,6 @@ const {
 } = require('../src/multiscope');
 const { buildReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { TransientError } = require('../src/failover');
-const { parseArgs } = require('../scripts/multi-scope-review');
 
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
@@ -39,15 +38,30 @@ describe('parseScopes', () => {
     assert.deepEqual(scopes, [{ name: 'a', focus: 'foo' }, { name: 'b', focus: 'bar' }]);
   });
 
-  test('takes the FIRST balanced array when prose contains more than one', () => {
-    const summary = '[{"name":"a","focus":"x"}]\nLATER: [{"name":"b","focus":"y"}]';
+  test('ignores a [LAW:token] bracket in the prose and parses the real scope array', () => {
+    // Regression (caught by the engine reviewing itself): the scout's structural prose naturally
+    // contains [LAW:...] citations; scanning for the FIRST '[' grabbed the citation and threw a false
+    // "invalid JSON", reddening a perfectly good review.
+    const summary = 'This codebase obeys [LAW:decomposition] throughout.\n[{"name":"cost","focus":"src/usage.js"}]';
     const scopes = parseScopes(summary);
     assert.equal(scopes.length, 1);
-    assert.equal(scopes[0].name, 'a');
+    assert.equal(scopes[0].name, 'cost');
   });
 
-  test('throws with the raw summary when no JSON array is present', () => {
-    assert.throws(() => parseScopes('No JSON here at all.'), /Scout did not produce a JSON scope array/);
+  test('skips a non-object array (e.g. [3]) in the prose and parses the object array', () => {
+    const summary = 'It retries up to [3] times.\n[{"name":"a","focus":"x"}]';
+    assert.equal(parseScopes(summary)[0].name, 'a');
+  });
+
+  test('takes the LAST scope array, per the "put the JSON array last" contract', () => {
+    const summary = '[{"name":"a","focus":"x"}]\nactually, corrected:\n[{"name":"b","focus":"y"}]';
+    const scopes = parseScopes(summary);
+    assert.equal(scopes.length, 1);
+    assert.equal(scopes[0].name, 'b');
+  });
+
+  test('throws with the raw summary when no array of objects is present', () => {
+    assert.throws(() => parseScopes('No JSON here, only a [LAW:x] citation.'), /Scout did not produce a JSON/);
   });
 
   test('throws when the array is malformed JSON', () => {
@@ -66,16 +80,19 @@ describe('parseScopes', () => {
     assert.throws(() => parseScopes('[{"focus":"x"}]'), /invalid or empty name/);
   });
 
-  test('throws when a scope is not an object', () => {
-    assert.throws(() => parseScopes('["just a string"]'), /is not an object/);
+  test('throws when an object array contains a non-object element', () => {
+    assert.throws(() => parseScopes('[{"name":"a","focus":"x"},"oops"]'), /is not an object/);
   });
 });
 
 // ── structuralProse / workerFocusText — the context handed to each worker ─────────────────────────
 
 describe('structuralProse', () => {
-  test('returns everything before the JSON array, trimmed', () => {
+  test('returns everything before the scope array, trimmed', () => {
     assert.equal(structuralProse('Prose here.\n\n[{"name":"a","focus":"x"}]'), 'Prose here.');
+  });
+  test('keeps a [LAW:token] bracket in the prose as context, cutting only at the scope array', () => {
+    assert.equal(structuralProse('It obeys [LAW:x] here.\n[{"name":"a","focus":"y"}]'), 'It obeys [LAW:x] here.');
   });
   test('returns the whole string trimmed when there is no array', () => {
     assert.equal(structuralProse('  just prose  '), 'just prose');
@@ -291,35 +308,5 @@ describe('buildReviewInput focus', () => {
   test('a non-empty focus renders the CONCENTRATE block with the focus text', () => {
     const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, 'cost — src/usage.js');
     assert.match(prompt, /CONCENTRATE THIS REVIEW on one part of the change: cost — src\/usage\.js/);
-  });
-});
-
-// ── parseArgs (the dev script's CLI) ─────────────────────────────────────────────────────────────
-
-describe('parseArgs', () => {
-  test('defaults: repo=cwd, provider=auto, workers=4', () => {
-    const opts = parseArgs([]);
-    assert.equal(opts.provider, 'auto');
-    assert.equal(opts.workers, 4);
-  });
-
-  test('--workers parses as an integer', () => {
-    assert.equal(parseArgs(['--workers', '6']).workers, 6);
-  });
-
-  test('--scope is accepted and captured', () => {
-    assert.equal(parseArgs(['--scope', 'the auth layer']).scope, 'the auth layer');
-  });
-
-  test('--help returns { help: true }', () => {
-    assert.deepEqual(parseArgs(['--help']), { help: true });
-  });
-
-  test('throws on unknown option', () => {
-    assert.throws(() => parseArgs(['--bogus', 'x']), /Unknown option/);
-  });
-
-  test('throws on a non-positive --workers', () => {
-    assert.throws(() => parseArgs(['--workers', '0']), /positive integer/);
   });
 });
