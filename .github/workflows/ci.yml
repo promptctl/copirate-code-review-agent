@@ -32,3 +32,23 @@ jobs:
 
       - name: Test
         run: npm test
+
+  version-bump:
+    # Enforce the version-bump rule only where there is a base to diff against:
+    # a pull request. On a push to main there is no "PR base"; the rule has already
+    # been enforced on the PR that produced the merge. [LAW:dataflow-not-control-flow]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base branch and the merge base are reachable for
+          # the diff in check-version-bump.sh.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Require a version bump when the shipped surface changed
+        run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}"
