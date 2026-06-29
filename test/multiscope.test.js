@@ -3,8 +3,6 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  parseScopes,
-  structuralProse,
   workerFocusText,
   dedupeFindings,
   sumUsage,
@@ -14,88 +12,33 @@ const {
   buildRepoMaterial,
 } = require('../src/multiscope');
 const { buildReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
+const { parseScopeValue } = require('../src/review');
 const { TransientError } = require('../src/failover');
 
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
+  addScope: 'mcp__review_collector__add_scope',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
 
-// ── parseScopes — the loud backstop for whatever the (weak) scout emits ──────────────────────────
+// ── parseScopeValue — typed scope records from the add_scope tool (mirrors parseFindingValue) ─────
+// The plan is no longer parsed from prose; the scout records each scope through the collector, so the
+// validation lives at the same boundary as a finding's, never in a bracket scanner.
 
-describe('parseScopes', () => {
-  test('extracts a JSON scope array embedded in prose', () => {
-    const summary = 'This is a CLI tool.\n[{"name":"cost","focus":"src/usage.js — the price table"}]';
-    const scopes = parseScopes(summary);
-    assert.equal(scopes.length, 1);
-    assert.deepEqual(scopes[0], { name: 'cost', focus: 'src/usage.js — the price table' });
+describe('parseScopeValue', () => {
+  test('accepts a {name, focus} record and trims both fields', () => {
+    assert.deepEqual(parseScopeValue({ name: ' cost ', focus: ' src/usage.js ' }, 0), { name: 'cost', focus: 'src/usage.js' });
   });
-
-  test('parses multiple scopes and trims whitespace in fields', () => {
-    const summary = '[{"name":" a ","focus":" foo "},{"name":"b","focus":"bar"}]';
-    const scopes = parseScopes(summary);
-    assert.deepEqual(scopes, [{ name: 'a', focus: 'foo' }, { name: 'b', focus: 'bar' }]);
+  test('rejects a missing/empty name', () => {
+    assert.throws(() => parseScopeValue({ focus: 'x' }, 0), /invalid name/);
+    assert.throws(() => parseScopeValue({ name: '  ', focus: 'x' }, 0), /invalid name/);
   });
-
-  test('ignores a [LAW:token] bracket in the prose and parses the real scope array', () => {
-    // Regression (caught by the engine reviewing itself): the scout's structural prose naturally
-    // contains [LAW:...] citations; scanning for the FIRST '[' grabbed the citation and threw a false
-    // "invalid JSON", reddening a perfectly good review.
-    const summary = 'This codebase obeys [LAW:decomposition] throughout.\n[{"name":"cost","focus":"src/usage.js"}]';
-    const scopes = parseScopes(summary);
-    assert.equal(scopes.length, 1);
-    assert.equal(scopes[0].name, 'cost');
+  test('rejects a missing/empty focus', () => {
+    assert.throws(() => parseScopeValue({ name: 'a' }, 0), /invalid focus/);
   });
-
-  test('skips a non-object array (e.g. [3]) in the prose and parses the object array', () => {
-    const summary = 'It retries up to [3] times.\n[{"name":"a","focus":"x"}]';
-    assert.equal(parseScopes(summary)[0].name, 'a');
-  });
-
-  test('takes the LAST scope array, per the "put the JSON array last" contract', () => {
-    const summary = '[{"name":"a","focus":"x"}]\nactually, corrected:\n[{"name":"b","focus":"y"}]';
-    const scopes = parseScopes(summary);
-    assert.equal(scopes.length, 1);
-    assert.equal(scopes[0].name, 'b');
-  });
-
-  test('throws with the raw summary when no array of objects is present', () => {
-    assert.throws(() => parseScopes('No JSON here, only a [LAW:x] citation.'), /Scout did not produce a JSON/);
-  });
-
-  test('throws when the array is malformed JSON', () => {
-    assert.throws(() => parseScopes('[{bad json}]'), /not valid JSON/);
-  });
-
-  test('throws on an empty array — never a vacuous zero-scope plan', () => {
-    assert.throws(() => parseScopes('[]'), /non-empty JSON array/);
-  });
-
-  test('throws when a scope is missing its focus', () => {
-    assert.throws(() => parseScopes('[{"name":"a"}]'), /invalid or empty focus/);
-  });
-
-  test('throws when a scope is missing its name', () => {
-    assert.throws(() => parseScopes('[{"focus":"x"}]'), /invalid or empty name/);
-  });
-
-  test('throws when an object array contains a non-object element', () => {
-    assert.throws(() => parseScopes('[{"name":"a","focus":"x"},"oops"]'), /is not an object/);
-  });
-});
-
-// ── structuralProse / workerFocusText — the context handed to each worker ─────────────────────────
-
-describe('structuralProse', () => {
-  test('returns everything before the scope array, trimmed', () => {
-    assert.equal(structuralProse('Prose here.\n\n[{"name":"a","focus":"x"}]'), 'Prose here.');
-  });
-  test('keeps a [LAW:token] bracket in the prose as context, cutting only at the scope array', () => {
-    assert.equal(structuralProse('It obeys [LAW:x] here.\n[{"name":"a","focus":"y"}]'), 'It obeys [LAW:x] here.');
-  });
-  test('returns the whole string trimmed when there is no array', () => {
-    assert.equal(structuralProse('  just prose  '), 'just prose');
+  test('rejects a non-object', () => {
+    assert.throws(() => parseScopeValue('nope', 0), /is not an object/);
   });
 });
 
@@ -226,11 +169,12 @@ describe('buildPrMaterial', () => {
   const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
   const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
 
-  test('scout prompt lists the changed file paths and the scope-array contract', () => {
+  test('scout prompt lists the changed file paths and records scopes via the add_scope tool', () => {
     const prompt = material.buildScoutPrompt(TOOL_NAMES);
     assert.match(prompt, /src\/a\.js/);
-    assert.match(prompt, /JSON array of review scopes/);
+    assert.match(prompt, /mcp__review_collector__add_scope ONCE PER SCOPE/);
     assert.match(prompt, /mcp__review_collector__finish_review/);
+    assert.doesNotMatch(prompt, /JSON array/);
   });
 
   test('worker prompt is the diff review with a CONCENTRATE focus block', () => {
@@ -243,10 +187,11 @@ describe('buildPrMaterial', () => {
 describe('buildRepoMaterial', () => {
   const material = buildRepoMaterial({ scope: '', excludePatterns: [], reviewedRepoRoot: REPO_ROOT });
 
-  test('scout prompt surveys the tree and emits the scope-array contract', () => {
+  test('scout prompt surveys the tree and records scopes via the add_scope tool', () => {
     const prompt = material.buildScoutPrompt(TOOL_NAMES);
     assert.match(prompt, /There is no diff/);
-    assert.match(prompt, /JSON array of review scopes/);
+    assert.match(prompt, /mcp__review_collector__add_scope ONCE PER SCOPE/);
+    assert.doesNotMatch(prompt, /JSON array/);
   });
 
   test('worker prompt is a focused whole-repo review (the scope focus IS the repo scope)', () => {
@@ -275,11 +220,12 @@ describe('scout prompts carry no size threshold', () => {
     assert.match(prScout, /ALSO read the files this group imports/);
   });
 
-  test('both forward the engine tool identifiers, never hardcoded names', () => {
-    const custom = { requestChange: 'tool_rc', finishReview: 'tool_fr' };
+  test('both forward the engine tool identifiers (incl. add_scope), never hardcoded names', () => {
+    const custom = { requestChange: 'tool_rc', finishReview: 'tool_fr', addScope: 'tool_as' };
     const p = buildPrScoutInput({ changedPaths: ['src/a.js'], toolNames: custom, reviewedRepoRoot: REPO_ROOT }).prompt;
     assert.match(p, /tool_fr/);
-    assert.doesNotMatch(p, /mcp__review_collector__finish_review/);
+    assert.match(p, /tool_as/);
+    assert.doesNotMatch(p, /mcp__review_collector__/);
   });
 
   test('a non-empty repo scope BOUNDS grouping to the focus, not a soft hint', () => {

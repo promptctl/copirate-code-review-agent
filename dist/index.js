@@ -29928,7 +29928,7 @@ function wrappy (fn, cb) {
 "use strict";
 
 const fs = __nccwpck_require__(9896);
-const { parseFindingValue } = __nccwpck_require__(1565);
+const { parseFindingValue, parseScopeValue } = __nccwpck_require__(1565);
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -29963,6 +29963,19 @@ function collectorTools() {
       },
     },
     {
+      name: 'add_scope',
+      description: 'Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. Call once per scope. Do not use while reviewing code (use request_change for findings).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          focus: { type: 'string' },
+        },
+        required: ['name', 'focus'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'finish_review',
       description: 'Finish the review after all required changes have been requested.',
       inputSchema: {
@@ -29982,6 +29995,11 @@ function callCollectorTool(name, args) {
     const finding = parseFindingValue(args, 0);
     appendCollectorRecord({ type: 'request_change', finding });
     return { content: [{ type: 'text', text: 'Required change recorded.' }] };
+  }
+  if (name === 'add_scope') {
+    const scope = parseScopeValue(args, 0);
+    appendCollectorRecord({ type: 'scope', scope });
+    return { content: [{ type: 'text', text: 'Review scope recorded.' }] };
   }
   if (name === 'finish_review') {
     if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {
@@ -30058,7 +30076,7 @@ module.exports = { runReviewCollectorServer };
 const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
-const { parseFindingValue, parseReviewValue } = __nccwpck_require__(1565);
+const { parseFindingValue, parseScopeValue, parseReviewValue } = __nccwpck_require__(1565);
 
 const COLLECTOR_SERVER_ARG = '--review-collector-server';
 
@@ -30097,10 +30115,18 @@ function readCollectedReview(recordsPath) {
   const findings = records
     .filter(record => record.type === 'request_change')
     .map((record, index) => parseFindingValue(record.finding, index));
-  return parseReviewValue({
+  // [LAW:dataflow-not-control-flow] One reader, two record kinds: a worker run produces findings (no
+  // scopes), a scout run produces scopes (no findings) — both flow through the same collector and the
+  // same exactly-one-finish gate. Scopes are typed, schema-validated records exactly like findings,
+  // never parsed from prose. [FRAMING:representation]
+  const scopes = records
+    .filter(record => record.type === 'scope')
+    .map((record, index) => parseScopeValue(record.scope, index));
+  const review = parseReviewValue({
     summary: finishes[0].summary,
     findings,
   }, 'Review collector output');
+  return { ...review, scopes };
 }
 
 // [FRAMING:representation] The MCP config createReviewCollector writes self-references this file:
@@ -30543,8 +30569,11 @@ const CLAUDE_TIMEOUT_MS = 3_000_000;
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
+  addScope: 'mcp__review_collector__add_scope',
 };
 
+// [LAW:single-enforcer] Every collector tool the model is told to call is also allowed here — the
+// allowlist derives from TOOL_NAMES, so a new tool (add_scope) is reachable by construction.
 const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',
@@ -30814,7 +30843,9 @@ function makeCliAdapter(spec) {
             const output = await runEngine(spec, config, prompt, home, collector, cwd);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
-            return { summary: review.summary, findings: review.findings, usage };
+            // [LAW:dataflow-not-control-flow] scopes (a scout run) and findings (a worker run) are
+            // both carried through as values; the caller uses whichever its pass produced.
+            return { summary: review.summary, findings: review.findings, scopes: review.scopes, usage };
           } finally {
             fs.rmSync(home, { recursive: true });
           }
@@ -30869,6 +30900,7 @@ const INTERNAL_PROVIDER = 'api';
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
+  addScope: 'mcp__review_collector__add_scope',
 };
 
 // [LAW:effects-at-boundaries] Pure: produces TOML text from values, touches no filesystem.
@@ -31110,6 +31142,7 @@ const MCP_SERVER_NAME = 'review_collector';
 const TOOL_NAMES = {
   requestChange: `${MCP_SERVER_NAME}_request_change`,
   finishReview: `${MCP_SERVER_NAME}_finish_review`,
+  addScope: `${MCP_SERVER_NAME}_add_scope`,
 };
 
 // [LAW:effects-at-boundaries] Pure: builds the opencode.json object from values, touches no
@@ -31755,90 +31788,14 @@ const {
 // concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
 const DEFAULT_SCOPE_CONCURRENCY = 4;
 
-// Find every top-level BALANCED [...] array in text, in order, each as {raw, start}. Honors nested
-// brackets and quoted strings. [LAW:single-enforcer] the one bracket scanner; findScopeArray below
-// selects among its results, and nothing else re-implements bracket matching.
-function findBalancedArrays(text) {
-  const arrays = [];
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] !== '[') { i++; continue; }
-    let depth = 0;
-    let inString = false;
-    let end = -1;
-    for (let j = i; j < text.length; j++) {
-      const ch = text[j];
-      if (inString) {
-        if (ch === '\\') { j++; continue; }
-        if (ch === '"') inString = false;
-      } else if (ch === '"') {
-        inString = true;
-      } else if (ch === '[') {
-        depth++;
-      } else if (ch === ']') {
-        depth--;
-        if (depth === 0) { end = j; break; }
-      }
-    }
-    if (end === -1) break; // no complete array from here onward
-    arrays.push({ raw: text.slice(i, end + 1), start: i });
-    i = end + 1;
-  }
-  return arrays;
-}
-
-// [LAW:types-are-the-program] The scope array is an array of OBJECTS (or empty), placed LAST per the
-// scout contract. Selecting "the last balanced array whose body starts with '{' or ']'" makes prose
-// brackets unrepresentable as false matches: a [LAW:token] citation starts with a letter, a [3] with
-// a digit, a ["s"] with a quote — all skipped, so a bracket in the scout's prose can never be mistaken
-// for the plan (which threw a false "invalid JSON" and reddened a good review). A genuine object array
-// — including a malformed [{...}] or an empty [] — is still selected, so its specific validation error
-// (invalid JSON / non-empty / per-field) still surfaces. [LAW:no-silent-failure]
-function findScopeArray(text) {
-  const arrays = findBalancedArrays(text);
-  for (let k = arrays.length - 1; k >= 0; k--) {
-    const body = arrays[k].raw.slice(1).trimStart();
-    if (body.startsWith('{') || body.startsWith(']')) return arrays[k];
-  }
-  return null;
-}
-
 // [LAW:types-are-the-program] A scope is the strongest true theorem: a named focus, nothing more.
 // There is deliberately NO `kind` discriminator — module scopes and boundary scopes are reviewed by
-// the identical worker, so the difference lives entirely in the focus TEXT, never in a branch.
-// [LAW:no-silent-failure] A malformed plan throws loudly here, naming what was wrong, rather than
-// running vacuous workers that would make the whole review succeed having examined nothing.
-function parseScopes(summary) {
-  const found = findScopeArray(summary);
-  if (!found) throw new Error(`Scout did not produce a JSON array of scope objects. Summary was:\n${summary}`);
-  let scopes;
-  try {
-    scopes = JSON.parse(found.raw);
-  } catch (e) {
-    throw new Error(`Scout scope plan is not valid JSON: ${e.message}\nRaw: ${found.raw}`);
-  }
-  if (!Array.isArray(scopes) || scopes.length === 0) {
-    throw new Error(`Scout scope plan must be a non-empty JSON array. Raw: ${found.raw}`);
-  }
-  return scopes.map((s, i) => {
-    if (!s || typeof s !== 'object' || Array.isArray(s)) {
-      throw new Error(`Scope ${i + 1} is not an object. Raw: ${found.raw}`);
-    }
-    const name = typeof s.name === 'string' ? s.name.trim() : '';
-    const focus = typeof s.focus === 'string' ? s.focus.trim() : '';
-    if (!name) throw new Error(`Scope ${i + 1} has an invalid or empty name. Raw: ${found.raw}`);
-    if (!focus) throw new Error(`Scope ${i + 1} ('${name}') has an invalid or empty focus. Raw: ${found.raw}`);
-    return { name, focus };
-  });
-}
-
-// [LAW:effects-at-boundaries] Pure: the scout's structural prose is everything BEFORE the scope array,
-// located by the same finder so a bracket in the prose is kept as context, never treated as the cut.
-// It becomes shared context handed to every worker so each understands how its part fits the whole.
-function structuralProse(scoutSummary) {
-  const found = findScopeArray(scoutSummary);
-  return scoutSummary.slice(0, found ? found.start : scoutSummary.length).trim();
-}
+// the identical worker, so the difference lives entirely in the focus TEXT, never in a branch. The
+// scout records each scope through the add_scope collector tool, so scopes arrive as typed,
+// schema-validated values (parseScopeValue, in src/review.js) — never parsed from the model's prose.
+// [FRAMING:representation] That is why this module no longer extracts a JSON array from text: the
+// representation a machine checks (the tool schema) replaced the representation we hoped to recover
+// (brackets in free text), and the whole class of prose-parsing bugs went with it.
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
 // structural context (when present) plus this scope's name and focus. The material turns it into the
@@ -31932,12 +31889,18 @@ async function runScopeWorker({ scope, context, config, material, adapter, instr
 async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log }) {
   const adapter = registry.get(config.engine);
 
-  // Layer 1 — the scout: a survey-only spawn. Its findings (if any) are ignored by design; its
-  // product is the plan carried in its summary. [LAW:single-enforcer] parseScopes is the one validator.
+  // Layer 1 — the scout: a survey-only spawn. Its product is the typed scope records it logged through
+  // the add_scope collector tool (validated at the collector boundary), plus a structural summary that
+  // becomes shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure]
+  // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
+  // having reviewed nothing.
   const scoutResult = await adapter.produceReview({ config, buildPromptFor: material.buildScoutPrompt, instructionsPath });
-  const scopes = parseScopes(scoutResult.summary);
+  const scopes = scoutResult.scopes;
+  if (scopes.length === 0) {
+    throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
+  }
   log(`scout planned ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
-  const context = structuralProse(scoutResult.summary);
+  const context = scoutResult.summary.trim();
 
   // Layer 2 — one worker per scope, judging in parallel under the concurrency cap.
   const workerResults = await runScopeWorkers({
@@ -31988,10 +31951,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
-  findBalancedArrays,
-  findScopeArray,
-  parseScopes,
-  structuralProse,
   workerFocusText,
   dedupeFindings,
   sumUsage,
@@ -32290,26 +32249,23 @@ Review this repository against the LAWS in your guidance. There is no diff — t
   };
 }
 
-// [LAW:one-source-of-truth] The scout's OUTPUT format lives here, once, shared by both scout
-// builders below. A scout plans the review; it does not flag code. Its only product is a JSON array
-// of scopes (each a {name, focus} value) that src/multiscope.js parses and turns into one worker per
-// scope. The number of scopes is whatever the grouping rules produce — adaptivity is the grouping,
-// never a counted threshold. [LAW:dataflow-not-control-flow]
+// [LAW:one-source-of-truth] The scout's OUTPUT protocol lives here, once, shared by both scout
+// builders below. A scout plans the review; it does not flag code. It records each scope through the
+// add_scope COLLECTOR TOOL — a typed, schema-validated record, exactly as a worker records a finding
+// through request_change — so the plan is never parsed from prose. [FRAMING:representation] The number
+// of scopes is whatever the grouping rules produce — adaptivity is the grouping, never a counted
+// threshold. [LAW:dataflow-not-control-flow]
 function scoutOutputContract(toolNames) {
-  return `Do NOT call ${toolNames.requestChange}. You are not reviewing code here; you are planning the review.
+  return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
-    Call ${toolNames.finishReview} exactly once. Its summary MUST contain, in this order:
+    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE. Each call takes exactly two fields:
+      - name: a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
+      - focus: one or two sentences naming the exact files and what to examine in them.
 
-    1. Two to four plain sentences describing what this codebase is and how its main parts relate.
-
-    2. A JSON array of review scopes. Each scope is an object with EXACTLY two string fields and no others:
-       - "name": a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
-       - "focus": one or two sentences naming the exact files and what to examine in them.
-       Write it as valid JSON. For example:
-       [{"name":"cost","focus":"src/usage.js and the extractUsage function in src/engine/claude-code.js — the token-to-USD cost path."},
-        {"name":"run→transport","focus":"The boundary where src/run.js calls src/transport.js — check the dependency points one way and no concept is owned on both sides."}]
-
-    Put the JSON array last. Do not write any prose after it. The collector tools are your only output channel.`;
+    Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
+    describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
+    summary — the scopes ARE your ${toolNames.addScope} calls. These collector tools are your only
+    output channel; never print the plan as text.`;
 }
 
 // [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed
@@ -32652,6 +32608,25 @@ function parseFindingValue(finding, index) {
   }, `Review collector finding ${index + 1}`).findings[0];
 }
 
+// [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
+// finding — a name + focus, both non-empty strings. It is recorded through the collector tool (never
+// parsed from the model's prose), so an empty or malformed scope is rejected here at the one boundary,
+// exactly as a finding is. [LAW:single-enforcer]
+function parseScopeValue(scope, index) {
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
+    throw new Error(`Review collector scope ${index + 1} is not an object.`);
+  }
+  const name = scope.name;
+  const focus = scope.focus;
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    throw new Error(`Review collector scope ${index + 1} has an invalid name.`);
+  }
+  if (typeof focus !== 'string' || focus.trim().length === 0) {
+    throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
+  }
+  return { name: name.trim(), focus: focus.trim() };
+}
+
 // A finding cited a line within this many lines of a real anchorable line is snapped to
 // that line rather than dropped: the model named a line just outside the diff hunk, but the
 // comment body is specific enough that a small offset still lands on the right change and the
@@ -32707,7 +32682,7 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, partitionFindings, nearestAnchorableLine };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine };
 
 
 /***/ }),

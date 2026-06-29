@@ -157,26 +157,23 @@ Review this repository against the LAWS in your guidance. There is no diff — t
   };
 }
 
-// [LAW:one-source-of-truth] The scout's OUTPUT format lives here, once, shared by both scout
-// builders below. A scout plans the review; it does not flag code. Its only product is a JSON array
-// of scopes (each a {name, focus} value) that src/multiscope.js parses and turns into one worker per
-// scope. The number of scopes is whatever the grouping rules produce — adaptivity is the grouping,
-// never a counted threshold. [LAW:dataflow-not-control-flow]
+// [LAW:one-source-of-truth] The scout's OUTPUT protocol lives here, once, shared by both scout
+// builders below. A scout plans the review; it does not flag code. It records each scope through the
+// add_scope COLLECTOR TOOL — a typed, schema-validated record, exactly as a worker records a finding
+// through request_change — so the plan is never parsed from prose. [FRAMING:representation] The number
+// of scopes is whatever the grouping rules produce — adaptivity is the grouping, never a counted
+// threshold. [LAW:dataflow-not-control-flow]
 function scoutOutputContract(toolNames) {
-  return `Do NOT call ${toolNames.requestChange}. You are not reviewing code here; you are planning the review.
+  return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
-    Call ${toolNames.finishReview} exactly once. Its summary MUST contain, in this order:
+    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE. Each call takes exactly two fields:
+      - name: a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
+      - focus: one or two sentences naming the exact files and what to examine in them.
 
-    1. Two to four plain sentences describing what this codebase is and how its main parts relate.
-
-    2. A JSON array of review scopes. Each scope is an object with EXACTLY two string fields and no others:
-       - "name": a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
-       - "focus": one or two sentences naming the exact files and what to examine in them.
-       Write it as valid JSON. For example:
-       [{"name":"cost","focus":"src/usage.js and the extractUsage function in src/engine/claude-code.js — the token-to-USD cost path."},
-        {"name":"run→transport","focus":"The boundary where src/run.js calls src/transport.js — check the dependency points one way and no concept is owned on both sides."}]
-
-    Put the JSON array last. Do not write any prose after it. The collector tools are your only output channel.`;
+    Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
+    describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
+    summary — the scopes ARE your ${toolNames.addScope} calls. These collector tools are your only
+    output channel; never print the plan as text.`;
 }
 
 // [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed

@@ -29,90 +29,14 @@ const {
 // concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
 const DEFAULT_SCOPE_CONCURRENCY = 4;
 
-// Find every top-level BALANCED [...] array in text, in order, each as {raw, start}. Honors nested
-// brackets and quoted strings. [LAW:single-enforcer] the one bracket scanner; findScopeArray below
-// selects among its results, and nothing else re-implements bracket matching.
-function findBalancedArrays(text) {
-  const arrays = [];
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] !== '[') { i++; continue; }
-    let depth = 0;
-    let inString = false;
-    let end = -1;
-    for (let j = i; j < text.length; j++) {
-      const ch = text[j];
-      if (inString) {
-        if (ch === '\\') { j++; continue; }
-        if (ch === '"') inString = false;
-      } else if (ch === '"') {
-        inString = true;
-      } else if (ch === '[') {
-        depth++;
-      } else if (ch === ']') {
-        depth--;
-        if (depth === 0) { end = j; break; }
-      }
-    }
-    if (end === -1) break; // no complete array from here onward
-    arrays.push({ raw: text.slice(i, end + 1), start: i });
-    i = end + 1;
-  }
-  return arrays;
-}
-
-// [LAW:types-are-the-program] The scope array is an array of OBJECTS (or empty), placed LAST per the
-// scout contract. Selecting "the last balanced array whose body starts with '{' or ']'" makes prose
-// brackets unrepresentable as false matches: a [LAW:token] citation starts with a letter, a [3] with
-// a digit, a ["s"] with a quote — all skipped, so a bracket in the scout's prose can never be mistaken
-// for the plan (which threw a false "invalid JSON" and reddened a good review). A genuine object array
-// — including a malformed [{...}] or an empty [] — is still selected, so its specific validation error
-// (invalid JSON / non-empty / per-field) still surfaces. [LAW:no-silent-failure]
-function findScopeArray(text) {
-  const arrays = findBalancedArrays(text);
-  for (let k = arrays.length - 1; k >= 0; k--) {
-    const body = arrays[k].raw.slice(1).trimStart();
-    if (body.startsWith('{') || body.startsWith(']')) return arrays[k];
-  }
-  return null;
-}
-
 // [LAW:types-are-the-program] A scope is the strongest true theorem: a named focus, nothing more.
 // There is deliberately NO `kind` discriminator — module scopes and boundary scopes are reviewed by
-// the identical worker, so the difference lives entirely in the focus TEXT, never in a branch.
-// [LAW:no-silent-failure] A malformed plan throws loudly here, naming what was wrong, rather than
-// running vacuous workers that would make the whole review succeed having examined nothing.
-function parseScopes(summary) {
-  const found = findScopeArray(summary);
-  if (!found) throw new Error(`Scout did not produce a JSON array of scope objects. Summary was:\n${summary}`);
-  let scopes;
-  try {
-    scopes = JSON.parse(found.raw);
-  } catch (e) {
-    throw new Error(`Scout scope plan is not valid JSON: ${e.message}\nRaw: ${found.raw}`);
-  }
-  if (!Array.isArray(scopes) || scopes.length === 0) {
-    throw new Error(`Scout scope plan must be a non-empty JSON array. Raw: ${found.raw}`);
-  }
-  return scopes.map((s, i) => {
-    if (!s || typeof s !== 'object' || Array.isArray(s)) {
-      throw new Error(`Scope ${i + 1} is not an object. Raw: ${found.raw}`);
-    }
-    const name = typeof s.name === 'string' ? s.name.trim() : '';
-    const focus = typeof s.focus === 'string' ? s.focus.trim() : '';
-    if (!name) throw new Error(`Scope ${i + 1} has an invalid or empty name. Raw: ${found.raw}`);
-    if (!focus) throw new Error(`Scope ${i + 1} ('${name}') has an invalid or empty focus. Raw: ${found.raw}`);
-    return { name, focus };
-  });
-}
-
-// [LAW:effects-at-boundaries] Pure: the scout's structural prose is everything BEFORE the scope array,
-// located by the same finder so a bracket in the prose is kept as context, never treated as the cut.
-// It becomes shared context handed to every worker so each understands how its part fits the whole.
-function structuralProse(scoutSummary) {
-  const found = findScopeArray(scoutSummary);
-  return scoutSummary.slice(0, found ? found.start : scoutSummary.length).trim();
-}
+// the identical worker, so the difference lives entirely in the focus TEXT, never in a branch. The
+// scout records each scope through the add_scope collector tool, so scopes arrive as typed,
+// schema-validated values (parseScopeValue, in src/review.js) — never parsed from the model's prose.
+// [FRAMING:representation] That is why this module no longer extracts a JSON array from text: the
+// representation a machine checks (the tool schema) replaced the representation we hoped to recover
+// (brackets in free text), and the whole class of prose-parsing bugs went with it.
 
 // [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
 // structural context (when present) plus this scope's name and focus. The material turns it into the
@@ -206,12 +130,18 @@ async function runScopeWorker({ scope, context, config, material, adapter, instr
 async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log }) {
   const adapter = registry.get(config.engine);
 
-  // Layer 1 — the scout: a survey-only spawn. Its findings (if any) are ignored by design; its
-  // product is the plan carried in its summary. [LAW:single-enforcer] parseScopes is the one validator.
+  // Layer 1 — the scout: a survey-only spawn. Its product is the typed scope records it logged through
+  // the add_scope collector tool (validated at the collector boundary), plus a structural summary that
+  // becomes shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure]
+  // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
+  // having reviewed nothing.
   const scoutResult = await adapter.produceReview({ config, buildPromptFor: material.buildScoutPrompt, instructionsPath });
-  const scopes = parseScopes(scoutResult.summary);
+  const scopes = scoutResult.scopes;
+  if (scopes.length === 0) {
+    throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
+  }
   log(`scout planned ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
-  const context = structuralProse(scoutResult.summary);
+  const context = scoutResult.summary.trim();
 
   // Layer 2 — one worker per scope, judging in parallel under the concurrency cap.
   const workerResults = await runScopeWorkers({
@@ -262,10 +192,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
-  findBalancedArrays,
-  findScopeArray,
-  parseScopes,
-  structuralProse,
   workerFocusText,
   dedupeFindings,
   sumUsage,
