@@ -29,6 +29,22 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # temp file as JavaScript. One mechanism for both sides. [LAW:one-type-per-behavior]
 pkg_version() { node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$1"; }
 
+# A bump is a strict semver INCREASE, not merely a change — a downgrade (1.21.2 →
+# 1.20.0) is not a bump. [LAW:types-are-the-program] the rule encodes direction.
+# Pure-node numeric compare of x.y.z; this project has no semver dependency and its
+# versions are strict 1.MINOR.PATCH (release.sh enforces major 1). Exit 0 iff $1 > $2.
+version_gt() {
+  node -e '
+    const a = process.argv[1].split(".").map(Number);
+    const b = process.argv[2].split(".").map(Number);
+    for (let i = 0; i < 3; i++) {
+      if (a[i] > b[i]) process.exit(0);
+      if (a[i] < b[i]) process.exit(1);
+    }
+    process.exit(1);
+  ' "$1" "$2"
+}
+
 BASE_REF="${1:?usage: check-version-bump.sh <base-ref>}"
 
 # The shipped surface: the files whose change a consumer actually runs (the action
@@ -65,10 +81,11 @@ BASE_VERSION="$(pkg_version "$BASE_PKG")"
 [ -n "$HEAD_VERSION" ] || die "could not read version from package.json on HEAD."
 [ -n "$BASE_VERSION" ] || die "could not read version from package.json on ${BASE_REF}."
 
-if [ "$HEAD_VERSION" = "$BASE_VERSION" ]; then
+if ! version_gt "$HEAD_VERSION" "$BASE_VERSION"; then
   die "this PR changes the shipped surface (src/, dist/, action.yml, or review-agent/) \
-but package.json's version is unchanged (${HEAD_VERSION}). Bump the version and rebuild \
-dist/ in this PR — see CLAUDE.md, 'Every PR that changes what consumers run bumps the version'."
+but package.json's version (${HEAD_VERSION}) is not greater than the base (${BASE_VERSION}). \
+Bump the version (a strict increase) and rebuild dist/ in this PR — see CLAUDE.md, \
+'Every PR that changes what consumers run bumps the version'."
 fi
 
 echo "✓ shipped surface changed and version was bumped: ${BASE_VERSION} → ${HEAD_VERSION}"

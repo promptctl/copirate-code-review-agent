@@ -14,6 +14,19 @@ cd "$(git rev-parse --show-toplevel)"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# --if-untagged turns an already-released version from a fatal error into a clean
+# no-op (exit 0). The manual path takes no flag and dies loudly on a re-release;
+# automation (the publish-on-merge workflow) passes --if-untagged so a no-bump push
+# exits 0 instead. The outcome is a value the caller passes — the tag-existence
+# predicate stays computed only here. [LAW:single-enforcer] [LAW:dataflow-not-control-flow]
+IF_UNTAGGED=false
+for arg in "$@"; do
+  case "$arg" in
+    --if-untagged) IF_UNTAGGED=true ;;
+    *) die "unknown argument: $arg (usage: release.sh [--if-untagged])" ;;
+  esac
+done
+
 # --- Preconditions: each fails loudly with a specific cause. [LAW:no-silent-failure] ---
 command -v gh   >/dev/null 2>&1 || die "GitHub CLI 'gh' is not installed (https://cli.github.com)."
 command -v node >/dev/null 2>&1 || die "node is not installed."
@@ -44,11 +57,16 @@ MAJOR="${VERSION%%.*}"
 
 MAJOR_TAG="v${MAJOR}"   # always v1 — guarded above. The moving tag consumers pin. [LAW:dataflow-not-control-flow]
 
-# Immutable tags never move: refuse to re-release an existing version.
+# Immutable tags never move. An existing tag is a fatal mistake on the manual path
+# and a clean no-op under --if-untagged; the predicate is checked once, here.
+skip_or_die() {
+  $IF_UNTAGGED && { echo "✓ version ${VERSION} is already tagged — nothing to release."; exit 0; }
+  die "$1"
+}
 git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1 \
-  && die "tag ${VERSION} already exists locally. Bump package.json to a new version first."
+  && skip_or_die "tag ${VERSION} already exists locally. Bump package.json to a new version first."
 git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1 \
-  && die "tag ${VERSION} already exists on origin. Bump package.json to a new version first."
+  && skip_or_die "tag ${VERSION} already exists on origin. Bump package.json to a new version first."
 
 # The release gate: the committed dist MUST match a fresh build of src.
 # Otherwise the Actions runner (which executes dist/index.js directly) ships
