@@ -15,19 +15,19 @@ function parseReviewValue(parsed, context) {
 
   const findings = parsed.findings.map((finding, index) => {
     if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
-      throw new Error(`Claude Code finding ${index + 1} is not an object.`);
+      throw new Error(`Review collector finding ${index + 1} is not an object.`);
     }
     const pathValue = finding.path;
     const line = finding.line;
     const body = finding.body;
     if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid path.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid path.`);
     }
     if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid line.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid line.`);
     }
     if (typeof body !== 'string' || body.trim().length === 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid body.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
     }
     return {
       path: pathValue.trim(),

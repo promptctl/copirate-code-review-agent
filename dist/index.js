@@ -30101,7 +30101,7 @@ function createReviewCollector() {
 
 function readCollectedReview(recordsPath) {
   if (!fs.existsSync(recordsPath)) {
-    throw new Error('Claude Code did not call the review collector tools.');
+    throw new Error('The review engine did not call the review collector tools.');
   }
 
   const records = fs.readFileSync(recordsPath, 'utf8')
@@ -30110,7 +30110,7 @@ function readCollectedReview(recordsPath) {
     .map(line => JSON.parse(line));
   const finishes = records.filter(record => record.type === 'finish');
   if (finishes.length !== 1) {
-    throw new Error(`Claude Code must call finish_review exactly once; saw ${finishes.length}.`);
+    throw new Error(`The review engine must call finish_review exactly once; saw ${finishes.length}.`);
   }
   const findings = records
     .filter(record => record.type === 'request_change')
@@ -32577,19 +32577,19 @@ function parseReviewValue(parsed, context) {
 
   const findings = parsed.findings.map((finding, index) => {
     if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
-      throw new Error(`Claude Code finding ${index + 1} is not an object.`);
+      throw new Error(`Review collector finding ${index + 1} is not an object.`);
     }
     const pathValue = finding.path;
     const line = finding.line;
     const body = finding.body;
     if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid path.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid path.`);
     }
     if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid line.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid line.`);
     }
     if (typeof body !== 'string' || body.trim().length === 0) {
-      throw new Error(`Claude Code finding ${index + 1} has an invalid body.`);
+      throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
     }
     return {
       path: pathValue.trim(),
