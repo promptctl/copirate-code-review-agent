@@ -25,8 +25,11 @@ const CLAUDE_TIMEOUT_MS = 3_000_000;
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
+  addScope: 'mcp__review_collector__add_scope',
 };
 
+// [LAW:single-enforcer] Every collector tool the model is told to call is also allowed here — the
+// allowlist derives from TOOL_NAMES, so a new tool (add_scope) is reachable by construction.
 const CLAUDE_ALLOWED_TOOLS = [
   'Read',
   'Grep',

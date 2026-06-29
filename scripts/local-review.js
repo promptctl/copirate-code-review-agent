@@ -5,10 +5,14 @@
 // it reports, per attempt, whether the engine explored the repo (Read/Grep/Glob) or reviewed the
 // inline diff only, alongside the findings it produced and the cost.
 //
-// It reuses the action's own seams — synthesizeProviderConfig (config), parseUnifiedDiff (diff),
-// buildReviewInput/buildRepoReviewInput (prompt), and the engine adapter (judgment) — so its behavior
-// matches a production run for the same inputs. [LAW:one-source-of-truth] Nothing about config,
-// diffs, or prompts is reimplemented here.
+// It reuses the action's own seams — synthesizeProviderConfig (config), parseUnifiedDiff (diff), and
+// runMultiScope (the SAME adaptive multi-scope engine production runs) — so its behavior matches a
+// production run for the same inputs. [LAW:one-source-of-truth] Nothing about config, diffs, prompts,
+// or the scout→workers pass is reimplemented here.
+//
+// [LAW:one-type-per-behavior] Both modes drive runMultiScope and differ ONLY in the material (a PR
+// diff vs the repo tree) — the exact differential run.js has. So either mode is equally drivable here;
+// it is never possible to exercise one mode locally but not the other.
 //
 //   node scripts/local-review.js [--provider auto] [--range "HEAD~1 HEAD"] [--repo .] [--mode pr|repo]
 //
@@ -38,6 +42,7 @@ Usage: node scripts/local-review.js [options]
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
   --mode <pr|repo>    Review mode (default: pr). repo = whole-repo exploration, no diff.
   --scope <text>      Optional free-text scope, repo mode only.
+  --workers <N>       Max concurrent scope workers (default: 4).
   --model <id>        Override the provider's default model.
   --base-url <url>    Override the provider's endpoint base URL.
   --help              Show this help.
@@ -46,8 +51,8 @@ Usage: node scripts/local-review.js [options]
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO, no defaults
 // that touch the world. `--flag value` and `--flag=value` both supported.
 function parseArgs(argv) {
-  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '' };
-  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'model', 'base-url']);
+  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
+  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url']);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') return { help: true };
@@ -60,6 +65,8 @@ function parseArgs(argv) {
     opts[name === 'base-url' ? 'baseUrl' : name] = value;
   }
   if (opts.mode !== 'pr' && opts.mode !== 'repo') throw new Error(`--mode must be 'pr' or 'repo' (got '${opts.mode}').`);
+  opts.workers = parseInt(opts.workers, 10);
+  if (isNaN(opts.workers) || opts.workers < 1) throw new Error('--workers must be a positive integer.');
   return opts;
 }
 
@@ -160,7 +167,7 @@ async function main() {
   const runTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'local-review-'));
   process.env.RUNNER_TEMP = runTemp;
   const { TRANSCRIPT_DIR } = require('../src/debug');
-  const { buildReviewInput, buildRepoReviewInput } = require('../src/prompt');
+  const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('../src/multiscope');
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
@@ -168,14 +175,20 @@ async function main() {
   const files = opts.mode === 'pr' ? loadDiffFiles(opts) : [];
   const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
 
-  const buildPromptFor = opts.mode === 'repo'
-    ? (toolNames) => buildRepoReviewInput({ scope: opts.scope, excludePatterns: [], toolNames, reviewedRepoRoot: repo }).prompt
-    : (toolNames) => buildReviewInput(files, 0, toolNames, repo).prompt;
+  // [LAW:one-type-per-behavior] Pick the material by mode — the only thing PR and repo differ on,
+  // exactly as run.js does — then drive the identical production engine. The local harness IS the
+  // production path minus the GitHub sink.
+  const material = opts.mode === 'pr'
+    ? buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: repo })
+    : buildRepoMaterial({ scope: opts.scope, excludePatterns: [], reviewedRepoRoot: repo });
 
-  process.stderr.write(`Running ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
-  const result = await registry.get(config.engine).produceReview({ config, buildPromptFor, instructionsPath });
+  process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
+  const { review } = await runMultiScope({
+    chain: [config], material, registry, instructionsPath, maxConcurrent: opts.workers,
+    log: msg => process.stderr.write(`[local-review] ${msg}\n`),
+  });
 
-  const report = formatReport({ config, mode: opts.mode, files, result, sessions: readSessions(TRANSCRIPT_DIR), repo });
+  const report = formatReport({ config, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo });
   process.stdout.write(`\n${report}\n`);
 }
 
