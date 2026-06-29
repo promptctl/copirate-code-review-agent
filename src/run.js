@@ -6,9 +6,10 @@ const path = require('path');
 
 const { filterFiles, buildReviewAnchors } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = require('./transport');
-const { buildReviewInput, buildRepoReviewInput } = require('./prompt');
+const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
-const { produceReview, buildAttributionFooter } = require('./failover');
+const { buildAttributionFooter } = require('./failover');
+const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
 const { renderCostLine, costWarning } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -31,40 +32,10 @@ const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'i
 // Gitea's act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
 const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 
-// [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
-// runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
-// pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
-// collector dance is private to the CLI adapters); it only chooses the adapter and supplies the
-// shared review context. buildPromptFor(toolNames) is applied inside the adapter with its own MCP
-// tool identifiers, so a failover chain gives each engine the right names. [LAW:types-are-the-program]
-function runOneReview(config, buildPromptFor) {
-  return registry.get(config.engine).produceReview({
-    config,
-    buildPromptFor,
-    instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
-  });
-}
-
-// PR-mode attempt: the shared engine plus diff-anchor reconciliation. [LAW:dataflow-not-control-flow]
-// Reconcile findings with the diff anchors as a value: anchored (incl. snapped) post inline;
-// unanchored are surfaced in the summary. A mis-anchored finding never aborts the review.
-// [LAW:no-silent-failure] each unanchored finding is logged here at the boundary so it is visible
-// in the run, never dropped silently.
-async function produceReviewOnce(config, buildPromptFor, anchors) {
-  const { summary, findings, usage } = await runOneReview(config, buildPromptFor);
-  const { anchored, unanchored } = partitionFindings(findings, anchors);
-  for (const f of unanchored) {
-    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-  }
-  return { summary, findings: anchored, unanchored, usage };
-}
-
-// Repo-mode attempt: the shared engine, with no anchor reconciliation. There is no diff grid, so
-// every file:line the agent cites is valid — findings flow through unchanged. produceReview passes
-// anchors as the third argument for every mode; this attempt ignores it. [LAW:composability]
-async function produceRepoReviewOnce(config, buildPromptFor) {
-  return runOneReview(config, buildPromptFor);
-}
+// [LAW:decomposition] The review engine — scout → workers → aggregate, wrapped in failover — now
+// lives in src/multiscope.js as runMultiScope, the single seam both modes call. The orchestrator
+// only chooses the `material` (what the scout surveys, what each worker reviews) and the `sink`
+// (how findings leave); it owns no CLI lifecycle and no retry timing. [LAW:types-are-the-program]
 
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
 // secrets. selection is the value PR/repo modes differ on: a PR run passes its labels + body so a
@@ -237,18 +208,35 @@ async function runPrReview(reviewerName, excludePatterns) {
   }
 
   // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
-  // toolNames; buildPromptFor is called per-attempt so each engine gets its own tool identifiers.
-  // [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] produceReview owns retry timing.
+  // toolNames; the material rebuilds the worker prompt per attempt so each engine gets its own tool
+  // identifiers. [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] runMultiScope (via
+  // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames, REVIEWED_REPO_ROOT).prompt;
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
-  core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
-  const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
+  core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
+  const { review, configUsed } = await runMultiScope({
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+  });
+
+  // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
+  // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
+  // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
+  // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
+  // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
+  const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+  for (const f of unanchored) {
+    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
+  }
 
   const footer = buildReviewFooter(review.usage, configUsed);
-  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
+  await submitReview(
+    reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+    { summary: review.summary, findings: anchored, unanchored },
+    Boolean(reviewToken), transport, footer,
+  );
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
@@ -268,15 +256,17 @@ async function runRepoReview(reviewerName, excludePatterns) {
 
   if (!(await preflightChain(chain))) return;
 
-  // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
-  // engine so each gets its own tool identifiers. [LAW:composability]
-  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT }).prompt;
+  // No diff means no anchors; the material's scout surveys the tree and each worker reviews one scope
+  // by absolute path, rebuilding its prompt per engine so each gets its own tool identifiers. [LAW:composability]
+  const material = buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot: REVIEWED_REPO_ROOT });
 
   core.info(
-    `Running whole-repo review with ${chain.length} config(s) in chain`
+    `Running multi-scope whole-repo review with ${chain.length} config(s) in chain`
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
-  const { review, configUsed } = await produceReview(chain, buildPromptFor, null, produceRepoReviewOnce);
+  const { review, configUsed } = await runMultiScope({
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+  });
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });
