@@ -1,0 +1,66 @@
+name: Release
+
+# Publish-on-merge: a merge to main that bumped package.json's version publishes
+# that release; a merge that didn't is a clean no-op. This removes the human from
+# the release loop — the gap that let package.json reach 1.21.2 while @v1 stayed
+# pinned at the 1.19.0-era commit, stranding four merged releases. [LAW:no-ambient-temporal-coupling]
+#
+# The release ritual itself is NOT reimplemented here. scripts/release.sh is the
+# single source of the publish ritual (tag the immutable version, repoint v1,
+# create the GitHub Release) and it already enforces v1-only and refuses an
+# existing tag. This workflow only owns WHEN it runs. [LAW:single-enforcer]
+on:
+  push:
+    branches: [main]
+
+# release.sh pushes tags and creates a GitHub Release; both need write on contents.
+permissions:
+  contents: write
+
+# Never run two publishes at once; serialize on the workflow so a rapid second
+# merge waits rather than racing release.sh's tag push. [LAW:no-ambient-temporal-coupling]
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release.sh requires a real, in-sync main branch (not a detached SHA):
+          # it checks `git branch --show-current` == main and HEAD == origin/main.
+          ref: main
+          # Full history + tags so the no-op gate below can ask "is this version
+          # already tagged?" accurately, and so release.sh's own tag checks see them.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # release.sh requires node_modules present and rebuilds dist to verify it
+      # matches src before publishing.
+      - run: npm ci
+
+      - name: Publish release if this version is untagged
+        env:
+          # gh (used by release.sh for `gh release create`) authenticates via GH_TOKEN.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          # The routing value: is main's current version already released?
+          # [LAW:dataflow-not-control-flow] same workflow every push; this fact picks
+          # no-op vs publish. release.sh ALSO refuses an existing tag — but that is its
+          # enforcement of "never re-release" (a loud error); this gate is the steady-state
+          # no-bump push exiting 0 instead of tripping that error. Two questions, one predicate.
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "✓ version ${VERSION} is already tagged — nothing to release."
+            exit 0
+          fi
+          echo "→ version ${VERSION} is untagged; publishing via scripts/release.sh…"
+          ./scripts/release.sh
