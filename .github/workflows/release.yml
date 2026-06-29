@@ -1,0 +1,56 @@
+name: Release
+
+# Publish-on-merge: a merge to main that bumped package.json's version publishes
+# that release; a merge that didn't is a clean no-op. This removes the human from
+# the release loop — the gap that let package.json reach 1.21.2 while @v1 stayed
+# pinned at the 1.19.0-era commit, stranding four merged releases. [LAW:no-ambient-temporal-coupling]
+#
+# The release ritual itself is NOT reimplemented here. scripts/release.sh is the
+# single source of the publish ritual (tag the immutable version, repoint v1,
+# create the GitHub Release) and it already enforces v1-only and refuses an
+# existing tag. This workflow only owns WHEN it runs. [LAW:single-enforcer]
+on:
+  push:
+    branches: [main]
+
+# release.sh pushes tags and creates a GitHub Release; both need write on contents.
+permissions:
+  contents: write
+
+# Never run two publishes at once; serialize on the workflow so a rapid second
+# merge waits rather than racing release.sh's tag push. [LAW:no-ambient-temporal-coupling]
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release.sh requires a real, in-sync main branch (not a detached SHA):
+          # it checks `git branch --show-current` == main and HEAD == origin/main.
+          ref: main
+          # Full history + tags so release.sh's HEAD==origin/main check and its local
+          # tag check (git rev-parse refs/tags/<version>) see the real state.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # release.sh requires node_modules present and rebuilds dist to verify it
+      # matches src before publishing.
+      - run: npm ci
+
+      - name: Publish release if this version is untagged
+        env:
+          # gh (used by release.sh for `gh release create`) authenticates via GH_TOKEN.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # release.sh owns the tag-existence predicate. --if-untagged makes an already-tagged
+        # version a clean no-op (exit 0) instead of release.sh's default loud die, so a no-bump
+        # push doesn't red the run. The workflow no longer recomputes the predicate. [LAW:single-enforcer]
+        run: ./scripts/release.sh --if-untagged
