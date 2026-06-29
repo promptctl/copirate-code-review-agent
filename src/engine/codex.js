@@ -30,6 +30,7 @@ const INTERNAL_PROVIDER = 'api';
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
   finishReview: 'mcp__review_collector__finish_review',
+  addScope: 'mcp__review_collector__add_scope',
 };
 
 // [LAW:effects-at-boundaries] Pure: produces TOML text from values, touches no filesystem.

@@ -1,6 +1,6 @@
 'use strict';
 const fs = require('fs');
-const { parseFindingValue } = require('./review');
+const { parseFindingValue, parseScopeValue } = require('./review');
 
 function writeJsonRpcResponse(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
@@ -35,6 +35,19 @@ function collectorTools() {
       },
     },
     {
+      name: 'add_scope',
+      description: 'Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. Call once per scope. Do not use while reviewing code (use request_change for findings).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          focus: { type: 'string' },
+        },
+        required: ['name', 'focus'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'finish_review',
       description: 'Finish the review after all required changes have been requested.',
       inputSchema: {
@@ -54,6 +67,11 @@ function callCollectorTool(name, args) {
     const finding = parseFindingValue(args, 0);
     appendCollectorRecord({ type: 'request_change', finding });
     return { content: [{ type: 'text', text: 'Required change recorded.' }] };
+  }
+  if (name === 'add_scope') {
+    const scope = parseScopeValue(args, 0);
+    appendCollectorRecord({ type: 'scope', scope });
+    return { content: [{ type: 'text', text: 'Review scope recorded.' }] };
   }
   if (name === 'finish_review') {
     if (!args || typeof args.summary !== 'string' || args.summary.trim().length === 0) {

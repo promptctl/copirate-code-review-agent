@@ -56,7 +56,9 @@ function makeCliAdapter(spec) {
             const output = await runEngine(spec, config, prompt, home, collector, cwd);
             const usage = spec.extractUsage(output, config);
             const review = readCollectedReview(collector.recordsPath);
-            return { summary: review.summary, findings: review.findings, usage };
+            // [LAW:dataflow-not-control-flow] scopes (a scout run) and findings (a worker run) are
+            // both carried through as values; the caller uses whichever its pass produced.
+            return { summary: review.summary, findings: review.findings, scopes: review.scopes, usage };
           } finally {
             fs.rmSync(home, { recursive: true });
           }

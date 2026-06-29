@@ -46,6 +46,25 @@ function parseFindingValue(finding, index) {
   }, `Review collector finding ${index + 1}`).findings[0];
 }
 
+// [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
+// finding — a name + focus, both non-empty strings. It is recorded through the collector tool (never
+// parsed from the model's prose), so an empty or malformed scope is rejected here at the one boundary,
+// exactly as a finding is. [LAW:single-enforcer]
+function parseScopeValue(scope, index) {
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
+    throw new Error(`Review collector scope ${index + 1} is not an object.`);
+  }
+  const name = scope.name;
+  const focus = scope.focus;
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    throw new Error(`Review collector scope ${index + 1} has an invalid name.`);
+  }
+  if (typeof focus !== 'string' || focus.trim().length === 0) {
+    throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
+  }
+  return { name: name.trim(), focus: focus.trim() };
+}
+
 // A finding cited a line within this many lines of a real anchorable line is snapped to
 // that line rather than dropped: the model named a line just outside the diff hunk, but the
 // comment body is specific enough that a small offset still lands on the right change and the
@@ -101,4 +120,4 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, partitionFindings, nearestAnchorableLine };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine };

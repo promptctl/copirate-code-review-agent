@@ -2,7 +2,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { parseFindingValue, parseReviewValue } = require('./review');
+const { parseFindingValue, parseScopeValue, parseReviewValue } = require('./review');
 
 const COLLECTOR_SERVER_ARG = '--review-collector-server';
 
@@ -41,10 +41,18 @@ function readCollectedReview(recordsPath) {
   const findings = records
     .filter(record => record.type === 'request_change')
     .map((record, index) => parseFindingValue(record.finding, index));
-  return parseReviewValue({
+  // [LAW:dataflow-not-control-flow] One reader, two record kinds: a worker run produces findings (no
+  // scopes), a scout run produces scopes (no findings) — both flow through the same collector and the
+  // same exactly-one-finish gate. Scopes are typed, schema-validated records exactly like findings,
+  // never parsed from prose. [FRAMING:representation]
+  const scopes = records
+    .filter(record => record.type === 'scope')
+    .map((record, index) => parseScopeValue(record.scope, index));
+  const review = parseReviewValue({
     summary: finishes[0].summary,
     findings,
   }, 'Review collector output');
+  return { ...review, scopes };
 }
 
 // [FRAMING:representation] The MCP config createReviewCollector writes self-references this file:

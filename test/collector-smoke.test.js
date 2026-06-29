@@ -77,6 +77,7 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     const toolNames = tools.map(t => t.name);
     assert.ok(toolNames.includes('request_change'), 'tools must include request_change');
     assert.ok(toolNames.includes('finish_review'), 'tools must include finish_review');
+    assert.ok(toolNames.includes('add_scope'), 'tools must include add_scope');
 
     // 3. tools/call request_change
     const changeResp = await rpc(child, 3, 'tools/call', {
@@ -108,6 +109,38 @@ test('collector smoke: full MCP handshake produces valid records.jsonl', async (
     const finishRecord = JSON.parse(lines[1]);
     assert.equal(finishRecord.type, 'finish');
     assert.equal(finishRecord.summary, 'One required change.');
+  } finally {
+    child.kill();
+    fs.rmSync(tmpDir, { recursive: true });
+  }
+});
+
+test('collector smoke: a scout records scopes via add_scope and readCollectedReview returns them typed', async () => {
+  const { readCollectedReview } = require('../src/collector');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'collector-smoke-'));
+  const recordsPath = path.join(tmpDir, 'records.jsonl');
+
+  const child = spawn(process.execPath, [DIST, '--review-collector-server'], {
+    env: { ...process.env, REVIEW_COLLECTOR_RECORDS: recordsPath },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  try {
+    await rpc(child, 1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0.0.1' } });
+
+    // A scout planning a review: two add_scope calls, then finish_review with structural prose.
+    const s1 = await rpc(child, 2, 'tools/call', { name: 'add_scope', arguments: { name: 'cost', focus: 'src/usage.js — the price table' } });
+    assert.ok(!s1.error, `add_scope must not error: ${JSON.stringify(s1.error)}`);
+    await rpc(child, 3, 'tools/call', { name: 'add_scope', arguments: { name: 'run→transport', focus: 'src/run.js → src/transport.js boundary' } });
+    await rpc(child, 4, 'tools/call', { name: 'finish_review', arguments: { summary: 'A code-review GitHub Action.' } });
+
+    // readCollectedReview returns scopes as typed records, findings empty — never parsed from prose.
+    const review = readCollectedReview(recordsPath);
+    assert.deepEqual(review.findings, []);
+    assert.equal(review.scopes.length, 2);
+    assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'src/usage.js — the price table' });
+    assert.equal(review.scopes[1].name, 'run→transport');
+    assert.equal(review.summary, 'A code-review GitHub Action.');
   } finally {
     child.kill();
     fs.rmSync(tmpDir, { recursive: true });
