@@ -31720,6 +31720,264 @@ module.exports = {
 
 /***/ }),
 
+/***/ 3746:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { produceReview } = __nccwpck_require__(2887);
+const {
+  buildReviewInput,
+  buildRepoReviewInput,
+  buildPrScoutInput,
+  buildRepoScoutInput,
+} = __nccwpck_require__(3479);
+
+// The adaptive multi-scope review engine, shared by both review modes (PR and whole-repo).
+//
+// [FRAMING:parts-and-seams] A review IS one shape regardless of material or sink: a SCOUT plans the
+// review (one survey spawn that emits a list of scopes), then one WORKER per scope judges it (one
+// review spawn each), then the workers' findings + usage AGGREGATE into a single review value. PR and
+// repo differ only in two values they already differ on elsewhere — the `material` (what the scout
+// surveys and what each worker reviews) and the `sink` (how findings leave). [LAW:one-type-per-behavior]
+//
+// Adaptivity is the GROUPING, not a counted threshold: the scout groups the change by concern and
+// follows the import edges it actually crosses, so a one-concern change yields one scope and a
+// many-concern change yields many — the same worker pool runs over a list of length 1 or 20,
+// identically. There is no "is it big" branch anywhere. [LAW:dataflow-not-control-flow]
+//
+// [LAW:no-ambient-temporal-coupling] The WHOLE pass (scout → workers → aggregate) is ONE attempt of
+// failover.produceReview per config: a transient error in the scout or any worker fails the pass and
+// failover retries/advances the entire pass as a unit. produceReview stays the single owner of retry
+// timing; this module never reimplements it.
+
+// [LAW:no-mode-explosion] One internal constant, not a consumer input: how many scope workers run
+// concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
+const DEFAULT_SCOPE_CONCURRENCY = 4;
+
+// Extract the first BALANCED JSON array from text, honoring nested brackets and quoted strings.
+// A greedy /\[[\s\S]*\]/ fails when several arrays share a document (it spans the first '[' to the
+// last ']'); this bracket counter returns just the first complete array. [LAW:no-silent-failure]
+function extractFirstJsonArray(text) {
+  const start = text.indexOf('[');
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === '"') inString = false;
+    } else {
+      if (ch === '"') { inString = true; continue; }
+      if (ch === '[') depth++;
+      else if (ch === ']') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+    }
+  }
+  return null;
+}
+
+// [LAW:types-are-the-program] A scope is the strongest true theorem: a named focus, nothing more.
+// There is deliberately NO `kind` discriminator — module scopes and boundary scopes are reviewed by
+// the identical worker, so the difference lives entirely in the focus TEXT, never in a branch.
+// [LAW:no-silent-failure] A malformed plan throws loudly here, naming what was wrong, rather than
+// running vacuous workers that would make the whole review succeed having examined nothing.
+function parseScopes(summary) {
+  const raw = extractFirstJsonArray(summary);
+  if (!raw) throw new Error(`Scout did not produce a JSON scope array. Summary was:\n${summary}`);
+  let scopes;
+  try {
+    scopes = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`Scout scope plan is not valid JSON: ${e.message}\nRaw: ${raw}`);
+  }
+  if (!Array.isArray(scopes) || scopes.length === 0) {
+    throw new Error(`Scout scope plan must be a non-empty JSON array. Raw: ${raw}`);
+  }
+  return scopes.map((s, i) => {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) {
+      throw new Error(`Scope ${i + 1} is not an object. Raw: ${raw}`);
+    }
+    const name = typeof s.name === 'string' ? s.name.trim() : '';
+    const focus = typeof s.focus === 'string' ? s.focus.trim() : '';
+    if (!name) throw new Error(`Scope ${i + 1} has an invalid or empty name. Raw: ${raw}`);
+    if (!focus) throw new Error(`Scope ${i + 1} ('${name}') has an invalid or empty focus. Raw: ${raw}`);
+    return { name, focus };
+  });
+}
+
+// [LAW:effects-at-boundaries] Pure: the scout's structural prose is everything BEFORE the JSON array.
+// It becomes shared context handed to every worker so each understands how its part fits the whole.
+function structuralProse(scoutSummary) {
+  const bracket = scoutSummary.indexOf('[');
+  return (bracket === -1 ? scoutSummary : scoutSummary.slice(0, bracket)).trim();
+}
+
+// [LAW:effects-at-boundaries] Pure: compose the single focus string a worker receives — the scout's
+// structural context (when present) plus this scope's name and focus. The material turns it into the
+// engine prompt (a PR worker's CONCENTRATE block, a repo worker's scope focus).
+function workerFocusText(scope, context) {
+  const prefix = context ? `Structural context from the planning pass:\n${context}\n\n---\n\n` : '';
+  return `${prefix}${scope.name} — ${scope.focus}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
+// two adjacent scopes can both touch a shared file. Keyed by path:line:body-prefix — the same key the
+// printed report and the PR review treat as "the same finding". [LAW:one-source-of-truth]
+function dedupeFindings(findings) {
+  const seen = new Set();
+  return findings.filter(f => {
+    const key = `${f.path}:${f.line}:${(f.body || '').slice(0, 60)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
+// Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
+// same model and the same availability — so the sum is available iff every spawn's cost is, carrying
+// the same unavailable reason otherwise. [LAW:no-silent-failure] no spawn's cost is silently dropped.
+// usage === null (an engine reported nothing) is excluded; all-null sums to null, matching the
+// single-spawn behavior the cost renderer already handles.
+function sumUsage(usages) {
+  const present = usages.filter(Boolean);
+  if (present.length === 0) return null;
+  const inputTokens = present.reduce((sum, u) => sum + u.inputTokens, 0);
+  const outputTokens = present.reduce((sum, u) => sum + u.outputTokens, 0);
+  const cost = present.every(u => u.cost.available)
+    ? { available: true, usd: present.reduce((sum, u) => sum + u.cost.usd, 0) }
+    : { available: false, reason: present.find(u => !u.cost.available).cost.reason };
+  return { inputTokens, outputTokens, cost };
+}
+
+// [LAW:effects-at-boundaries] Pure: the aggregated review summary. It names every scope reviewed and
+// carries each worker's own summary verbatim — never the scout's raw JSON, which stays out of the
+// author-facing text. [LAW:one-source-of-truth]
+function composeSummary(scopes, workerResults) {
+  const lines = [`Reviewed ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}.`, ''];
+  for (const r of workerResults) {
+    lines.push(`**${r.name}** — ${(r.summary || '(no summary)').trim()}`);
+  }
+  return lines.join('\n');
+}
+
+// [LAW:dataflow-not-control-flow] A bounded-concurrency worker pool that is FAIL-LOUD: the first error
+// stops new work and is rethrown after in-flight workers settle, preserving its type (a TransientError
+// stays a TransientError so failover can classify it). [LAW:no-silent-failure] this is the deliberate
+// inverse of swallowing a failed scope into an empty-finding result — an unreviewed scope must never
+// pass as a clean one. results are returned in scope order.
+async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
+  const results = new Array(scopes.length);
+  let next = 0;
+  let firstError = null;
+  async function lane() {
+    while (next < scopes.length && !firstError) {
+      const i = next++;
+      try {
+        results[i] = await runOne(scopes[i]);
+      } catch (e) {
+        firstError = firstError || e;
+      }
+    }
+  }
+  const laneCount = Math.min(Math.max(1, maxConcurrent), scopes.length);
+  await Promise.all(Array.from({ length: laneCount }, lane));
+  if (firstError) throw firstError;
+  return results;
+}
+
+// One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
+// It does one thing — review one scope — and returns its raw findings + summary + usage as a value.
+async function runScopeWorker({ scope, context, config, material, adapter, instructionsPath, log }) {
+  const focusText = workerFocusText(scope, context);
+  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames);
+  log(`scope '${scope.name}' starting…`);
+  const { summary, findings, usage } = await adapter.produceReview({ config, buildPromptFor, instructionsPath });
+  log(`scope '${scope.name}' done — ${findings.length} finding(s)`);
+  return { name: scope.name, summary, findings, usage };
+}
+
+// One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
+// failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
+// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
+// every downstream sink stays unchanged. [LAW:decomposition]
+async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log }) {
+  const adapter = registry.get(config.engine);
+
+  // Layer 1 — the scout: a survey-only spawn. Its findings (if any) are ignored by design; its
+  // product is the plan carried in its summary. [LAW:single-enforcer] parseScopes is the one validator.
+  const scoutResult = await adapter.produceReview({ config, buildPromptFor: material.buildScoutPrompt, instructionsPath });
+  const scopes = parseScopes(scoutResult.summary);
+  log(`scout planned ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
+  const context = structuralProse(scoutResult.summary);
+
+  // Layer 2 — one worker per scope, judging in parallel under the concurrency cap.
+  const workerResults = await runScopeWorkers({
+    scopes,
+    maxConcurrent,
+    runOne: (scope) => runScopeWorker({ scope, context, config, material, adapter, instructionsPath, log }),
+  });
+
+  return {
+    summary: composeSummary(scopes, workerResults),
+    findings: dedupeFindings(workerResults.flatMap(r => r.findings)),
+    usage: sumUsage([scoutResult.usage, ...workerResults.map(r => r.usage)]),
+  };
+}
+
+// The engine seam both modes call. Wraps the multi-scope pass in failover.produceReview so the whole
+// pass retries/advances per config. produceReview supplies (config, buildPromptFor, anchors); the
+// multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
+// here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
+// log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
+function runMultiScope({ chain, material, registry, instructionsPath, maxConcurrent = DEFAULT_SCOPE_CONCURRENCY, log = () => {} }) {
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log });
+  return produceReview(chain, null, null, produceOnce);
+}
+
+// [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
+// prompt and a worker prompt from the inputs its mode already has; the engine above is material-blind.
+
+// PR material: the scout is handed the changed file paths; each worker sees the WHOLE annotated diff
+// (so every anchor stays valid) with its scope as the CONCENTRATE focus. files/maxDiffChars are the
+// same values run.js uses to build the anchors, so worker findings and anchors share one diff.
+function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
+  const changedPaths = files.map(f => f.filename);
+  return {
+    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
+    buildWorkerPrompt: (focusText, toolNames) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText).prompt,
+  };
+}
+
+// Repo material: no diff. The scout surveys the tree; each worker reviews one scope, where the scope
+// focus IS the repo-review `scope` value — so a worker is exactly a focused whole-repo review.
+function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
+  return {
+    buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
+    buildWorkerPrompt: (focusText, toolNames) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
+  };
+}
+
+module.exports = {
+  DEFAULT_SCOPE_CONCURRENCY,
+  extractFirstJsonArray,
+  parseScopes,
+  structuralProse,
+  workerFocusText,
+  dedupeFindings,
+  sumUsage,
+  composeSummary,
+  runScopeWorkers,
+  runMultiScopePass,
+  runMultiScope,
+  buildPrMaterial,
+  buildRepoMaterial,
+};
+
+
+/***/ }),
+
 /***/ 9866:
 /***/ ((module) => {
 
@@ -31854,7 +32112,11 @@ const { annotatePatchWithLines } = __nccwpck_require__(9898);
 // working directory OUTSIDE that tree (so no repo-committed CLAUDE.md/AGENTS.md is auto-loaded
 // as reviewer instructions), so the repo is named here as an explicit value and the agent reads
 // it by absolute path — never via cwd-relative discovery. [LAW:effects-at-boundaries]
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
+// focus is a free-text value naming the part of the change this review should concentrate on (a
+// multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
+// (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
+// never a branch. The whole annotated diff is shown either way so every anchor stays valid.
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '') {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -31878,13 +32140,21 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot) {
     diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
   }
 
+  // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
+  // concentration instruction. The worker still sees the whole diff (anchors stay valid) and reads
+  // for cross-file context, but reports only what belongs to its scope; overlap is de-duplicated when
+  // scopes' findings merge.
+  const focusBlock = focus
+    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below for context, but only flag issues that belong to that part. Other parts are reviewed separately.\n`
+    : '';
+
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-
+${focusBlock}
     BEFORE judging anything, Read the complete content of every changed source file listed in the diff
     (files under src/ or scripts/ — not dist/, not docs, not test/). The diff shows only the changed
     hunks; a violation is only visible in the full surrounding context of the function and module. Do
@@ -31992,7 +32262,114 @@ Review this repository against the LAWS in your guidance. There is no diff — t
   };
 }
 
-module.exports = { buildReviewInput, buildRepoReviewInput };
+// [LAW:one-source-of-truth] The scout's OUTPUT format lives here, once, shared by both scout
+// builders below. A scout plans the review; it does not flag code. Its only product is a JSON array
+// of scopes (each a {name, focus} value) that src/multiscope.js parses and turns into one worker per
+// scope. The number of scopes is whatever the grouping rules produce — adaptivity is the grouping,
+// never a counted threshold. [LAW:dataflow-not-control-flow]
+function scoutOutputContract(toolNames) {
+  return `Do NOT call ${toolNames.requestChange}. You are not reviewing code here; you are planning the review.
+
+    Call ${toolNames.finishReview} exactly once. Its summary MUST contain, in this order:
+
+    1. Two to four plain sentences describing what this codebase is and how its main parts relate.
+
+    2. A JSON array of review scopes. Each scope is an object with EXACTLY two string fields and no others:
+       - "name": a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
+       - "focus": one or two sentences naming the exact files and what to examine in them.
+       Write it as valid JSON. For example:
+       [{"name":"cost","focus":"src/usage.js and the extractUsage function in src/engine/claude-code.js — the token-to-USD cost path."},
+        {"name":"run→transport","focus":"The boundary where src/run.js calls src/transport.js — check the dependency points one way and no concept is owned on both sides."}]
+
+    Put the JSON array last. Do not write any prose after it. The collector tools are your only output channel.`;
+}
+
+// [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed
+// and divides them into review scopes by the explicit rules below. It surveys; the workers judge.
+// The rules are written for a weak model — concrete, example-grounded, and free of any "is it big"
+// threshold: the scope COUNT falls out of grouping changed files by concern and following the import
+// edges the change actually crosses. [LAW:dataflow-not-control-flow]
+function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }) {
+  const fileList = changedPaths.map(p => `      - ${p}`).join('\n');
+  return {
+    prompt: `
+Plan the review of a pull request. The repository under review is checked out at ${reviewedRepoRoot}; your working
+    directory is intentionally outside it, so reach files by that absolute path with your Read, Grep, and Glob tools.
+
+    This pull request changed these source files:
+${fileList}
+
+    Divide these changed files into review scopes by this ONE rule. Do not invent scopes for anything these files do not
+    change.
+
+    Group the changed files by the ONE concern each serves, and emit exactly ONE scope per group — no more. [LAW:decomposition]:
+    a part does one thing, so each group is one concern. A concern is usually the directory a file sits in, but judge by what
+    the code DOES, not only where it sits. Read the changed files if you are unsure what they do.
+      - Example: a change to src/usage.js (the price table) and a change to the extractUsage function in
+        src/engine/claude-code.js both serve the cost concern — ONE group, ONE scope, though they are different files.
+      - Example: a change to src/diff.js (line anchoring) and a change to src/report.js (rendering) serve two different
+        concerns — TWO groups, TWO scopes.
+
+    The number of scopes EQUALS the number of distinct concerns these changed files touch: a change to one concern yields
+    exactly one scope; a change touching five concerns yields exactly five scopes. Do NOT split one concern across several
+    scopes, and do NOT create a separate scope for a boundary between concerns — boundaries are reviewed from inside a scope,
+    next.
+
+    In each scope's "focus", do THREE things: (1) name that group's changed files and what to review in them; (2) tell the
+    reviewer to ALSO read the files this group imports (its require(...) targets) and check the connection — that the
+    dependency points one way [LAW:one-way-deps] and that no single fact is defined or owned on both sides
+    [LAW:one-source-of-truth]; (3) keep it to one or two sentences.
+
+    ${scoutOutputContract(toolNames)}`,
+  };
+}
+
+// [LAW:decomposition] The whole-repo scout MATERIAL: no diff, so it surveys the working tree and
+// divides the SOURCE (not just changed files) into scopes by the same concern-grouping rules. scope
+// is optional free text that narrows where planning starts; excludePatterns are forwarded as "never
+// scope these". [LAW:dataflow-not-control-flow] empty scope and empty excludePatterns are distinct
+// rendered values, not skipped branches.
+function buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }) {
+  // [LAW:dataflow-not-control-flow] The maintainer's focus is a BOUND on grouping, not a soft hint:
+  // when present, scopes may only cover files inside the focus and the files those import. Absent, the
+  // whole repository is in bounds. This is the fix for a weak model that otherwise "follows the code
+  // outward" until it has re-scoped the entire repo.
+  const boundLine = scope
+    ? `The maintainer has focused this review on: ${scope}\n    IMPORTANT: create scopes ONLY for files inside that focus and the files those files directly import. Do NOT create scopes for unrelated parts of the repository, even ones you notice while surveying.`
+    : 'Cover the whole repository: every distinct concern in the source is in bounds.';
+  const exclude = excludePatterns.length > 0
+    ? `\n\n    Do NOT include files matching these excluded patterns in any scope: ${excludePatterns.join(', ')}.`
+    : '';
+  return {
+    prompt: `
+Plan the review of this repository. There is no diff. The repository under review is checked out at ${reviewedRepoRoot};
+    your working directory is intentionally outside it, so explore by that absolute path with your Read, Grep, and Glob tools.
+    ${boundLine}${exclude}
+
+    First, survey the structure: read the entry points, the package manifest, and one key file per major part so you
+    understand what the parts are and how they relate. Then divide the IN-BOUNDS source into review scopes by this ONE rule.
+
+    Group the in-bounds source by the ONE concern each part serves, and emit exactly ONE scope per group — no more.
+    [LAW:decomposition]: a part does one thing, so each group is one concern. A concern is usually a directory (for example
+    src/engine), but judge by what the code DOES, not only where it sits.
+      - Example: src/usage.js (the price table) and the extractUsage function in src/engine/claude-code.js both serve the
+        cost concern — ONE group, ONE scope.
+      - Example: src/diff.js (line anchoring) and src/report.js (rendering) serve two concerns — TWO groups, TWO scopes.
+
+    The number of scopes EQUALS the number of distinct concerns in bounds — nothing else. A small or tightly focused review
+    yields few scopes; a whole large repository yields one scope per concern. Do NOT split one concern across several scopes,
+    and do NOT create a separate scope for a boundary between concerns — boundaries are reviewed from inside a scope, next.
+
+    In each scope's "focus", do THREE things: (1) name that group's files and what to review in them; (2) tell the reviewer
+    to ALSO read the files this group imports (its require(...) targets) and check the connection — that the dependency
+    points one way [LAW:one-way-deps] and that no single fact is defined or owned on both sides [LAW:one-source-of-truth];
+    (3) keep it to one or two sentences.
+
+    ${scoutOutputContract(toolNames)}`,
+  };
+}
+
+module.exports = { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput };
 
 
 /***/ }),
@@ -32319,9 +32696,10 @@ const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork } = __nccwpck_require__(7228);
-const { buildReviewInput, buildRepoReviewInput } = __nccwpck_require__(3479);
+const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
-const { produceReview, buildAttributionFooter } = __nccwpck_require__(2887);
+const { buildAttributionFooter } = __nccwpck_require__(2887);
+const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
 const { renderCostLine, costWarning } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
@@ -32344,40 +32722,10 @@ const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'i
 // Gitea's act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
 const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 
-// [LAW:decomposition] The engine attempt is now the adapter's own concern: adapter.produceReview
-// runs one engine against the prompt and returns {summary, findings, usage}, knowing nothing about
-// pull requests, diff anchors, or the host. The orchestrator no longer owns the CLI lifecycle (the
-// collector dance is private to the CLI adapters); it only chooses the adapter and supplies the
-// shared review context. buildPromptFor(toolNames) is applied inside the adapter with its own MCP
-// tool identifiers, so a failover chain gives each engine the right names. [LAW:types-are-the-program]
-function runOneReview(config, buildPromptFor) {
-  return registry.get(config.engine).produceReview({
-    config,
-    buildPromptFor,
-    instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH,
-  });
-}
-
-// PR-mode attempt: the shared engine plus diff-anchor reconciliation. [LAW:dataflow-not-control-flow]
-// Reconcile findings with the diff anchors as a value: anchored (incl. snapped) post inline;
-// unanchored are surfaced in the summary. A mis-anchored finding never aborts the review.
-// [LAW:no-silent-failure] each unanchored finding is logged here at the boundary so it is visible
-// in the run, never dropped silently.
-async function produceReviewOnce(config, buildPromptFor, anchors) {
-  const { summary, findings, usage } = await runOneReview(config, buildPromptFor);
-  const { anchored, unanchored } = partitionFindings(findings, anchors);
-  for (const f of unanchored) {
-    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-  }
-  return { summary, findings: anchored, unanchored, usage };
-}
-
-// Repo-mode attempt: the shared engine, with no anchor reconciliation. There is no diff grid, so
-// every file:line the agent cites is valid — findings flow through unchanged. produceReview passes
-// anchors as the third argument for every mode; this attempt ignores it. [LAW:composability]
-async function produceRepoReviewOnce(config, buildPromptFor) {
-  return runOneReview(config, buildPromptFor);
-}
+// [LAW:decomposition] The review engine — scout → workers → aggregate, wrapped in failover — now
+// lives in src/multiscope.js as runMultiScope, the single seam both modes call. The orchestrator
+// only chooses the `material` (what the scout surveys, what each worker reviews) and the `sink`
+// (how findings leave); it owns no CLI lifecycle and no retry timing. [LAW:types-are-the-program]
 
 // [LAW:decomposition] Establish the typed ReviewConfig chain for this run and register its
 // secrets. selection is the value PR/repo modes differ on: a PR run passes its labels + body so a
@@ -32550,18 +32898,35 @@ async function runPrReview(reviewerName, excludePatterns) {
   }
 
   // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
-  // toolNames; buildPromptFor is called per-attempt so each engine gets its own tool identifiers.
-  // [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] produceReview owns retry timing.
+  // toolNames; the material rebuilds the worker prompt per attempt so each engine gets its own tool
+  // identifiers. [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] runMultiScope (via
+  // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
   const anchorInput = buildReviewInput(filteredFiles, maxDiffChars, registry.get(chain[0].engine).toolNames, REVIEWED_REPO_ROOT);
   const anchors = buildReviewAnchors(anchorInput.files);
-  const buildPromptFor = (toolNames) => buildReviewInput(filteredFiles, maxDiffChars, toolNames, REVIEWED_REPO_ROOT).prompt;
+  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
-  core.info(`Running PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
-  const { review, configUsed } = await produceReview(chain, buildPromptFor, anchors, produceReviewOnce);
+  core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
+  const { review, configUsed } = await runMultiScope({
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+  });
+
+  // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
+  // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
+  // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
+  // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
+  // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
+  const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+  for (const f of unanchored) {
+    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
+  }
 
   const footer = buildReviewFooter(review.usage, configUsed);
-  await submitReview(reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, review, Boolean(reviewToken), transport, footer);
+  await submitReview(
+    reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+    { summary: review.summary, findings: anchored, unanchored },
+    Boolean(reviewToken), transport, footer,
+  );
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
@@ -32581,15 +32946,17 @@ async function runRepoReview(reviewerName, excludePatterns) {
 
   if (!(await preflightChain(chain))) return;
 
-  // No diff means no anchors and no per-attempt anchor reconciliation; the prompt is rebuilt per
-  // engine so each gets its own tool identifiers. [LAW:composability]
-  const buildPromptFor = (toolNames) => buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT }).prompt;
+  // No diff means no anchors; the material's scout surveys the tree and each worker reviews one scope
+  // by absolute path, rebuilding its prompt per engine so each gets its own tool identifiers. [LAW:composability]
+  const material = buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot: REVIEWED_REPO_ROOT });
 
   core.info(
-    `Running whole-repo review with ${chain.length} config(s) in chain`
+    `Running multi-scope whole-repo review with ${chain.length} config(s) in chain`
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
-  const { review, configUsed } = await produceReview(chain, buildPromptFor, null, produceRepoReviewOnce);
+  const { review, configUsed } = await runMultiScope({
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+  });
 
   const footer = buildReviewFooter(review.usage, configUsed);
   const report = renderRepoReport({ reviewerName, scope, review, footer });
