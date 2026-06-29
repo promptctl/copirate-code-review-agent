@@ -166,12 +166,17 @@ function assertSucceeded(stdout) {
 // across steps, never read from a single event (the values are per-step, not cumulative).
 //
 // [LAW:dataflow-not-control-flow] OpenCode self-reports USD (its own models.dev price estimate),
-// like claude-code and unlike codex — so cost needs no local price table. A run with at least one
-// usage-bearing step reports cost {available:true, usd}; a run that emitted no token counts at all
-// is reported as no usage (null), not a $0.00 run. The reported USD is OpenCode's estimate (0 for
-// subscription/unpriced providers), so the renderer marks every cost line "est." [FRAMING:representation]
+// like claude-code and unlike codex — so cost needs no local price table. Cost is available only
+// when a numeric cost field was actually observed; a run that emitted no token counts at all is
+// reported as no usage (null), and a run with tokens but no cost field yields cost
+// {available:false, reason:'not-reported'} — never a fabricated $0.00. [LAW:no-silent-failure]
+// This gates availability on an OBSERVED cost exactly as claude-code gates on a present
+// total_cost_usd, so a missing figure surfaces "unknown" loudly. [LAW:one-type-per-behavior]
+// An observed numeric 0 (subscription/unpriced provider) is a real available:true usd:0; the
+// reported USD is OpenCode's estimate, so the renderer marks every cost line "est." [FRAMING:representation]
 function extractUsage(stdout) {
   let sawTokens = false;
+  let sawCost = false;
   let inputTokens = 0;
   let outputTokens = 0;
   let usd = 0;
@@ -190,10 +195,16 @@ function extractUsage(stdout) {
       inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
       outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
     }
-    if (typeof cost === 'number') usd += cost;
+    if (typeof cost === 'number') {
+      sawCost = true;
+      usd += cost;
+    }
   }
   if (!sawTokens) return null;
-  return { inputTokens, outputTokens, cost: { available: true, usd } };
+  const cost = sawCost
+    ? { available: true, usd }
+    : { available: false, reason: 'not-reported' };
+  return { inputTokens, outputTokens, cost };
 }
 
 // [LAW:single-enforcer] Transient-error classification happens once, here. OpenCode retries many

@@ -226,6 +226,18 @@ describe('extractUsage', () => {
     assert.equal(usage.cost.usd, 0);
   });
 
+  test('reports cost unavailable (not a fabricated $0.00) when tokens are present but no cost field was ever observed', () => {
+    const stdout = [
+      '{"type":"step_finish","part":{"reason":"tool-calls","tokens":{"input":100,"output":10}}}',
+      '{"type":"step_finish","part":{"reason":"stop","tokens":{"input":20,"output":5}}}',
+    ].join('\n');
+    const usage = extractUsage(stdout);
+    assert.equal(usage.inputTokens, 120);
+    assert.equal(usage.outputTokens, 15);
+    assert.equal(usage.cost.available, false);
+    assert.equal(usage.cost.reason, 'not-reported');
+  });
+
   test('returns null when no usage was reported at all', () => {
     const stdout = '{"type":"text","part":{"type":"text","text":"hi"}}';
     assert.equal(extractUsage(stdout), null);
