@@ -2,7 +2,7 @@
 
 A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE`. It can also do an on-demand whole-repo review (`MODE: repo`).
 
-The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
+The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Claude Code against DeepSeek). You can also run Claude Code against Z.ai, or Codex against OpenAI. The engine reviews read-only — it cannot push to GitHub itself; findings flow through a private collector and are submitted by the action.
 
 ## Quickstart
 
@@ -49,6 +49,7 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 |---|---|---|---|
 | `auto` *(default)* | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` |
 | `deepseek` | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` |
+| `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | `glm-5.1` |
 | `codex` | Codex → OpenAI | `OPENAI_API_KEY` | `gpt-5.4-mini` |
 
 `auto` resolves to whichever provider the action currently points at (DeepSeek today). Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow — supply the key for whatever `auto` currently resolves to.
@@ -68,10 +69,14 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 
 | Input | Default | Description |
 |---|---|---|
-| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, or `codex`. Ignored when a `CONFIG_FILE` exists. |
+| `PROVIDER` | `auto` | Engine: `auto`, `deepseek`, `zai`, or `codex`. Ignored when a `CONFIG_FILE` exists. |
 | `DEEPSEEK_API_KEY` | — | Required for `auto`/`deepseek`. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model for the `deepseek` provider. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible endpoint for `deepseek`. |
+| `ZAI_API_KEY` | — | Required for `zai`. |
+| `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |
+| `ZAI_BASE_URL` | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for `zai`. |
+| `ZAI_SYSTEM_PROMPT` | *(built-in law-review prompt)* | Extra system prompt appended to the reviewer for the `zai` provider. |
 | `OPENAI_API_KEY` | — | Required for `codex`. |
 | `OPENAI_MODEL` | `gpt-5.4-mini` | Model for the `codex` provider. |
 | `OPENAI_REASONING_EFFORT` | — | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
@@ -83,6 +88,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_REVIEWER_NAME` | `CoPirate Code Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
+| `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
 | `HEAD_SHA` | from event | Head SHA the review anchors to. Auto-detected on `pull_request` events. |
