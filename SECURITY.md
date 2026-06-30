@@ -10,7 +10,7 @@ See the [releases page](../../releases) for latest available version.
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Use [GitHub's private vulnerability reporting](https://github.com/brandon-fryslie/zai-coding-agent-review/security/advisories/new) to submit a report.
+Use [GitHub's private vulnerability reporting](https://github.com/brandon-fryslie/coding-agent-review/security/advisories/new) to submit a report.
 
 When reporting, please include:
 
@@ -41,7 +41,7 @@ Do not grant broader permissions than what is listed above.
 For supply chain security, pin the action to a specific release tag rather than a mutable branch name:
 
 ```yaml
-uses: brandon-fryslie/zai-coding-agent-review@0.1.0
+uses: brandon-fryslie/coding-agent-review@1.21.2
 ```
 
 Avoid using branch names such as `@main` in production workflows.
