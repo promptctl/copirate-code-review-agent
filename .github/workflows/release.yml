@@ -46,6 +46,18 @@ jobs:
       # matches src before publishing.
       - run: npm ci
 
+      # release.sh creates an annotated tag (`git tag -a`), which requires a git
+      # committer identity. A fresh runner has none, so the FIRST real release this
+      # automation attempted (1.22.0) died with "empty ident name" while every prior
+      # no-op push passed — the actual-publish path was never exercised until a real
+      # version bump forced it. Set the github-actions bot identity as an explicit,
+      # owned step rather than depend on an ambient one the runner doesn't provide.
+      # [LAW:no-ambient-temporal-coupling]
+      - name: Configure git identity for the release tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Publish release if this version is untagged
         env:
           # gh (used by release.sh for `gh release create`) authenticates via GH_TOKEN.
