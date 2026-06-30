@@ -1,0 +1,8 @@
+# Force every issue through a template, and route the one report kind that must
+# NOT be a public issue — a security vulnerability — to the private channel that
+# SECURITY.md already owns. [LAW:single-enforcer]
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/brandon-fryslie/coding-agent-review/security/advisories/new
+    about: Do not open a public issue for security reports. Use GitHub's private vulnerability reporting (see SECURITY.md).

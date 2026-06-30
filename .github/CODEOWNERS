@@ -1,0 +1,10 @@
+# CODEOWNERS — the single declared owner for review of every change.
+# GitHub auto-requests review from the owner(s) listed for any matching path,
+# which is also how Dependabot's weekly pin-bump PRs (.github/dependabot.yml)
+# land on a real reviewer instead of going unwatched. [LAW:single-enforcer]
+#
+# Last match wins, so the catch-all below is the default owner for everything;
+# add more specific path rules above this line only when a subtree needs a
+# different owner.
+
+* @brandon-fryslie
