@@ -1,8 +1,17 @@
 {
-  "name": "zai-coding-agent-review",
+  "name": "coding-agent-review",
   "version": "1.21.2",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brandon-fryslie/coding-agent-review.git"
+  },
+  "author": "Brandon Fryslie",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "ncc build src/index.js -o dist --license licenses.txt",
     "test": "node --test",

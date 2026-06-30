@@ -21,8 +21,8 @@ The action runs from `dist/index.js`, which is a self-contained bundle built fro
 **Prerequisites:** Node.js 20+
 
 ```bash
-git clone https://github.com/brandon-fryslie/zai-coding-agent-review.git
-cd zai-coding-agent-review
+git clone https://github.com/brandon-fryslie/coding-agent-review.git
+cd coding-agent-review
 npm install
 ```
 
