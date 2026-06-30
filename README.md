@@ -1,4 +1,4 @@
-# Coding Agent Review
+# CoPirate Code Review
 
 A GitHub Action that runs an AI coding agent as a **read-only** code reviewer. It reviews a pull request diff and submits an inline GitHub review — `REQUEST_CHANGES` when it finds blocking issues, otherwise `APPROVE`. It can also do an on-demand whole-repo review (`MODE: repo`).
 
@@ -80,7 +80,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `SCOPE` | — | Free-text focus for `MODE: repo` (e.g. `the auth layer`). Ignored when `MODE: pr`. |
 | `CONFIG_FILE` | `.github/review-agents.yml` | [Multi-engine config file](#multi-engine-configuration). When present it owns engine selection and the `PROVIDER`/key inputs are ignored. |
 | `CONFIG` | — | Select a named config from the config file, overriding its `default`. |
-| `ZAI_REVIEWER_NAME` | `Coding Agent Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
+| `ZAI_REVIEWER_NAME` | `CoPirate Code Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
