@@ -18,7 +18,7 @@ The action runs from `dist/index.js`, which is a self-contained bundle built fro
 
 ## Development setup
 
-**Prerequisites:** Node.js 20+
+**Prerequisites:** Node.js 24+ (matches the action runtime — `action.yml` `using: "node24"` and `package.json` `engines.node`)
 
 ```bash
 git clone https://github.com/brandon-fryslie/coding-agent-review.git
