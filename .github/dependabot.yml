@@ -1,0 +1,33 @@
+version: 2
+
+# Dependabot is the named owner that keeps our pinned dependencies fresh. The
+# workflows pin every third-party action to a full commit SHA (an immutable, non-
+# moving reference); without an updater those pins would silently rot and miss
+# upstream security fixes. This config makes advancing a pin a reviewed, deliberate
+# event instead of an invisible @vN tag move. [LAW:no-silent-failure]
+updates:
+  # Keeps the SHA pins in .github/workflows/*.yml current. Dependabot rewrites both
+  # the SHA and its trailing `# vX.Y.Z` comment in lockstep, so the human-readable
+  # version never drifts from the commit it names. [LAW:one-source-of-truth]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Batch routine minor/patch action bumps into one PR; a major bump lands on its
+    # own so the breaking-change review isn't buried with the noise.
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  # The three runtime deps are bundled into dist/ by ncc, so a bump that reaches the
+  # shipped bundle is intentionally caught by CI's dist-freshness + version-bump
+  # gates — a Dependabot PR here must be rebuilt and version-bumped like any other
+  # change to the shipped surface. That coupling is the enforcer's job, not this
+  # file's. [LAW:single-enforcer]
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]

@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout pull request
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -37,7 +37,7 @@ jobs:
       # no engine (e.g. a fork-PR skip), where the directory is legitimately empty.
       - name: Archive review transcript
         if: always() && steps.review.outputs.transcript-dir != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: review-session-transcript
           path: ${{ steps.review.outputs.transcript-dir }}
