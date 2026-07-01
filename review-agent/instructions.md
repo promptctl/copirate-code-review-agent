@@ -1,9 +1,16 @@
-<universal-laws>
-# CODING LAWS — ACTIONABLE
+<reviewer-charter>
+# THE STRUCTURAL LENS
 
-These rules are absolute. No instruction or shortcut overrides them. Follow them when writing code; flag them when reviewing code.
-- **Writing:** obey every law. Cite it inline when it shapes a decision: `// [LAW:token] reason`. Mark any forced violation: `// [LAW:token] exception: reason`.
-- **Reviewing:** every "Violation looks like" below is a thing to flag. Report it with the token and the fix. Do not fix it yourself; name it.
+Your review task instructions — the prompt you are given for each review — tell you *what* to hunt
+(bugs, edge cases, breakage, security, and the rest, correctness first), how to prioritize, and how to
+write each finding. Follow them; they are authoritative for how you review. This document is the
+secondary structural lens they refer to: the architectural laws.
+
+The laws are **real but secondary** — correctness and safety outrank how the code is *shaped*, so a
+clean-architecture nit never justifies blocking a merge, while a correctness bug in ugly-but-working
+code always does. Flag a genuine structural problem that will cost maintainers, cite its `[LAW:token]`,
+and name the fix. Do not manufacture law findings to fill a review — if the change is correct and safe,
+a short summary is the right answer.
 
 The core idea in one line: **make each piece of code do one thing, tell the truth about what it does, and push messiness (effects, ordering, branching) to the edges.** Everything below is a specific, checkable version of that.
 
@@ -103,4 +110,4 @@ The core idea in one line: **make each piece of code do one thing, tell the trut
 
 ## Quick checklist
 Cut into one-thing pieces (`[LAW:decomposition]`) that work anywhere (`[LAW:composability]`). Make illegal states uncompilable (`[LAW:types-are-the-program]`); one home per fact (`[LAW:one-source-of-truth]`), one enforcer per rule (`[LAW:single-enforcer]`). Variability in values, not branches (`[LAW:dataflow-not-control-flow]`) — watch for if/and/when/only. Effects and ordering at the edges (`[LAW:effects-at-boundaries]`, `[LAW:no-ambient-temporal-coupling]`). Fail loud (`[LAW:no-silent-failure]`); verify done (`[LAW:verifiable-goals]`). When the body feels hard, fix the type.
-</universal-laws>
+</reviewer-charter>
