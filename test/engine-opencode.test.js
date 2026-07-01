@@ -260,6 +260,20 @@ describe('classifyError', () => {
     assert.ok(classifyError(base, 'server overloaded') instanceof TransientError);
   });
 
+  // The shared transient vocabulary (classifyTransient in src/failover.js) is now recognized by every
+  // engine identically — opencode previously lacked the network class, so a dropped socket that escaped
+  // its internal retries fell through as fatal while claude-code retried it. These assert the shared class.
+  test('shared network class is recognized identically (dropped socket / 5xx / socket codes)', () => {
+    assert.ok(classifyError(base, 'API Error: terminated') instanceof TransientError);
+    assert.ok(classifyError(base, 'API Error: 502 Bad Gateway') instanceof TransientError);
+    assert.ok(classifyError(base, 'getaddrinfo ENOTFOUND api.example.com') instanceof TransientError);
+  });
+
+  test('bare English phrases do NOT false-match without the API-error anchor', () => {
+    assert.equal(classifyError(base, 'we log when fetch failed in the client'), base);
+    assert.equal(classifyError(base, 'the worker process at line 502 was cleanly shut down'), base);
+  });
+
   test('unrelated error is returned unchanged', () => {
     assert.equal(classifyError(base, 'unexpected token at line 5'), base);
   });
