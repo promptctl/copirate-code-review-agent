@@ -30737,7 +30737,7 @@ function costFromEnvelope(env, config, buckets) {
 // trusted. Patterns are anchored — to the CLI's "API Error:" context or to Node's socket error codes
 // (ECONNRESET/…), never a bare English word — so ordinary review content can't false-match;
 // classifyError runs only on an already-failed spawn regardless. [LAW:single-enforcer]
-const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|5\d\d)\b|socket hang up|fetch failed|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
+const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
 // once, here at the engine boundary. 529/overloaded has no hint header;
@@ -31650,6 +31650,13 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // progress effect; sleepFn is injectable so tests drive the retry path with no real waits.
 // [LAW:effects-at-boundaries]
 async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
+  // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
+  // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
+  // The destructuring default fires only on `undefined`, so an explicit 0/negative reaches here; a
+  // nonsensical retry budget is a caller bug, surfaced — never silently clamped to hide it.
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(`retryTransientSpawn: limit must be a positive integer, got ${limit}`);
+  }
   let lastErr;
   for (let attempt = 1; attempt <= limit; attempt++) {
     try {
@@ -31663,7 +31670,10 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
       await sleepFn(delay);
     }
   }
-  throw lastErr; // unreachable (limit >= 1 always returns or throws inside the loop)
+  // [LAW:no-silent-failure] Unreachable given the validated limit >= 1 (the final iteration always
+  // returns or throws); a loud invariant backstop so a future refactor that breaks that can never fall
+  // through to an undefined return silently masquerading as a successful review.
+  throw new Error('retryTransientSpawn: loop exited without returning (invariant violated)');
 }
 
 // [LAW:no-ambient-temporal-coupling] produceReview is the single explicit owner of all

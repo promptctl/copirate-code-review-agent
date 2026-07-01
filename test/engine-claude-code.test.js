@@ -265,16 +265,25 @@ describe('classifyError', () => {
     assert.ok(result.message.includes('connection error'));
   });
 
-  test('Node socket error codes are transient (ECONNRESET / ETIMEDOUT / socket hang up)', () => {
+  test('Node socket error codes are transient (ECONNRESET / ETIMEDOUT / ENOTFOUND)', () => {
     const { TransientError } = require('../src/failover');
     assert.ok(classifyError(base, 'read ECONNRESET') instanceof TransientError);
     assert.ok(classifyError(base, 'connect ETIMEDOUT 1.2.3.4:443') instanceof TransientError);
-    assert.ok(classifyError(base, 'socket hang up') instanceof TransientError);
+    assert.ok(classifyError(base, 'getaddrinfo ENOTFOUND api.example.com') instanceof TransientError);
   });
 
-  test('a 5xx from the endpoint (in API-error context) is transient', () => {
+  test('endpoint 5xx / socket-hang-up / fetch-failed are transient IN the API-error context', () => {
     const { TransientError } = require('../src/failover');
     assert.ok(classifyError(base, 'API Error: 503 Service Unavailable') instanceof TransientError);
+    assert.ok(classifyError(base, 'API Error: socket hang up') instanceof TransientError);
+    assert.ok(classifyError(base, 'API Error: fetch failed') instanceof TransientError);
+  });
+
+  test('bare English phrases (socket hang up / fetch failed) do NOT false-match without the API-error anchor', () => {
+    // The reviewed diff or a model's prose may mention these; only the endpoint's own
+    // `API Error: …` framing makes them a real transient signal. Unanchored, they must NOT match.
+    assert.equal(classifyError(base, 'the retry logic handles a socket hang up gracefully'), base);
+    assert.equal(classifyError(base, 'we log when fetch failed in the client'), base);
   });
 
   test('unrelated error is returned unchanged', () => {

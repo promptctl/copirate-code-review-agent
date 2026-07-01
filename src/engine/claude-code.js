@@ -193,7 +193,7 @@ function costFromEnvelope(env, config, buckets) {
 // trusted. Patterns are anchored — to the CLI's "API Error:" context or to Node's socket error codes
 // (ECONNRESET/…), never a bare English word — so ordinary review content can't false-match;
 // classifyError runs only on an already-failed spawn regardless. [LAW:single-enforcer]
-const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|5\d\d)\b|socket hang up|fetch failed|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
+const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
 
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
 // once, here at the engine boundary. 529/overloaded has no hint header;

@@ -90,6 +90,17 @@ describe('retryTransientSpawn', () => {
     assert.equal(slept, TRANSIENT_SPAWN_ATTEMPTS - 1); // no sleep after the final failed attempt
   });
 
+  it('rejects a limit < 1 loud with a diagnostic (never an opaque throw undefined)', async () => {
+    // An explicit limit:0 bypasses the destructuring default (which fires only on undefined); without
+    // validation the loop runs zero times and `throw lastErr` throws undefined. [LAW:no-silent-failure]
+    for (const bad of [0, -1, 1.5]) {
+      await assert.rejects(
+        () => retryTransientSpawn(async () => 'unreached', { limit: bad, sleepFn: async () => {} }),
+        err => err instanceof Error && /limit must be a positive integer/.test(err.message),
+      );
+    }
+  });
+
   it('honors the error Retry-After hint over backoff when choosing the delay', async () => {
     const delays = [];
     let calls = 0;
