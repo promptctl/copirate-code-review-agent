@@ -3,7 +3,13 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { TransientError, produceReview, buildAttributionFooter } = require('../src/failover');
+const {
+  TransientError,
+  produceReview,
+  buildAttributionFooter,
+  retryTransientSpawn,
+  TRANSIENT_SPAWN_ATTEMPTS,
+} = require('../src/failover');
 
 // Stub config factory — minimal ReviewConfig values needed by the policy and footer.
 function cfg(name, engine = 'claude-code', model = 'glm-5.1', reasoning) {
@@ -29,6 +35,71 @@ function makeStub(throwsByConfig = {}, callLog = []) {
     return FAKE_REVIEW;
   };
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// retryTransientSpawn — spawn-level transient recovery (a different axis from failover)
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('retryTransientSpawn', () => {
+  it('returns the thunk value on first success, with no retry', async () => {
+    let calls = 0;
+    let slept = 0;
+    const value = await retryTransientSpawn(
+      async () => { calls++; return 'ok'; },
+      { sleepFn: async () => { slept++; } },
+    );
+    assert.equal(value, 'ok');
+    assert.equal(calls, 1);
+    assert.equal(slept, 0);
+  });
+
+  it('retries on TransientError then returns the eventual success', async () => {
+    let calls = 0;
+    const retries = [];
+    const value = await retryTransientSpawn(
+      async () => { calls++; if (calls < 3) throw new TransientError('terminated'); return 'recovered'; },
+      { sleepFn: async () => {}, onRetry: (info) => retries.push(info.attempt) },
+    );
+    assert.equal(value, 'recovered');
+    assert.equal(calls, 3);
+    assert.deepEqual(retries, [1, 2]); // onRetry fires before each of the two retries
+  });
+
+  it('surfaces a non-transient error immediately, without retrying', async () => {
+    let calls = 0;
+    const fatal = new Error('bad envelope');
+    await assert.rejects(
+      () => retryTransientSpawn(async () => { calls++; throw fatal; }, { sleepFn: async () => {} }),
+      err => err === fatal,
+    );
+    assert.equal(calls, 1);
+  });
+
+  it('rethrows the last TransientError after exhausting the attempt budget (never swallowed)', async () => {
+    let calls = 0;
+    let slept = 0;
+    const last = new TransientError('still terminated');
+    await assert.rejects(
+      () => retryTransientSpawn(
+        async () => { calls++; throw calls === TRANSIENT_SPAWN_ATTEMPTS ? last : new TransientError('terminated'); },
+        { sleepFn: async () => { slept++; } },
+      ),
+      err => err === last && err instanceof TransientError,
+    );
+    assert.equal(calls, TRANSIENT_SPAWN_ATTEMPTS); // 1 initial + (ATTEMPTS-1) retries
+    assert.equal(slept, TRANSIENT_SPAWN_ATTEMPTS - 1); // no sleep after the final failed attempt
+  });
+
+  it('honors the error Retry-After hint over backoff when choosing the delay', async () => {
+    const delays = [];
+    let calls = 0;
+    await retryTransientSpawn(
+      async () => { calls++; if (calls === 1) throw new TransientError('rate', 4321); return 'ok'; },
+      { sleepFn: async (ms) => { delays.push(ms); } },
+    );
+    assert.deepEqual(delays, [4321]);
+  });
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 // buildAttributionFooter

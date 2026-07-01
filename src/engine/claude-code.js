@@ -183,12 +183,25 @@ function costFromEnvelope(env, config, buckets) {
   return usd == null ? { available: false, reason: 'no-price' } : { available: true, usd };
 }
 
+// [LAW:one-type-per-behavior] A dropped/terminated connection and a 5xx from the endpoint are the
+// SAME class as 429/529 — the request got no definitive answer and the per-spawn collector is torn
+// down each attempt, so a retry is safe; all share the transient retry behavior, so they are one
+// type. 'API Error: terminated' (the streaming socket dropped mid-review) is the canonical case
+// observed against the deepseek/z.ai Anthropic-compatible endpoints — it previously fell through as a
+// plain (fatal) Error, reddening the whole run and discarding sibling workers' findings.
+// [FRAMING:representation] Representing a transient network drop as fatal was a lie the retry loop
+// trusted. Patterns are anchored — to the CLI's "API Error:" context or to Node's socket error codes
+// (ECONNRESET/…), never a bare English word — so ordinary review content can't false-match;
+// classifyError runs only on an already-failed spawn regardless. [LAW:single-enforcer]
+const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|5\d\d)\b|socket hang up|fetch failed|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
+
 // [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
 // once, here at the engine boundary. 529/overloaded has no hint header;
 // 429/rate-limited attaches it when the CLI echoes it. [LAW:one-source-of-truth]
 function classifyError(err, text) {
   if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`, parseRetryAfterMs(text));
   if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  if (TRANSIENT_NETWORK.test(text)) return new TransientError(`connection error: ${err.message}`);
   return err;
 }
 

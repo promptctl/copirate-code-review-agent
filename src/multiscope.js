@@ -1,5 +1,5 @@
 'use strict';
-const { produceReview } = require('./failover');
+const { produceReview, retryTransientSpawn, sleep } = require('./failover');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -20,10 +20,14 @@ const {
 // many-concern change yields many — the same worker pool runs over a list of length 1 or 20,
 // identically. There is no "is it big" branch anywhere. [LAW:dataflow-not-control-flow]
 //
-// [LAW:no-ambient-temporal-coupling] The WHOLE pass (scout → workers → aggregate) is ONE attempt of
-// failover.produceReview per config: a transient error in the scout or any worker fails the pass and
-// failover retries/advances the entire pass as a unit. produceReview stays the single owner of retry
-// timing; this module never reimplements it.
+// [LAW:no-ambient-temporal-coupling] Retry lives at TWO nested layers, each owned by failover.js so
+// this module reimplements no retry timing. Inner: every engine spawn (the scout and each worker) is
+// wrapped in retryTransientSpawn, so a single transient blip in one of N concurrent workers is
+// absorbed in place — the sibling workers' already-recorded findings are never discarded by re-running
+// the whole pass. Outer: the WHOLE pass (scout → workers → aggregate) is still ONE attempt of
+// failover.produceReview per config, so a transient that PERSISTS past a spawn's inner retries
+// escalates to config-level failover/budget as before. Both layers are fail-loud (a scope is never
+// dropped); the run only reds when a transient genuinely survives both. [LAW:no-silent-failure]
 
 // [LAW:no-mode-explosion] One internal constant, not a consumer input: how many scope workers run
 // concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
@@ -114,11 +118,13 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
 // It does one thing — review one scope — and returns its raw findings + summary + usage as a value.
-async function runScopeWorker({ scope, context, config, material, adapter, instructionsPath, log }) {
+// `spawn` is the transient-retry-wrapped engine spawn (see runMultiScopePass), so a blip retries THIS
+// worker in place rather than failing the whole pass. [LAW:decomposition]
+async function runScopeWorker({ scope, context, material, spawn, log }) {
   const focusText = workerFocusText(scope, context);
   const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames);
   log(`scope '${scope.name}' starting…`);
-  const { summary, findings, usage } = await adapter.produceReview({ config, buildPromptFor, instructionsPath });
+  const { summary, findings, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
   log(`scope '${scope.name}' done — ${findings.length} finding(s)`);
   return { name: scope.name, summary, findings, usage };
 }
@@ -127,15 +133,29 @@ async function runScopeWorker({ scope, context, config, material, adapter, instr
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
 // unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
 // every downstream sink stays unchanged. [LAW:decomposition]
-async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn = sleep }) {
   const adapter = registry.get(config.engine);
+
+  // [LAW:decomposition] Every engine spawn in this pass goes through one transient-retry seam, so a
+  // single flaky request (a dropped socket, a 5xx) is absorbed in place — the scout and each worker
+  // recover independently and a blip never re-runs the whole pass. An exhausted or non-transient error
+  // still propagates, so config-level failover (produceReview) is unchanged. [LAW:one-source-of-truth]
+  const spawn = (buildPromptFor, label) =>
+    retryTransientSpawn(
+      () => adapter.produceReview({ config, buildPromptFor, instructionsPath }),
+      {
+        sleepFn,
+        onRetry: ({ attempt, limit, delay, err }) =>
+          log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`),
+      },
+    );
 
   // Layer 1 — the scout: a survey-only spawn. Its product is the typed scope records it logged through
   // the add_scope collector tool (validated at the collector boundary), plus a structural summary that
   // becomes shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure]
   // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
   // having reviewed nothing.
-  const scoutResult = await adapter.produceReview({ config, buildPromptFor: material.buildScoutPrompt, instructionsPath });
+  const scoutResult = await spawn(material.buildScoutPrompt, 'scout');
   const scopes = scoutResult.scopes;
   if (scopes.length === 0) {
     throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
@@ -147,7 +167,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const workerResults = await runScopeWorkers({
     scopes,
     maxConcurrent,
-    runOne: (scope) => runScopeWorker({ scope, context, config, material, adapter, instructionsPath, log }),
+    runOne: (scope) => runScopeWorker({ scope, context, material, spawn, log }),
   });
 
   return {
@@ -162,8 +182,8 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-function runMultiScope({ chain, material, registry, instructionsPath, maxConcurrent = DEFAULT_SCOPE_CONCURRENCY, log = () => {} }) {
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log });
+function runMultiScope({ chain, material, registry, instructionsPath, maxConcurrent = DEFAULT_SCOPE_CONCURRENCY, log = () => {}, sleepFn = sleep }) {
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn });
   return produceReview(chain, null, null, produceOnce);
 }
 
