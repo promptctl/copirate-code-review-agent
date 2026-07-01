@@ -8,6 +8,7 @@ const {
   produceReview,
   buildAttributionFooter,
   retryTransientSpawn,
+  classifyTransient,
   TRANSIENT_SPAWN_ATTEMPTS,
 } = require('../src/failover');
 
@@ -109,6 +110,50 @@ describe('retryTransientSpawn', () => {
       { sleepFn: async (ms) => { delays.push(ms); } },
     );
     assert.deepEqual(delays, [4321]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// classifyTransient — the single source of truth for the shared transient vocabulary
+// (429/529/network drop). Every engine adapter's classifyError consumes it, so a dropped
+// socket is the same class regardless of engine. These assert the shared contract at its owner.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('classifyTransient', () => {
+  const base = new Error('spawn failed');
+
+  it('classifies 429 / rate-limit as a rate-limited TransientError', () => {
+    const r = classifyTransient(base, 'HTTP 429 Too Many Requests');
+    assert.ok(r instanceof TransientError);
+    assert.match(r.message, /rate-limited/);
+  });
+
+  it('classifies 529 / overloaded as a TransientError', () => {
+    assert.ok(classifyTransient(base, 'HTTP 529 overloaded') instanceof TransientError);
+    assert.ok(classifyTransient(base, 'model is overloaded') instanceof TransientError);
+  });
+
+  it('classifies the network class — dropped socket / 5xx / Node socket codes', () => {
+    assert.ok(classifyTransient(base, 'API Error: terminated') instanceof TransientError);
+    assert.ok(classifyTransient(base, 'API Error: 503 Service Unavailable') instanceof TransientError);
+    assert.ok(classifyTransient(base, 'read ECONNRESET') instanceof TransientError);
+  });
+
+  it('returns null (not the error) when no shared signal is present, so adapters can add their own class', () => {
+    assert.equal(classifyTransient(base, 'unexpected token at line 42'), null);
+  });
+
+  it('does NOT false-match bare English phrases lacking the API-error anchor', () => {
+    assert.equal(classifyTransient(base, 'the retry logic handles a socket hang up gracefully'), null);
+    assert.equal(classifyTransient(base, 'the worker process at line 502 was cleanly shut down'), null);
+  });
+
+  it('attaches the Retry-After hint only via the injected extractor (per-engine bit)', () => {
+    // Default: no extractor → null hint (codex/opencode fall to backoff).
+    assert.equal(classifyTransient(base, 'HTTP 429 — retry-after: 90').retryAfterMs, null);
+    // With an extractor (claude-code passes parseRetryAfterMs) → the server hint flows through.
+    const withHint = classifyTransient(base, 'HTTP 429 — retry-after: 90', t => (/retry.?after[:\s]+(\d+)/i.exec(t) ? 90_000 : null));
+    assert.equal(withHint.retryAfterMs, 90_000);
   });
 });
 

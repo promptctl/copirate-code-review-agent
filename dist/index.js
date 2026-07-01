@@ -30546,7 +30546,7 @@ module.exports = {
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
-const { TransientError, parseRetryAfterMs } = __nccwpck_require__(2887);
+const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 const { isAnthropicEndpoint, computeCostUsd } = __nccwpck_require__(9614);
@@ -30727,26 +30727,13 @@ function costFromEnvelope(env, config, buckets) {
   return usd == null ? { available: false, reason: 'no-price' } : { available: true, usd };
 }
 
-// [LAW:one-type-per-behavior] A dropped/terminated connection and a 5xx from the endpoint are the
-// SAME class as 429/529 — the request got no definitive answer and the per-spawn collector is torn
-// down each attempt, so a retry is safe; all share the transient retry behavior, so they are one
-// type. 'API Error: terminated' (the streaming socket dropped mid-review) is the canonical case
-// observed against the deepseek/z.ai Anthropic-compatible endpoints — it previously fell through as a
-// plain (fatal) Error, reddening the whole run and discarding sibling workers' findings.
-// [FRAMING:representation] Representing a transient network drop as fatal was a lie the retry loop
-// trusted. Patterns are anchored — to the CLI's "API Error:" context or to Node's socket error codes
-// (ECONNRESET/…), never a bare English word — so ordinary review content can't false-match;
-// classifyError runs only on an already-failed spawn regardless. [LAW:single-enforcer]
-const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
-
-// [LAW:single-enforcer] Error classification and Retry-After extraction happen exactly
-// once, here at the engine boundary. 529/overloaded has no hint header;
-// 429/rate-limited attaches it when the CLI echoes it. [LAW:one-source-of-truth]
+// [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
+// once in src/failover.js (classifyTransient); this adapter contributes only its genuinely
+// engine-specific bit — the Anthropic-compatible CLI echoes the Retry-After header, so it passes
+// parseRetryAfterMs as the rate-limit hint extractor. Nothing else is claude-code-specific: no local
+// pattern set to drift from the other engines'. [LAW:one-source-of-truth]
 function classifyError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`, parseRetryAfterMs(text));
-  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
-  if (TRANSIENT_NETWORK.test(text)) return new TransientError(`connection error: ${err.message}`);
-  return err;
+  return classifyTransient(err, text, parseRetryAfterMs) ?? err;
 }
 
 // [LAW:one-source-of-truth] classifyClaudeError is the stable public name re-exported
@@ -30885,7 +30872,7 @@ module.exports = { makeCliAdapter };
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
-const { TransientError } = __nccwpck_require__(2887);
+const { TransientError, classifyTransient } = __nccwpck_require__(2887);
 const { computeCostUsd } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
@@ -31078,13 +31065,14 @@ function extractUsage(stdout, config) {
   return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.
-// 429 + rate_limit are rate-limiting; insufficient_quota is a billing limit (also transient
-// in the sense that exhaustion clears with time or a new quota window). [LAW:one-source-of-truth]
+// [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
+// src/failover.js (classifyTransient); codex consumes it and adds only its genuinely OpenAI-specific
+// class — insufficient_quota, a billing limit that also clears with time or a new quota window. codex
+// doesn't surface Retry-After in a parseable form, so it omits the extractor and rate-limits fall to
+// exponential backoff. [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
 function classifyError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
-  if (/insufficient.quota|quota.exceeded/i.test(text)) return new TransientError(`quota exceeded: ${err.message}`);
-  return err;
+  return classifyTransient(err, text)
+    ?? (/insufficient.quota|quota.exceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
@@ -31132,7 +31120,7 @@ module.exports = {
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
-const { TransientError } = __nccwpck_require__(2887);
+const { classifyTransient } = __nccwpck_require__(2887);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -31337,13 +31325,13 @@ function extractUsage(stdout) {
   return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:single-enforcer] Transient-error classification happens once, here. OpenCode retries many
-// transient API errors internally, so these signals fire mainly when a failure escapes to the
-// captured output text; the shared 429/overloaded regex set is the starting point. [LAW:one-source-of-truth]
+// [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
+// src/failover.js (classifyTransient); opencode consumes it whole and adds nothing engine-specific.
+// OpenCode retries many transient API errors internally, so these signals fire mainly when a failure
+// escapes to the captured output text; it doesn't surface Retry-After parseably, so rate-limits fall
+// to exponential backoff. [LAW:one-source-of-truth] No local copy of the pattern set to drift.
 function classifyError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
-  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
-  return err;
+  return classifyTransient(err, text) ?? err;
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built
@@ -31625,6 +31613,39 @@ function parseRetryAfterMs(text) {
   return parseInt(match[1], 10) * 1000;
 }
 
+// [LAW:one-source-of-truth]/[LAW:single-enforcer] The shared transient-failure vocabulary lives
+// here, in exactly ONE place, and every engine adapter's classifyError consumes it — so a dropped
+// socket is the SAME class of failure regardless of which engine hit it. Previously each adapter
+// re-authored these regexes independently and they drifted: only claude-code recognized the network
+// class, codex lacked 529, etc. — the same physical failure classified differently by engine.
+// [FRAMING:representation] Three copies of one concept that can disagree is an under-constrained type.
+//
+// [LAW:one-type-per-behavior] A 429 rate-limit, a 529 overload, a dropped/terminated connection, and
+// an endpoint 5xx are ONE class — the request got no definitive answer and a retry is safe — so they
+// all construct the same TransientError; the cause survives only as the message prefix (a value).
+// The network patterns are anchored — to the CLI's "API Error:" framing or to Node's socket error
+// codes (ECONNRESET/…), never a bare English word — so ordinary review content (a diff mentioning
+// "socket hang up" or "line 502") can't false-match; classifyError runs only on an already-failed
+// spawn regardless.
+const TRANSIENT_RATE_LIMIT = /\b429\b|rate.?limit/i;
+const TRANSIENT_OVERLOADED = /\b529\b|overloaded/i;
+const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
+
+// Classify the shared transient signals from an engine's captured output. Returns a TransientError
+// when the text carries one of the shared physical-failure signals, else null so the calling adapter
+// can add its OWN engine-specific classes (codex's insufficient_quota) before falling through to the
+// raw error. [LAW:dataflow-not-control-flow] The rate-limit branch attaches the Retry-After hint via
+// the injected retryAfterFrom extractor: claude-code echoes the header so it passes parseRetryAfterMs;
+// codex/opencode don't surface it in a parseable form, so they omit the extractor (default → null) and
+// fall to exponential backoff — the one genuinely per-engine difference, expressed as a value not a
+// forked copy of the pattern set.
+function classifyTransient(err, text, retryAfterFrom = () => null) {
+  if (TRANSIENT_RATE_LIMIT.test(text)) return new TransientError(`rate-limited: ${err.message}`, retryAfterFrom(text));
+  if (TRANSIENT_OVERLOADED.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  if (TRANSIENT_NETWORK.test(text)) return new TransientError(`connection error: ${err.message}`);
+  return null;
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function transientBackoffMs(attempt) {
@@ -31773,6 +31794,7 @@ module.exports = {
   TRANSIENT_SPAWN_ATTEMPTS,
   TransientError,
   parseRetryAfterMs,
+  classifyTransient,
   sleep,
   transientBackoffMs,
   retryTransientSpawn,
