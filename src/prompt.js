@@ -1,6 +1,66 @@
 'use strict';
 const { annotatePatchWithLines } = require('./diff');
 
+// [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
+// whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
+// stop bugs, breakage, and security holes from merging — the architectural laws are ONE secondary
+// structural lens that ranks below "will this ship a defect". The two builders differ only in their
+// MATERIAL (diff vs working tree) and ANCHORING (LINE N vs any line); the standard of what a good
+// review IS does not differ, so it is a value both interpolate rather than two copies that drift.
+// [LAW:decomposition] Correctness-hunting and law-auditing are two concerns; this orders them by the
+// cost of missing each — a shipped bug is expensive, an ugly-but-working function is not.
+function reviewCharter(toolNames) {
+  return `Your job is to catch what would hurt if it shipped. Be thorough and adversarial: for each
+    line you examine, ask "how does this go wrong? what input breaks it? what did the author assume that
+    isn't guaranteed?" Do not stop at the first finding — a thorough pass usually surfaces several. A
+    miss is far more expensive than a false alarm, so when you are moderately (not fully) sure a line is
+    wrong, still flag it and say what you're unsure of. That latitude is for correctness and security
+    ONLY; for pure style, naming, and formatting, stay silent.
+
+    Hunt in this order — highest cost-of-missing first:
+    1. Correctness bugs — the code does not do what it plainly intends. Wrong operator or comparison,
+       inverted or short-circuited condition, off-by-one, wrong variable, bad default, an ignored
+       return value, a missing \`await\` so a promise is used unresolved, an error/callback path that
+       never runs. Trace the changed code with real values in your head.
+    2. Unhandled edge cases — empty, null/undefined, zero, negative, a single element, a huge input,
+       duplicate keys, missing field, out-of-range index, unicode, an error thrown mid-operation. The
+       happy path usually works; bugs live at the boundaries. Name the exact input that breaks it.
+    3. Breakage & regressions — a broken caller, a changed public signature/return shape/serialized or
+       on-disk format/config key/migration path, a removed or renamed export still used elsewhere, a
+       default that shifts under existing callers.
+    4. Security — untrusted input reaching a shell/SQL/path/eval/template sink; missing authz/authn; a
+       secret logged or returned; unsafe deserialization; SSRF; a widened privilege. Follow the data
+       from its untrusted source to where it is used.
+    5. Concurrency & data integrity — a race, a lost update, a non-idempotent retry, a TOCTOU gap, a
+       dual write, an ordering assumption nothing enforces.
+    6. Silent failure — a swallowed error, an empty catch, \`|| true\`, \`2>/dev/null\`, a fallback that
+       quietly returns different data when the real source fails. Errors must surface, not vanish. [LAW:no-silent-failure]
+    7. Resource & lifecycle — an unclosed file/socket/connection, a leaked handle or listener, a timer
+       never cleared, a lock never released, unbounded growth.
+    8. Missing tests for risky logic — new non-trivial behavior with no test over its failure modes, or
+       a test that asserts implementation instead of behavior. [LAW:behavior-not-structure]
+    9. Performance on real paths — accidental O(n²), N+1 queries, work repeated in a loop that could be
+       hoisted, blocking a hot path.
+    10. Architecture & maintainability — genuine structural problems that will cost maintainers: a part
+       doing several things, a type that admits illegal states, a fact with two sources of truth that
+       can drift, effects tangled through pure logic, a dependency cycle. These map to the [LAW:*] tokens
+       in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
+       ship a bug" — a clean-architecture nit never justifies blocking a merge, a correctness bug in
+       ugly-but-working code always does.
+
+    Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
+    Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Perf, or a [LAW:token] for
+    a structural issue; (2) one or two sentences saying WHAT goes wrong and HOW it manifests — the
+    concrete failure and, where you can, the exact input or sequence that triggers it, not just a
+    label; (3) the concrete fix. Lead with the impact, not the category. One comment per distinct issue
+    — flag the clearest instance and note the pattern once; do not repeat it across many lines.
+
+    Do not invent rules, and do not request changes for style, naming preference, or speculative
+    "might one day". Every finding names a concrete way the code misbehaves, breaks a caller, or will
+    bite a maintainer. Do NOT state an overall verdict, approval status, or a finding count — the action
+    derives the verdict from the recorded changes and appends it itself.`;
+}
+
 // toolNames is required; callers supply adapter.toolNames so each engine's actual
 // MCP tool identifiers are interpolated into the prompt. [LAW:composability]
 // reviewedRepoRoot is the absolute path of the checked-out repo. The engine spawns with a
@@ -52,47 +112,26 @@ Review this pull request. The repository under review is checked out at ${review
 ${focusBlock}
     BEFORE judging anything, Read the complete content of every changed source file listed in the diff
     (files under src/ or scripts/ — not dist/, not docs, not test/). The diff shows only the changed
-    hunks; a violation is only visible in the full surrounding context of the function and module. Do
-    not form or report any judgment until you have read each changed source file in full.
+    hunks; most bugs are only visible in the full surrounding context of the function and module — a
+    missing guard, a caller you'd break, a value that can't be what this line assumes. Do not form or
+    report any judgment until you have read each changed source file in full.
 
-    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} only for code that must change before merge.
-    Every requested change must use path, line, and body with the displayed LINE value. When the review is complete,
-    call ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
+    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for code that should
+    change before merge. Every requested change must use path, line, and body with the displayed LINE
+    value. When the review is complete, call ${toolNames.finishReview} exactly once with a concise
+    summary. The collector tools are the only review output channel; you flag issues, you do not fix them.
 
-    You review against the LAWS in your guidance. You flag violations; you do not fix them. A change MUST change before merge only if this
-    diff introduces or worsens a LAW violation, or introduces a correctness bug. Pre-existing violations in unchanged code, and matters of
-    taste the laws do not cover, are NOT request_change material — mention the significant ones in the finish_review summary instead.
+    Flag any problem this change introduces or is now responsible for — a bug or risk in the code this
+    diff adds, or in existing code it now relies on or feeds. Pre-existing problems in code this PR does
+    not touch are not this review's job; note only the significant ones in the ${toolNames.finishReview}
+    summary. You can ONLY attach a comment to a line shown as LINE N — a line this diff added or kept as
+    context; the host does not allow comments on unchanged or deleted code. When the change creates a
+    problem whose root cause sits in unchanged code (it feeds a bad value into an existing function, or
+    relies on an existing loose type), attach the comment to the changed LINE responsible for the new
+    problem and explain the upstream link in the body. If a real finding cannot be tied to any changed
+    LINE, put it in the ${toolNames.finishReview} summary rather than dropping it.
 
-    You can ONLY attach a comment to a line shown as LINE N — that is, a line this diff added or kept as context. You cannot comment on
-    unchanged or deleted code; the host does not allow it. When the diff introduces a violation whose root cause sits in unchanged code
-    (e.g. it feeds a bad state into an existing guard, or relies on an existing loose type), attach the comment to the changed LINE that is
-    responsible for the new problem and explain the upstream link in the body. If a finding cannot be tied to any changed LINE, it goes in
-    the finish_review summary, not a request_change.
-
-    Each request_change body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow]; (2) one sentence naming the
-    specific violation on that line; (3) the concrete fix. Keep it short. One comment per distinct issue — do not repeat the same finding
-    across many lines; flag the clearest instance and note the pattern once.
-
-    Priorities, highest first:
-    - [LAW:dataflow-not-control-flow] — the most common and most important violation to catch. Flag: a new \`if\`/\`switch\` that selects WHICH
-      operation runs rather than letting data decide the result; a guard that makes an operation sometimes-run, sometimes-skip (especially
-      \`if (x) { ...work... }\` with no else — that is [LAW:no-defensive-null-guards] too); branching on a mode/flag instead of passing a
-      value; logic whose described mechanics need "if / and / when / skip / only". Fix toward: the operation always runs, variability moves
-      into the values flowing through it.
-    - [LAW:decomposition] / [LAW:composability] — a new function that does more than one thing (needs "and" to describe), or hardcodes a
-      caller-specific choice that should be a parameter. Fix toward: split, or lift the choice to the seam as a value.
-    - [LAW:types-are-the-program] — a new type that admits illegal states (\`any\`, \`string\` for an enum, fields that must agree but aren't
-      tied), or a body that branches/guards to compensate for a too-loose type. Fix toward: tighten the type so the bad state cannot compile.
-    - [LAW:effects-at-boundaries] — new code mixing computation with IO/mutation/network/clock/randomness in the same unit. Fix toward:
-      pure core, effects at the edge.
-    - [LAW:no-silent-failure] — newly introduced swallowed errors, \`|| true\`, \`2>/dev/null\`, empty catches, or meaning-changing fallbacks.
-    - [LAW:one-source-of-truth] / [LAW:single-enforcer] — a new second home for an existing fact, or a duplicated enforcement check.
-    - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag when the diff clearly violates them.
-
-    Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns. When unsure whether
-    something rises to must-change, it does not — leave it for the summary. The finish_review summary describes the nature of any must-change
-    items and any pattern-level or pre-existing concerns worth the author's attention. Do NOT state an overall verdict, approval status, or
-    must-change count — the action derives the verdict from the recorded changes and appends it itself.
+    ${reviewCharter(toolNames)}
     \n\n${diffs}`,
   };
 }
@@ -119,7 +158,7 @@ function buildRepoReviewInput({ scope, excludePatterns, toolNames, reviewedRepoR
 
   return {
     prompt: `
-Review this repository against the LAWS in your guidance. There is no diff — the repository under review is checked out
+Review this repository for what would hurt if it shipped. There is no diff — the repository under review is checked out
     at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
     working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
 
@@ -128,32 +167,9 @@ Review this repository against the LAWS in your guidance. There is no diff — t
     ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
 
     This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.
-    You flag violations; you do not fix them. Flag the most important LAW violations, correctness bugs, security flaws,
-    invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal
-    coupling, or missing behavior tests that you find.
+    This is an informational report, not a merge gate.
 
-    Each ${toolNames.requestChange} body has three parts, in order: (1) the token, e.g. [LAW:dataflow-not-control-flow];
-    (2) one sentence naming the specific violation at that path:line; (3) the concrete fix. Keep it short. One comment
-    per distinct issue — do not repeat the same finding across many lines; flag the clearest instance and note the
-    pattern once in the body.
-
-    Priorities, highest first:
-    - [LAW:dataflow-not-control-flow] — the most common and most important violation to catch. Flag: an \`if\`/\`switch\`
-      that selects WHICH operation runs rather than letting data decide the result; a guard that makes an operation
-      sometimes-run, sometimes-skip (especially \`if (x) { ...work... }\` with no else — that is [LAW:no-defensive-null-guards]
-      too); branching on a mode/flag instead of passing a value.
-    - [LAW:decomposition] / [LAW:composability] — a function that does more than one thing (needs "and" to describe), or
-      hardcodes a caller-specific choice that should be a parameter.
-    - [LAW:types-are-the-program] — a type that admits illegal states (\`any\`, \`string\` for an enum, fields that must
-      agree but aren't tied), or a body that branches/guards to compensate for a too-loose type.
-    - [LAW:effects-at-boundaries] — code mixing computation with IO/mutation/network/clock/randomness in the same unit.
-    - [LAW:no-silent-failure] — swallowed errors, \`|| true\`, \`2>/dev/null\`, empty catches, or meaning-changing fallbacks.
-    - [LAW:one-source-of-truth] / [LAW:single-enforcer] — a second home for an existing fact, or a duplicated enforcement check.
-    - [LAW:no-ambient-temporal-coupling], [LAW:behavior-not-structure], and the remaining laws — flag clear violations.
-
-    Do not invent rules beyond the laws. Do not request changes for style, naming preference, or speculative concerns.
-    When unsure whether something rises to must-change, leave it for the summary instead. Do NOT state an overall verdict
-    or approval status — this is an informational report, not a merge gate.`,
+    ${reviewCharter(toolNames)}`,
   };
 }
 
@@ -205,7 +221,7 @@ ${fileList}
     The number of scopes EQUALS the number of distinct concerns these changed files touch: a change to one concern yields
     exactly one scope; a change touching five concerns yields exactly five scopes. Do NOT split one concern across several
     scopes, and do NOT create a separate scope for a boundary between concerns — boundaries are reviewed from inside a scope,
-    next.
+    next. EVERY changed file listed above must belong to exactly one scope — none left out, or its changes go unreviewed.
 
     In each scope's "focus", do THREE things: (1) name that group's changed files and what to review in them; (2) tell the
     reviewer to ALSO read the files this group imports (its require(...) targets) and check the connection — that the
