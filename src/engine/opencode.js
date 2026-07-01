@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { TransientError } = require('../failover');
+const { classifyTransient } = require('../failover');
 const { makeCliAdapter } = require('./cli');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
@@ -207,13 +207,13 @@ function extractUsage(stdout) {
   return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:single-enforcer] Transient-error classification happens once, here. OpenCode retries many
-// transient API errors internally, so these signals fire mainly when a failure escapes to the
-// captured output text; the shared 429/overloaded regex set is the starting point. [LAW:one-source-of-truth]
+// [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
+// src/failover.js (classifyTransient); opencode consumes it whole and adds nothing engine-specific.
+// OpenCode retries many transient API errors internally, so these signals fire mainly when a failure
+// escapes to the captured output text; it doesn't surface Retry-After parseably, so rate-limits fall
+// to exponential backoff. [LAW:one-source-of-truth] No local copy of the pattern set to drift.
 function classifyError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
-  if (/\b529\b|overloaded/i.test(text)) return new TransientError(`overloaded: ${err.message}`);
-  return err;
+  return classifyTransient(err, text) ?? err;
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built

@@ -30,6 +30,39 @@ function parseRetryAfterMs(text) {
   return parseInt(match[1], 10) * 1000;
 }
 
+// [LAW:one-source-of-truth]/[LAW:single-enforcer] The shared transient-failure vocabulary lives
+// here, in exactly ONE place, and every engine adapter's classifyError consumes it — so a dropped
+// socket is the SAME class of failure regardless of which engine hit it. Previously each adapter
+// re-authored these regexes independently and they drifted: only claude-code recognized the network
+// class, codex lacked 529, etc. — the same physical failure classified differently by engine.
+// [FRAMING:representation] Three copies of one concept that can disagree is an under-constrained type.
+//
+// [LAW:one-type-per-behavior] A 429 rate-limit, a 529 overload, a dropped/terminated connection, and
+// an endpoint 5xx are ONE class — the request got no definitive answer and a retry is safe — so they
+// all construct the same TransientError; the cause survives only as the message prefix (a value).
+// The network patterns are anchored — to the CLI's "API Error:" framing or to Node's socket error
+// codes (ECONNRESET/…), never a bare English word — so ordinary review content (a diff mentioning
+// "socket hang up" or "line 502") can't false-match; classifyError runs only on an already-failed
+// spawn regardless.
+const TRANSIENT_RATE_LIMIT = /\b429\b|rate.?limit/i;
+const TRANSIENT_OVERLOADED = /\b529\b|overloaded/i;
+const TRANSIENT_NETWORK = /api error:\s*(?:terminated|connection error|internal server error|socket hang up|fetch failed|5\d\d)\b|\bECONNRESET\b|\bETIMEDOUT\b|\bECONNREFUSED\b|\bEPIPE\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i;
+
+// Classify the shared transient signals from an engine's captured output. Returns a TransientError
+// when the text carries one of the shared physical-failure signals, else null so the calling adapter
+// can add its OWN engine-specific classes (codex's insufficient_quota) before falling through to the
+// raw error. [LAW:dataflow-not-control-flow] The rate-limit branch attaches the Retry-After hint via
+// the injected retryAfterFrom extractor: claude-code echoes the header so it passes parseRetryAfterMs;
+// codex/opencode don't surface it in a parseable form, so they omit the extractor (default → null) and
+// fall to exponential backoff — the one genuinely per-engine difference, expressed as a value not a
+// forked copy of the pattern set.
+function classifyTransient(err, text, retryAfterFrom = () => null) {
+  if (TRANSIENT_RATE_LIMIT.test(text)) return new TransientError(`rate-limited: ${err.message}`, retryAfterFrom(text));
+  if (TRANSIENT_OVERLOADED.test(text)) return new TransientError(`overloaded: ${err.message}`);
+  if (TRANSIENT_NETWORK.test(text)) return new TransientError(`connection error: ${err.message}`);
+  return null;
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function transientBackoffMs(attempt) {
@@ -178,6 +211,7 @@ module.exports = {
   TRANSIENT_SPAWN_ATTEMPTS,
   TransientError,
   parseRetryAfterMs,
+  classifyTransient,
   sleep,
   transientBackoffMs,
   retryTransientSpawn,

@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { TransientError } = require('../failover');
+const { TransientError, classifyTransient } = require('../failover');
 const { computeCostUsd } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 
@@ -195,13 +195,14 @@ function extractUsage(stdout, config) {
   return { inputTokens, outputTokens, cost };
 }
 
-// [LAW:single-enforcer] OpenAI Responses API transient signals classified once, here.
-// 429 + rate_limit are rate-limiting; insufficient_quota is a billing limit (also transient
-// in the sense that exhaustion clears with time or a new quota window). [LAW:one-source-of-truth]
+// [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
+// src/failover.js (classifyTransient); codex consumes it and adds only its genuinely OpenAI-specific
+// class — insufficient_quota, a billing limit that also clears with time or a new quota window. codex
+// doesn't surface Retry-After in a parseable form, so it omits the extractor and rate-limits fall to
+// exponential backoff. [LAW:one-source-of-truth] No local copy of the 429/529/network patterns to drift.
 function classifyError(err, text) {
-  if (/\b429\b|rate.?limit/i.test(text)) return new TransientError(`rate-limited: ${err.message}`);
-  if (/insufficient.quota|quota.exceeded/i.test(text)) return new TransientError(`quota exceeded: ${err.message}`);
-  return err;
+  return classifyTransient(err, text)
+    ?? (/insufficient.quota|quota.exceeded/i.test(text) ? new TransientError(`quota exceeded: ${err.message}`) : err);
 }
 
 // [LAW:one-type-per-behavior] The CLI lifecycle is identical across engines, so the adapter is built

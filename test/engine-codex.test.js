@@ -308,6 +308,25 @@ describe('classifyError', () => {
     assert.equal(result.retryAfterMs, null);
   });
 
+  // The shared transient vocabulary (classifyTransient in src/failover.js) is now recognized by every
+  // engine identically — codex previously lacked 529 and the network class, so a dropped socket fell
+  // through as a fatal error under codex while claude-code retried it. These assert the shared class.
+  test('529 / overloaded produces a TransientError (shared class, previously unrecognized by codex)', () => {
+    assert.ok(classifyError(base, 'HTTP 529 overloaded') instanceof TransientError);
+    assert.ok(classifyError(base, 'the model is overloaded') instanceof TransientError);
+  });
+
+  test('shared network class is recognized identically (dropped socket / 5xx / socket codes)', () => {
+    assert.ok(classifyError(base, 'API Error: terminated') instanceof TransientError);
+    assert.ok(classifyError(base, 'API Error: 503 Service Unavailable') instanceof TransientError);
+    assert.ok(classifyError(base, 'read ECONNRESET') instanceof TransientError);
+  });
+
+  test('bare English phrases do NOT false-match without the API-error anchor', () => {
+    assert.equal(classifyError(base, 'the retry logic handles a socket hang up gracefully'), base);
+    assert.equal(classifyError(base, 'the worker process at line 502 was cleanly shut down'), base);
+  });
+
   test('unrelated error is returned unchanged', () => {
     const result = classifyError(base, 'unexpected JSON at line 5');
     assert.equal(result, base);
