@@ -37,6 +37,50 @@ function transientBackoffMs(attempt) {
   return cap / 2 + Math.random() * (cap / 2);
 }
 
+// [LAW:no-mode-explosion] Short-horizon attempts for spawn-level recovery: 1 initial + 2 retries.
+// Matches produceReview's PER_CONFIG_LIMIT, but is a DIFFERENT axis (see retryTransientSpawn).
+const TRANSIENT_SPAWN_ATTEMPTS = 3;
+
+// [LAW:decomposition] Spawn-level transient recovery — a DIFFERENT axis from produceReview's config
+// failover. produceReview walks a chain of CONFIGS with a global budget; this retries ONE flaky
+// engine request in place, so a single blip in one of N concurrent scope workers is absorbed there
+// instead of failing the whole scout->workers pass (which would re-run the scout + every sibling
+// worker and discard their already-recorded findings — a failure probability that GROWS with N).
+// [LAW:one-source-of-truth] It owns no new timing math: the backoff curve and Retry-After precedence
+// are the SAME shared primitives produceReview uses (transientBackoffMs, err.retryAfterMs), so retry
+// TIMING lives in exactly one place; only the short-horizon attempt policy is local here.
+// [LAW:no-silent-failure] A non-transient error surfaces immediately; an EXHAUSTED transient is
+// rethrown (never swallowed), so produceReview's config-level failover/budget still takes over — the
+// run only reds when a transient genuinely persists past both layers. onRetry is the injected
+// progress effect; sleepFn is injectable so tests drive the retry path with no real waits.
+// [LAW:effects-at-boundaries]
+async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
+  // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
+  // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
+  // The destructuring default fires only on `undefined`, so an explicit 0/negative reaches here; a
+  // nonsensical retry budget is a caller bug, surfaced — never silently clamped to hide it.
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(`retryTransientSpawn: limit must be a positive integer, got ${limit}`);
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= limit; attempt++) {
+    try {
+      return await thunk();
+    } catch (err) {
+      if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
+      lastErr = err;
+      if (attempt === limit) throw lastErr; // exhausted: let the config-level failover take over
+      const delay = err.retryAfterMs ?? transientBackoffMs(attempt);
+      onRetry({ attempt, limit, delay, err });
+      await sleepFn(delay);
+    }
+  }
+  // [LAW:no-silent-failure] Unreachable given the validated limit >= 1 (the final iteration always
+  // returns or throws); a loud invariant backstop so a future refactor that breaks that can never fall
+  // through to an undefined return silently masquerading as a successful review.
+  throw new Error('retryTransientSpawn: loop exited without returning (invariant violated)');
+}
+
 // [LAW:no-ambient-temporal-coupling] produceReview is the single explicit owner of all
 // retry timing and failover policy. produceOnce makes one attempt with no timing knowledge.
 // [LAW:dataflow-not-control-flow] The chain is policy data, not branching: the same loop
@@ -131,10 +175,12 @@ function buildAttributionFooter(config) {
 
 module.exports = {
   TRANSIENT_RETRY_BUDGET_MS,
+  TRANSIENT_SPAWN_ATTEMPTS,
   TransientError,
   parseRetryAfterMs,
   sleep,
   transientBackoffMs,
+  retryTransientSpawn,
   produceReview,
   buildAttributionFooter,
 };

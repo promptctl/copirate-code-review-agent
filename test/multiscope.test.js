@@ -8,6 +8,7 @@ const {
   sumUsage,
   composeSummary,
   runScopeWorkers,
+  runMultiScopePass,
   buildPrMaterial,
   buildRepoMaterial,
 } = require('../src/multiscope');
@@ -160,6 +161,79 @@ describe('runScopeWorkers', () => {
     const scopes = [{ name: 'a' }];
     const runOne = async () => { throw new Error('engine produced garbage'); };
     await assert.rejects(runScopeWorkers({ scopes, runOne, maxConcurrent: 2 }), /engine produced garbage/);
+  });
+});
+
+// ── spawn-level transient resilience (the g6x fix) ─────────────────────────────────────────────────
+// A transient blip in ONE scope worker must be retried IN PLACE, so it never discards the sibling
+// workers' already-recorded findings by failing (and re-running) the whole scout->workers pass.
+
+describe('runMultiScopePass — spawn-level transient resilience', () => {
+  const SCOPES = [
+    { name: 'a', focus: 'fa' },
+    { name: 'b', focus: 'fb' },
+    { name: 'c', focus: 'fc' },
+  ];
+  const material = {
+    buildScoutPrompt: () => 'SCOUT',
+    buildWorkerPrompt: (focusText) => focusText, // focusText carries `${scope.name} — ${scope.focus}`
+  };
+  const config = { engine: 'fake', name: 'c1' };
+  const passArgs = (registry) => ({
+    config, material, registry, instructionsPath: 'x', maxConcurrent: 4, log: () => {}, sleepFn: async () => {},
+  });
+
+  // A fake engine adapter: the scout returns SCOPES; each worker returns one finding tagged with its
+  // scope. `flaky` names a scope whose worker throws a transient error ONCE before succeeding.
+  function makeRegistry({ flaky } = {}) {
+    const calls = { scout: 0, workers: {} };
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') {
+          calls.scout++;
+          return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
+        }
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        calls.workers[scope.name] = (calls.workers[scope.name] ?? 0) + 1;
+        if (flaky === scope.name && calls.workers[scope.name] === 1) {
+          throw new TransientError('API Error: terminated');
+        }
+        return {
+          summary: `sum-${scope.name}`,
+          findings: [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}` }],
+          usage: null,
+        };
+      },
+    };
+    return { registry: { get: () => adapter }, calls };
+  }
+
+  test("a transient blip in one of N workers does not discard the other N-1 workers' findings", async () => {
+    const { registry, calls } = makeRegistry({ flaky: 'b' });
+    const review = await runMultiScopePass(passArgs(registry));
+    // All three scopes' findings survive — the blip on 'b' was retried in place.
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
+    // The scout ran exactly ONCE (the whole pass was not re-run), and only 'b' was re-spawned.
+    assert.equal(calls.scout, 1);
+    assert.equal(calls.workers.a, 1);
+    assert.equal(calls.workers.b, 2); // 1 blip + 1 successful retry
+    assert.equal(calls.workers.c, 1);
+  });
+
+  test('a transient error that persists past spawn retries propagates loudly — no scope is silently dropped', async () => {
+    const alwaysFlaky = {
+      async produceReview({ buildPromptFor }) {
+        if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
+        throw new TransientError('API Error: terminated');
+      },
+    };
+    // The blip never clears, so it escalates (still transient) to produceReview's config-level failover
+    // instead of being swallowed into a partial review. runScopeWorkers stays fail-loud.
+    await assert.rejects(
+      runMultiScopePass(passArgs({ get: () => alwaysFlaky })),
+      err => err instanceof TransientError,
+    );
   });
 });
 
