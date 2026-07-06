@@ -358,4 +358,15 @@ describe('buildReviewInput focus', () => {
     const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, 'cost — src/usage.js');
     assert.match(prompt, /CONCENTRATE THIS REVIEW on one part of the change: cost — src\/usage\.js/);
   });
+
+  test('the focus block orders the worker to report issues found ANYWHERE, not withhold out-of-scope ones', () => {
+    const { prompt } = buildReviewInput(FILES, 0, TOOL_NAMES, REPO_ROOT, 'cost — src/usage.js');
+    // Report everything: a real bug outside the scope is still recorded, dedup happens downstream.
+    assert.match(prompt, /if you notice a genuine issue ANYWHERE in the diff, still record it/);
+    assert.match(prompt, new RegExp(`still record it with ${TOOL_NAMES.requestChange}`));
+    assert.match(prompt, /de-duplicated downstream/);
+    // The old suppression sentence must be gone — it is what taught the model to self-censor.
+    assert.doesNotMatch(prompt, /only flag issues that belong to that part/);
+    assert.doesNotMatch(prompt, /Other parts are reviewed separately/);
+  });
 });
