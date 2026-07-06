@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
@@ -180,7 +180,13 @@ async function runPrReview(reviewerName, excludePatterns) {
   // stands. [LAW:no-silent-failure] the skip names the cap so a missing review is never mistaken for a
   // clean pass. A weak model surfaces everything important in the first few rounds; beyond the cap,
   // re-reviewing every push only re-spends the diff's full token cost for diminishing return.
-  const maxReviewRounds = parseInt(core.getInput('MAX_REVIEW_ROUNDS'), 10) || 0;
+  let maxReviewRounds;
+  try {
+    maxReviewRounds = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
   const priorReviews = await countPriorReviews(octokit, owner, repo, pullNumber);
   if (roundCapReached(priorReviews, maxReviewRounds)) {
     core.info(

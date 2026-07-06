@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, REVIEW_MARKER } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
@@ -92,20 +92,59 @@ describe('roundCapReached', () => {
   });
 });
 
+describe('parseMaxRounds', () => {
+  test('a run of digits parses to that integer', () => {
+    assert.equal(parseMaxRounds('5'), 5);
+    assert.equal(parseMaxRounds('0'), 0);
+    assert.equal(parseMaxRounds('42'), 42);
+  });
+
+  test('surrounding whitespace is trimmed', () => {
+    assert.equal(parseMaxRounds('  7 '), 7);
+  });
+
+  test('empty (explicitly cleared) is the unlimited sentinel 0', () => {
+    assert.equal(parseMaxRounds(''), 0);
+    assert.equal(parseMaxRounds('   '), 0);
+  });
+
+  test('[LAW:no-silent-failure] non-numeric input throws — never silently becomes 0/unlimited', () => {
+    assert.throws(() => parseMaxRounds('five'), /non-negative integer/);
+    assert.throws(() => parseMaxRounds('abc'), /got "abc"/);
+  });
+
+  test('[LAW:no-silent-failure] a partly-numeric value throws rather than parseInt-truncating to a cap the user never wrote', () => {
+    assert.throws(() => parseMaxRounds('3x'), /non-negative integer/);
+    assert.throws(() => parseMaxRounds('3abc'), /non-negative integer/);
+  });
+
+  test('a negative value is rejected (not a non-negative integer)', () => {
+    assert.throws(() => parseMaxRounds('-1'), /non-negative integer/);
+  });
+});
+
 describe('countPriorReviews', () => {
   // A fake octokit whose listReviews returns fixed pages; asserts the marker filter and pagination.
   const fakeOctokit = (pages) => ({
     rest: { pulls: { listReviews: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
   });
 
-  test('counts only reviews whose body carries the marker', async () => {
+  test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
     const octokit = fakeOctokit([[
       { body: `some verdict\n\n${REVIEW_MARKER}` },
       { body: 'a human review, no marker' },
-      { body: `another round\n\n${REVIEW_MARKER}` },
+      { body: `another round\n\n${REVIEW_MARKER}\n` }, // trailing whitespace tolerated
       { body: null }, // dismissed/empty review body
     ]]);
     assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 2);
+  });
+
+  test('a human review that merely QUOTES the marker mid-body is not counted', async () => {
+    const octokit = fakeOctokit([[
+      { body: `I see the action posts \`${REVIEW_MARKER}\` — but here is my own comment.` },
+      { body: `real round\n\n${REVIEW_MARKER}` },
+    ]]);
+    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 1);
   });
 
   test('returns 0 when the PR has no reviews', async () => {

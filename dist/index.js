@@ -31824,7 +31824,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, REVIEW_MARKER } = __nccwpck_require__(7228);
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
 
@@ -31839,6 +31839,7 @@ module.exports = {
   prIsFromFork,
   countPriorReviews,
   roundCapReached,
+  parseMaxRounds,
   REVIEW_MARKER,
   TransientError,
   classifyClaudeError,
@@ -32938,7 +32939,7 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
@@ -33113,7 +33114,13 @@ async function runPrReview(reviewerName, excludePatterns) {
   // stands. [LAW:no-silent-failure] the skip names the cap so a missing review is never mistaken for a
   // clean pass. A weak model surfaces everything important in the first few rounds; beyond the cap,
   // re-reviewing every push only re-spends the diff's full token cost for diminishing return.
-  const maxReviewRounds = parseInt(core.getInput('MAX_REVIEW_ROUNDS'), 10) || 0;
+  let maxReviewRounds;
+  try {
+    maxReviewRounds = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
   const priorReviews = await countPriorReviews(octokit, owner, repo, pullNumber);
   if (roundCapReached(priorReviews, maxReviewRounds)) {
     core.info(
@@ -33408,7 +33415,11 @@ async function countPriorReviews(octokit, owner, repo, pullNumber) {
       per_page: 100,
       page,
     });
-    count += data.filter(r => typeof r.body === 'string' && r.body.includes(REVIEW_MARKER)).length;
+    // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel
+    // of the body, so match it as the ending — not a loose substring `includes`, which a human review
+    // that merely quotes the marker string would satisfy, over-counting rounds and starving the PR of
+    // further review.
+    count += data.filter(r => typeof r.body === 'string' && r.body.trimEnd().endsWith(REVIEW_MARKER)).length;
     if (data.length < 100) break;
     page++;
   }
@@ -33422,6 +33433,21 @@ async function countPriorReviews(octokit, owner, repo, pullNumber) {
 // 0..4 run and the 6th push (priorReviews=5) is skipped, yielding exactly 5 reviews.
 function roundCapReached(priorReviews, maxRounds) {
   return maxRounds > 0 && priorReviews >= maxRounds;
+}
+
+// [LAW:no-silent-failure] Parse the round cap strictly. The prior `parseInt(raw, 10) || 0` silently
+// turned any non-numeric input (a typo like "five") into 0 = unlimited — DISABLING the cost cap on a
+// misconfiguration, the exact opposite of intent, with no diagnostic. And `parseInt("3x", 10)` → 3
+// caps at a value the user never wrote. [LAW:types-are-the-program] the input's domain is a
+// non-negative integer (0 = unlimited); accept a run of digits, reject everything else loudly. Empty
+// (an explicitly cleared input) is unlimited; unset gets action.yml's "5" default from the runner.
+function parseMaxRounds(raw) {
+  const s = String(raw).trim();
+  if (s === '') return 0;
+  if (!/^\d+$/.test(s)) {
+    throw new Error(`MAX_REVIEW_ROUNDS must be a non-negative integer (0 = unlimited); got "${raw}".`);
+  }
+  return parseInt(s, 10);
 }
 
 // [LAW:dataflow-not-control-flow] A review is ALWAYS posted to the PR. The data
@@ -33517,6 +33543,7 @@ module.exports = {
   prIsFromFork,
   countPriorReviews,
   roundCapReached,
+  parseMaxRounds,
   REVIEW_MARKER,
 };
 
