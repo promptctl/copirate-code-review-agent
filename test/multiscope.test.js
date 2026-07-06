@@ -7,6 +7,7 @@ const {
   dedupeFindings,
   sumUsage,
   composeSummary,
+  planScopes,
   runScopeWorkers,
   runMultiScopePass,
   buildPrMaterial,
@@ -204,6 +205,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
     { name: 'c', focus: 'fc' },
   ];
   const material = {
+    changedPaths: [], // no coverage sweep in this suite; scope-worker resilience is what's under test
     buildScoutPrompt: () => 'SCOUT',
     buildWorkerPrompt: (focusText) => focusText, // focusText carries `${scope.name} — ${scope.focus}`
   };
@@ -266,11 +268,141 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   });
 });
 
+// ── planScopes — mechanical scout-coverage verification (598.3) ──────────────────────────────────
+// The scout prompt promises every changed file belongs to a scope; planScopes is the check that was
+// missing. A path mentioned in no scope's name/focus is swept into ONE synthetic 'unassigned files'
+// scope so some worker reads it in full — DEEP coverage guaranteed as a value, not left to the plan.
+
+describe('planScopes', () => {
+  const scopes = [
+    { name: 'cost', focus: 'src/usage.js pricing math' },
+    { name: 'transport', focus: 'GitHub review submission' },
+  ];
+
+  test('a changed path mentioned in no scope is swept into one synthetic scope + reported', () => {
+    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js', 'src/report.js']);
+    assert.deepEqual(sweptPaths, ['src/report.js']);
+    assert.equal(planned.length, 3);
+    const synthetic = planned[planned.length - 1];
+    assert.equal(synthetic.name, 'unassigned files');
+    assert.match(synthetic.focus, /src\/report\.js/);
+    assert.match(synthetic.focus, /Review their changes fully/);
+  });
+
+  test('a path covered only by its basename counts as covered (lenient textual match)', () => {
+    const { scopes: planned, sweptPaths } = planScopes(
+      [{ name: 'cost', focus: 'the usage.js pricing table' }],
+      ['src/usage.js'],
+    );
+    assert.deepEqual(sweptPaths, []);
+    assert.equal(planned.length, 1);
+  });
+
+  test('full coverage yields no synthetic scope and returns the plan array unchanged', () => {
+    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js']);
+    assert.deepEqual(sweptPaths, []);
+    assert.equal(planned, scopes); // same reference — no rebuild when nothing is swept
+  });
+
+  test('an empty changedPaths list (repo material) never yields a synthetic scope', () => {
+    const { scopes: planned, sweptPaths } = planScopes(scopes, []);
+    assert.deepEqual(sweptPaths, []);
+    assert.equal(planned, scopes);
+  });
+
+  // Regression (PR #70 review): whole-token matching, not substring containment. A basename that is a
+  // substring of a LONGER filename mentioned in a scope must NOT count as covered — otherwise the real
+  // file is silently dropped from the sweep, a false-positive in the anti-silent-drop mechanism itself.
+  test("'scope.js' is NOT covered by a scope that only mentions 'multiscope.js' (substring collision)", () => {
+    const { sweptPaths } = planScopes(
+      [{ name: 'engine', focus: 'Review src/multiscope.js worker orchestration' }],
+      ['src/scope.js'],
+    );
+    assert.deepEqual(sweptPaths, ['src/scope.js']); // swept, not falsely judged covered
+  });
+
+  test("'app.js' is NOT covered by a scope that only mentions 'app.json' (extension-prefix collision)", () => {
+    const { sweptPaths } = planScopes(
+      [{ name: 'config', focus: 'the app.json manifest' }],
+      ['src/app.js'],
+    );
+    assert.deepEqual(sweptPaths, ['src/app.js']);
+  });
+
+  test('a path named as a whole token (even flanked by punctuation) IS covered', () => {
+    const { sweptPaths } = planScopes(
+      [{ name: 'render', focus: 'changes in `src/report.js`, plus its callers' }],
+      ['src/report.js'],
+    );
+    assert.deepEqual(sweptPaths, []);
+  });
+
+  test('all unmentioned paths land in ONE synthetic scope, never one scope each', () => {
+    const { scopes: planned, sweptPaths } = planScopes(scopes, ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(sweptPaths, ['a.js', 'b.js', 'c.js']);
+    assert.equal(planned.length, 3); // 2 planned + exactly 1 catch-all
+    assert.match(planned[2].focus, /a\.js, b\.js, c\.js/);
+  });
+});
+
+// ── the sweep actually reaches the worker pool (end-to-end through runMultiScopePass) ─────────────
+
+describe('runMultiScopePass — scout coverage sweep', () => {
+  const config = { engine: 'fake', name: 'c1' };
+  // Scout returns the given plan; each worker echoes its own prompt so we can see which scopes ran.
+  function registryFor(scoutScopes) {
+    const seen = [];
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: scoutScopes, usage: null };
+        seen.push(prompt);
+        return { summary: 'ok', findings: [], usage: null };
+      },
+    };
+    return { registry: { get: () => adapter }, seen };
+  }
+  const runWith = ({ registry, scoutScopes, changedPaths, log }) =>
+    runMultiScopePass({
+      config,
+      material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
+      registry, instructionsPath: 'x', maxConcurrent: 4, log, sleepFn: async () => {},
+    });
+
+  test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
+    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js' }]);
+    const logs = [];
+    await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
+    assert.ok(seen.some(p => p.includes('unassigned files') && p.includes('b.js')), 'synthetic worker ran for b.js');
+    assert.ok(logs.some(m => /unassigned/.test(m) && m.includes('b.js')), 'warning names the swept path');
+  });
+
+  test('full coverage runs no synthetic worker and logs no sweep warning', async () => {
+    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js' }, { name: 'b', focus: 'b.js' }]);
+    const logs = [];
+    await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
+    assert.ok(!seen.some(p => p.includes('unassigned files')));
+    assert.ok(!logs.some(m => /unassigned/.test(m)));
+  });
+
+  test('repo material (changedPaths: []) never sweeps even when the scout plans one scope', async () => {
+    const { registry, seen } = registryFor([{ name: 'whole', focus: 'everything' }]);
+    const logs = [];
+    await runWith({ registry, changedPaths: [], log: (m) => logs.push(m) });
+    assert.ok(!seen.some(p => p.includes('unassigned files')));
+    assert.ok(!logs.some(m => /unassigned/.test(m)));
+  });
+});
+
 // ── materials — closures that build the real engine prompts ──────────────────────────────────────
 
 describe('buildPrMaterial', () => {
   const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
   const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
+
+  test('exposes the changed-file list so the pass can verify scout coverage against it', () => {
+    assert.deepEqual(material.changedPaths, ['src/a.js']);
+  });
 
   test('scout prompt lists the changed file paths and records scopes via the add_scope tool', () => {
     const prompt = material.buildScoutPrompt(TOOL_NAMES);
@@ -289,6 +421,10 @@ describe('buildPrMaterial', () => {
 
 describe('buildRepoMaterial', () => {
   const material = buildRepoMaterial({ scope: '', excludePatterns: [], reviewedRepoRoot: REPO_ROOT });
+
+  test('exposes an empty changed-file list, making the coverage sweep a no-op by construction', () => {
+    assert.deepEqual(material.changedPaths, []);
+  });
 
   test('scout prompt surveys the tree and records scopes via the add_scope tool', () => {
     const prompt = material.buildScoutPrompt(TOOL_NAMES);

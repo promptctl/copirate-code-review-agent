@@ -1,4 +1,5 @@
 'use strict';
+const path = require('path');
 const { produceReview, retryTransientSpawn, sleep } = require('./failover');
 const {
   buildReviewInput,
@@ -139,6 +140,51 @@ async function runScopeWorker({ scope, context, material, spawn, log }) {
   return { name: scope.name, summary, findings, usage };
 }
 
+// [LAW:effects-at-boundaries] Pure: does `text` mention `needle` as a whole path token? A "path char" is
+// [\w./-] — the set a filename is built from — so `needle` matches only when it is not flanked by another
+// path char (the lookbehind/lookahead), which rejects substring collisions like 'scope.js' ⊂ 'multiscope.js'
+// and 'app.js' ⊂ 'app.json' while still matching a path delimited by whitespace, quotes, or commas.
+const PATH_CHAR = '[\\w./-]';
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function mentionsToken(text, needle) {
+  return new RegExp(`(?<!${PATH_CHAR})${escapeRegExp(needle)}(?!${PATH_CHAR})`).test(text);
+}
+
+// [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
+// meant to cover, return the scope list the workers actually run — the plan, plus ONE synthetic
+// 'unassigned files' scope whenever the plan's name+focus texts mention neither a changed path nor its
+// basename. [LAW:verifiable-goals] The scout prompt asserts "every changed file belongs to exactly one
+// scope", a done-state with a checkable shape that the engine never checked (its only check was
+// scopes.length === 0). A dropped file is the most common weak-model planning slip; since sibling 598.2
+// stopped workers suppressing out-of-scope findings it is no longer INVISIBLE, but a file with no owning
+// scope still gets no worker reading it in FULL — so this guarantees DEEP coverage, not merely non-zero
+// coverage.
+//
+// [LAW:no-silent-failure] A path is "mentioned" only as a WHOLE path token, never as an incidental
+// substring of a longer filename: plain substring containment would judge 'scope.js' covered by a focus
+// naming 'multiscope.js', or 'app.js' covered by 'app.json', and silently drop the real file from the
+// sweep — a false-positive in the exact mechanism that exists to stop silent drops. mentionsToken anchors
+// the match on path-token boundaries ([\w./-]), so surrounding whitespace/quotes/commas delimit a token
+// but an adjacent letter or extension does not. A near-miss errs toward over-sweeping (the file lands in
+// the catch-all and is reviewed anyway), never toward dropping it.
+//
+// [LAW:dataflow-not-control-flow] The sweep is a value flowing into the same worker pool, not a new
+// engine branch: repo material carries changedPaths = [], so the filter finds nothing and the plan is
+// returned unchanged — a no-op by construction, an empty value, not a mode. sweptPaths is returned so
+// the caller can surface scout quality as an observable signal, never a silent correction. [LAW:no-silent-failure]
+function planScopes(scopes, changedPaths) {
+  const covered = scopes.map(s => `${s.name} ${s.focus}`).join('\n');
+  const sweptPaths = changedPaths.filter(
+    p => !mentionsToken(covered, p) && !mentionsToken(covered, path.basename(p)),
+  );
+  if (sweptPaths.length === 0) return { scopes, sweptPaths };
+  const catchAll = {
+    name: 'unassigned files',
+    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
+  };
+  return { scopes: [...scopes, catchAll], sweptPaths };
+}
+
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
 // unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return, so
@@ -166,11 +212,19 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
   // having reviewed nothing.
   const scoutResult = await spawn(material.buildScoutPrompt, 'scout');
-  const scopes = scoutResult.scopes;
-  if (scopes.length === 0) {
+  if (scoutResult.scopes.length === 0) {
     throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
   }
-  log(`scout planned ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
+  log(`scout planned ${scoutResult.scopes.length} scope(s): ${scoutResult.scopes.map(s => s.name).join(', ')}`);
+
+  // [LAW:verifiable-goals] Mechanically verify the plan covers every changed file (PR only — repo
+  // material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
+  // synthetic catch-all scope so some worker reads them in full. The zero-scope throw above stays
+  // FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
+  const { scopes, sweptPaths } = planScopes(scoutResult.scopes, material.changedPaths);
+  if (sweptPaths.length > 0) {
+    log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
+  }
   const context = scoutResult.summary.trim();
 
   // Layer 2 — one worker per scope, judging in parallel under the concurrency cap.
@@ -206,6 +260,9 @@ function runMultiScope({ chain, material, registry, instructionsPath, maxConcurr
 function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
   const changedPaths = files.map(f => f.filename);
   return {
+    // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
+    // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
+    changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
     buildWorkerPrompt: (focusText, toolNames) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText).prompt,
   };
@@ -215,6 +272,9 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
 // focus IS the repo-review `scope` value — so a worker is exactly a focused whole-repo review.
 function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
   return {
+    // Repo mode has no changed-file list to verify against, so coverage-sweeping is a no-op by
+    // construction: an empty value flows to planScopes, never a mode. [LAW:dataflow-not-control-flow]
+    changedPaths: [],
     buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
     buildWorkerPrompt: (focusText, toolNames) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
   };
@@ -226,6 +286,7 @@ module.exports = {
   dedupeFindings,
   sumUsage,
   composeSummary,
+  planScopes,
   runScopeWorkers,
   runMultiScopePass,
   runMultiScope,
