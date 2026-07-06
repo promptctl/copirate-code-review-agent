@@ -97,12 +97,14 @@ The action installs its bundled reviewer instructions as the engine's user-globa
 
 ## Approvals
 
+Each finding carries a **severity** — `blocking` (must change before merge) or `advisory` (a genuine issue worth surfacing that need not block the merge, e.g. a missing test, a perf concern, or a maintainability nit). Only a `blocking` finding requests changes; a review whose findings are all advisory is not a merge gate. Advisory findings still post as inline comments, tagged so the author can tell them apart.
+
 The default `GITHUB_TOKEN` cannot approve PRs. With no `GITHUB_REVIEW_TOKEN`:
 
-- Findings are submitted as a `REQUEST_CHANGES` review with inline threads.
-- A clean review just logs `✅ Approved` (no formal approval is submitted).
+- A `blocking` finding is submitted as a `REQUEST_CHANGES` review with inline threads.
+- A review with no blocking findings (clean, or advisory-only) just logs `✅ Approved` — advisory findings still post as inline comments — with no formal approval submitted.
 
-Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have clean reviews submit a formal `APPROVE`. When findings exist the action requests changes — resolve the threads and dismiss the review to proceed.
+Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to have non-blocking reviews submit a formal `APPROVE`. When a blocking finding exists the action requests changes — resolve the threads and dismiss the review to proceed.
 
 ## Fork PRs are never reviewed
 

@@ -61,9 +61,9 @@ describe('workerFocusText', () => {
 describe('dedupeFindings', () => {
   test('drops duplicates by path:line:body-prefix, preserving order', () => {
     const findings = [
-      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
-      { path: 'b.js', line: 2, body: '[LAW:y] bar' },
-      { path: 'a.js', line: 1, body: '[LAW:x] foo' },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 'blocking' },
+      { path: 'b.js', line: 2, body: '[LAW:y] bar', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 'blocking' },
     ];
     const out = dedupeFindings(findings);
     assert.equal(out.length, 2);
@@ -72,10 +72,39 @@ describe('dedupeFindings', () => {
 
   test('keeps two findings on the same line with different bodies', () => {
     const out = dedupeFindings([
-      { path: 'a.js', line: 1, body: 'first distinct issue here' },
-      { path: 'a.js', line: 1, body: 'second different issue here' },
+      { path: 'a.js', line: 1, body: 'first distinct issue here', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: 'second different issue here', severity: 'advisory' },
     ]);
     assert.equal(out.length, 2);
+  });
+
+  // [LAW:no-silent-failure] severity decides the merge gate, so a duplicate must not lose it to order.
+  test('a blocking duplicate wins over an advisory that arrived first (upward merge)', () => {
+    const out = dedupeFindings([
+      { path: 'a.js', line: 1, body: 'same issue', severity: 'advisory' },
+      { path: 'a.js', line: 1, body: 'same issue', severity: 'blocking' },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].severity, 'blocking'); // advisory-first never downgrades the merged finding
+  });
+
+  test('a blocking finding is not downgraded by a later advisory duplicate', () => {
+    const out = dedupeFindings([
+      { path: 'a.js', line: 1, body: 'same issue', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: 'same issue', severity: 'advisory' },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].severity, 'blocking');
+  });
+
+  test('merging preserves first-seen order across keys', () => {
+    const out = dedupeFindings([
+      { path: 'a.js', line: 1, body: 'x', severity: 'advisory' },
+      { path: 'b.js', line: 2, body: 'y', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: 'x', severity: 'blocking' }, // upgrades a.js in place
+    ]);
+    assert.deepEqual(out.map(f => f.path), ['a.js', 'b.js']); // a.js keeps its original position
+    assert.equal(out[0].severity, 'blocking');
   });
 });
 

@@ -29950,15 +29950,16 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: 'Request a required pre-merge code change anchored to a visible diff line. Do not use for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes.',
+      description: "Record a code issue anchored to a visible diff line. Set severity 'blocking' if it must change before merge, 'advisory' if it is a genuine issue worth surfacing but need not block the merge (e.g. a missing test, a perf concern, a maintainability problem, or a finding you are only moderately sure of). Record EVERY genuine issue you find at the right severity — do not withhold one because it is non-blocking. Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
           path: { type: 'string' },
           line: { type: 'integer' },
           body: { type: 'string' },
+          severity: { type: 'string', enum: ['blocking', 'advisory'] },
         },
-        required: ['path', 'line', 'body'],
+        required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
       },
     },
@@ -31904,14 +31905,24 @@ function workerFocusText(scope, context) {
 // [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
 // two adjacent scopes can both touch a shared file. Keyed by path:line:body-prefix — the same key the
 // printed report and the PR review treat as "the same finding". [LAW:one-source-of-truth]
+//
+// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
+// to arrival order: when two workers flag the same key with different severities, the merged finding is
+// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
+// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
+// order is preserved (a Map keeps a key's original position when its value is replaced).
 function dedupeFindings(findings) {
-  const seen = new Set();
-  return findings.filter(f => {
+  const byKey = new Map();
+  for (const f of findings) {
     const key = `${f.path}:${f.line}:${(f.body || '').slice(0, 60)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
+      byKey.set(key, f);
+    }
+  }
+  return [...byKey.values()];
 }
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
@@ -32218,8 +32229,9 @@ function reviewCharter(toolNames) {
     line you examine, ask "how does this go wrong? what input breaks it? what did the author assume that
     isn't guaranteed?" Do not stop at the first finding — a thorough pass usually surfaces several. A
     miss is far more expensive than a false alarm, so when you are moderately (not fully) sure a line is
-    wrong, still flag it and say what you're unsure of. That latitude is for correctness and security
-    ONLY; for pure style, naming, and formatting, stay silent.
+    wrong, still record it — as an 'advisory' finding (see severity below) — and say what you're unsure
+    of. Recording every genuine issue is the goal; the severity field, not silence, is how you mark one
+    non-blocking. For pure style, naming, and formatting, stay silent.
 
     Hunt in this order — highest cost-of-missing first:
     1. Correctness bugs — the code does not do what it plainly intends. Wrong operator or comparison,
@@ -32249,8 +32261,16 @@ function reviewCharter(toolNames) {
        doing several things, a type that admits illegal states, a fact with two sources of truth that
        can drift, effects tangled through pure logic, a dependency cycle. These map to the [LAW:*] tokens
        in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
-       ship a bug" — a clean-architecture nit never justifies blocking a merge, a correctness bug in
-       ugly-but-working code always does.
+       ship a bug" — record a clean-architecture nit as 'advisory', never blocking; a correctness bug in
+       ugly-but-working code is always 'blocking'.
+
+    Set each finding's severity by where it falls in that list. Categories 1–7 (correctness, edge cases,
+    breakage, security, concurrency, silent failure, resource/lifecycle) default to 'blocking' — they
+    must change before merge. Categories 8–10 (missing tests, performance, architecture/maintainability)
+    default to 'advisory' — record them so they are not lost, but they do not block the merge. A finding
+    you are only moderately sure of is 'advisory', not withheld. Never drop a genuine issue because it is
+    non-blocking; give it the right severity and record it — the action blocks the merge only when at
+    least one finding is 'blocking', so an advisory finding is always safe to record.
 
     Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
     Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Perf, or a [LAW:token] for
@@ -32320,9 +32340,10 @@ ${focusBlock}
     missing guard, a caller you'd break, a value that can't be what this line assumes. Do not form or
     report any judgment until you have read each changed source file in full.
 
-    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for code that should
-    change before merge. Every requested change must use path, line, and body with the displayed LINE
-    value. When the review is complete, call ${toolNames.finishReview} exactly once with a concise
+    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
+    find. Every recorded change must use path, line (the displayed LINE value), body, and severity
+    ('blocking' if it must change before merge, 'advisory' otherwise — see the charter below). When the
+    review is complete, call ${toolNames.finishReview} exactly once with a concise
     summary. The collector tools are the only review output channel; you flag issues, you do not fix them.
 
     Flag any problem this change introduces or is now responsible for — a bug or risk in the code this
@@ -32366,8 +32387,9 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
     working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
 
-    Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
-    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
+    Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
+    there is no diff grid here, so any line is valid), a body, and a severity ('blocking' if it must change
+    before merge, 'advisory' otherwise — see the charter below). When the review is complete, call
     ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
 
     This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.
@@ -32613,10 +32635,11 @@ module.exports = { synthesizeProviderConfig, PROVIDERS, PROVIDER_ALIASES, PROVID
 /***/ }),
 
 /***/ 8959:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+const { severityTaggedBody } = __nccwpck_require__(1565);
 
 // The printed sink for full-repo review mode. There is no pull request to comment on, so
 // findings are rendered as a single Markdown report written to the GitHub Step Summary and
@@ -32642,7 +32665,7 @@ function groupByPath(findings) {
 // One finding rendered as a list item; the body is flattened to a single line so the grouped
 // list stays scannable in the Step Summary.
 function renderFinding(finding) {
-  const body = finding.body.replace(/\s*\n\s*/g, ' ').trim();
+  const body = severityTaggedBody(finding).replace(/\s*\n\s*/g, ' ').trim();
   return `- **line ${finding.line}:** ${body}`;
 }
 
@@ -32690,6 +32713,38 @@ module.exports = { renderRepoReport, groupByPath };
 "use strict";
 
 
+// [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
+// finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
+// finding's real position (the array index for a batch, the record index for a single finding), so an
+// error always identifies the right one. [LAW:single-enforcer] a finding is validated in exactly one
+// place; parseReviewValue and parseFindingValue are two callers of this, not two copies of the rule.
+function parseOneFinding(finding, label) {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    throw new Error(`${label} is not an object.`);
+  }
+  const pathValue = finding.path;
+  const line = finding.line;
+  const body = finding.body;
+  if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
+    throw new Error(`${label} has an invalid path.`);
+  }
+  if (!Number.isInteger(line) || line <= 0) {
+    throw new Error(`${label} has an invalid line.`);
+  }
+  if (typeof body !== 'string' || body.trim().length === 0) {
+    throw new Error(`${label} has an invalid body.`);
+  }
+  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
+  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
+  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
+  // flows to the verdict computation instead. [LAW:no-silent-failure]
+  const severity = finding.severity;
+  if (severity !== 'blocking' && severity !== 'advisory') {
+    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
+  }
+  return { path: pathValue.trim(), line, body: body.trim(), severity };
+}
+
 function parseReviewValue(parsed, context) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${context} has the wrong shape.`);
@@ -32703,37 +32758,14 @@ function parseReviewValue(parsed, context) {
     throw new Error(`${context} must include a findings array.`);
   }
 
-  const findings = parsed.findings.map((finding, index) => {
-    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
-      throw new Error(`Review collector finding ${index + 1} is not an object.`);
-    }
-    const pathValue = finding.path;
-    const line = finding.line;
-    const body = finding.body;
-    if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid path.`);
-    }
-    if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid line.`);
-    }
-    if (typeof body !== 'string' || body.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
-    }
-    return {
-      path: pathValue.trim(),
-      line,
-      body: body.trim(),
-    };
-  });
+  const findings = parsed.findings.map((finding, index) =>
+    parseOneFinding(finding, `Review collector finding ${index + 1}`));
 
   return { summary, findings };
 }
 
 function parseFindingValue(finding, index) {
-  return parseReviewValue({
-    summary: 'collector finding',
-    findings: [finding],
-  }, `Review collector finding ${index + 1}`).findings[0];
+  return parseOneFinding(finding, `Review collector finding ${index + 1}`);
 }
 
 // [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
@@ -32810,7 +32842,20 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine };
+// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
+// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
+// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
+// channel is the body text — this is the one place that string is defined, and all three sinks derive
+// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
+// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
+// whether the finding is shown — every finding is shown; only its label varies.
+function severityTaggedBody(finding) {
+  return finding.severity === 'advisory'
+    ? `**Advisory (non-blocking):** ${finding.body}`
+    : finding.body;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine, severityTaggedBody };
 
 
 /***/ }),
@@ -33209,6 +33254,7 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 const core = __nccwpck_require__(7484);
 const { parseUnifiedDiff } = __nccwpck_require__(9898);
+const { severityTaggedBody } = __nccwpck_require__(1565);
 
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -33276,23 +33322,28 @@ function reviewEvent(requestsChanges, canApprove) {
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${severityTaggedBody(f)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
 
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
-  // verdict, so they cannot disagree. The model never states the verdict. An unanchored
-  // finding is still a finding: it counts toward "request changes" so a mis-anchored real
-  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  // verdict, so they cannot disagree. The model never states the verdict.
+  // [LAW:dataflow-not-control-flow] The verdict is derived from a value carried on each finding —
+  // its severity — not from whether the finding exists. Only BLOCKING findings force
+  // REQUEST_CHANGES; a review of purely advisory findings is APPROVE/COMMENT. An unanchored
+  // blocking finding still counts, so a mis-anchored real blocker can never silently downgrade the
+  // verdict to APPROVE. [LAW:no-silent-failure] Advisory findings are never dropped — they still
+  // post inline (below) and render in the unanchored section, just tagged and non-blocking.
   const unanchored = review.unanchored || [];
-  const requestsChanges = review.findings.length + unanchored.length > 0;
+  const isBlocking = f => f.severity === 'blocking';
+  const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
   const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment(finding));
+  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({

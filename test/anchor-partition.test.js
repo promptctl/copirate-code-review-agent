@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { partitionFindings, nearestAnchorableLine } = require('../src/review');
+const { partitionFindings, nearestAnchorableLine, parseFindingValue, severityTaggedBody } = require('../src/review');
 const { submitReview, gitHubTransport } = require('../src/transport');
 const { buildReviewAnchors } = require('../src/diff');
 
@@ -144,7 +144,7 @@ describe('submitReview — unanchored findings', () => {
     const review = {
       summary: 'Summary text.',
       findings: [],
-      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment' }],
+      unanchored: [{ path: 's.astro', line: 79, body: 'stale doc comment', severity: 'blocking' }],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
     const arg = octokit.calls[0];
@@ -160,7 +160,7 @@ describe('submitReview — unanchored findings', () => {
     const octokit = fakeOctokit();
     const review = {
       summary: 'Summary.',
-      findings: [{ path: 'a.js', line: 10, body: 'fix' }],
+      findings: [{ path: 'a.js', line: 10, body: 'fix', severity: 'blocking' }],
       unanchored: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
@@ -188,5 +188,122 @@ describe('submitReview — unanchored findings', () => {
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT'); // not approvable, no findings
     assert.doesNotMatch(arg.body, /Findings outside the reviewed diff/);
+  });
+});
+
+// ── severity: the discriminator that separates "worth surfacing" from "worth blocking" ────────────
+// [LAW:verifiable-goals] AC: recording a finding no longer forces REQUEST_CHANGES — an advisory
+// finding still posts and still counts, but the verdict blocks only on a 'blocking' finding.
+
+describe('parseFindingValue — severity', () => {
+  test('accepts a blocking finding and carries severity through', () => {
+    assert.deepEqual(
+      parseFindingValue({ path: 'a.js', line: 3, body: 'bug', severity: 'blocking' }, 0),
+      { path: 'a.js', line: 3, body: 'bug', severity: 'blocking' },
+    );
+  });
+  test('accepts an advisory finding', () => {
+    assert.equal(parseFindingValue({ path: 'a.js', line: 3, body: 'nit', severity: 'advisory' }, 0).severity, 'advisory');
+  });
+  test('rejects a missing severity — the field is required', () => {
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x' }, 0), /invalid severity/);
+  });
+  test('rejects an unknown severity value', () => {
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'critical' }, 0), /invalid severity/);
+  });
+  test('the error names the caller-supplied position, not always "finding 1"', () => {
+    // parseFindingValue(index=5) must report "finding 6" — the record's real position — so a bad
+    // finding deep in records.jsonl is locatable, not mislabeled as the first. [LAW:decomposition]
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'nope' }, 5), /finding 6 has an invalid severity/);
+    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 'blocking' }, 2), /finding 3 has an invalid path/);
+  });
+});
+
+describe('severityTaggedBody', () => {
+  test('prefixes an advisory finding so a reader can tell it apart', () => {
+    assert.equal(severityTaggedBody({ body: 'missing test', severity: 'advisory' }), '**Advisory (non-blocking):** missing test');
+  });
+  test('leaves a blocking finding body untagged', () => {
+    assert.equal(severityTaggedBody({ body: 'off-by-one', severity: 'blocking' }), 'off-by-one');
+  });
+});
+
+describe('partitionFindings — severity carried through', () => {
+  test('severity survives an exact anchor and a snap', () => {
+    const anchors = anchorsFor([['a.js', 10], ['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'exact', severity: 'advisory' },
+      { path: 'a.js', line: 14, body: 'near', severity: 'blocking' }, // snaps to 12
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored[0].severity, 'advisory');
+    assert.equal(anchored[1].severity, 'blocking'); // snapped, severity intact
+  });
+});
+
+describe('submitReview — severity drives the verdict, never whether a finding is recorded', () => {
+  test('all-advisory findings APPROVE (canApprove) yet still post inline, tagged', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 'Two non-blocking notes.',
+      findings: [
+        { path: 'a.js', line: 10, body: 'add a test', severity: 'advisory' },
+        { path: 'b.js', line: 20, body: 'could be faster', severity: 'advisory' },
+      ],
+      unanchored: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'APPROVE'); // recording advisory findings does NOT block the merge
+    assert.match(arg.body, /✅ Approved/);
+    assert.equal(arg.comments.length, 2); // advisory findings still post inline
+    assert.match(arg.comments[0].body, /^\*\*Advisory \(non-blocking\):\*\* add a test/);
+  });
+
+  test('all-advisory findings post as COMMENT when the token cannot approve', async () => {
+    const octokit = fakeOctokit();
+    const review = { summary: 's', findings: [{ path: 'a.js', line: 1, body: 'nit', severity: 'advisory' }], unanchored: [] };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, false, gitHubTransport([]));
+    assert.equal(octokit.calls[0].event, 'COMMENT');
+  });
+
+  test('one blocking finding among advisories forces REQUEST_CHANGES', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [
+        { path: 'a.js', line: 10, body: 'nit', severity: 'advisory' },
+        { path: 'b.js', line: 20, body: 'real bug', severity: 'blocking' },
+      ],
+      unanchored: [],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    assert.equal(octokit.calls[0].event, 'REQUEST_CHANGES');
+  });
+
+  test('a blocking UNANCHORED finding still blocks — a mis-anchored blocker cannot downgrade to APPROVE', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [{ path: 'a.js', line: 10, body: 'nit', severity: 'advisory' }],
+      unanchored: [{ path: 'b.js', line: 999, body: 'real bug off-grid', severity: 'blocking' }],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'REQUEST_CHANGES');
+    assert.match(arg.body, /Findings outside the reviewed diff/);
+  });
+
+  test('an advisory unanchored finding is tagged in the summary section', async () => {
+    const octokit = fakeOctokit();
+    const review = {
+      summary: 's',
+      findings: [],
+      unanchored: [{ path: 'b.js', line: 999, body: 'perf note off-grid', severity: 'advisory' }],
+    };
+    await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([]));
+    const arg = octokit.calls[0];
+    assert.equal(arg.event, 'APPROVE'); // advisory-only, even unanchored, does not block
+    assert.match(arg.body, /\*\*Advisory \(non-blocking\):\*\* perf note off-grid/);
   });
 });
