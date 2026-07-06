@@ -1,6 +1,7 @@
 'use strict';
 const core = require('@actions/core');
 const { parseUnifiedDiff } = require('./diff');
+const { severityTaggedBody } = require('./review');
 
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -68,23 +69,28 @@ function reviewEvent(requestsChanges, canApprove) {
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
-    .map(f => `- \`${f.path}:${f.line}\` — ${f.body}`)
+    .map(f => `- \`${f.path}:${f.line}\` — ${severityTaggedBody(f)}`)
     .join('\n');
   return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
 }
 
 async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewerName, review, canApprove, transport, attributionFooter) {
   // [LAW:one-source-of-truth] One boolean drives both the GitHub event and the rendered
-  // verdict, so they cannot disagree. The model never states the verdict. An unanchored
-  // finding is still a finding: it counts toward "request changes" so a mis-anchored real
-  // issue can never silently downgrade the verdict to APPROVE. [LAW:no-silent-failure]
+  // verdict, so they cannot disagree. The model never states the verdict.
+  // [LAW:dataflow-not-control-flow] The verdict is derived from a value carried on each finding —
+  // its severity — not from whether the finding exists. Only BLOCKING findings force
+  // REQUEST_CHANGES; a review of purely advisory findings is APPROVE/COMMENT. An unanchored
+  // blocking finding still counts, so a mis-anchored real blocker can never silently downgrade the
+  // verdict to APPROVE. [LAW:no-silent-failure] Advisory findings are never dropped — they still
+  // post inline (below) and render in the unanchored section, just tagged and non-blocking.
   const unanchored = review.unanchored || [];
-  const requestsChanges = review.findings.length + unanchored.length > 0;
+  const isBlocking = f => f.severity === 'blocking';
+  const requestsChanges = review.findings.some(isBlocking) || unanchored.some(isBlocking);
   const event = reviewEvent(requestsChanges, canApprove);
   const verdict = requestsChanges ? REQUEST_CHANGES_MESSAGE : APPROVED_MESSAGE;
   const footer = attributionFooter ? `\n\n${attributionFooter}` : '';
   const body = `## ${reviewerName}\n\n${review.summary}${renderUnanchoredSection(unanchored)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
-  const comments = review.findings.map(finding => transport.toComment(finding));
+  const comments = review.findings.map(finding => transport.toComment({ ...finding, body: severityTaggedBody(finding) }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
   await octokit.rest.pulls.createReview({

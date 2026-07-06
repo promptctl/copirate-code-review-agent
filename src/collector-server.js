@@ -22,15 +22,16 @@ function collectorTools() {
   return [
     {
       name: 'request_change',
-      description: 'Request a required pre-merge code change anchored to a visible diff line. Do not use for praise, good architecture, neutral observations, optional improvements, style preferences, or non-blocking notes.',
+      description: "Record a code issue anchored to a visible diff line. Set severity 'blocking' if it must change before merge, 'advisory' if it is a genuine issue worth surfacing but need not block the merge (e.g. a missing test, a perf concern, a maintainability problem, or a finding you are only moderately sure of). Record EVERY genuine issue you find at the right severity — do not withhold one because it is non-blocking. Do not use for praise, neutral observations, or pure style/naming preferences.",
       inputSchema: {
         type: 'object',
         properties: {
           path: { type: 'string' },
           line: { type: 'integer' },
           body: { type: 'string' },
+          severity: { type: 'string', enum: ['blocking', 'advisory'] },
         },
-        required: ['path', 'line', 'body'],
+        required: ['path', 'line', 'body', 'severity'],
         additionalProperties: false,
       },
     },

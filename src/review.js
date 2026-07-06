@@ -29,10 +29,21 @@ function parseReviewValue(parsed, context) {
     if (typeof body !== 'string' || body.trim().length === 0) {
       throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
     }
+    // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing"
+    // from "worth blocking a merge". Without it those two facts collapse into the model's private
+    // judgment and a non-blocking finding is silently withheld; as a required enum value it rides on
+    // the record and flows to the verdict computation instead. [LAW:single-enforcer] validated here,
+    // the one boundary every finding crosses (collector record time AND readCollectedReview), so an
+    // absent or unknown severity is rejected identically wherever it enters. [LAW:no-silent-failure]
+    const severity = finding.severity;
+    if (severity !== 'blocking' && severity !== 'advisory') {
+      throw new Error(`Review collector finding ${index + 1} has an invalid severity (expected 'blocking' or 'advisory').`);
+    }
     return {
       path: pathValue.trim(),
       line,
       body: body.trim(),
+      severity,
     };
   });
 
@@ -120,4 +131,17 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine };
+// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
+// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
+// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
+// channel is the body text — this is the one place that string is defined, and all three sinks derive
+// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
+// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
+// whether the finding is shown — every finding is shown; only its label varies.
+function severityTaggedBody(finding) {
+  return finding.severity === 'advisory'
+    ? `**Advisory (non-blocking):** ${finding.body}`
+    : finding.body;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine, severityTaggedBody };
