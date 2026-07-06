@@ -9,6 +9,13 @@ permissions:
   issues: write
   pull-requests: write
 
+# A push during an in-flight review supersedes it: cancel the stale round rather than
+# let it burn the full diff's token cost reviewing an already-replaced commit. Scoped
+# per-PR so concurrent PRs never cancel each other.
+concurrency:
+  group: ai-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     name: Review

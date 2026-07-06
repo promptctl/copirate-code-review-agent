@@ -72,6 +72,10 @@ inputs:
     description: "Max characters of diff sent to the API (0 = unlimited)."
     required: false
     default: "0"
+  MAX_REVIEW_ROUNDS:
+    description: "Max times this action reviews one PR; further pushes skip cleanly, no engine spawned (0 = unlimited). Bounds cost on PRs that are pushed many times."
+    required: false
+    default: "5"
   GITHUB_TOKEN:
     description: "GitHub token for API access."
     required: false

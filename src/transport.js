@@ -55,6 +55,58 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   return giteaTransport(parsed);
 }
 
+// [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER —
+// there is no separate round counter to drift. Count the PR's own marker-bearing reviews; that count
+// equals the number of rounds this action has already spent. The listReviews API is served by GitHub
+// and Gitea alike and the marker lives in the body regardless of host, so counting is host-agnostic —
+// one function, no transport-instance split. [LAW:no-silent-failure] pagination is exhausted so a PR
+// with many reviews is counted in full, never truncated to an undercount that reopens the cost hole.
+async function countPriorReviews(octokit, owner, repo, pullNumber) {
+  let count = 0;
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.pulls.listReviews({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+      page,
+    });
+    // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel
+    // of the body, so match it as the ending — not a loose substring `includes`, which a human review
+    // that merely quotes the marker string would satisfy, over-counting rounds and starving the PR of
+    // further review.
+    count += data.filter(r => typeof r.body === 'string' && r.body.trimEnd().endsWith(REVIEW_MARKER)).length;
+    if (data.length < 100) break;
+    page++;
+  }
+  return count;
+}
+
+// [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
+// fake API. [LAW:dataflow-not-control-flow] The cap is a value, not a mode: maxRounds <= 0 is the
+// documented "unlimited" sentinel (matching MAX_DIFF_CHARS), so there is no separate enable flag.
+// Skip once priorReviews has reached the cap — with maxRounds=5, rounds recorded at priorReviews
+// 0..4 run and the 6th push (priorReviews=5) is skipped, yielding exactly 5 reviews.
+function roundCapReached(priorReviews, maxRounds) {
+  return maxRounds > 0 && priorReviews >= maxRounds;
+}
+
+// [LAW:no-silent-failure] Parse the round cap strictly. The prior `parseInt(raw, 10) || 0` silently
+// turned any non-numeric input (a typo like "five") into 0 = unlimited — DISABLING the cost cap on a
+// misconfiguration, the exact opposite of intent, with no diagnostic. And `parseInt("3x", 10)` → 3
+// caps at a value the user never wrote. [LAW:types-are-the-program] the input's domain is a
+// non-negative integer (0 = unlimited); accept a run of digits, reject everything else loudly. Empty
+// (an explicitly cleared input) is unlimited; unset gets action.yml's "5" default from the runner.
+function parseMaxRounds(raw) {
+  const s = String(raw).trim();
+  if (s === '') return 0;
+  if (!/^\d+$/.test(s)) {
+    throw new Error(`MAX_REVIEW_ROUNDS must be a non-negative integer (0 = unlimited); got "${raw}".`);
+  }
+  return parseInt(s, 10);
+}
+
 // [LAW:dataflow-not-control-flow] A review is ALWAYS posted to the PR. The data
 // (findings present? token approval-capable?) selects only the GitHub event —
 // never whether the message is posted. canApprove gates APPROVE vs COMMENT
@@ -146,4 +198,8 @@ module.exports = {
   submitReview,
   resolveReviewTarget,
   prIsFromFork,
+  countPriorReviews,
+  roundCapReached,
+  parseMaxRounds,
+  REVIEW_MARKER,
 };
