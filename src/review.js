@@ -1,5 +1,37 @@
 'use strict';
 
+// [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
+// finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
+// finding's real position (the array index for a batch, the record index for a single finding), so an
+// error always identifies the right one. [LAW:single-enforcer] a finding is validated in exactly one
+// place; parseReviewValue and parseFindingValue are two callers of this, not two copies of the rule.
+function parseOneFinding(finding, label) {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    throw new Error(`${label} is not an object.`);
+  }
+  const pathValue = finding.path;
+  const line = finding.line;
+  const body = finding.body;
+  if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
+    throw new Error(`${label} has an invalid path.`);
+  }
+  if (!Number.isInteger(line) || line <= 0) {
+    throw new Error(`${label} has an invalid line.`);
+  }
+  if (typeof body !== 'string' || body.trim().length === 0) {
+    throw new Error(`${label} has an invalid body.`);
+  }
+  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
+  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
+  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
+  // flows to the verdict computation instead. [LAW:no-silent-failure]
+  const severity = finding.severity;
+  if (severity !== 'blocking' && severity !== 'advisory') {
+    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
+  }
+  return { path: pathValue.trim(), line, body: body.trim(), severity };
+}
+
 function parseReviewValue(parsed, context) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${context} has the wrong shape.`);
@@ -13,37 +45,14 @@ function parseReviewValue(parsed, context) {
     throw new Error(`${context} must include a findings array.`);
   }
 
-  const findings = parsed.findings.map((finding, index) => {
-    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
-      throw new Error(`Review collector finding ${index + 1} is not an object.`);
-    }
-    const pathValue = finding.path;
-    const line = finding.line;
-    const body = finding.body;
-    if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid path.`);
-    }
-    if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid line.`);
-    }
-    if (typeof body !== 'string' || body.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
-    }
-    return {
-      path: pathValue.trim(),
-      line,
-      body: body.trim(),
-    };
-  });
+  const findings = parsed.findings.map((finding, index) =>
+    parseOneFinding(finding, `Review collector finding ${index + 1}`));
 
   return { summary, findings };
 }
 
 function parseFindingValue(finding, index) {
-  return parseReviewValue({
-    summary: 'collector finding',
-    findings: [finding],
-  }, `Review collector finding ${index + 1}`).findings[0];
+  return parseOneFinding(finding, `Review collector finding ${index + 1}`);
 }
 
 // [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
@@ -120,4 +129,17 @@ function partitionFindings(findings, anchors) {
   return { anchored, unanchored };
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine };
+// [LAW:one-source-of-truth] Severity is a value on the finding; a human reader must be able to tell a
+// blocking request from an advisory note in EVERY sink (inline PR comment, the unanchored summary
+// section, the whole-repo report). GitHub has no "advisory" field on a review comment, so the only
+// channel is the body text — this is the one place that string is defined, and all three sinks derive
+// the presented body from here rather than each restating the tag. [LAW:single-enforcer]
+// [LAW:dataflow-not-control-flow] The tag is a rendering of the severity value, not a branch on
+// whether the finding is shown — every finding is shown; only its label varies.
+function severityTaggedBody(finding) {
+  return finding.severity === 'advisory'
+    ? `**Advisory (non-blocking):** ${finding.body}`
+    : finding.body;
+}
+
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine, severityTaggedBody };

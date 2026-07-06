@@ -14,8 +14,9 @@ function reviewCharter(toolNames) {
     line you examine, ask "how does this go wrong? what input breaks it? what did the author assume that
     isn't guaranteed?" Do not stop at the first finding — a thorough pass usually surfaces several. A
     miss is far more expensive than a false alarm, so when you are moderately (not fully) sure a line is
-    wrong, still flag it and say what you're unsure of. That latitude is for correctness and security
-    ONLY; for pure style, naming, and formatting, stay silent.
+    wrong, still record it — as an 'advisory' finding (see severity below) — and say what you're unsure
+    of. Recording every genuine issue is the goal; the severity field, not silence, is how you mark one
+    non-blocking. For pure style, naming, and formatting, stay silent.
 
     Hunt in this order — highest cost-of-missing first:
     1. Correctness bugs — the code does not do what it plainly intends. Wrong operator or comparison,
@@ -45,8 +46,16 @@ function reviewCharter(toolNames) {
        doing several things, a type that admits illegal states, a fact with two sources of truth that
        can drift, effects tangled through pure logic, a dependency cycle. These map to the [LAW:*] tokens
        in your guidance; cite the token when one fits. These are real, but they rank BELOW "will this
-       ship a bug" — a clean-architecture nit never justifies blocking a merge, a correctness bug in
-       ugly-but-working code always does.
+       ship a bug" — record a clean-architecture nit as 'advisory', never blocking; a correctness bug in
+       ugly-but-working code is always 'blocking'.
+
+    Set each finding's severity by where it falls in that list. Categories 1–7 (correctness, edge cases,
+    breakage, security, concurrency, silent failure, resource/lifecycle) default to 'blocking' — they
+    must change before merge. Categories 8–10 (missing tests, performance, architecture/maintainability)
+    default to 'advisory' — record them so they are not lost, but they do not block the merge. A finding
+    you are only moderately sure of is 'advisory', not withheld. Never drop a genuine issue because it is
+    non-blocking; give it the right severity and record it — the action blocks the merge only when at
+    least one finding is 'blocking', so an advisory finding is always safe to record.
 
     Each ${toolNames.requestChange} body has three parts, in order: (1) a short tag naming the kind —
     Bug, Edge case, Breaking, Security, Race, Silent failure, Resource leak, Perf, or a [LAW:token] for
@@ -116,9 +125,10 @@ ${focusBlock}
     missing guard, a caller you'd break, a value that can't be what this line assumes. Do not form or
     report any judgment until you have read each changed source file in full.
 
-    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for code that should
-    change before merge. Every requested change must use path, line, and body with the displayed LINE
-    value. When the review is complete, call ${toolNames.finishReview} exactly once with a concise
+    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
+    find. Every recorded change must use path, line (the displayed LINE value), body, and severity
+    ('blocking' if it must change before merge, 'advisory' otherwise — see the charter below). When the
+    review is complete, call ${toolNames.finishReview} exactly once with a concise
     summary. The collector tools are the only review output channel; you flag issues, you do not fix them.
 
     Flag any problem this change introduces or is now responsible for — a bug or risk in the code this
@@ -162,8 +172,9 @@ Review this repository for what would hurt if it shipped. There is no diff — t
     at ${reviewedRepoRoot}; explore it yourself using your Read, Grep, and Glob tools against that absolute path (your
     working directory is intentionally outside the repository) and judge the code you find. ${focus}${exclude}
 
-    Call ${toolNames.requestChange} for each issue that should change, with path, line (any real line in that file —
-    there is no diff grid here, so any line is valid), and a body. When the review is complete, call
+    Call ${toolNames.requestChange} for each issue you find, with path, line (any real line in that file —
+    there is no diff grid here, so any line is valid), a body, and a severity ('blocking' if it must change
+    before merge, 'advisory' otherwise — see the charter below). When the review is complete, call
     ${toolNames.finishReview} exactly once with a concise summary. The collector tools are the only review output channel.
 
     This is a whole-repository audit, so PRE-EXISTING issues in any file ARE in scope — that is the point of this mode.

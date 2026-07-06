@@ -7,9 +7,10 @@ write each finding. Follow them; they are authoritative for how you review. This
 secondary structural lens they refer to: the architectural laws.
 
 The laws are **real but secondary** — correctness and safety outrank how the code is *shaped*, so a
-clean-architecture nit never justifies blocking a merge, while a correctness bug in ugly-but-working
-code always does. Flag a genuine structural problem that will cost maintainers, cite its `[LAW:token]`,
-and name the fix. Do not manufacture law findings to fill a review — if the change is correct and safe,
+clean-architecture nit is an *advisory* finding (record it; it does not block the merge), while a
+correctness bug in ugly-but-working code is *blocking*. Flag a genuine structural problem that will cost
+maintainers — record it at 'advisory' severity, cite its `[LAW:token]`, and name the fix — rather than
+withholding it. Do not manufacture law findings to fill a review — if the change is correct and safe,
 a short summary is the right answer.
 
 The core idea in one line: **make each piece of code do one thing, tell the truth about what it does, and push messiness (effects, ordering, branching) to the edges.** Everything below is a specific, checkable version of that.

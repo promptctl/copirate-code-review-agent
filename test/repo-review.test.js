@@ -79,9 +79,9 @@ describe('buildReviewInput repo-root anchoring', () => {
 const REVIEW_WITH_FINDINGS = {
   summary: 'Two issues across the data layer.',
   findings: [
-    { path: 'src/b.js', line: 5, body: 'first b finding' },
-    { path: 'src/a.js', line: 40, body: 'late a finding' },
-    { path: 'src/a.js', line: 10, body: 'early a finding' },
+    { path: 'src/b.js', line: 5, body: 'first b finding', severity: 'blocking' },
+    { path: 'src/a.js', line: 40, body: 'late a finding', severity: 'blocking' },
+    { path: 'src/a.js', line: 10, body: 'early a finding', severity: 'blocking' },
   ],
 };
 
@@ -123,9 +123,22 @@ describe('renderRepoReport', () => {
   });
 
   test('flattens multi-line finding bodies to a single scannable line', () => {
-    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three' }] };
+    const review = { summary: 's', findings: [{ path: 'f.js', line: 1, body: 'line one\n  line two\nline three', severity: 'blocking' }] };
     const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
     assert.match(report, /- \*\*line 1:\*\* line one line two line three/);
+  });
+
+  test('tags an advisory finding so the reader can tell it from a blocking one', () => {
+    const review = {
+      summary: 's',
+      findings: [
+        { path: 'f.js', line: 1, body: 'must fix', severity: 'blocking' },
+        { path: 'f.js', line: 2, body: 'nice to have', severity: 'advisory' },
+      ],
+    };
+    const report = renderRepoReport({ reviewerName: 'R', scope: '', review, footer: '' });
+    assert.match(report, /- \*\*line 2:\*\* \*\*Advisory \(non-blocking\):\*\* nice to have/);
+    assert.match(report, /- \*\*line 1:\*\* must fix/); // blocking stays untagged
   });
 });
 
