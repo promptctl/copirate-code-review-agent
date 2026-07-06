@@ -29965,12 +29965,13 @@ function collectorTools() {
     },
     {
       name: 'add_scope',
-      description: 'Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. Call once per scope. Do not use while reviewing code (use request_change for findings).',
+      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. Call once per scope. Do not use while reviewing code (use request_change for findings).",
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string' },
           focus: { type: 'string' },
+          files: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
         additionalProperties: false,
@@ -31855,7 +31856,6 @@ module.exports = {
 
 "use strict";
 
-const path = __nccwpck_require__(6928);
 const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
 const {
   buildReviewInput,
@@ -31989,56 +31989,58 @@ async function runScopeWorkers({ scopes, runOne, maxConcurrent }) {
 // worker in place rather than failing the whole pass. [LAW:decomposition]
 async function runScopeWorker({ scope, context, material, spawn, log }) {
   const focusText = workerFocusText(scope, context);
-  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames);
+  // [LAW:decomposition] The worker reads its scope's assigned files in full, not the whole changed set;
+  // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
+  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files);
   log(`scope '${scope.name}' starting…`);
   const { summary, findings, usage } = await spawn(buildPromptFor, `scope '${scope.name}'`);
   log(`scope '${scope.name}' done — ${findings.length} finding(s)`);
   return { name: scope.name, summary, findings, usage };
 }
 
-// [LAW:effects-at-boundaries] Pure: does `text` mention `needle` as a whole path token? A "path char" is
-// [\w./-] — the set a filename is built from — so `needle` matches only when it is not flanked by another
-// path char (the lookbehind/lookahead), which rejects substring collisions like 'scope.js' ⊂ 'multiscope.js'
-// and 'app.js' ⊂ 'app.json' while still matching a path delimited by whitespace, quotes, or commas.
-const PATH_CHAR = '[\\w./-]';
-const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-function mentionsToken(text, needle) {
-  return new RegExp(`(?<!${PATH_CHAR})${escapeRegExp(needle)}(?!${PATH_CHAR})`).test(text);
-}
-
 // [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
 // meant to cover, return the scope list the workers actually run — the plan, plus ONE synthetic
-// 'unassigned files' scope whenever the plan's name+focus texts mention neither a changed path nor its
-// basename. [LAW:verifiable-goals] The scout prompt asserts "every changed file belongs to exactly one
-// scope", a done-state with a checkable shape that the engine never checked (its only check was
-// scopes.length === 0). A dropped file is the most common weak-model planning slip; since sibling 598.2
-// stopped workers suppressing out-of-scope findings it is no longer INVISIBLE, but a file with no owning
-// scope still gets no worker reading it in FULL — so this guarantees DEEP coverage, not merely non-zero
-// coverage.
+// 'unassigned files' scope holding any changed path no scope claimed in its `files`. [LAW:verifiable-goals]
+// The scout prompt asserts "every changed file belongs to exactly one scope"; the scope schema now carries
+// that assignment as DATA (scope.files), so coverage is exact SET MEMBERSHIP, not a text-match heuristic.
+// [LAW:types-are-the-program] the representation a machine checks (the assigned-file set) replaced the one
+// we hoped to recover from prose (a path token mentioned somewhere in the focus), and the whole class of
+// substring-collision bugs went with it — no more 'scope.js' ⊂ 'multiscope.js' false positives to guard.
 //
-// [LAW:no-silent-failure] A path is "mentioned" only as a WHOLE path token, never as an incidental
-// substring of a longer filename: plain substring containment would judge 'scope.js' covered by a focus
-// naming 'multiscope.js', or 'app.js' covered by 'app.json', and silently drop the real file from the
-// sweep — a false-positive in the exact mechanism that exists to stop silent drops. mentionsToken anchors
-// the match on path-token boundaries ([\w./-]), so surrounding whitespace/quotes/commas delimit a token
-// but an adjacent letter or extension does not. A near-miss errs toward over-sweeping (the file lands in
-// the catch-all and is reviewed anyway), never toward dropping it.
+// A dropped file is the most common weak-model planning slip: since sibling 598.2 stopped workers
+// suppressing out-of-scope findings it is no longer invisible, but a file no scope claims gets no worker
+// reading it in FULL — so the catch-all guarantees DEEP coverage, not merely non-zero coverage. A path
+// the scout mis-typed (so it matches no changed file) simply lands in the catch-all and is read there:
+// the sweep errs toward over-reading, never toward dropping. [LAW:no-silent-failure]
 //
 // [LAW:dataflow-not-control-flow] The sweep is a value flowing into the same worker pool, not a new
-// engine branch: repo material carries changedPaths = [], so the filter finds nothing and the plan is
+// engine branch: repo material carries changedPaths = [], so nothing is ever swept and the plan is
 // returned unchanged — a no-op by construction, an empty value, not a mode. sweptPaths is returned so
 // the caller can surface scout quality as an observable signal, never a silent correction. [LAW:no-silent-failure]
 function planScopes(scopes, changedPaths) {
-  const covered = scopes.map(s => `${s.name} ${s.focus}`).join('\n');
-  const sweptPaths = changedPaths.filter(
-    p => !mentionsToken(covered, p) && !mentionsToken(covered, path.basename(p)),
-  );
-  if (sweptPaths.length === 0) return { scopes, sweptPaths };
+  const assigned = new Set(scopes.flatMap(s => s.files));
+  const sweptPaths = changedPaths.filter(p => !assigned.has(p));
+  // [LAW:verifiable-goals] The scout promises each changed file appears in EXACTLY one scope. The sweep
+  // catches the lower bound (a file in no scope); this catches the upper bound (a file in two+ scopes),
+  // where two workers each read it in full — the redundant cost the whole change exists to remove. It is
+  // surfaced as an observable value, not silently folded away by the Set above. [LAW:no-silent-failure]
+  const seen = new Set();
+  const recordedDup = new Set();
+  const duplicatePaths = [];
+  for (const p of scopes.flatMap(s => s.files)) {
+    if (seen.has(p) && !recordedDup.has(p)) {
+      recordedDup.add(p);
+      duplicatePaths.push(p); // first-seen order, each duplicate once — O(1) membership, O(n) overall
+    }
+    seen.add(p);
+  }
+  if (sweptPaths.length === 0) return { scopes, sweptPaths, duplicatePaths };
   const catchAll = {
     name: 'unassigned files',
     focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
+    files: sweptPaths,
   };
-  return { scopes: [...scopes, catchAll], sweptPaths };
+  return { scopes: [...scopes, catchAll], sweptPaths, duplicatePaths };
 }
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
@@ -32077,9 +32079,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
   // synthetic catch-all scope so some worker reads them in full. The zero-scope throw above stays
   // FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
-  const { scopes, sweptPaths } = planScopes(scoutResult.scopes, material.changedPaths);
+  const { scopes, sweptPaths, duplicatePaths } = planScopes(scoutResult.scopes, material.changedPaths);
   if (sweptPaths.length > 0) {
     log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
+  }
+  if (duplicatePaths.length > 0) {
+    log(`⚠️ scout assigned ${duplicatePaths.length} changed file(s) to more than one scope; each is read by every claiming worker: ${duplicatePaths.join(', ')}`);
   }
   const context = scoutResult.summary.trim();
 
@@ -32111,8 +32116,9 @@ function runMultiScope({ chain, material, registry, instructionsPath, maxConcurr
 // prompt and a worker prompt from the inputs its mode already has; the engine above is material-blind.
 
 // PR material: the scout is handed the changed file paths; each worker sees the WHOLE annotated diff
-// (so every anchor stays valid) with its scope as the CONCENTRATE focus. files/maxDiffChars are the
-// same values run.js uses to build the anchors, so worker findings and anchors share one diff.
+// (so every anchor stays valid) with its scope as the CONCENTRATE focus, but reads only its scope's
+// assigned files in full. files/maxDiffChars are the same values run.js uses to build the anchors, so
+// worker findings and anchors share one diff.
 function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
   const changedPaths = files.map(f => f.filename);
   return {
@@ -32120,7 +32126,7 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot }) {
     // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
     changedPaths,
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot }).prompt,
-    buildWorkerPrompt: (focusText, toolNames) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText).prompt,
+    buildWorkerPrompt: (focusText, toolNames, scopeFiles) => buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focusText, scopeFiles).prompt,
   };
 }
 
@@ -32132,6 +32138,8 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
     // construction: an empty value flows to planScopes, never a mode. [LAW:dataflow-not-control-flow]
     changedPaths: [],
     buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
+    // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
+    // tree; the scopeFiles arg the PR worker uses is deliberately ignored here. [LAW:dataflow-not-control-flow]
     buildWorkerPrompt: (focusText, toolNames) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
   };
 }
@@ -32360,7 +32368,10 @@ function reviewCharter(toolNames) {
 // multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
 // (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
 // never a branch. The whole annotated diff is shown either way so every anchor stays valid.
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '') {
+// scopeFiles is this worker's assigned changed files: it reads THOSE in full, not the whole changed
+// set, so N workers cost ~1× the read of the changed set (split), not N× (duplicated). Empty scopeFiles
+// is the whole-set read (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = []) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -32395,6 +32406,20 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange} (assigning severity as usual). Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
+  // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
+  // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
+  // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
+  // or repo mode). Either way the whole diff is shown, so cross-file context and report-anywhere are
+  // unchanged — only the expensive full-file reads are partitioned.
+  const readTargets = scopeFiles.length > 0
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
+      + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
+      + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
+      + `You may consult a file your assigned files import when a specific finding needs it: prefer Grep to confirm a symbol or signature `
+      + `over Reading the whole file, and read an imported file in full only when a finding truly requires it. Do not pre-read the tree.`
+    : `Read the complete content of every changed file that contains code — skip only generated or vendored `
+      + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them.`;
+
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
@@ -32402,12 +32427,10 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 ${focusBlock}
-    BEFORE judging anything, Read the complete content of every changed file that contains code — skip
-    only generated or vendored artifacts (bundled or minified output, lockfiles) and pure documentation.
-    Test files count: read them. The diff shows only the changed hunks; most bugs are only visible in the
-    full surrounding context of the function and module — a missing guard, a caller you'd break, a value
-    that can't be what this line assumes. Do not form or report any judgment until you have read each
-    changed code file in full.
+    BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
+    visible in the full surrounding context of the function and module — a missing guard, a caller you'd
+    break, a value that can't be what this line assumes. Do not form or report any judgment until you
+    have read the files you are responsible for in full.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
@@ -32474,12 +32497,20 @@ Review this repository for what would hurt if it shipped. There is no diff — t
 // through request_change — so the plan is never parsed from prose. [FRAMING:representation] The number
 // of scopes is whatever the grouping rules produce — adaptivity is the grouping, never a counted
 // threshold. [LAW:dataflow-not-control-flow]
-function scoutOutputContract(toolNames) {
+// assignFiles adds the `files` field to the contract: in PR mode the scout assigns every changed file
+// to exactly one scope (its worker reads those in full), so the field is required; in repo mode there
+// is no diff to partition, so the contract omits it. [LAW:dataflow-not-control-flow] one contract,
+// varied by a value, not two copies.
+function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
+  const filesField = assignFiles
+    ? `\n      - files: the array of changed file paths this scope owns, copied EXACTLY as listed above. `
+      + `Every changed file must appear in exactly ONE scope's files — the worker for that scope reads those files in full.`
+    : '';
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
-    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE. Each call takes exactly two fields:
+    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
       - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
-      - focus: one or two sentences naming the exact files and what to examine in them.
+      - focus: one or two sentences naming the exact files and what to examine in them.${filesField}
 
     Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
     describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
@@ -32523,7 +32554,9 @@ ${fileList}
     dependency points one way [LAW:one-way-deps] and that no single fact is defined or owned on both sides
     [LAW:one-source-of-truth]; (3) keep it to one or two sentences.
 
-    ${scoutOutputContract(toolNames)}`,
+    Separately, put that group's changed file paths in the scope's "files" field — that is the set the scope's worker reads in full.
+
+    ${scoutOutputContract(toolNames, { assignFiles: true })}`,
   };
 }
 
@@ -32837,9 +32870,15 @@ function parseFindingValue(finding, index) {
 }
 
 // [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
-// finding — a name + focus, both non-empty strings. It is recorded through the collector tool (never
-// parsed from the model's prose), so an empty or malformed scope is rejected here at the one boundary,
-// exactly as a finding is. [LAW:single-enforcer]
+// finding — a name + focus (both non-empty strings) plus the changed files this scope owns. It is
+// recorded through the collector tool (never parsed from the model's prose), so an empty or malformed
+// scope is rejected here at the one boundary, exactly as a finding is. [LAW:single-enforcer]
+//
+// `files` is the scope's changed-file assignment: in PR mode every changed file belongs to exactly one
+// scope and its worker reads those files in full (the read cost is thus split across workers, not
+// duplicated). It is OPTIONAL because the whole-repo scout has no diff to partition — an absent or
+// non-array files is a clean empty list, so a repo scope (or a PR scope the model left unlisted) carries
+// []. Non-string / blank entries are dropped so a sloppy list can't inject an empty path. [LAW:no-silent-failure]
 function parseScopeValue(scope, index) {
   if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
     throw new Error(`Review collector scope ${index + 1} is not an object.`);
@@ -32852,7 +32891,10 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  return { name: name.trim(), focus: focus.trim() };
+  const files = Array.isArray(scope.files)
+    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => f.trim())
+    : [];
+  return { name: name.trim(), focus: focus.trim(), files };
 }
 
 // A finding cited a line within this many lines of a real anchorable line is snapped to

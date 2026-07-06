@@ -56,9 +56,15 @@ function parseFindingValue(finding, index) {
 }
 
 // [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
-// finding — a name + focus, both non-empty strings. It is recorded through the collector tool (never
-// parsed from the model's prose), so an empty or malformed scope is rejected here at the one boundary,
-// exactly as a finding is. [LAW:single-enforcer]
+// finding — a name + focus (both non-empty strings) plus the changed files this scope owns. It is
+// recorded through the collector tool (never parsed from the model's prose), so an empty or malformed
+// scope is rejected here at the one boundary, exactly as a finding is. [LAW:single-enforcer]
+//
+// `files` is the scope's changed-file assignment: in PR mode every changed file belongs to exactly one
+// scope and its worker reads those files in full (the read cost is thus split across workers, not
+// duplicated). It is OPTIONAL because the whole-repo scout has no diff to partition — an absent or
+// non-array files is a clean empty list, so a repo scope (or a PR scope the model left unlisted) carries
+// []. Non-string / blank entries are dropped so a sloppy list can't inject an empty path. [LAW:no-silent-failure]
 function parseScopeValue(scope, index) {
   if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
     throw new Error(`Review collector scope ${index + 1} is not an object.`);
@@ -71,7 +77,10 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  return { name: name.trim(), focus: focus.trim() };
+  const files = Array.isArray(scope.files)
+    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => f.trim())
+    : [];
+  return { name: name.trim(), focus: focus.trim(), files };
 }
 
 // A finding cited a line within this many lines of a real anchorable line is snapped to

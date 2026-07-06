@@ -80,7 +80,10 @@ function reviewCharter(toolNames) {
 // multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
 // (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
 // never a branch. The whole annotated diff is shown either way so every anchor stays valid.
-function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '') {
+// scopeFiles is this worker's assigned changed files: it reads THOSE in full, not the whole changed
+// set, so N workers cost ~1× the read of the changed set (split), not N× (duplicated). Empty scopeFiles
+// is the whole-set read (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
+function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = []) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -115,6 +118,20 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
     ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange} (assigning severity as usual). Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
+  // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
+  // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
+  // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
+  // or repo mode). Either way the whole diff is shown, so cross-file context and report-anywhere are
+  // unchanged — only the expensive full-file reads are partitioned.
+  const readTargets = scopeFiles.length > 0
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
+      + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
+      + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
+      + `You may consult a file your assigned files import when a specific finding needs it: prefer Grep to confirm a symbol or signature `
+      + `over Reading the whole file, and read an imported file in full only when a finding truly requires it. Do not pre-read the tree.`
+    : `Read the complete content of every changed file that contains code — skip only generated or vendored `
+      + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them.`;
+
   return {
     // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
     files: includedFiles,
@@ -122,12 +139,10 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 ${focusBlock}
-    BEFORE judging anything, Read the complete content of every changed file that contains code — skip
-    only generated or vendored artifacts (bundled or minified output, lockfiles) and pure documentation.
-    Test files count: read them. The diff shows only the changed hunks; most bugs are only visible in the
-    full surrounding context of the function and module — a missing guard, a caller you'd break, a value
-    that can't be what this line assumes. Do not form or report any judgment until you have read each
-    changed code file in full.
+    BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
+    visible in the full surrounding context of the function and module — a missing guard, a caller you'd
+    break, a value that can't be what this line assumes. Do not form or report any judgment until you
+    have read the files you are responsible for in full.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
@@ -194,12 +209,20 @@ Review this repository for what would hurt if it shipped. There is no diff — t
 // through request_change — so the plan is never parsed from prose. [FRAMING:representation] The number
 // of scopes is whatever the grouping rules produce — adaptivity is the grouping, never a counted
 // threshold. [LAW:dataflow-not-control-flow]
-function scoutOutputContract(toolNames) {
+// assignFiles adds the `files` field to the contract: in PR mode the scout assigns every changed file
+// to exactly one scope (its worker reads those in full), so the field is required; in repo mode there
+// is no diff to partition, so the contract omits it. [LAW:dataflow-not-control-flow] one contract,
+// varied by a value, not two copies.
+function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
+  const filesField = assignFiles
+    ? `\n      - files: the array of changed file paths this scope owns, copied EXACTLY as listed above. `
+      + `Every changed file must appear in exactly ONE scope's files — the worker for that scope reads those files in full.`
+    : '';
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
-    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE. Each call takes exactly two fields:
+    Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
       - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
-      - focus: one or two sentences naming the exact files and what to examine in them.
+      - focus: one or two sentences naming the exact files and what to examine in them.${filesField}
 
     Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
     describing what this codebase is and how its main parts relate. Do NOT list the scopes in the
@@ -243,7 +266,9 @@ ${fileList}
     dependency points one way [LAW:one-way-deps] and that no single fact is defined or owned on both sides
     [LAW:one-source-of-truth]; (3) keep it to one or two sentences.
 
-    ${scoutOutputContract(toolNames)}`,
+    Separately, put that group's changed file paths in the scope's "files" field — that is the set the scope's worker reads in full.
+
+    ${scoutOutputContract(toolNames, { assignFiles: true })}`,
   };
 }
 

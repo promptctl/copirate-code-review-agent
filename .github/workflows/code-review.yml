@@ -37,6 +37,12 @@ jobs:
           PROVIDER: auto
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ZAI_REVIEWER_NAME: ${{ vars.ZAI_REVIEWER_NAME }}
+          # dist/** is committed BUNDLED output (ncc): every feature PR changes it, and reviewing
+          # the 1.5 MB bundle in full costs ~700K input tokens for zero signal — CI already verifies
+          # dist matches a fresh build of src/. Exclude it so no worker reads generated output.
+          # EXCLUDE_PATTERNS REPLACES the default (it does not append), so the lock-file patterns are
+          # copied from action.yml's EXCLUDE_PATTERNS default — keep them in sync if that default changes.
+          EXCLUDE_PATTERNS: "dist/**,*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
 
       # Archive the full session transcript (prompt + raw engine output incl. thinking/tool
       # calls + stderr) on every run, success or failure. if: always() guarantees it is captured
