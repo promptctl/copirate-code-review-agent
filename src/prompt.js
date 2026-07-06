@@ -122,11 +122,12 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 ${focusBlock}
-    BEFORE judging anything, Read the complete content of every changed source file listed in the diff
-    (files under src/ or scripts/ — not dist/, not docs, not test/). The diff shows only the changed
-    hunks; most bugs are only visible in the full surrounding context of the function and module — a
-    missing guard, a caller you'd break, a value that can't be what this line assumes. Do not form or
-    report any judgment until you have read each changed source file in full.
+    BEFORE judging anything, Read the complete content of every changed file that contains code — skip
+    only generated or vendored artifacts (bundled or minified output, lockfiles) and pure documentation.
+    Test files count: read them. The diff shows only the changed hunks; most bugs are only visible in the
+    full surrounding context of the function and module — a missing guard, a caller you'd break, a value
+    that can't be what this line assumes. Do not form or report any judgment until you have read each
+    changed code file in full.
 
     Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
     find. Every recorded change must use path, line (the displayed LINE value), body, and severity
@@ -197,7 +198,7 @@ function scoutOutputContract(toolNames) {
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE. Each call takes exactly two fields:
-      - name: a short label (for example "cost", "diff-anchoring", or "run→transport" for a boundary).
+      - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
       - focus: one or two sentences naming the exact files and what to examine in them.
 
     Then call ${toolNames.finishReview} exactly once, with a summary of two to four plain sentences
@@ -227,9 +228,9 @@ ${fileList}
     Group the changed files by the ONE concern each serves, and emit exactly ONE scope per group — no more. [LAW:decomposition]:
     a part does one thing, so each group is one concern. A concern is usually the directory a file sits in, but judge by what
     the code DOES, not only where it sits. Read the changed files if you are unsure what they do.
-      - Example: a change to src/usage.js (the price table) and a change to the extractUsage function in
-        src/engine/claude-code.js both serve the cost concern — ONE group, ONE scope, though they are different files.
-      - Example: a change to src/diff.js (line anchoring) and a change to src/report.js (rendering) serve two different
+      - Example: a change to a price table and a change to the function that reads that table both serve the
+        cost concern — ONE group, ONE scope, though they are different files.
+      - Example: a change to line-anchor parsing and a change to report rendering serve two different
         concerns — TWO groups, TWO scopes.
 
     The number of scopes EQUALS the number of distinct concerns these changed files touch: a change to one concern yields
@@ -272,11 +273,10 @@ Plan the review of this repository. There is no diff. The repository under revie
     understand what the parts are and how they relate. Then divide the IN-BOUNDS source into review scopes by this ONE rule.
 
     Group the in-bounds source by the ONE concern each part serves, and emit exactly ONE scope per group — no more.
-    [LAW:decomposition]: a part does one thing, so each group is one concern. A concern is usually a directory (for example
-    src/engine), but judge by what the code DOES, not only where it sits.
-      - Example: src/usage.js (the price table) and the extractUsage function in src/engine/claude-code.js both serve the
-        cost concern — ONE group, ONE scope.
-      - Example: src/diff.js (line anchoring) and src/report.js (rendering) serve two concerns — TWO groups, TWO scopes.
+    [LAW:decomposition]: a part does one thing, so each group is one concern. A concern is usually a single directory,
+    but judge by what the code DOES, not only where it sits.
+      - Example: a price table and the function that reads that table both serve the cost concern — ONE group, ONE scope.
+      - Example: line-anchor parsing and report rendering serve two concerns — TWO groups, TWO scopes.
 
     The number of scopes EQUALS the number of distinct concerns in bounds — nothing else. A small or tightly focused review
     yields few scopes; a whole large repository yields one scope per concern. Do NOT split one concern across several scopes,
