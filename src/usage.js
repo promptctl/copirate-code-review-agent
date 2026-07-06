@@ -80,18 +80,53 @@ function reviewerTag(config) {
 // [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
 // distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
 // tokens with cost "unknown".
-function renderCostLine(usage, config) {
+// [LAW:types-are-the-program] A machine-readable cost record embedded in each review body, so a later
+// round sums prior rounds from a typed value — never by re-parsing the rendered "Cost: $X" prose, which
+// would be a representation re-parsing itself. Rendered as an HTML comment (invisible, like REVIEW_MARKER)
+// and placed in the footer BEFORE REVIEW_MARKER, so the trailing-marker round-count contract is untouched.
+// An unavailable or absent cost records 'unknown' — the round is still counted, its cost just isn't summed.
+const COST_MARKER_RE = /<!-- agent-review-cost-usd:([0-9.]+|unknown) -->/;
+function costMarker(cost) {
+  const value = cost && cost.available ? cost.usd.toFixed(6) : 'unknown';
+  return `<!-- agent-review-cost-usd:${value} -->`;
+}
+function parseCostMarker(body) {
+  if (typeof body !== 'string') return null; // not a marker-bearing body (human review, old review)
+  const m = body.match(COST_MARKER_RE);
+  if (!m) return null;
+  return m[1] === 'unknown' ? 'unknown' : Number(m[1]);
+}
+
+// [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
+// there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
+// clause is a VALUE keyed on the prior-round count, not a second footer format. [LAW:no-silent-failure]
+// a round with unknown cost is NOT dropped from the count — the total carries a '+' and names how many
+// rounds are unpriced, so the PR total is honestly a lower bound rather than a silently-partial sum.
+function renderPrTotal(thisCost, priorCost) {
+  if (!priorCost) return '';
+  const priorRounds = priorCost.knownRounds + priorCost.unknownRounds;
+  if (priorRounds === 0) return '';
+  const totalUsd = priorCost.usd + (thisCost.available ? thisCost.usd : 0);
+  const unknownRounds = priorCost.unknownRounds + (thisCost.available ? 0 : 1);
+  const rounds = priorRounds + 1;
+  const approx = unknownRounds > 0 ? '+' : '';
+  const note = unknownRounds > 0 ? `, ${unknownRounds} with unknown cost` : '';
+  return ` · PR total $${totalUsd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+}
+
+function renderCostLine(usage, config, priorCost = null) {
   if (!usage) return '';
   const tag = reviewerTag(config);
   const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
+  const prTotal = renderPrTotal(usage.cost, priorCost);
   if (!usage.cost.available) {
-    return `_Cost: unknown · ${tokens} · ${tag}_`;
+    return `_Cost: unknown · ${tokens} · ${tag}${prTotal}_`;
   }
   // [FRAMING:representation] Every available cost this action renders is an ESTIMATE, never a billed
   // charge: a table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine
   // Anthropic run is Claude Code's own client-side total_cost_usd. So every line is marked "est."
   // rather than implying exactness.
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est._`;
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est.${prTotal}_`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
@@ -114,6 +149,9 @@ module.exports = {
   PRICES_PER_MILLION,
   computeCostUsd,
   renderCostLine,
+  renderPrTotal,
+  costMarker,
+  parseCostMarker,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,

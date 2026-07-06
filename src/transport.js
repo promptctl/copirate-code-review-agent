@@ -2,6 +2,7 @@
 const core = require('@actions/core');
 const { parseUnifiedDiff } = require('./diff');
 const { severityTaggedBody } = require('./review');
+const { parseCostMarker } = require('./usage');
 
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -55,14 +56,18 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   return giteaTransport(parsed);
 }
 
-// [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER —
-// there is no separate round counter to drift. Count the PR's own marker-bearing reviews; that count
-// equals the number of rounds this action has already spent. The listReviews API is served by GitHub
-// and Gitea alike and the marker lives in the body regardless of host, so counting is host-agnostic —
-// one function, no transport-instance split. [LAW:no-silent-failure] pagination is exhausted so a PR
-// with many reviews is counted in full, never truncated to an undercount that reopens the cost hole.
-async function countPriorReviews(octokit, owner, repo, pullNumber) {
+// [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
+// cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
+// over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
+// PR-total footer), so the two consumers share one fetch. [LAW:decomposition] "summarize this PR's prior
+// agent reviews" is one cohesive concern. The listReviews API is served by GitHub and Gitea alike and
+// both markers live in the body regardless of host, so this is host-agnostic. [LAW:no-silent-failure]
+// pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
+async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   let count = 0;
+  let usd = 0;
+  let knownRounds = 0;
+  let unknownRounds = 0;
   let page = 1;
   while (true) {
     const { data } = await octokit.rest.pulls.listReviews({
@@ -72,15 +77,20 @@ async function countPriorReviews(octokit, owner, repo, pullNumber) {
       per_page: 100,
       page,
     });
-    // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel
-    // of the body, so match it as the ending — not a loose substring `includes`, which a human review
-    // that merely quotes the marker string would satisfy, over-counting rounds and starving the PR of
-    // further review.
-    count += data.filter(r => typeof r.body === 'string' && r.body.trimEnd().endsWith(REVIEW_MARKER)).length;
+    for (const r of data) {
+      const body = typeof r.body === 'string' ? r.body : '';
+      // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel,
+      // so match it as the ending — not a loose `includes`, which a human review quoting the marker
+      // would satisfy, over-counting rounds and starving the PR of further review.
+      if (body.trimEnd().endsWith(REVIEW_MARKER)) count++;
+      const cost = parseCostMarker(body); // null (no marker), 'unknown', or a number
+      if (cost === 'unknown') unknownRounds++;
+      else if (typeof cost === 'number') { usd += cost; knownRounds++; }
+    }
     if (data.length < 100) break;
     page++;
   }
-  return count;
+  return { count, cost: { usd, knownRounds, unknownRounds } };
 }
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
@@ -198,7 +208,7 @@ module.exports = {
   submitReview,
   resolveReviewTarget,
   prIsFromFork,
-  countPriorReviews,
+  summarizePriorReviews,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,
