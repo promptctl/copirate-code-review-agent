@@ -76,7 +76,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_API_KEY` | — | Required for `zai`. |
 | `ZAI_MODEL` | `glm-5.1` | Model for the `zai` provider. |
 | `ZAI_BASE_URL` | `https://api.z.ai/api/anthropic` | Anthropic-compatible endpoint for `zai`. |
-| `ZAI_SYSTEM_PROMPT` | *(built-in law-review prompt)* | Extra system prompt appended to the reviewer for the `zai` provider. |
+| `ZAI_SYSTEM_PROMPT` | — | Optional extra system prompt appended to the reviewer for the `zai` provider. Empty by default; the built-in review charter already carries the whole review standard. |
 | `OPENAI_API_KEY` | — | Required for `codex`. |
 | `OPENAI_MODEL` | `gpt-5.4-mini` | Model for the `codex` provider. |
 | `OPENAI_REASONING_EFFORT` | — | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
