@@ -506,3 +506,39 @@ describe('buildReviewInput focus', () => {
     assert.doesNotMatch(prompt, /Other parts are reviewed separately/);
   });
 });
+
+// ── shipped prompts carry NO reviewed-repo layout (598.4) ─────────────────────────────────────────
+// The action reviews arbitrary repos; the reviewed repo's layout is a fact of the INPUT, not a constant
+// of the prompt. Baking THIS repo's directories (src/, scripts/) and filenames into the generic prompts
+// taught weak models on consumer repos to read shallow (nothing "qualifies" for a full read) and to
+// hallucinate groupings around files that do not exist there. These prompts must name invariant
+// CATEGORIES, never this repo's instances of them. [FRAMING:representation]
+describe('shipped prompts carry no reviewed-repo layout', () => {
+  // Inputs deliberately carry NONE of the hunted tokens, so any src/|scripts/|dist/ match below can only
+  // be baked-in template text — never echoed input. (This is the 598.3 discipline: test the template by
+  // feeding it inputs free of what you are hunting.)
+  const NEUTRAL_FILES = [{ filename: 'lib/thing.go', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x := 1' }];
+  const review = buildReviewInput(NEUTRAL_FILES, 0, TOOL_NAMES, REPO_ROOT).prompt;
+  const prScout = buildPrScoutInput({ changedPaths: ['lib/thing.go', 'app/main.rb'], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
+  const repoScout = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
+
+  test('none of the three prompts hardcode a reviewed-repo path (src/, scripts/, dist/, or a src/*.js file)', () => {
+    for (const [name, prompt] of [['review', review], ['prScout', prScout], ['repoScout', repoScout]]) {
+      assert.doesNotMatch(prompt, /(?:src|scripts|dist)\//, `${name} prompt must not name this repo's directories`);
+    }
+  });
+
+  test('the read instruction is layout-neutral: every changed code file, tests included', () => {
+    assert.match(review, /every changed file that contains code/);
+    assert.match(review, /Test files count: read them/);
+    // The old layout-specific instruction must be gone.
+    assert.doesNotMatch(review, /files under src/);
+  });
+
+  test('both scouts teach concern-grouping with abstract examples, not this repo\'s filenames', () => {
+    assert.match(prScout, /the function that reads that table/);
+    assert.match(prScout, /line-anchor parsing and a change to report rendering/);
+    assert.match(repoScout, /a price table and the function that reads that table/);
+    assert.match(repoScout, /line-anchor parsing and report rendering/);
+  });
+});

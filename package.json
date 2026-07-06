@@ -1,6 +1,6 @@
 {
   "name": "coding-agent-review",
-  "version": "1.26.2",
+  "version": "1.26.3",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
   "license": "MIT",
   "repository": {
