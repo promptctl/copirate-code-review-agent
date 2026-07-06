@@ -26,6 +26,12 @@ The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Clau
      issues: write
      pull-requests: write
 
+   # Cancel an in-flight review when a new commit is pushed, so a rapid
+   # push loop doesn't pay for reviews of commits that are already replaced.
+   concurrency:
+     group: ai-code-review-${{ github.event.pull_request.number }}
+     cancel-in-progress: true
+
    jobs:
      review:
        runs-on: ubuntu-latest
@@ -88,6 +94,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_REVIEWER_NAME` | `CoPirate Code Review` | Name shown in the review comment header (applies to every provider; the `ZAI_` prefix is historical). |
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
+| `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |

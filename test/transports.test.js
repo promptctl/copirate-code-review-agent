@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
@@ -62,6 +62,99 @@ describe('prIsFromFork', () => {
   test('missing base repo fails loud (malformed PR data, not a silent skip)', () => {
     const pr = { head: { repo: { id: 100 } }, base: {} };
     assert.throws(() => prIsFromFork(pr), /no base repository/);
+  });
+});
+
+describe('roundCapReached', () => {
+  test('not reached below the cap', () => {
+    assert.equal(roundCapReached(4, 5), false);
+  });
+
+  test('reached exactly at the cap (yields exactly maxRounds reviews)', () => {
+    assert.equal(roundCapReached(5, 5), true);
+  });
+
+  test('reached above the cap', () => {
+    assert.equal(roundCapReached(6, 5), true);
+  });
+
+  test('maxRounds 0 is the unlimited sentinel — never reached', () => {
+    assert.equal(roundCapReached(0, 0), false);
+    assert.equal(roundCapReached(1000, 0), false);
+  });
+
+  test('negative maxRounds is treated as unlimited, never reached', () => {
+    assert.equal(roundCapReached(1000, -1), false);
+  });
+
+  test('zero prior reviews under a positive cap always runs', () => {
+    assert.equal(roundCapReached(0, 5), false);
+  });
+});
+
+describe('parseMaxRounds', () => {
+  test('a run of digits parses to that integer', () => {
+    assert.equal(parseMaxRounds('5'), 5);
+    assert.equal(parseMaxRounds('0'), 0);
+    assert.equal(parseMaxRounds('42'), 42);
+  });
+
+  test('surrounding whitespace is trimmed', () => {
+    assert.equal(parseMaxRounds('  7 '), 7);
+  });
+
+  test('empty (explicitly cleared) is the unlimited sentinel 0', () => {
+    assert.equal(parseMaxRounds(''), 0);
+    assert.equal(parseMaxRounds('   '), 0);
+  });
+
+  test('[LAW:no-silent-failure] non-numeric input throws — never silently becomes 0/unlimited', () => {
+    assert.throws(() => parseMaxRounds('five'), /non-negative integer/);
+    assert.throws(() => parseMaxRounds('abc'), /got "abc"/);
+  });
+
+  test('[LAW:no-silent-failure] a partly-numeric value throws rather than parseInt-truncating to a cap the user never wrote', () => {
+    assert.throws(() => parseMaxRounds('3x'), /non-negative integer/);
+    assert.throws(() => parseMaxRounds('3abc'), /non-negative integer/);
+  });
+
+  test('a negative value is rejected (not a non-negative integer)', () => {
+    assert.throws(() => parseMaxRounds('-1'), /non-negative integer/);
+  });
+});
+
+describe('countPriorReviews', () => {
+  // A fake octokit whose listReviews returns fixed pages; asserts the marker filter and pagination.
+  const fakeOctokit = (pages) => ({
+    rest: { pulls: { listReviews: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
+  });
+
+  test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
+    const octokit = fakeOctokit([[
+      { body: `some verdict\n\n${REVIEW_MARKER}` },
+      { body: 'a human review, no marker' },
+      { body: `another round\n\n${REVIEW_MARKER}\n` }, // trailing whitespace tolerated
+      { body: null }, // dismissed/empty review body
+    ]]);
+    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 2);
+  });
+
+  test('a human review that merely QUOTES the marker mid-body is not counted', async () => {
+    const octokit = fakeOctokit([[
+      { body: `I see the action posts \`${REVIEW_MARKER}\` — but here is my own comment.` },
+      { body: `real round\n\n${REVIEW_MARKER}` },
+    ]]);
+    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 1);
+  });
+
+  test('returns 0 when the PR has no reviews', async () => {
+    assert.equal(await countPriorReviews(fakeOctokit([[]]), 'o', 'r', 1), 0);
+  });
+
+  test('exhausts pagination — a full first page forces a second fetch', async () => {
+    const full = Array.from({ length: 100 }, () => ({ body: REVIEW_MARKER }));
+    const octokit = fakeOctokit([full, [{ body: REVIEW_MARKER }, { body: 'no marker' }]]);
+    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 101);
   });
 });
 
