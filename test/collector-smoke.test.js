@@ -128,18 +128,21 @@ test('collector smoke: a scout records scopes via add_scope and readCollectedRev
   try {
     await rpc(child, 1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0.0.1' } });
 
-    // A scout planning a review: two add_scope calls, then finish_review with structural prose.
-    const s1 = await rpc(child, 2, 'tools/call', { name: 'add_scope', arguments: { name: 'cost', focus: 'src/usage.js — the price table' } });
+    // A scout planning a review: two add_scope calls, then finish_review with structural prose. The
+    // first assigns its changed files (PR mode); the second omits files (verifying the [] default).
+    const s1 = await rpc(child, 2, 'tools/call', { name: 'add_scope', arguments: { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'] } });
     assert.ok(!s1.error, `add_scope must not error: ${JSON.stringify(s1.error)}`);
-    await rpc(child, 3, 'tools/call', { name: 'add_scope', arguments: { name: 'run→transport', focus: 'src/run.js → src/transport.js boundary' } });
+    await rpc(child, 3, 'tools/call', { name: 'add_scope', arguments: { name: 'run→transport', focus: 'the run→transport boundary' } });
     await rpc(child, 4, 'tools/call', { name: 'finish_review', arguments: { summary: 'A code-review GitHub Action.' } });
 
     // readCollectedReview returns scopes as typed records, findings empty — never parsed from prose.
     const review = readCollectedReview(recordsPath);
     assert.deepEqual(review.findings, []);
     assert.equal(review.scopes.length, 2);
-    assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'src/usage.js — the price table' });
+    assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'] });
     assert.equal(review.scopes[1].name, 'run→transport');
+    assert.equal(review.scopes[1].focus, 'the run→transport boundary');
+    assert.deepEqual(review.scopes[1].files, []); // files omitted → clean empty assignment
     assert.equal(review.summary, 'A code-review GitHub Action.');
   } finally {
     child.kill();

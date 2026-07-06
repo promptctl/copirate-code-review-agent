@@ -29,8 +29,23 @@ const REPO_ROOT = '/home/runner/work/acme/acme';
 // validation lives at the same boundary as a finding's, never in a bracket scanner.
 
 describe('parseScopeValue', () => {
-  test('accepts a {name, focus} record and trims both fields', () => {
-    assert.deepEqual(parseScopeValue({ name: ' cost ', focus: ' src/usage.js ' }, 0), { name: 'cost', focus: 'src/usage.js' });
+  test('accepts a {name, focus} record, trims both fields, defaults files to []', () => {
+    assert.deepEqual(parseScopeValue({ name: ' cost ', focus: ' src/usage.js ' }, 0), { name: 'cost', focus: 'src/usage.js', files: [] });
+  });
+  test('parses and trims the files array when present', () => {
+    assert.deepEqual(
+      parseScopeValue({ name: 'cost', focus: 'x', files: [' src/usage.js ', 'src/report.js'] }, 0),
+      { name: 'cost', focus: 'x', files: ['src/usage.js', 'src/report.js'] },
+    );
+  });
+  test('drops non-string / blank file entries rather than injecting an empty path', () => {
+    assert.deepEqual(
+      parseScopeValue({ name: 'a', focus: 'x', files: ['a.js', '', '  ', 42, null] }, 0).files,
+      ['a.js'],
+    );
+  });
+  test('a non-array files field is treated as no assignment ([])', () => {
+    assert.deepEqual(parseScopeValue({ name: 'a', focus: 'x', files: 'a.js' }, 0).files, []);
   });
   test('rejects a missing/empty name', () => {
     assert.throws(() => parseScopeValue({ focus: 'x' }, 0), /invalid name/);
@@ -268,18 +283,19 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   });
 });
 
-// ── planScopes — mechanical scout-coverage verification (598.3) ──────────────────────────────────
-// The scout prompt promises every changed file belongs to a scope; planScopes is the check that was
-// missing. A path mentioned in no scope's name/focus is swept into ONE synthetic 'unassigned files'
-// scope so some worker reads it in full — DEEP coverage guaranteed as a value, not left to the plan.
+// ── planScopes — mechanical scout-coverage verification (598.3, now file-set based) ───────────────
+// The scout assigns every changed file to a scope via scope.files; planScopes verifies that assignment
+// by EXACT set membership. A changed path no scope claimed is swept into ONE synthetic 'unassigned
+// files' scope (carrying those paths in its own files) so some worker reads it in full — DEEP coverage
+// guaranteed as a value, not left to the plan or recovered from prose.
 
 describe('planScopes', () => {
   const scopes = [
-    { name: 'cost', focus: 'src/usage.js pricing math' },
-    { name: 'transport', focus: 'GitHub review submission' },
+    { name: 'cost', focus: 'pricing math', files: ['src/usage.js'] },
+    { name: 'transport', focus: 'GitHub review submission', files: ['src/transport.js'] },
   ];
 
-  test('a changed path mentioned in no scope is swept into one synthetic scope + reported', () => {
+  test('a changed path claimed by no scope is swept into one synthetic scope + reported', () => {
     const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js', 'src/report.js']);
     assert.deepEqual(sweptPaths, ['src/report.js']);
     assert.equal(planned.length, 3);
@@ -287,19 +303,19 @@ describe('planScopes', () => {
     assert.equal(synthetic.name, 'unassigned files');
     assert.match(synthetic.focus, /src\/report\.js/);
     assert.match(synthetic.focus, /Review their changes fully/);
+    assert.deepEqual(synthetic.files, ['src/report.js']); // the catch-all carries its own files to read
   });
 
-  test('a path covered only by its basename counts as covered (lenient textual match)', () => {
-    const { scopes: planned, sweptPaths } = planScopes(
-      [{ name: 'cost', focus: 'the usage.js pricing table' }],
+  test('coverage is exact set membership — a path is covered iff it appears in some scope.files', () => {
+    const { sweptPaths } = planScopes(
+      [{ name: 'cost', focus: 'the usage table', files: ['src/usage.js'] }],
       ['src/usage.js'],
     );
     assert.deepEqual(sweptPaths, []);
-    assert.equal(planned.length, 1);
   });
 
   test('full coverage yields no synthetic scope and returns the plan array unchanged', () => {
-    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js']);
+    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js', 'src/transport.js']);
     assert.deepEqual(sweptPaths, []);
     assert.equal(planned, scopes); // same reference — no rebuild when nothing is swept
   });
@@ -310,38 +326,48 @@ describe('planScopes', () => {
     assert.equal(planned, scopes);
   });
 
-  // Regression (PR #70 review): whole-token matching, not substring containment. A basename that is a
-  // substring of a LONGER filename mentioned in a scope must NOT count as covered — otherwise the real
-  // file is silently dropped from the sweep, a false-positive in the anti-silent-drop mechanism itself.
-  test("'scope.js' is NOT covered by a scope that only mentions 'multiscope.js' (substring collision)", () => {
+  // A path mentioned in a scope's prose but NOT listed in its files is uncovered — the assignment is the
+  // files field, not the focus text. This is the exactness the file-set model buys over text-matching:
+  // no substring collisions, and no "mentioned in passing" false positives either.
+  test('a path named only in focus prose but absent from scope.files is swept', () => {
     const { sweptPaths } = planScopes(
-      [{ name: 'engine', focus: 'Review src/multiscope.js worker orchestration' }],
+      [{ name: 'engine', focus: 'Review src/multiscope.js and its neighbor src/scope.js', files: ['src/multiscope.js'] }],
       ['src/scope.js'],
     );
-    assert.deepEqual(sweptPaths, ['src/scope.js']); // swept, not falsely judged covered
+    assert.deepEqual(sweptPaths, ['src/scope.js']);
   });
 
-  test("'app.js' is NOT covered by a scope that only mentions 'app.json' (extension-prefix collision)", () => {
-    const { sweptPaths } = planScopes(
-      [{ name: 'config', focus: 'the app.json manifest' }],
-      ['src/app.js'],
-    );
-    assert.deepEqual(sweptPaths, ['src/app.js']);
-  });
-
-  test('a path named as a whole token (even flanked by punctuation) IS covered', () => {
-    const { sweptPaths } = planScopes(
-      [{ name: 'render', focus: 'changes in `src/report.js`, plus its callers' }],
-      ['src/report.js'],
-    );
-    assert.deepEqual(sweptPaths, []);
-  });
-
-  test('all unmentioned paths land in ONE synthetic scope, never one scope each', () => {
+  test('all unassigned paths land in ONE synthetic scope, never one scope each', () => {
     const { scopes: planned, sweptPaths } = planScopes(scopes, ['a.js', 'b.js', 'c.js']);
     assert.deepEqual(sweptPaths, ['a.js', 'b.js', 'c.js']);
     assert.equal(planned.length, 3); // 2 planned + exactly 1 catch-all
     assert.match(planned[2].focus, /a\.js, b\.js, c\.js/);
+    assert.deepEqual(planned[2].files, ['a.js', 'b.js', 'c.js']);
+  });
+
+  test('a file claimed by two scopes (over-assignment) is reported as a duplicate', () => {
+    const overlap = [
+      { name: 'a', focus: 'x', files: ['src/shared.js', 'src/a.js'] },
+      { name: 'b', focus: 'y', files: ['src/shared.js', 'src/b.js'] },
+    ];
+    const { duplicatePaths, sweptPaths } = planScopes(overlap, ['src/shared.js', 'src/a.js', 'src/b.js']);
+    assert.deepEqual(duplicatePaths, ['src/shared.js']); // read by both workers — the redundant cost
+    assert.deepEqual(sweptPaths, []); // every changed file is covered (by at least one scope)
+  });
+
+  test('no over-assignment yields an empty duplicatePaths', () => {
+    const { duplicatePaths } = planScopes(scopes, ['src/usage.js', 'src/transport.js']);
+    assert.deepEqual(duplicatePaths, []);
+  });
+
+  test('a file claimed by THREE scopes appears exactly once in duplicatePaths', () => {
+    const triple = [
+      { name: 'a', focus: 'x', files: ['src/shared.js'] },
+      { name: 'b', focus: 'y', files: ['src/shared.js'] },
+      { name: 'c', focus: 'z', files: ['src/shared.js'] },
+    ];
+    const { duplicatePaths } = planScopes(triple, ['src/shared.js']);
+    assert.deepEqual(duplicatePaths, ['src/shared.js']); // once, not twice — the includes() guard holds
   });
 });
 
@@ -370,7 +396,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     });
 
   test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
-    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js' }]);
+    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js', files: ['a.js'] }]);
     const logs = [];
     await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
     assert.ok(seen.some(p => p.includes('unassigned files') && p.includes('b.js')), 'synthetic worker ran for b.js');
@@ -378,7 +404,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
   });
 
   test('full coverage runs no synthetic worker and logs no sweep warning', async () => {
-    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js' }, { name: 'b', focus: 'b.js' }]);
+    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js', files: ['a.js'] }, { name: 'b', focus: 'b.js', files: ['b.js'] }]);
     const logs = [];
     await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
     assert.ok(!seen.some(p => p.includes('unassigned files')));
@@ -386,11 +412,21 @@ describe('runMultiScopePass — scout coverage sweep', () => {
   });
 
   test('repo material (changedPaths: []) never sweeps even when the scout plans one scope', async () => {
-    const { registry, seen } = registryFor([{ name: 'whole', focus: 'everything' }]);
+    const { registry, seen } = registryFor([{ name: 'whole', focus: 'everything', files: [] }]);
     const logs = [];
     await runWith({ registry, changedPaths: [], log: (m) => logs.push(m) });
     assert.ok(!seen.some(p => p.includes('unassigned files')));
     assert.ok(!logs.some(m => /unassigned/.test(m)));
+  });
+
+  test('a file over-assigned to two scopes logs the duplicate warning at the pass level', async () => {
+    const { registry } = registryFor([
+      { name: 'a', focus: 'a', files: ['shared.js', 'a.js'] },
+      { name: 'b', focus: 'b', files: ['shared.js', 'b.js'] },
+    ]);
+    const logs = [];
+    await runWith({ registry, changedPaths: ['shared.js', 'a.js', 'b.js'], log: (m) => logs.push(m) });
+    assert.ok(logs.some(m => /more than one scope/.test(m) && m.includes('shared.js')), 'warns naming the doubly-claimed file');
   });
 });
 
@@ -416,6 +452,24 @@ describe('buildPrMaterial', () => {
     const prompt = material.buildWorkerPrompt('cost — src/usage.js', TOOL_NAMES);
     assert.match(prompt, /CONCENTRATE THIS REVIEW on one part of the change: cost — src\/usage\.js/);
     assert.match(prompt, /```diff/);
+  });
+
+  test('with assigned scopeFiles, the worker is told to read ONLY those in full (not the whole set)', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js', 'src/report.js']);
+    assert.match(prompt, /Read the complete content of THESE files/);
+    assert.match(prompt, /src\/usage\.js, src\/report\.js/);
+    assert.match(prompt, /Another scope's worker reads the other changed files/);
+    // roaming is bounded: prefer Grep for imports, don't pre-read the tree
+    assert.match(prompt, /prefer Grep/);
+    assert.match(prompt, /Do not pre-read the tree/);
+    // the whole diff is still shown (report-anywhere + anchor validity preserved)
+    assert.match(prompt, /```diff/);
+  });
+
+  test('with no assigned files (single-scope PR), the worker reads every changed file in full', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    assert.match(prompt, /Read the complete content of every changed file/);
+    assert.doesNotMatch(prompt, /Read the complete content of THESE files/);
   });
 });
 
@@ -457,6 +511,15 @@ describe('scout prompts carry no size threshold', () => {
     assert.match(prScout, /do NOT create a separate scope for a boundary/);
     assert.match(repoScout, /do NOT create a separate scope for a boundary/);
     assert.match(prScout, /ALSO read the files this group imports/);
+  });
+
+  test('the PR scout assigns changed files to scopes (files field); the repo scout does not', () => {
+    // PR mode partitions the diff so each worker reads only its files; repo mode has no diff to assign.
+    // The contract describes the fields to provide rather than asserting an exact count — the tool
+    // schema always makes files optional, so "exactly two/three fields" would misrepresent it.
+    assert.match(prScout, /files: the array of changed file paths this scope owns/);
+    assert.doesNotMatch(repoScout, /files: the array of changed file paths/);
+    assert.doesNotMatch(prScout, /exactly (two|three) fields/);
   });
 
   test('both forward the engine tool identifiers (incl. add_scope), never hardcoded names', () => {
