@@ -408,6 +408,16 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     assert.ok(!seen.some(p => p.includes('unassigned files')));
     assert.ok(!logs.some(m => /unassigned/.test(m)));
   });
+
+  test('a file over-assigned to two scopes logs the duplicate warning at the pass level', async () => {
+    const { registry } = registryFor([
+      { name: 'a', focus: 'a', files: ['shared.js', 'a.js'] },
+      { name: 'b', focus: 'b', files: ['shared.js', 'b.js'] },
+    ]);
+    const logs = [];
+    await runWith({ registry, changedPaths: ['shared.js', 'a.js', 'b.js'], log: (m) => logs.push(m) });
+    assert.ok(logs.some(m => /more than one scope/.test(m) && m.includes('shared.js')), 'warns naming the doubly-claimed file');
+  });
 });
 
 // ── materials — closures that build the real engine prompts ──────────────────────────────────────

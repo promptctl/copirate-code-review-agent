@@ -141,6 +141,7 @@ test('collector smoke: a scout records scopes via add_scope and readCollectedRev
     assert.equal(review.scopes.length, 2);
     assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'] });
     assert.equal(review.scopes[1].name, 'run→transport');
+    assert.equal(review.scopes[1].focus, 'the run→transport boundary');
     assert.deepEqual(review.scopes[1].files, []); // files omitted → clean empty assignment
     assert.equal(review.summary, 'A code-review GitHub Action.');
   } finally {
