@@ -31905,14 +31905,24 @@ function workerFocusText(scope, context) {
 // [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
 // two adjacent scopes can both touch a shared file. Keyed by path:line:body-prefix — the same key the
 // printed report and the PR review treat as "the same finding". [LAW:one-source-of-truth]
+//
+// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
+// to arrival order: when two workers flag the same key with different severities, the merged finding is
+// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
+// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
+// order is preserved (a Map keeps a key's original position when its value is replaced).
 function dedupeFindings(findings) {
-  const seen = new Set();
-  return findings.filter(f => {
+  const byKey = new Map();
+  for (const f of findings) {
     const key = `${f.path}:${f.line}:${(f.body || '').slice(0, 60)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
+      byKey.set(key, f);
+    }
+  }
+  return [...byKey.values()];
 }
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
