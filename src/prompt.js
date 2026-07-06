@@ -105,11 +105,14 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
   }
 
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
-  // concentration instruction. The worker still sees the whole diff (anchors stay valid) and reads
-  // for cross-file context, but reports only what belongs to its scope; overlap is de-duplicated when
-  // scopes' findings merge.
+  // concentration instruction. The worker sees the whole diff (anchors stay valid) and concentrates
+  // its deepest reading on the named part, but records EVERY genuine issue it notices anywhere —
+  // suppressing out-of-scope findings would be control flow ("don't run the report") solving a problem
+  // the pipeline already solves as dataflow: overlap is de-duplicated when scopes' findings merge
+  // (dedupeFindings), so a finding another worker may also catch costs nothing to report and is never
+  // silently withheld. [LAW:no-silent-failure]
   const focusBlock = focus
-    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below for context, but only flag issues that belong to that part. Other parts are reviewed separately.\n`
+    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The whole diff is shown below both for context and because you must not stay silent about a real bug just because it falls outside this part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange} (assigning severity as usual). Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
   return {
