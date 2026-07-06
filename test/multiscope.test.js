@@ -359,6 +359,16 @@ describe('planScopes', () => {
     const { duplicatePaths } = planScopes(scopes, ['src/usage.js', 'src/transport.js']);
     assert.deepEqual(duplicatePaths, []);
   });
+
+  test('a file claimed by THREE scopes appears exactly once in duplicatePaths', () => {
+    const triple = [
+      { name: 'a', focus: 'x', files: ['src/shared.js'] },
+      { name: 'b', focus: 'y', files: ['src/shared.js'] },
+      { name: 'c', focus: 'z', files: ['src/shared.js'] },
+    ];
+    const { duplicatePaths } = planScopes(triple, ['src/shared.js']);
+    assert.deepEqual(duplicatePaths, ['src/shared.js']); // once, not twice — the includes() guard holds
+  });
 });
 
 // ── the sweep actually reaches the worker pool (end-to-end through runMultiScopePass) ─────────────
