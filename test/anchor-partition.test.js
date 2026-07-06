@@ -211,6 +211,12 @@ describe('parseFindingValue — severity', () => {
   test('rejects an unknown severity value', () => {
     assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'critical' }, 0), /invalid severity/);
   });
+  test('the error names the caller-supplied position, not always "finding 1"', () => {
+    // parseFindingValue(index=5) must report "finding 6" — the record's real position — so a bad
+    // finding deep in records.jsonl is locatable, not mislabeled as the first. [LAW:decomposition]
+    assert.throws(() => parseFindingValue({ path: 'a.js', line: 3, body: 'x', severity: 'nope' }, 5), /finding 6 has an invalid severity/);
+    assert.throws(() => parseFindingValue({ path: '', line: 3, body: 'x', severity: 'blocking' }, 2), /finding 3 has an invalid path/);
+  });
 });
 
 describe('severityTaggedBody', () => {

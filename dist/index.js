@@ -32713,6 +32713,38 @@ module.exports = { renderRepoReport, groupByPath };
 "use strict";
 
 
+// [LAW:decomposition] The single per-finding validator: one job — turn one raw record into a typed
+// finding or throw. Both entry points below call it, each supplying the `label` IT knows names the
+// finding's real position (the array index for a batch, the record index for a single finding), so an
+// error always identifies the right one. [LAW:single-enforcer] a finding is validated in exactly one
+// place; parseReviewValue and parseFindingValue are two callers of this, not two copies of the rule.
+function parseOneFinding(finding, label) {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    throw new Error(`${label} is not an object.`);
+  }
+  const pathValue = finding.path;
+  const line = finding.line;
+  const body = finding.body;
+  if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
+    throw new Error(`${label} has an invalid path.`);
+  }
+  if (!Number.isInteger(line) || line <= 0) {
+    throw new Error(`${label} has an invalid line.`);
+  }
+  if (typeof body !== 'string' || body.trim().length === 0) {
+    throw new Error(`${label} has an invalid body.`);
+  }
+  // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing" from
+  // "worth blocking a merge". Without it those two facts collapse into the model's private judgment and
+  // a non-blocking finding is silently withheld; as a required enum value it rides on the record and
+  // flows to the verdict computation instead. [LAW:no-silent-failure]
+  const severity = finding.severity;
+  if (severity !== 'blocking' && severity !== 'advisory') {
+    throw new Error(`${label} has an invalid severity (expected 'blocking' or 'advisory').`);
+  }
+  return { path: pathValue.trim(), line, body: body.trim(), severity };
+}
+
 function parseReviewValue(parsed, context) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${context} has the wrong shape.`);
@@ -32726,48 +32758,14 @@ function parseReviewValue(parsed, context) {
     throw new Error(`${context} must include a findings array.`);
   }
 
-  const findings = parsed.findings.map((finding, index) => {
-    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
-      throw new Error(`Review collector finding ${index + 1} is not an object.`);
-    }
-    const pathValue = finding.path;
-    const line = finding.line;
-    const body = finding.body;
-    if (typeof pathValue !== 'string' || pathValue.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid path.`);
-    }
-    if (!Number.isInteger(line) || line <= 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid line.`);
-    }
-    if (typeof body !== 'string' || body.trim().length === 0) {
-      throw new Error(`Review collector finding ${index + 1} has an invalid body.`);
-    }
-    // [LAW:types-are-the-program] severity is the discriminator that separates "worth surfacing"
-    // from "worth blocking a merge". Without it those two facts collapse into the model's private
-    // judgment and a non-blocking finding is silently withheld; as a required enum value it rides on
-    // the record and flows to the verdict computation instead. [LAW:single-enforcer] validated here,
-    // the one boundary every finding crosses (collector record time AND readCollectedReview), so an
-    // absent or unknown severity is rejected identically wherever it enters. [LAW:no-silent-failure]
-    const severity = finding.severity;
-    if (severity !== 'blocking' && severity !== 'advisory') {
-      throw new Error(`Review collector finding ${index + 1} has an invalid severity (expected 'blocking' or 'advisory').`);
-    }
-    return {
-      path: pathValue.trim(),
-      line,
-      body: body.trim(),
-      severity,
-    };
-  });
+  const findings = parsed.findings.map((finding, index) =>
+    parseOneFinding(finding, `Review collector finding ${index + 1}`));
 
   return { summary, findings };
 }
 
 function parseFindingValue(finding, index) {
-  return parseReviewValue({
-    summary: 'collector finding',
-    findings: [finding],
-  }, `Review collector finding ${index + 1}`).findings[0];
+  return parseOneFinding(finding, `Review collector finding ${index + 1}`);
 }
 
 // [LAW:types-are-the-program] A scout's scope is the same kind of typed, schema-validated record as a
