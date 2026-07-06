@@ -46,9 +46,9 @@ inputs:
     required: false
     default: "https://api.z.ai/api/anthropic"
   ZAI_SYSTEM_PROMPT:
-    description: "Extra system prompt appended for the reviewer."
+    description: "Optional extra system prompt appended for the reviewer. Empty by default — the built-in review charter already carries the whole review standard."
     required: false
-    default: "Review according to the LAWS. Request changes for blocking issues: LAW VIOLATIONS, bugs, security flaws, invariant/type violations, rough data/control flow, duplicate truth/enforcement, dependency cycles, temporal coupling, or missing behavior tests."
+    default: ""
   DEEPSEEK_API_KEY:
     description: "DeepSeek API key for the deepseek provider."
     required: false
