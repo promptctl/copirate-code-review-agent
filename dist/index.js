@@ -30721,7 +30721,11 @@ function extractUsage(stdout, config) {
 // entry in the price table — 'no-price' when the model is not yet listed. [LAW:no-silent-failure]
 function costFromEnvelope(env, config, buckets) {
   if (isAnthropicEndpoint(config)) {
-    return typeof env.total_cost_usd === 'number'
+    // [LAW:types-are-the-program] available:true must carry a FINITE usd — Number.isFinite, not
+    // typeof==='number' (which accepts NaN), so a garbage total_cost_usd is 'not-reported', never a
+    // NaN that later renders "$NaN" or poisons a PR cost total. The invariant is enforced here at the
+    // source so no downstream consumer needs its own guard.
+    return Number.isFinite(env.total_cost_usd)
       ? { available: true, usd: env.total_cost_usd }
       : { available: false, reason: 'not-reported' };
   }
@@ -31315,7 +31319,9 @@ function extractUsage(stdout) {
       inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
       outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
     }
-    if (typeof cost === 'number') {
+    if (Number.isFinite(cost)) {
+      // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
+      // reported cost must not turn the accumulated usd into NaN and thus a non-finite available cost.
       sawCost = true;
       usd += cost;
     }
@@ -31825,7 +31831,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
 
@@ -31838,7 +31844,7 @@ module.exports = {
   giteaTransport,
   resolveReviewTarget,
   prIsFromFork,
-  countPriorReviews,
+  summarizePriorReviews,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,
@@ -32981,12 +32987,12 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
-const { renderCostLine, costWarning } = __nccwpck_require__(9614);
+const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -33081,12 +33087,17 @@ async function preflightChain(chain) {
 // and costWarning are pure; this is the one place the "loud, not silent" signal is emitted, and it
 // returns the full attribution + cost footer. [LAW:no-silent-failure] costWarning names the actual
 // cause (carried in usage.cost.reason), so the boundary never re-derives why cost is absent.
-function buildReviewFooter(usage, configUsed) {
+// priorCost (PR mode only) is the summed cost of this PR's earlier review rounds; when present the cost
+// line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
+// sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
+// simply isn't read by anyone. [LAW:dataflow-not-control-flow]
+function buildReviewFooter(usage, configUsed, priorCost = null) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
-  const costLine = renderCostLine(usage, configUsed);
+  const costLine = renderCostLine(usage, configUsed, priorCost);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
-  return [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
+  const marker = costMarker(usage && usage.cost);
+  return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -33163,19 +33174,20 @@ async function runPrReview(reviewerName, excludePatterns) {
     core.setFailed(e.message);
     return;
   }
-  // [LAW:no-silent-failure] Name the round-cap check as the failure point, matching the fork-gate
+  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the fork-gate
   // fetch above — a bare throw would surface only the generic top-level message, hiding which step
-  // failed. A listReviews error fails the run loud rather than silently skipping the cap.
-  let priorReviews;
+  // failed. A listReviews error fails the run loud rather than silently skipping the cap. One fetch
+  // feeds both the round cap (.count) and the PR-total footer (.cost). [LAW:one-source-of-truth]
+  let prior;
   try {
-    priorReviews = await countPriorReviews(octokit, owner, repo, pullNumber);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
   } catch (e) {
-    core.setFailed(`Failed to count prior reviews for PR #${pullNumber}: ${e.message}`);
+    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
-  if (roundCapReached(priorReviews, maxReviewRounds)) {
+  if (roundCapReached(prior.count, maxReviewRounds)) {
     core.info(
-      `Skipping review: PR #${pullNumber} has already been reviewed ${priorReviews} time(s), reaching `
+      `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
       + `the MAX_REVIEW_ROUNDS cap of ${maxReviewRounds}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
     );
     return;
@@ -33238,7 +33250,7 @@ async function runPrReview(reviewerName, excludePatterns) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
   }
 
-  const footer = buildReviewFooter(review.usage, configUsed);
+  const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
     { summary: review.summary, findings: anchored, unanchored },
@@ -33396,6 +33408,7 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 const core = __nccwpck_require__(7484);
 const { parseUnifiedDiff } = __nccwpck_require__(9898);
 const { severityTaggedBody } = __nccwpck_require__(1565);
+const { parseCostMarker } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
 const APPROVED_MESSAGE = '✅ Approved';
@@ -33449,14 +33462,18 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   return giteaTransport(parsed);
 }
 
-// [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER —
-// there is no separate round counter to drift. Count the PR's own marker-bearing reviews; that count
-// equals the number of rounds this action has already spent. The listReviews API is served by GitHub
-// and Gitea alike and the marker lives in the body regardless of host, so counting is host-agnostic —
-// one function, no transport-instance split. [LAW:no-silent-failure] pagination is exhausted so a PR
-// with many reviews is counted in full, never truncated to an undercount that reopens the cost hole.
-async function countPriorReviews(octokit, owner, repo, pullNumber) {
+// [LAW:one-source-of-truth] A completed review round IS a posted review carrying REVIEW_MARKER, and its
+// cost IS the cost marker in that same body — there is no separate counter or ledger to drift. One pass
+// over the PR's own reviews yields BOTH the round count (for the round cap) and the summed cost (for the
+// PR-total footer), so the two consumers share one fetch. [LAW:decomposition] "summarize this PR's prior
+// agent reviews" is one cohesive concern. The listReviews API is served by GitHub and Gitea alike and
+// both markers live in the body regardless of host, so this is host-agnostic. [LAW:no-silent-failure]
+// pagination is exhausted so a PR with many reviews is summarized in full, never truncated.
+async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
   let count = 0;
+  let usd = 0;
+  let knownRounds = 0;
+  let unknownRounds = 0;
   let page = 1;
   while (true) {
     const { data } = await octokit.rest.pulls.listReviews({
@@ -33466,15 +33483,26 @@ async function countPriorReviews(octokit, owner, repo, pullNumber) {
       per_page: 100,
       page,
     });
-    // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel
-    // of the body, so match it as the ending — not a loose substring `includes`, which a human review
-    // that merely quotes the marker string would satisfy, over-counting rounds and starving the PR of
-    // further review.
-    count += data.filter(r => typeof r.body === 'string' && r.body.trimEnd().endsWith(REVIEW_MARKER)).length;
+    for (const r of data) {
+      const body = typeof r.body === 'string' ? r.body : '';
+      // [LAW:single-enforcer] ONE definition of "an agent review round" — a body whose trailing
+      // sentinel is REVIEW_MARKER — gates BOTH the count and the cost sum. Matching the ending (not a
+      // loose `includes`) means a human review that merely quotes a marker satisfies neither, so it can
+      // over-count neither rounds nor cost. Cost is read only from within that gate.
+      if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
+      count++;
+      // [LAW:no-silent-failure] An agent round with a numeric cost marker is summed; any other case —
+      // an explicit 'unknown' marker, a pre-feature review with no marker, or a malformed value that
+      // won't parse — is a round whose cost we don't have, counted as unknown so the PR total is an
+      // honest lower bound (+), never silently omitted.
+      const cost = parseCostMarker(body);
+      if (typeof cost === 'number') { usd += cost; knownRounds++; }
+      else unknownRounds++;
+    }
     if (data.length < 100) break;
     page++;
   }
-  return count;
+  return { count, cost: { usd, knownRounds, unknownRounds } };
 }
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
@@ -33592,7 +33620,7 @@ module.exports = {
   submitReview,
   resolveReviewTarget,
   prIsFromFork,
-  countPriorReviews,
+  summarizePriorReviews,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,
@@ -33650,7 +33678,10 @@ function computeCostUsd({ inputTokens, outputTokens, cachedInputTokens = 0 }, mo
     nonCachedInput * price.input +
     cachedInputTokens * price.cachedInput +
     outputTokens * price.output;
-  return total / 1_000_000;
+  const usd = total / 1_000_000;
+  // [LAW:types-are-the-program] Non-finite input (a NaN token count) yields no usable price, not a NaN
+  // "cost": return null so the caller renders it unavailable, keeping available:true ⟹ finite usd.
+  return Number.isFinite(usd) ? usd : null;
 }
 
 // Claude Code self-reports total_cost_usd using Anthropic's price table, so that figure is this
@@ -33687,18 +33718,69 @@ function reviewerTag(config) {
 // [LAW:dataflow-not-control-flow] usage === null and an unavailable cost are distinct values with
 // distinct renderings, not branches that skip work: no usage -> no line; cost unavailable ->
 // tokens with cost "unknown".
-function renderCostLine(usage, config) {
+// [LAW:types-are-the-program] A machine-readable cost record embedded in each review body, so a later
+// round sums prior rounds from a typed value — never by re-parsing the rendered "Cost: $X" prose, which
+// would be a representation re-parsing itself. Rendered as an HTML comment (invisible, like REVIEW_MARKER)
+// and placed in the footer BEFORE REVIEW_MARKER, so the trailing-marker round-count contract is untouched.
+// An unavailable or absent cost records 'unknown' — the round is still counted, its cost just isn't summed.
+// [LAW:types-are-the-program] The value is a strict non-negative decimal (digits, one optional
+// fractional part) or the literal 'unknown' — NOT a loose `[0-9.]+`, which would match '.', '1.2.3',
+// or '123..456', all of which Number() turns into NaN. Cost is non-negative by construction, so no
+// leading '-'; no exponent, so no Infinity. The producer (costMarker) always emits toFixed(6), which
+// satisfies this; the strict pattern rejects a corrupted marker at the boundary.
+const COST_MARKER_RE = /<!-- agent-review-cost-usd:([0-9]+(?:\.[0-9]+)?|unknown) -->/g;
+function costMarker(cost) {
+  // [LAW:types-are-the-program] The marker never carries a non-number: a finite available cost renders
+  // as a decimal, everything else (unavailable, or a non-finite usd from a broken upstream) as 'unknown'
+  // — symmetric with parseCostMarker's finiteness guard, so the round-trip can never smuggle a NaN.
+  const value = cost && cost.available && Number.isFinite(cost.usd) ? cost.usd.toFixed(6) : 'unknown';
+  return `<!-- agent-review-cost-usd:${value} -->`;
+}
+function parseCostMarker(body) {
+  if (typeof body !== 'string') return null; // not a marker-bearing body (human review, old review)
+  // [LAW:one-source-of-truth] The authoritative marker is the LAST one in the body — it lives in the
+  // footer, after all summary/finding prose. A review that QUOTES a marker in its prose (e.g. a review
+  // OF this feature) would otherwise let a first-match grab the wrong one. Take the final match.
+  const matches = [...body.matchAll(COST_MARKER_RE)];
+  if (matches.length === 0) return null;
+  const value = matches[matches.length - 1][1];
+  if (value === 'unknown') return 'unknown';
+  const n = Number(value);
+  // [LAW:no-silent-failure] belt to the strict regex: a value that does not parse to a finite number
+  // is null (→ counted as an unknown-cost round), never a NaN summed into and poisoning the PR total.
+  return Number.isFinite(n) ? n : null;
+}
+
+// [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
+// there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
+// clause is a VALUE keyed on the prior-round count, not a second footer format. [LAW:no-silent-failure]
+// a round with unknown cost is NOT dropped from the count — the total carries a '+' and names how many
+// rounds are unpriced, so the PR total is honestly a lower bound rather than a silently-partial sum.
+function renderPrTotal(thisCost, priorCost) {
+  if (!priorCost) return '';
+  const priorRounds = priorCost.knownRounds + priorCost.unknownRounds;
+  if (priorRounds === 0) return '';
+  const totalUsd = priorCost.usd + (thisCost.available ? thisCost.usd : 0);
+  const unknownRounds = priorCost.unknownRounds + (thisCost.available ? 0 : 1);
+  const rounds = priorRounds + 1;
+  const approx = unknownRounds > 0 ? '+' : '';
+  const note = unknownRounds > 0 ? `, ${unknownRounds} with unknown cost` : '';
+  return ` · PR total $${totalUsd.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+}
+
+function renderCostLine(usage, config, priorCost = null) {
   if (!usage) return '';
   const tag = reviewerTag(config);
   const tokens = `${formatTokenCount(usage.inputTokens)} in / ${formatTokenCount(usage.outputTokens)} out tokens`;
+  const prTotal = renderPrTotal(usage.cost, priorCost);
   if (!usage.cost.available) {
-    return `_Cost: unknown · ${tokens} · ${tag}_`;
+    return `_Cost: unknown · ${tokens} · ${tag}${prTotal}_`;
   }
   // [FRAMING:representation] Every available cost this action renders is an ESTIMATE, never a billed
   // charge: a table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine
   // Anthropic run is Claude Code's own client-side total_cost_usd. So every line is marked "est."
   // rather than implying exactness.
-  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est._`;
+  return `_Cost: $${usage.cost.usd.toFixed(4)} · ${tokens} · ${tag} · est.${prTotal}_`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the text of the "cost unavailable" warning, or null when cost
@@ -33721,6 +33803,9 @@ module.exports = {
   PRICES_PER_MILLION,
   computeCostUsd,
   renderCostLine,
+  renderPrTotal,
+  costMarker,
+  parseCostMarker,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,

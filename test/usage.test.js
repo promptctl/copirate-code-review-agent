@@ -7,6 +7,9 @@ const { extractUsage: claudeExtractUsage } = require('../src/engine/claude-code'
 const {
   computeCostUsd,
   renderCostLine,
+  renderPrTotal,
+  costMarker,
+  parseCostMarker,
   costWarning,
   formatTokenCount,
   PRICES_PER_MILLION,
@@ -52,6 +55,10 @@ describe('computeCostUsd', () => {
       'gpt-5.4-mini',
     );
     assert.ok(Math.abs(cost - 0.0138) < 1e-9, `expected ~0.0138, got ${cost}`);
+  });
+
+  test('a non-finite result (NaN token count) is null (unknown), never a NaN cost', () => {
+    assert.equal(computeCostUsd({ inputTokens: NaN, outputTokens: 2_000 }, 'gpt-5.4-mini'), null);
   });
 
   test('treats absent cached tokens as zero (all input billed at full rate)', () => {
@@ -247,6 +254,68 @@ describe('renderCostLine', () => {
 
   test('returns empty string when there is no usage at all', () => {
     assert.equal(renderCostLine(null, CODEX_CONFIG), '');
+  });
+
+  test('no prior rounds → single-round line, no PR total (first review unchanged)', () => {
+    const usage = { inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.02 } };
+    const line = renderCostLine(usage, CODEX_CONFIG, { usd: 0, knownRounds: 0, unknownRounds: 0 });
+    assert.doesNotMatch(line, /PR total/);
+    assert.match(line, /· est\._$/);
+  });
+
+  test('with prior rounds → appends a running PR total across all rounds', () => {
+    const usage = { inputTokens: 100, outputTokens: 50, cost: { available: true, usd: 0.03 } };
+    const line = renderCostLine(usage, CODEX_CONFIG, { usd: 0.09, knownRounds: 2, unknownRounds: 0 });
+    assert.match(line, /\$0\.0300/);                          // this round
+    assert.match(line, /PR total \$0\.1200 across 3 rounds/); // 0.09 prior + 0.03 this
+  });
+
+  test('an unknown-cost round makes the PR total a lower bound (+) and names the unpriced count', () => {
+    const usage = { inputTokens: 100, outputTokens: 50, cost: { available: false, reason: 'no-price' } };
+    const line = renderCostLine(usage, CODEX_CONFIG, { usd: 0.09, knownRounds: 2, unknownRounds: 1 });
+    assert.match(line, /PR total \$0\.0900\+ across 4 rounds, 2 with unknown cost/);
+  });
+});
+
+describe('cost marker (machine-readable per-round cost)', () => {
+  test('round-trips an available cost', () => {
+    assert.equal(parseCostMarker(costMarker({ available: true, usd: 0.1234 })), 0.1234);
+  });
+  test('records unavailable cost as the string "unknown"', () => {
+    assert.equal(parseCostMarker(costMarker({ available: false, reason: 'no-price' })), 'unknown');
+    assert.equal(parseCostMarker(costMarker(null)), 'unknown');
+  });
+  test('a body with no marker (human review / old review) parses to null', () => {
+    assert.equal(parseCostMarker('just a comment, no marker'), null);
+    assert.equal(parseCostMarker(null), null);
+  });
+  test('a malformed marker value never returns NaN (would poison the PR total) — parses to null', () => {
+    for (const bad of ['.', '1.2.3', '123..456', '', 'abc']) {
+      const r = parseCostMarker(`<!-- agent-review-cost-usd:${bad} -->`);
+      assert.ok(r === null, `"${bad}" must parse to null, got ${r}`);
+    }
+  });
+  test('the marker is an invisible HTML comment (does not render in the review body)', () => {
+    assert.match(costMarker({ available: true, usd: 1 }), /^<!-- .* -->$/);
+  });
+  test('takes the LAST marker — a body quoting a marker in prose + the real one at the end', () => {
+    // A review OF this feature could quote a marker in its summary; the real cost marker trails it.
+    const body = `Findings: the format is ${costMarker({ available: true, usd: 9.99 })} for example.\n\n`
+      + `footer\n\n${costMarker({ available: true, usd: 0.42 })}\n\n<!-- zai-coding-agent-review -->`;
+    assert.equal(parseCostMarker(body), 0.42); // the real trailing marker, not the quoted 9.99
+  });
+});
+
+describe('renderPrTotal', () => {
+  test('empty when there is no prior-cost value at all', () => {
+    assert.equal(renderPrTotal({ available: true, usd: 1 }, null), '');
+  });
+  test('empty when there are zero prior rounds (the first review)', () => {
+    assert.equal(renderPrTotal({ available: true, usd: 1 }, { usd: 0, knownRounds: 0, unknownRounds: 0 }), '');
+  });
+  test('available this-round + mixed known/unknown prior → total plus a "+" and the unpriced count', () => {
+    const clause = renderPrTotal({ available: true, usd: 0.03 }, { usd: 0.10, knownRounds: 2, unknownRounds: 1 });
+    assert.match(clause, /PR total \$0\.1300\+ across 4 rounds, 1 with unknown cost/); // 0.10 + 0.03, 1 unpriced
   });
 });
 

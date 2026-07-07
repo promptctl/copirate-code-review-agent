@@ -175,7 +175,11 @@ function extractUsage(stdout, config) {
 // entry in the price table — 'no-price' when the model is not yet listed. [LAW:no-silent-failure]
 function costFromEnvelope(env, config, buckets) {
   if (isAnthropicEndpoint(config)) {
-    return typeof env.total_cost_usd === 'number'
+    // [LAW:types-are-the-program] available:true must carry a FINITE usd — Number.isFinite, not
+    // typeof==='number' (which accepts NaN), so a garbage total_cost_usd is 'not-reported', never a
+    // NaN that later renders "$NaN" or poisons a PR cost total. The invariant is enforced here at the
+    // source so no downstream consumer needs its own guard.
+    return Number.isFinite(env.total_cost_usd)
       ? { available: true, usd: env.total_cost_usd }
       : { available: false, reason: 'not-reported' };
   }

@@ -12,7 +12,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
 const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = require('./diff');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('./transport');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('./transport');
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = require('./failover');
 const { classifyClaudeError } = require('./engine/claude-code');
 
@@ -25,7 +25,7 @@ module.exports = {
   giteaTransport,
   resolveReviewTarget,
   prIsFromFork,
-  countPriorReviews,
+  summarizePriorReviews,
   roundCapReached,
   parseMaxRounds,
   REVIEW_MARKER,

@@ -1,7 +1,8 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
+const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('../src/index.js');
+const { costMarker } = require('../src/usage');
 
 describe('gitHubTransport.toComment', () => {
   test('maps finding to GitHub inline comment shape', () => {
@@ -123,11 +124,13 @@ describe('parseMaxRounds', () => {
   });
 });
 
-describe('countPriorReviews', () => {
-  // A fake octokit whose listReviews returns fixed pages; asserts the marker filter and pagination.
+describe('summarizePriorReviews', () => {
+  // A fake octokit whose listReviews returns fixed pages; asserts the marker filter, cost sum, pagination.
   const fakeOctokit = (pages) => ({
     rest: { pulls: { listReviews: async ({ page }) => ({ data: pages[page - 1] || [] }) } },
   });
+  const withCost = (usd) => `verdict\n\n${costMarker({ available: true, usd })}\n\n${REVIEW_MARKER}`;
+  const unknownCost = () => `verdict\n\n${costMarker(null)}\n\n${REVIEW_MARKER}`;
 
   test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
     const octokit = fakeOctokit([[
@@ -136,7 +139,7 @@ describe('countPriorReviews', () => {
       { body: `another round\n\n${REVIEW_MARKER}\n` }, // trailing whitespace tolerated
       { body: null }, // dismissed/empty review body
     ]]);
-    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 2);
+    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1)).count, 2);
   });
 
   test('a human review that merely QUOTES the marker mid-body is not counted', async () => {
@@ -144,17 +147,58 @@ describe('countPriorReviews', () => {
       { body: `I see the action posts \`${REVIEW_MARKER}\` — but here is my own comment.` },
       { body: `real round\n\n${REVIEW_MARKER}` },
     ]]);
-    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 1);
+    assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1)).count, 1);
   });
 
-  test('returns 0 when the PR has no reviews', async () => {
-    assert.equal(await countPriorReviews(fakeOctokit([[]]), 'o', 'r', 1), 0);
+  test('sums the per-round cost markers into the PR cost total', async () => {
+    const octokit = fakeOctokit([[
+      { body: withCost(0.05) },
+      { body: withCost(0.03) },
+      { body: unknownCost() },              // counted as an unknown-cost round
+      { body: 'a human review, no marker' }, // not a round, no cost
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 3); // three marker-bearing reviews
+    assert.equal(Number(cost.usd.toFixed(2)), 0.08);
+    assert.equal(cost.knownRounds, 2);
+    assert.equal(cost.unknownRounds, 1);
   });
 
-  test('exhausts pagination — a full first page forces a second fetch', async () => {
-    const full = Array.from({ length: 100 }, () => ({ body: REVIEW_MARKER }));
-    const octokit = fakeOctokit([full, [{ body: REVIEW_MARKER }, { body: 'no marker' }]]);
-    assert.equal(await countPriorReviews(octokit, 'o', 'r', 1), 101);
+  test('a human review that QUOTES a cost marker is excluded from BOTH count and cost (one gate)', async () => {
+    const octokit = fakeOctokit([[
+      { body: `here is what the bot posts: ${costMarker({ available: true, usd: 999 })} — my own note` }, // no REVIEW_MARKER
+      { body: withCost(0.04) },
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 1);                 // only the real agent round
+    assert.equal(Number(cost.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
+    assert.equal(cost.knownRounds, 1);
+  });
+
+  test('an agent round with no cost marker (pre-feature review) counts as unknown, not omitted', async () => {
+    const octokit = fakeOctokit([[
+      { body: `old verdict\n\n${REVIEW_MARKER}` }, // agent round, but no cost marker
+      { body: withCost(0.04) },
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 2);
+    assert.equal(cost.knownRounds, 1);
+    assert.equal(cost.unknownRounds, 1); // the markerless agent round is an honest unknown
+  });
+
+  test('returns zeroes when the PR has no reviews', async () => {
+    const { count, cost } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
+    assert.equal(count, 0);
+    assert.deepEqual(cost, { usd: 0, knownRounds: 0, unknownRounds: 0 });
+  });
+
+  test('exhausts pagination — a full first page forces a second fetch (count AND cost span pages)', async () => {
+    const full = Array.from({ length: 100 }, () => ({ body: withCost(0.01) }));
+    const octokit = fakeOctokit([full, [{ body: withCost(0.01) }, { body: 'no marker' }]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 101);
+    assert.equal(cost.knownRounds, 101);              // cost summed across BOTH pages, not just page 1
+    assert.equal(Number(cost.usd.toFixed(2)), 1.01);  // 101 × $0.01
   });
 });
 

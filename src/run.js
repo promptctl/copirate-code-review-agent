@@ -5,12 +5,12 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, countPriorReviews, roundCapReached, parseMaxRounds } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds } = require('./transport');
 const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
-const { renderCostLine, costWarning } = require('./usage');
+const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
@@ -105,12 +105,17 @@ async function preflightChain(chain) {
 // and costWarning are pure; this is the one place the "loud, not silent" signal is emitted, and it
 // returns the full attribution + cost footer. [LAW:no-silent-failure] costWarning names the actual
 // cause (carried in usage.cost.reason), so the boundary never re-derives why cost is absent.
-function buildReviewFooter(usage, configUsed) {
+// priorCost (PR mode only) is the summed cost of this PR's earlier review rounds; when present the cost
+// line carries a running PR total, and a machine-readable cost marker is embedded so the NEXT round can
+// sum this one. Repo mode passes no priorCost — the single-round line stands, and the (harmless) marker
+// simply isn't read by anyone. [LAW:dataflow-not-control-flow]
+function buildReviewFooter(usage, configUsed, priorCost = null) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
-  const costLine = renderCostLine(usage, configUsed);
+  const costLine = renderCostLine(usage, configUsed, priorCost);
   if (costLine) core.info(costLine.replace(/^_|_$/g, ''));
-  return [buildAttributionFooter(configUsed), costLine].filter(Boolean).join('\n\n');
+  const marker = costMarker(usage && usage.cost);
+  return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -187,19 +192,20 @@ async function runPrReview(reviewerName, excludePatterns) {
     core.setFailed(e.message);
     return;
   }
-  // [LAW:no-silent-failure] Name the round-cap check as the failure point, matching the fork-gate
+  // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the fork-gate
   // fetch above — a bare throw would surface only the generic top-level message, hiding which step
-  // failed. A listReviews error fails the run loud rather than silently skipping the cap.
-  let priorReviews;
+  // failed. A listReviews error fails the run loud rather than silently skipping the cap. One fetch
+  // feeds both the round cap (.count) and the PR-total footer (.cost). [LAW:one-source-of-truth]
+  let prior;
   try {
-    priorReviews = await countPriorReviews(octokit, owner, repo, pullNumber);
+    prior = await summarizePriorReviews(octokit, owner, repo, pullNumber);
   } catch (e) {
-    core.setFailed(`Failed to count prior reviews for PR #${pullNumber}: ${e.message}`);
+    core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
-  if (roundCapReached(priorReviews, maxReviewRounds)) {
+  if (roundCapReached(prior.count, maxReviewRounds)) {
     core.info(
-      `Skipping review: PR #${pullNumber} has already been reviewed ${priorReviews} time(s), reaching `
+      `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
       + `the MAX_REVIEW_ROUNDS cap of ${maxReviewRounds}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
     );
     return;
@@ -262,7 +268,7 @@ async function runPrReview(reviewerName, excludePatterns) {
     core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
   }
 
-  const footer = buildReviewFooter(review.usage, configUsed);
+  const footer = buildReviewFooter(review.usage, configUsed, prior.cost);
   await submitReview(
     reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
     { summary: review.summary, findings: anchored, unanchored },

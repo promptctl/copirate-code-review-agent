@@ -195,7 +195,9 @@ function extractUsage(stdout) {
       inputTokens += (tokens.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0);
       outputTokens += (tokens.output ?? 0) + (tokens.reasoning ?? 0);
     }
-    if (typeof cost === 'number') {
+    if (Number.isFinite(cost)) {
+      // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
+      // reported cost must not turn the accumulated usd into NaN and thus a non-finite available cost.
       sawCost = true;
       usd += cost;
     }
