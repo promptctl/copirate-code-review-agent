@@ -33479,13 +33479,19 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber) {
     });
     for (const r of data) {
       const body = typeof r.body === 'string' ? r.body : '';
-      // [LAW:types-are-the-program] submitReview always appends REVIEW_MARKER as the trailing sentinel,
-      // so match it as the ending — not a loose `includes`, which a human review quoting the marker
-      // would satisfy, over-counting rounds and starving the PR of further review.
-      if (body.trimEnd().endsWith(REVIEW_MARKER)) count++;
-      const cost = parseCostMarker(body); // null (no marker), 'unknown', or a number
-      if (cost === 'unknown') unknownRounds++;
-      else if (typeof cost === 'number') { usd += cost; knownRounds++; }
+      // [LAW:single-enforcer] ONE definition of "an agent review round" — a body whose trailing
+      // sentinel is REVIEW_MARKER — gates BOTH the count and the cost sum. Matching the ending (not a
+      // loose `includes`) means a human review that merely quotes a marker satisfies neither, so it can
+      // over-count neither rounds nor cost. Cost is read only from within that gate.
+      if (!body.trimEnd().endsWith(REVIEW_MARKER)) continue;
+      count++;
+      // [LAW:no-silent-failure] An agent round with a numeric cost marker is summed; any other case —
+      // an explicit 'unknown' marker, a pre-feature review with no marker, or a malformed value that
+      // won't parse — is a round whose cost we don't have, counted as unknown so the PR total is an
+      // honest lower bound (+), never silently omitted.
+      const cost = parseCostMarker(body);
+      if (typeof cost === 'number') { usd += cost; knownRounds++; }
+      else unknownRounds++;
     }
     if (data.length < 100) break;
     page++;

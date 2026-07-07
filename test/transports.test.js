@@ -164,6 +164,28 @@ describe('summarizePriorReviews', () => {
     assert.equal(cost.unknownRounds, 1);
   });
 
+  test('a human review that QUOTES a cost marker is excluded from BOTH count and cost (one gate)', async () => {
+    const octokit = fakeOctokit([[
+      { body: `here is what the bot posts: ${costMarker({ available: true, usd: 999 })} — my own note` }, // no REVIEW_MARKER
+      { body: withCost(0.04) },
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 1);                 // only the real agent round
+    assert.equal(Number(cost.usd.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
+    assert.equal(cost.knownRounds, 1);
+  });
+
+  test('an agent round with no cost marker (pre-feature review) counts as unknown, not omitted', async () => {
+    const octokit = fakeOctokit([[
+      { body: `old verdict\n\n${REVIEW_MARKER}` }, // agent round, but no cost marker
+      { body: withCost(0.04) },
+    ]]);
+    const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1);
+    assert.equal(count, 2);
+    assert.equal(cost.knownRounds, 1);
+    assert.equal(cost.unknownRounds, 1); // the markerless agent round is an honest unknown
+  });
+
   test('returns zeroes when the PR has no reviews', async () => {
     const { count, cost } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1);
     assert.equal(count, 0);
