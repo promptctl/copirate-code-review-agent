@@ -301,7 +301,7 @@ describe('cost marker (machine-readable per-round cost)', () => {
   test('takes the LAST marker — a body quoting a marker in prose + the real one at the end', () => {
     // A review OF this feature could quote a marker in its summary; the real cost marker trails it.
     const body = `Findings: the format is ${costMarker({ available: true, usd: 9.99 })} for example.\n\n`
-      + `footer\n\n${costMarker({ available: true, usd: 0.42 })}\n\n<!-- zai-coding-agent-review -->`;
+      + `footer\n\n${costMarker({ available: true, usd: 0.42 })}\n\n<!-- copirate-code-review-agent -->`;
     assert.equal(parseCostMarker(body), 0.42); // the real trailing marker, not the quoted 9.99
   });
 });
