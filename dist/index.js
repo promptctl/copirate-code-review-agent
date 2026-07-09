@@ -33410,7 +33410,7 @@ const { parseUnifiedDiff } = __nccwpck_require__(9898);
 const { severityTaggedBody } = __nccwpck_require__(1565);
 const { parseCostMarker } = __nccwpck_require__(9614);
 
-const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
+const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
 

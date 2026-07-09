@@ -4,5 +4,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/brandon-fryslie/coding-agent-review/security/advisories/new
+    url: https://github.com/promptctl/copirate-code-review-agent/security/advisories/new
     about: Do not open a public issue for security reports. Use GitHub's private vulnerability reporting (see SECURITY.md).

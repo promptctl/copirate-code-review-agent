@@ -4,7 +4,7 @@ const { parseUnifiedDiff } = require('./diff');
 const { severityTaggedBody } = require('./review');
 const { parseCostMarker } = require('./usage');
 
-const REVIEW_MARKER = '<!-- zai-coding-agent-review -->';
+const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const APPROVED_MESSAGE = '✅ Approved';
 const REQUEST_CHANGES_MESSAGE = '❌ Request Changes';
 

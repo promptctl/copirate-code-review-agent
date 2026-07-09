@@ -1,11 +1,11 @@
 {
-  "name": "coding-agent-review",
-  "version": "1.29.0",
+  "name": "copirate-code-review-agent",
+  "version": "1.30.0",
   "description": "AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/brandon-fryslie/coding-agent-review.git"
+    "url": "git+https://github.com/promptctl/copirate-code-review-agent.git"
   },
   "author": "Brandon Fryslie",
   "main": "dist/index.js",

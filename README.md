@@ -40,7 +40,7 @@ The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Clau
            with:
              ref: ${{ github.event.pull_request.head.sha }}
 
-         - uses: brandon-fryslie/coding-agent-review@v1
+         - uses: promptctl/copirate-code-review-agent@v1
            with:
              DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
    ```
@@ -63,7 +63,7 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 To run Codex instead:
 
 ```yaml
-      - uses: brandon-fryslie/coding-agent-review@v1
+      - uses: promptctl/copirate-code-review-agent@v1
         with:
           PROVIDER: codex
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -139,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: brandon-fryslie/coding-agent-review@v1
+      - uses: promptctl/copirate-code-review-agent@v1
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         with:
@@ -201,7 +201,7 @@ A config is rejected at load unless its `endpoint.kind` and `reasoning` are vali
 A config never holds a secret — `apiKeyEnv` names an env var the **workflow** maps from a GitHub secret. Map each one in the step's `env:` block:
 
 ```yaml
-      - uses: brandon-fryslie/coding-agent-review@v1
+      - uses: promptctl/copirate-code-review-agent@v1
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -240,7 +240,7 @@ Every review run captures the **full session** of every engine attempt — the e
 - **As a file** under `$RUNNER_TEMP/agent-review-transcripts/`, exposed via the action's `transcript-dir` **output**. Add one `actions/upload-artifact` step to archive the session as a downloadable artifact on **every** run — including failed attempts (`if: always()`):
 
 ```yaml
-      - uses: brandon-fryslie/coding-agent-review@v1
+      - uses: promptctl/copirate-code-review-agent@v1
         id: review
         with:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
