@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 
 const {
   TransientError,
+  ProtocolError,
+  isRetryableSpawnError,
   produceReview,
   buildAttributionFooter,
   retryTransientSpawn,
@@ -110,6 +112,49 @@ describe('retryTransientSpawn', () => {
       { sleepFn: async (ms) => { delays.push(ms); } },
     );
     assert.deepEqual(delays, [4321]);
+  });
+
+  // ProtocolError shares TransientError's retry policy but is a DISTINCT type. A model that forgot
+  // finish_review (or wrote no records) very likely succeeds on a fresh spawn, so it retries in place.
+  it('retries on ProtocolError then returns the eventual success', async () => {
+    let calls = 0;
+    const retries = [];
+    const value = await retryTransientSpawn(
+      async () => { calls++; if (calls < 3) throw new ProtocolError('no finish_review'); return 'recovered'; },
+      { sleepFn: async () => {}, onRetry: (info) => retries.push(info.attempt) },
+    );
+    assert.equal(value, 'recovered');
+    assert.equal(calls, 3);
+    assert.deepEqual(retries, [1, 2]);
+  });
+
+  it('rethrows the last ProtocolError after exhausting the budget, AS ITSELF (never a TransientError)', async () => {
+    // [LAW:one-type-per-behavior] Same retry policy, different identity: an exhausted ProtocolError must
+    // stay a ProtocolError so produceReview's `!instanceof TransientError` gate reds the run with the
+    // precise cause instead of laundering a broken engine into config-level failover.
+    let calls = 0;
+    const last = new ProtocolError('still no finish_review');
+    await assert.rejects(
+      () => retryTransientSpawn(
+        async () => { calls++; throw calls === TRANSIENT_SPAWN_ATTEMPTS ? last : new ProtocolError('slip'); },
+        { sleepFn: async () => {} },
+      ),
+      err => err === last && err instanceof ProtocolError && !(err instanceof TransientError),
+    );
+    assert.equal(calls, TRANSIENT_SPAWN_ATTEMPTS);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// isRetryableSpawnError — the single source of truth for which errors a re-spawn can fix
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('isRetryableSpawnError', () => {
+  it('is true for both retryable spawn types and false for a plain Error', () => {
+    assert.equal(isRetryableSpawnError(new TransientError('net')), true);
+    assert.equal(isRetryableSpawnError(new ProtocolError('slip')), true);
+    assert.equal(isRetryableSpawnError(new Error('code bug')), false);
+    assert.equal(isRetryableSpawnError(new TypeError('bad envelope')), false);
   });
 });
 

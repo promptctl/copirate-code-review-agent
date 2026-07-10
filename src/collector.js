@@ -2,7 +2,13 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const core = require('@actions/core');
 const { parseFindingValue, parseScopeValue, parseReviewValue } = require('./review');
+// [LAW:one-way-deps] ProtocolError's home is failover.js, beside TransientError — the retry seam owns
+// the vocabulary of errors a re-spawn can fix, and every thrower requires it from there (codex.js does
+// the same with TransientError). readCollectedReview runs in the ACTION process (never the collector
+// server), so requiring failover.js here pulls in nothing that reaches the MCP stdio subprocess.
+const { ProtocolError } = require('./failover');
 
 const COLLECTOR_SERVER_ARG = '--review-collector-server';
 
@@ -27,7 +33,10 @@ function createReviewCollector() {
 
 function readCollectedReview(recordsPath) {
   if (!fs.existsSync(recordsPath)) {
-    throw new Error('The review engine did not call the review collector tools.');
+    // [LAW:no-silent-failure] No records file at all is the zero-record extreme of a protocol slip: the
+    // engine terminated without ever driving the collector. Typed as ProtocolError so the retry seam
+    // re-spawns it in place rather than the plain Error that killed the whole multi-scope pass.
+    throw new ProtocolError('The review engine did not call the review collector tools.');
   }
 
   const records = fs.readFileSync(recordsPath, 'utf8')
@@ -35,9 +44,19 @@ function readCollectedReview(recordsPath) {
     .filter(line => line.trim().length > 0)
     .map(line => JSON.parse(line));
   const finishes = records.filter(record => record.type === 'finish');
-  if (finishes.length !== 1) {
-    throw new Error(`The review engine must call finish_review exactly once; saw ${finishes.length}.`);
+  // [LAW:no-silent-failure] Zero finishes is the most common weak-model slip (the model forgot the gate),
+  // not a code bug — typed as ProtocolError so retryTransientSpawn re-spawns instead of discarding every
+  // sibling worker's already-recorded findings. The exactly-one gate now applies ONLY to the zero case.
+  if (finishes.length === 0) {
+    throw new ProtocolError('The review engine did not call finish_review.');
   }
+  // [LAW:dataflow-not-control-flow] Two+ finishes is not a broken review — the model recorded its verdict
+  // more than once. Always take the LAST finish (its final word); for a single finish last === first, so
+  // there is no branch on the count for WHICH to pick — only the warning is gated on the duplicate case.
+  if (finishes.length > 1) {
+    core.warning(`The review engine called finish_review ${finishes.length} times; using the last one.`);
+  }
+  const finish = finishes[finishes.length - 1];
   const findings = records
     .filter(record => record.type === 'request_change')
     .map((record, index) => parseFindingValue(record.finding, index));
@@ -49,7 +68,7 @@ function readCollectedReview(recordsPath) {
     .filter(record => record.type === 'scope')
     .map((record, index) => parseScopeValue(record.scope, index));
   const review = parseReviewValue({
-    summary: finishes[0].summary,
+    summary: finish.summary,
     findings,
   }, 'Review collector output');
   return { ...review, scopes };
