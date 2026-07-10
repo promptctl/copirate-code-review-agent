@@ -30485,7 +30485,13 @@ function* patchLines(patch) {
       yield { kind: 'meta', text };
       continue;
     }
-    const marker = inHunk ? text[0] : undefined;
+    // Inside a hunk the first char classifies the line (+ added, ' ' context, - deletion,
+    // '\' the no-newline marker). A blank source line's context marker is a bare ' '; a host
+    // that strips trailing whitespace delivers it as '' — the one reading a well-formed patch
+    // allows, since it never carries a bare empty line inside a hunk. Restore the canonical
+    // ' ' so a stripped context line still advances the new-side counter, instead of silently
+    // desyncing every following anchor by one. [LAW:no-silent-failure] [FRAMING:representation]
+    const marker = inHunk ? (text === '' ? ' ' : text[0]) : undefined;
     if (marker === '+' || marker === ' ') {
       yield { kind: 'line', line: newLine, text };
       newLine++;

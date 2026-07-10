@@ -50,6 +50,33 @@ describe('patchLines — line-anchor invariant', () => {
     assert.equal(deletedEntry.line, undefined, 'deleted line must carry no line number');
   });
 
+  test('a stripped empty context line numbers identically to its well-formed twin', () => {
+    // A blank source line's context marker is a bare ' '; a whitespace-stripping host/proxy
+    // delivers it as ''. The desync would be silent — every following LINE off by one — so the
+    // stripped patch must produce the SAME anchor numbering as the well-formed one.
+    const wellFormed = [
+      '@@ -1,4 +1,4 @@',
+      ' context 1',   // line 1
+      ' ',            // line 2 — blank source line, canonical bare-space context marker
+      '+added 3',     // line 3
+      ' context 4',   // line 4
+    ].join('\n');
+    const stripped = [
+      '@@ -1,4 +1,4 @@',
+      ' context 1',   // line 1
+      '',             // line 2 — same blank line, trailing space stripped in transit
+      '+added 3',     // line 3
+      ' context 4',   // line 4
+    ].join('\n');
+    const numbering = patch => [...patchLines(patch)].filter(e => e.kind === 'line').map(e => e.line);
+    assert.deepEqual(numbering(stripped), [1, 2, 3, 4]);
+    assert.deepEqual(numbering(stripped), numbering(wellFormed));
+    // The stripped blank line is itself anchorable, carrying its own new-side line number.
+    const strippedBlank = [...patchLines(stripped)].find(e => e.kind === 'line' && e.text === '');
+    assert.ok(strippedBlank, 'stripped blank line must be an anchorable line, not meta');
+    assert.equal(strippedBlank.line, 2);
+  });
+
   test('@@ header resets counter to the declared new-side start', () => {
     const patch = [
       '@@ -10,3 +20,3 @@',
