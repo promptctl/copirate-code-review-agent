@@ -9,6 +9,7 @@ const {
   unquoteCStylePath,
   parseGitDiffHeader,
 } = require('../src/index.js');
+const { matchesPattern } = require('../src/diff.js');
 
 // The line-anchor invariant:
 //   - @@ hunk headers reset the new-side counter to the header's starting line
@@ -344,5 +345,40 @@ describe('parseGitDiffHeader', () => {
   test('malformed header returns null so the caller owns no file', () => {
     assert.equal(parseGitDiffHeader('diff --git something totally malformed'), null);
     assert.equal(parseGitDiffHeader('diff --git a/only-one-side'), null);
+  });
+});
+
+describe('matchesPattern — glob translation', () => {
+  test('? matches exactly one arbitrary character, not zero-or-one', () => {
+    // The bug: an unescaped ? reached the RegExp as an optional-quantifier, so
+    // "foo?.js" wrongly matched "fo.js" (the ? made the preceding "o" optional).
+    assert.equal(matchesPattern('food.js', 'foo?.js'), true);
+    assert.equal(matchesPattern('foo.js', 'foo?.js'), false);
+    assert.equal(matchesPattern('fo.js', 'foo?.js'), false);
+  });
+
+  test('? does not match a path separator (single non-slash segment char)', () => {
+    assert.equal(matchesPattern('a/b.js', 'a?b.js'), false);
+    assert.equal(matchesPattern('axb.js', 'a?b.js'), true);
+  });
+
+  test('literal . is still matched literally, not as any-char', () => {
+    assert.equal(matchesPattern('fooXjs', 'foo.js'), false);
+    assert.equal(matchesPattern('foo.js', 'foo.js'), true);
+  });
+
+  test('* still matches a run of non-slash characters within a segment', () => {
+    assert.equal(matchesPattern('dist/index.js', 'dist/*.js'), true);
+    assert.equal(matchesPattern('dist/sub/index.js', 'dist/*.js'), false);
+  });
+
+  test('** still crosses path separators', () => {
+    assert.equal(matchesPattern('dist/sub/index.js', 'dist/**/*.js'), true);
+  });
+
+  test('? combines with * without collapsing into a lazy quantifier', () => {
+    // "*?" must mean "one-or-more non-slash", never a lazy "*".
+    assert.equal(matchesPattern('ab', 'a*?'), true);
+    assert.equal(matchesPattern('a', 'a*?'), false);
   });
 });

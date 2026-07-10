@@ -30456,6 +30456,7 @@ function matchesPattern(filename, pattern) {
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
     .replace(/\*\*/g, '\x00')
     .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]')
     .replace(/\x00/g, '.*');
   const regex = new RegExp(`^${escaped}$`);
   const basename = filename.split('/').pop();
