@@ -32438,13 +32438,19 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
-  const skippedFiles = [];
+  // [LAW:one-type-per-behavior] A file GitHub returns without a patch (too large — roughly >400 changed
+  // lines — or binary) and a file whose diff overran the MAX_DIFF_CHARS budget are the SAME behavior: a
+  // changed file whose diff cannot be shown inline. They are two instances of one type, not two modes, so
+  // they merge into ONE list and one rendered block. Patchless files were previously filtered out at
+  // `f.patch` and vanished silently while the scout still assigned them to a scope (buildPrMaterial hands
+  // the scout every filename), so workers hunted for diff lines that did not exist. [LAW:no-silent-failure]
+  const unshowableFiles = files.filter(f => !f.patch).map(f => f.filename);
   let totalChars = 0;
 
   for (const f of patchableFiles) {
     const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
-      skippedFiles.push(f.filename);
+      unshowableFiles.push(f.filename);
     } else {
       includedDiffs.push(entry);
       includedFiles.push(f);
@@ -32454,8 +32460,12 @@ function buildReviewInput(files, maxDiffChars, toolNames, reviewedRepoRoot, focu
 
   let diffs = includedDiffs.join('\n\n');
 
-  if (skippedFiles.length > 0) {
-    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
+  // [LAW:dataflow-not-control-flow] The unshowable set is a VALUE: an empty list renders nothing, so this
+  // is one path, not a "patchless mode". The note names the recovery route the pipeline already owns —
+  // unanchored findings reported via finish_review are counted toward the verdict (transport.js), so the
+  // riskiest (biggest) changed files stay reviewable even though their diff cannot be anchored inline.
+  if (unshowableFiles.length > 0) {
+    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path, review its changes, and because its lines cannot be anchored inline, report any issues via the ${toolNames.finishReview} summary rather than ${toolNames.requestChange}:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
   }
 
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
