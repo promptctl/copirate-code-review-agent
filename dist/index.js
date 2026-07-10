@@ -33651,12 +33651,14 @@ module.exports = {
 // source — they MUST be updated by hand. `cachedInput` is the discounted prompt-cache rate.
 // Sources / last verified:
 //   OpenAI   2026-06-14 — https://openai.com/api/pricing/
-//   DeepSeek 2026-06-17 — https://api-docs.deepseek.com/quick_start/pricing  (aggressive disk-cache rate)
+//   DeepSeek 2026-07-10 — https://api-docs.deepseek.com/quick_start/pricing  (aggressive disk-cache rate)
 //   z.ai GLM 2026-06-17 — https://docs.z.ai/guides/overview/pricing
 const PRICES_PER_MILLION = {
   'gpt-5.5': { input: 5.00, cachedInput: 0.50, output: 30.00 },
   'gpt-5.4': { input: 2.50, cachedInput: 0.25, output: 15.00 },
   'gpt-5.4-mini': { input: 0.75, cachedInput: 0.075, output: 4.50 },
+  // DeepSeek prices a cache hit ~120x below a cache miss; the tiny cachedInput rates below are that
+  // real published disk-cache discount (verified 2026-07-10), an intentional outlier, not typos.
   'deepseek-v4-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87 },
   'deepseek-v4-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28 },
   'glm-5.1': { input: 1.40, cachedInput: 0.26, output: 4.40 },
