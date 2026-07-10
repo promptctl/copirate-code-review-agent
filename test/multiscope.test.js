@@ -75,7 +75,7 @@ describe('workerFocusText', () => {
 // ── dedupeFindings ────────────────────────────────────────────────────────────────────────────
 
 describe('dedupeFindings', () => {
-  test('drops duplicates by path:line:body-prefix, preserving order', () => {
+  test('drops exact-duplicate findings by path:line:body, preserving order', () => {
     const findings = [
       { path: 'a.js', line: 1, body: '[LAW:x] foo', severity: 'blocking' },
       { path: 'b.js', line: 2, body: '[LAW:y] bar', severity: 'blocking' },
@@ -92,6 +92,27 @@ describe('dedupeFindings', () => {
       { path: 'a.js', line: 1, body: 'second different issue here', severity: 'advisory' },
     ]);
     assert.equal(out.length, 2);
+  });
+
+  // [FRAMING:representation] The old key sliced the body to 60 chars; the prompt mandates every body open
+  // with a category tag, so two DISTINCT findings on one line share a long prefix and diverge only later.
+  // Keying on the full body keeps them apart — a recorded finding is never silently merged away.
+  test('keeps two same-line findings that share a >60-char prefix but differ later', () => {
+    const shared = 'Bug: this comparison on the id field looks wrong and needs a closer look here '; // 77 chars
+    const out = dedupeFindings([
+      { path: 'a.js', line: 1, body: `${shared}because it uses = instead of ===`, severity: 'blocking' },
+      { path: 'a.js', line: 1, body: `${shared}because it runs before the guard`, severity: 'advisory' },
+    ]);
+    assert.equal(out.length, 2);
+  });
+
+  // Byte-identical bodies modulo whitespace/case are the real double-record case: they still collapse.
+  test('dedupes bodies that differ only in whitespace and case', () => {
+    const out = dedupeFindings([
+      { path: 'a.js', line: 1, body: 'Bug:  the   guard is missing', severity: 'blocking' },
+      { path: 'a.js', line: 1, body: 'bug: the guard is missing', severity: 'blocking' },
+    ]);
+    assert.equal(out.length, 1);
   });
 
   // [LAW:no-silent-failure] severity decides the merge gate, so a duplicate must not lose it to order.
