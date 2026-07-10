@@ -33657,8 +33657,8 @@ const PRICES_PER_MILLION = {
   'gpt-5.5': { input: 5.00, cachedInput: 0.50, output: 30.00 },
   'gpt-5.4': { input: 2.50, cachedInput: 0.25, output: 15.00 },
   'gpt-5.4-mini': { input: 0.75, cachedInput: 0.075, output: 4.50 },
-  // DeepSeek prices a cache hit ~120x below a cache miss; the tiny cachedInput rates below are that
-  // real published disk-cache discount (verified 2026-07-10), an intentional outlier, not typos.
+  // The tiny cachedInput rates below are DeepSeek's real published disk-cache pricing — a cache hit is
+  // priced far below a cache miss — verified 2026-07-10 against the page, an intentional outlier not typos.
   'deepseek-v4-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87 },
   'deepseek-v4-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28 },
   'glm-5.1': { input: 1.40, cachedInput: 0.26, output: 4.40 },
