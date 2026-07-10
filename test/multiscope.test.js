@@ -591,6 +591,40 @@ describe('buildReviewInput focus', () => {
   });
 });
 
+// ── buildReviewInput surfaces unshowable files (patchless + budget-skipped) as ONE block ──────────
+// A file GitHub returns without a patch (large/binary) and a file whose diff overran MAX_DIFF_CHARS are
+// two instances of one type — "a changed file whose diff cannot be shown". Both must be named in the
+// prompt with a read-in-full instruction so the worker reviews them via the finish_review summary,
+// never silently dropped while the scout still assigns them to scopes. [LAW:no-silent-failure]
+describe('buildReviewInput surfaces unshowable files', () => {
+  test('a patchless file appears in the block with a read-in-full instruction and no diff fence', () => {
+    const files = [{ filename: 'src/big.js', status: 'modified' }]; // no `patch` — GitHub omitted it
+    const { prompt } = buildReviewInput(files, 0, TOOL_NAMES, REPO_ROOT);
+    assert.match(prompt, /could not be shown \(too large or binary/);
+    assert.match(prompt, new RegExp(`${REPO_ROOT}/src/big\\.js`));
+    assert.match(prompt, new RegExp(`report any issues via the ${TOOL_NAMES.finishReview} summary`));
+    assert.doesNotMatch(prompt, /```diff/); // nothing to show, so no diff fence
+  });
+
+  test('a budget-skipped file lands in the SAME block as a patchless file', () => {
+    const big = '@@ -1,1 +1,400 @@\n' + Array.from({ length: 400 }, (_, i) => `+line ${i}`).join('\n');
+    const files = [
+      { filename: 'src/patchless.js', status: 'modified' },
+      { filename: 'src/overbudget.js', status: 'modified', patch: big },
+    ];
+    // A tiny budget forces the patchable file to be skipped too.
+    const { prompt } = buildReviewInput(files, 50, TOOL_NAMES, REPO_ROOT);
+    assert.match(prompt, new RegExp(`${REPO_ROOT}/src/patchless\\.js`));
+    assert.match(prompt, new RegExp(`${REPO_ROOT}/src/overbudget\\.js`));
+  });
+
+  test('a fully-shown diff renders no unshowable block', () => {
+    const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+    const { prompt } = buildReviewInput(files, 0, TOOL_NAMES, REPO_ROOT);
+    assert.doesNotMatch(prompt, /could not be shown/);
+  });
+});
+
 // ── shipped prompts carry NO reviewed-repo layout (598.4) ─────────────────────────────────────────
 // The action reviews arbitrary repos; the reviewed repo's layout is a fact of the INPUT, not a constant
 // of the prompt. Baking THIS repo's directories (src/, scripts/) and filenames into the generic prompts
