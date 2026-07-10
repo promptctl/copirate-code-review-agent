@@ -96,8 +96,20 @@ function buildCommand({ config, collector, home }) {
 
   args.push('Review the pull request instructions and diff from stdin.');
 
+  // [LAW:single-enforcer] Env is an explicit allowlist — never a process.env spread, matching the
+  // codex/opencode adapters so all three enforce the same isolation posture (the boundary CLAUDE.md
+  // documents). claude-code is an AI agent that could surface an env var via a tool result or MCP
+  // call; spreading process.env would sit GITHUB_TOKEN and every runner secret in the child's
+  // environment for a prompt-injection payload in the diff under review to exfiltrate. Only the
+  // minimum is passed: the runner vars npx/node need (PATH resolution, TMPDIR for scratch, and the
+  // npm download cache so npx does not re-fetch the pinned CLI into the throwaway HOME every run —
+  // each omitted by node's spawn when unset, so an absent one is simply not present in the child)
+  // plus the claude-code-specific values this adapter owns (temp HOME, the ANTHROPIC_* auth
+  // translation, timeout, and CLI flags). [LAW:effects-at-boundaries]
   const env = {
-    ...process.env,
+    PATH: process.env.PATH,
+    TMPDIR: process.env.TMPDIR,
+    npm_config_cache: process.env.npm_config_cache,
     HOME: home,
     ANTHROPIC_AUTH_TOKEN: config.endpoint.apiKey,
     ANTHROPIC_BASE_URL: config.endpoint.baseUrl,

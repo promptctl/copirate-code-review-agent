@@ -115,7 +115,7 @@ describe('buildCommand — canonical claude-code args', () => {
   });
 });
 
-describe('buildCommand — env matches pre-refactor runClaudeCode env', () => {
+describe('buildCommand — env is an explicit allowlist', () => {
   test('HOME is set to the provided home directory', () => {
     const { env } = buildCommand({
       config: BASE_CONFIG,
@@ -197,14 +197,52 @@ describe('buildCommand — env matches pre-refactor runClaudeCode env', () => {
     assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, 'high');
   });
 
-  test('env inherits process.env entries', () => {
+  test('PATH is passed through from the runner env', () => {
     const { env } = buildCommand({
       config: BASE_CONFIG,
       collector: MOCK_COLLECTOR,
       home: MOCK_HOME,
     });
-    // PATH is always present in process.env; confirms spread is happening
-    assert.ok('PATH' in env);
+    assert.equal(env.PATH, process.env.PATH);
+  });
+
+  test('env is an explicit allowlist — does not leak arbitrary process.env vars', () => {
+    // Spreading process.env would expose GITHUB_TOKEN and repo secrets to the AI subprocess.
+    // Only the npx/node runner vars, the temp HOME, and the ANTHROPIC_*/CLAUDE_CODE_* values
+    // this adapter owns are permitted. [LAW:single-enforcer]
+    const { env } = buildCommand({
+      config: { ...BASE_CONFIG, reasoning: 'high' },
+      collector: MOCK_COLLECTOR,
+      home: MOCK_HOME,
+    });
+    const allowedKeys = new Set([
+      'PATH', 'TMPDIR', 'npm_config_cache', 'HOME',
+      'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
+      'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'NO_COLOR',
+      'CLAUDE_CODE_EFFORT_LEVEL',
+    ]);
+    for (const key of Object.keys(env)) {
+      assert.ok(allowedKeys.has(key), `unexpected env var leaked into subprocess: ${key}`);
+    }
+  });
+
+  test('a GITHUB_TOKEN in the runner env never reaches the child', () => {
+    // The exact exfiltration the isolation posture exists to prevent: a runner secret sitting in
+    // process.env must not be handed to the reviewer subprocess. Inject it, then assert absence.
+    const hadToken = 'GITHUB_TOKEN' in process.env;
+    const prior = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = 'ghs_secret_must_not_leak';
+    try {
+      const { env } = buildCommand({
+        config: BASE_CONFIG,
+        collector: MOCK_COLLECTOR,
+        home: MOCK_HOME,
+      });
+      assert.equal('GITHUB_TOKEN' in env, false);
+    } finally {
+      if (hadToken) process.env.GITHUB_TOKEN = prior;
+      else delete process.env.GITHUB_TOKEN;
+    }
   });
 });
 
