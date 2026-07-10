@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 
 const {
   workerFocusText,
-  dedupeFindings,
   sumUsage,
   composeSummary,
   planScopes,
@@ -14,7 +13,7 @@ const {
   buildRepoMaterial,
 } = require('../src/multiscope');
 const { buildReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
-const { parseScopeValue } = require('../src/review');
+const { parseScopeValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
 
 const TOOL_NAMES = {

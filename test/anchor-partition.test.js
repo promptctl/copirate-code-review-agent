@@ -241,6 +241,92 @@ describe('partitionFindings — severity carried through', () => {
   });
 });
 
+// [LAW:verifiable-goals] AC (zai-hardening-g4v.4): two findings the model recorded on DIFFERENT nearby
+// lines can snap onto the SAME anchor line. Pre-anchor dedup can't catch them (their lines differ), so
+// partitionFindings collapses them AFTER snapping — but keyed on the ORIGINAL body, since the snap note
+// (which cites each finding's own pre-snap line) would otherwise differ and defeat the collapse.
+describe('partitionFindings — collapses near-duplicates that snap onto one line', () => {
+  test('two findings on different pre-snap lines with equivalent bodies post once', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' }, // snaps to 12
+      { path: 'a.js', line: 14, body: 'Bug: off-by-one in the loop' }, // snaps to 12
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 12);
+    // Survivor is first-seen; its note cites ITS OWN pre-snap line (10), never the other member's.
+    assert.match(anchored[0].body, /Anchored to line 12; the review referenced line 10/);
+  });
+
+  test('two findings snapping to one line with DISTINCT bodies both post', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'Bug: off-by-one in the loop' },
+      { path: 'a.js', line: 14, body: 'Edge case: empty input crashes' },
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 2);
+    assert.deepEqual(anchored.map(f => f.line), [12, 12]);
+  });
+
+  test('collapse uses the SHARED normalization — bodies differing only in whitespace/case merge', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'Fix   the   NULL check' },
+      { path: 'a.js', line: 14, body: 'fix the null check' },
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+  });
+
+  test('an exact-anchor finding and an equivalent snapped one collapse; the on-grid survivor is unannotated', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 12, body: 'Bug: race on shared map' }, // exact, first-seen
+      { path: 'a.js', line: 14, body: 'Bug: race on shared map' }, // snaps to 12, same key
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.deepEqual(anchored[0], { path: 'a.js', line: 12, body: 'Bug: race on shared map' });
+  });
+
+  test('[LAW:no-silent-failure] collapse keeps the stronger severity regardless of arrival order', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 10, body: 'Bug: same issue', severity: 'advisory' },
+      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // arrives later
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].severity, 'blocking');
+  });
+
+  test('[LAW:no-silent-failure] severity-driven replacement swaps which candidate survives — the snapped blocking one wins AND is annotated', () => {
+    // The first-seen survivor is an EXACT-anchored advisory (no snap note); a later SNAPPED blocking
+    // finding with the same normalized body replaces it via blocking-wins. The survivor must flip both
+    // its severity (→ blocking) and its annotation state (→ carries the snap note of the snapped member).
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 'advisory' }, // exact, first-seen
+      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // snaps to 12, replaces
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 12);
+    assert.equal(anchored[0].severity, 'blocking');
+    assert.match(anchored[0].body, /Anchored to line 12; the review referenced line 14/);
+    assert.equal('snappedFromLine' in anchored[0], false);
+  });
+
+  test('snappedFromLine scaffolding never leaks onto an anchored finding', () => {
+    const anchors = anchorsFor([['a.js', 12]]);
+    const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x' }], anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal('snappedFromLine' in anchored[0], false);
+  });
+});
+
 describe('submitReview — severity drives the verdict, never whether a finding is recorded', () => {
   test('all-advisory findings APPROVE (canApprove) yet still post inline, tagged', async () => {
     const octokit = fakeOctokit();

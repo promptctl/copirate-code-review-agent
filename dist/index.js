@@ -31988,6 +31988,7 @@ module.exports = {
 "use strict";
 
 const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
+const { dedupeFindings } = __nccwpck_require__(1565);
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -32038,39 +32039,10 @@ function workerFocusText(scope, context) {
   return `${prefix}${scope.name} — ${scope.focus}`;
 }
 
-// [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
-// two adjacent scopes can both touch a shared file. This is the single place "same finding" is decided;
-// downstream (the printed report, the PR review) consume this deduped list, they never re-derive the
-// key. [LAW:single-enforcer]
-//
-// [FRAMING:representation] The key must be an HONEST representation of "the same recorded finding". A
-// body PREFIX lied in both directions: the prompt mandates every body open with a category tag ("Bug,
-// Edge case, …"), so two DISTINCT findings on one line systematically shared a 60-char prefix and the
-// second was silently dropped — a recorded finding lost after collection. [LAW:no-silent-failure] So key
-// on the FULL body, normalized (whitespace collapsed, lowercased) so byte-for-byte re-records — the real
-// double-record case — still collapse, while any genuine difference in wording keeps two findings apart.
-// Cross-worker paraphrases of one issue surviving as near-duplicates is noise, not loss — the accepted
-// direction to err.
-//
-// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
-// to arrival order: when two workers flag the same key with different severities, the merged finding is
-// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
-// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
-// order is preserved (a Map keeps a key's original position when its value is replaced).
-function dedupeFindings(findings) {
-  const byKey = new Map();
-  for (const f of findings) {
-    const normalizedBody = (f.body || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const key = `${f.path}:${f.line}:${normalizedBody}`;
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, f);
-    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
-      byKey.set(key, f);
-    }
-  }
-  return [...byKey.values()];
-}
+// [LAW:one-source-of-truth] "Same finding" is decided by dedupeFindings in src/review.js — one dedup
+// over the MERGED findings (not per worker), since two adjacent scopes can both touch a shared file.
+// It is imported, never re-implemented, so the pre-anchor merge here and the post-anchor snap-collapse
+// in partitionFindings share one key and one severity-merge rule. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
 // Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
@@ -32289,7 +32261,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
   workerFocusText,
-  dedupeFindings,
   sumUsage,
   composeSummary,
   planScopes,
@@ -33049,6 +33020,47 @@ function parseScopeValue(scope, index) {
   return { name: name.trim(), focus: focus.trim(), files };
 }
 
+// [LAW:one-source-of-truth] The single definition of "the same recorded finding, up to wording": a
+// body normalized by collapsing whitespace and lowercasing. Both dedup sites — the pre-anchor merge of
+// worker findings (dedupeFindings) and the post-anchor collapse of findings that snapped to one line
+// (partitionFindings) — derive their key from THIS, never re-authoring the normalization. [LAW:single-enforcer]
+function normalizeBody(body) {
+  return (body || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// [LAW:effects-at-boundaries] Pure: one dedup pass over a set of findings. This is the single place
+// "same finding" is decided; every downstream sink consumes this deduped list and never re-derives the
+// key. [LAW:single-enforcer] [LAW:one-type-per-behavior] It is called at two lifecycle points on the
+// same behavior — merging worker findings before anchoring, and collapsing findings that SNAP onto one
+// line after anchoring — so it is one function, not two copies.
+//
+// [FRAMING:representation] The key must be an HONEST representation of "the same recorded finding". A
+// body PREFIX lied in both directions: the prompt mandates every body open with a category tag ("Bug,
+// Edge case, …"), so two DISTINCT findings on one line systematically shared a 60-char prefix and the
+// second was silently dropped — a recorded finding lost after collection. [LAW:no-silent-failure] So key
+// on the FULL body, normalized, so byte-for-byte re-records — the real double-record case — still
+// collapse, while any genuine difference in wording keeps two findings apart. Cross-worker paraphrases
+// of one issue surviving as near-duplicates is noise, not loss — the accepted direction to err.
+//
+// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
+// to arrival order: when two members share a key with different severities, the merged finding is
+// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
+// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
+// order is preserved (a Map keeps a key's original position when its value is replaced).
+function dedupeFindings(findings) {
+  const byKey = new Map();
+  for (const f of findings) {
+    const key = `${f.path}:${f.line}:${normalizeBody(f.body)}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
+      byKey.set(key, f);
+    }
+  }
+  return [...byKey.values()];
+}
+
 // A finding cited a line within this many lines of a real anchorable line is snapped to
 // that line rather than dropped: the model named a line just outside the diff hunk, but the
 // comment body is specific enough that a small offset still lands on the right change and the
@@ -33083,11 +33095,14 @@ function partitionFindings(findings, anchors) {
     linesByPath.get(path).push(line);
   }
 
-  const anchored = [];
+  // [LAW:dataflow-not-control-flow] Resolve each finding to a value: an anchored CANDIDATE (original
+  // body kept intact, line set to the anchor it lands on) or unanchored. The body is NOT yet annotated
+  // — the snap note is a rendering applied last, so it never pollutes the identity the collapse keys on.
+  const candidates = [];
   const unanchored = [];
   for (const finding of findings) {
     if (anchors.has(`${finding.path}:${finding.line}`)) {
-      anchored.push({ ...finding });
+      candidates.push({ ...finding });
       continue;
     }
     const snapped = nearestAnchorableLine(finding.line, linesByPath.get(finding.path));
@@ -33095,12 +33110,23 @@ function partitionFindings(findings, anchors) {
       unanchored.push(finding);
       continue;
     }
-    anchored.push({
-      ...finding,
-      line: snapped,
-      body: `${finding.body}\n\n_(Anchored to line ${snapped}; the review referenced line ${finding.line}, just outside the diff.)_`,
-    });
+    candidates.push({ ...finding, line: snapped, snappedFromLine: finding.line });
   }
+
+  // [LAW:one-type-per-behavior] Two findings the model recorded on DIFFERENT nearby lines can snap onto
+  // one anchor line; keyed on path:line:normalizeBody they are now the same recorded finding, so the
+  // same dedup that merged worker findings collapses them here — one function, run after anchoring.
+  // Annotation is applied to survivors ONLY, so the differing pre-snap line in each note can never split
+  // the key and defeat the collapse. [LAW:effects-at-boundaries] snappedFromLine is scaffolding internal
+  // to this function; it is stripped as the note is rendered and never leaves.
+  const anchored = dedupeFindings(candidates).map(({ snappedFromLine, ...finding }) =>
+    snappedFromLine === undefined
+      ? finding
+      : {
+        ...finding,
+        body: `${finding.body}\n\n_(Anchored to line ${finding.line}; the review referenced line ${snappedFromLine}, just outside the diff.)_`,
+      },
+  );
   return { anchored, unanchored };
 }
 
@@ -33117,7 +33143,7 @@ function severityTaggedBody(finding) {
     : finding.body;
 }
 
-module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, partitionFindings, nearestAnchorableLine, severityTaggedBody };
+module.exports = { parseReviewValue, parseFindingValue, parseScopeValue, normalizeBody, dedupeFindings, partitionFindings, nearestAnchorableLine, severityTaggedBody };
 
 
 /***/ }),

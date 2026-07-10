@@ -1,5 +1,6 @@
 'use strict';
 const { produceReview, retryTransientSpawn, sleep } = require('./failover');
+const { dedupeFindings } = require('./review');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -50,39 +51,10 @@ function workerFocusText(scope, context) {
   return `${prefix}${scope.name} — ${scope.focus}`;
 }
 
-// [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
-// two adjacent scopes can both touch a shared file. This is the single place "same finding" is decided;
-// downstream (the printed report, the PR review) consume this deduped list, they never re-derive the
-// key. [LAW:single-enforcer]
-//
-// [FRAMING:representation] The key must be an HONEST representation of "the same recorded finding". A
-// body PREFIX lied in both directions: the prompt mandates every body open with a category tag ("Bug,
-// Edge case, …"), so two DISTINCT findings on one line systematically shared a 60-char prefix and the
-// second was silently dropped — a recorded finding lost after collection. [LAW:no-silent-failure] So key
-// on the FULL body, normalized (whitespace collapsed, lowercased) so byte-for-byte re-records — the real
-// double-record case — still collapse, while any genuine difference in wording keeps two findings apart.
-// Cross-worker paraphrases of one issue surviving as near-duplicates is noise, not loss — the accepted
-// direction to err.
-//
-// [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
-// to arrival order: when two workers flag the same key with different severities, the merged finding is
-// 'blocking' if ANY member is — the stronger severity wins, never the one that happened to arrive first.
-// A blocking finding can never be silently downgraded to the advisory that preceded it. First-seen
-// order is preserved (a Map keeps a key's original position when its value is replaced).
-function dedupeFindings(findings) {
-  const byKey = new Map();
-  for (const f of findings) {
-    const normalizedBody = (f.body || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const key = `${f.path}:${f.line}:${normalizedBody}`;
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, f);
-    } else if (f.severity === 'blocking' && existing.severity !== 'blocking') {
-      byKey.set(key, f);
-    }
-  }
-  return [...byKey.values()];
-}
+// [LAW:one-source-of-truth] "Same finding" is decided by dedupeFindings in src/review.js — one dedup
+// over the MERGED findings (not per worker), since two adjacent scopes can both touch a shared file.
+// It is imported, never re-implemented, so the pre-anchor merge here and the post-anchor snap-collapse
+// in partitionFindings share one key and one severity-merge rule. [LAW:single-enforcer]
 
 // [LAW:effects-at-boundaries] Pure: sum the per-spawn Usage values into one. Token counts always add.
 // Cost is uniform by construction — every spawn in a pass runs on ONE config, so all costs share the
@@ -301,7 +273,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 module.exports = {
   DEFAULT_SCOPE_CONCURRENCY,
   workerFocusText,
-  dedupeFindings,
   sumUsage,
   composeSummary,
   planScopes,
