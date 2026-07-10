@@ -137,7 +137,8 @@ function loadDiffFiles(opts) {
   const diffText = opts.diff
     ? fs.readFileSync(opts.diff, 'utf8')
     : execFileSync('git', ['-C', opts.repo, 'diff', ...opts.range.split(/\s+/).filter(Boolean)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  const files = parseUnifiedDiff(diffText);
+  const { files, warnings } = parseUnifiedDiff(diffText);
+  warnings.forEach(w => console.warn(w));
   if (files.length === 0) {
     throw new Error(`No changed files in the diff (${opts.diff || `git diff ${opts.range}`}). Pick a range with changes, or use --mode repo.`);
   }

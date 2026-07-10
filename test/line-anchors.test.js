@@ -161,13 +161,13 @@ describe('parseUnifiedDiff', () => {
   ].join('\n');
 
   test('parses filename from b/ side', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.equal(files.length, 1);
     assert.equal(files[0].filename, 'src/foo.js');
   });
 
   test('default status is modified', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.equal(files[0].status, 'modified');
   });
 
@@ -180,7 +180,7 @@ describe('parseUnifiedDiff', () => {
       '@@ -0,0 +1,1 @@',
       '+hello',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files[0].status, 'added');
   });
 
@@ -193,12 +193,12 @@ describe('parseUnifiedDiff', () => {
       '@@ -1,1 +0,0 @@',
       '-goodbye',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files[0].status, 'removed');
   });
 
   test('patch includes lines from @@ onward', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.ok(files[0].patch.startsWith('@@ '));
     assert.ok(files[0].patch.includes('+added'));
   });
@@ -210,7 +210,7 @@ describe('parseUnifiedDiff', () => {
       'index abc..def 100644',
       'Binary files differ',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files.length, 0);
   });
 
@@ -223,8 +223,67 @@ describe('parseUnifiedDiff', () => {
       '@@ -1,1 +1,1 @@',
       '+b',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files.length, 2);
     assert.deepEqual(files.map(f => f.filename), ['a.js', 'b.js']);
+  });
+
+  test('quoted unicode path: git octal-escapes the b-side; filename and hunks are its own', () => {
+    // git emits café.txt (é = UTF-8 0xC3 0xA9) as the octal-escaped, double-quoted form.
+    const diff = [
+      'diff --git a/before.js b/before.js',
+      '@@ -1,1 +1,1 @@',
+      '+before',
+      'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"',
+      '@@ -1,1 +1,1 @@',
+      '+content',
+      'diff --git a/after.js b/after.js',
+      '@@ -1,1 +1,1 @@',
+      '+after',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    assert.equal(warnings.length, 0);
+    assert.deepEqual(files.map(f => f.filename), ['before.js', 'café.txt', 'after.js']);
+    // The quoted file carries only its own hunk; neighbors are not polluted.
+    const cafe = files.find(f => f.filename === 'café.txt');
+    assert.ok(cafe.patch.includes('+content'));
+    assert.ok(!cafe.patch.includes('+before') && !cafe.patch.includes('+after'));
+    assert.equal(files.find(f => f.filename === 'before.js').patch, '@@ -1,1 +1,1 @@\n+before');
+    assert.equal(files.find(f => f.filename === 'after.js').patch, '@@ -1,1 +1,1 @@\n+after');
+  });
+
+  test('quoted path unescapes C-style escapes (quote, backslash, tab)', () => {
+    // A path literally containing a double-quote, a backslash, and a tab.
+    const diff = [
+      'diff --git "a/we\\"ird\\\\name\\ttab.txt" "b/we\\"ird\\\\name\\ttab.txt"',
+      '@@ -1,1 +1,1 @@',
+      '+x',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    assert.equal(warnings.length, 0);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].filename, 'we"ird\\name\ttab.txt');
+  });
+
+  test('unparseable diff header warns and does not bleed hunks into the prior file', () => {
+    const diff = [
+      'diff --git a/good.js b/good.js',
+      '@@ -1,1 +1,1 @@',
+      '+good',
+      'diff --git something totally malformed',
+      '@@ -1,1 +1,1 @@',
+      '+orphan',
+      'diff --git a/next.js b/next.js',
+      '@@ -1,1 +1,1 @@',
+      '+next',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    // The good file keeps ONLY its own hunk — the orphan hunk did not append to it.
+    assert.deepEqual(files.map(f => f.filename), ['good.js', 'next.js']);
+    assert.equal(files.find(f => f.filename === 'good.js').patch, '@@ -1,1 +1,1 @@\n+good');
+    assert.ok(!files.some(f => f.patch.includes('+orphan')));
+    // The failure is loud: exactly one warning that names the offending line.
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes('diff --git something totally malformed'));
   });
 });
