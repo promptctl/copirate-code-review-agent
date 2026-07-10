@@ -6,6 +6,8 @@ const {
   buildReviewAnchors,
   annotatePatchWithLines,
   parseUnifiedDiff,
+  unquoteCStylePath,
+  parseGitDiffHeader,
 } = require('../src/index.js');
 
 // The line-anchor invariant:
@@ -161,13 +163,13 @@ describe('parseUnifiedDiff', () => {
   ].join('\n');
 
   test('parses filename from b/ side', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.equal(files.length, 1);
     assert.equal(files[0].filename, 'src/foo.js');
   });
 
   test('default status is modified', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.equal(files[0].status, 'modified');
   });
 
@@ -180,7 +182,7 @@ describe('parseUnifiedDiff', () => {
       '@@ -0,0 +1,1 @@',
       '+hello',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files[0].status, 'added');
   });
 
@@ -193,12 +195,12 @@ describe('parseUnifiedDiff', () => {
       '@@ -1,1 +0,0 @@',
       '-goodbye',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files[0].status, 'removed');
   });
 
   test('patch includes lines from @@ onward', () => {
-    const files = parseUnifiedDiff(UNIFIED);
+    const { files } = parseUnifiedDiff(UNIFIED);
     assert.ok(files[0].patch.startsWith('@@ '));
     assert.ok(files[0].patch.includes('+added'));
   });
@@ -210,7 +212,7 @@ describe('parseUnifiedDiff', () => {
       'index abc..def 100644',
       'Binary files differ',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files.length, 0);
   });
 
@@ -223,8 +225,124 @@ describe('parseUnifiedDiff', () => {
       '@@ -1,1 +1,1 @@',
       '+b',
     ].join('\n');
-    const files = parseUnifiedDiff(diff);
+    const { files } = parseUnifiedDiff(diff);
     assert.equal(files.length, 2);
     assert.deepEqual(files.map(f => f.filename), ['a.js', 'b.js']);
+  });
+
+  test('quoted unicode path: git octal-escapes the b-side; filename and hunks are its own', () => {
+    // git emits café.txt (é = UTF-8 0xC3 0xA9) as the octal-escaped, double-quoted form.
+    const diff = [
+      'diff --git a/before.js b/before.js',
+      '@@ -1,1 +1,1 @@',
+      '+before',
+      'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"',
+      '@@ -1,1 +1,1 @@',
+      '+content',
+      'diff --git a/after.js b/after.js',
+      '@@ -1,1 +1,1 @@',
+      '+after',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    assert.equal(warnings.length, 0);
+    assert.deepEqual(files.map(f => f.filename), ['before.js', 'café.txt', 'after.js']);
+    // The quoted file carries only its own hunk; neighbors are not polluted.
+    const cafe = files.find(f => f.filename === 'café.txt');
+    assert.ok(cafe.patch.includes('+content'));
+    assert.ok(!cafe.patch.includes('+before') && !cafe.patch.includes('+after'));
+    assert.equal(files.find(f => f.filename === 'before.js').patch, '@@ -1,1 +1,1 @@\n+before');
+    assert.equal(files.find(f => f.filename === 'after.js').patch, '@@ -1,1 +1,1 @@\n+after');
+  });
+
+  test('quoted path unescapes C-style escapes (quote, backslash, tab)', () => {
+    // A path literally containing a double-quote, a backslash, and a tab.
+    const diff = [
+      'diff --git "a/we\\"ird\\\\name\\ttab.txt" "b/we\\"ird\\\\name\\ttab.txt"',
+      '@@ -1,1 +1,1 @@',
+      '+x',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    assert.equal(warnings.length, 0);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].filename, 'we"ird\\name\ttab.txt');
+  });
+
+  test('unparseable diff header warns and does not bleed hunks into the prior file', () => {
+    const diff = [
+      'diff --git a/good.js b/good.js',
+      '@@ -1,1 +1,1 @@',
+      '+good',
+      'diff --git something totally malformed',
+      '@@ -1,1 +1,1 @@',
+      '+orphan',
+      'diff --git a/next.js b/next.js',
+      '@@ -1,1 +1,1 @@',
+      '+next',
+    ].join('\n');
+    const { files, warnings } = parseUnifiedDiff(diff);
+    // The good file keeps ONLY its own hunk — the orphan hunk did not append to it.
+    assert.deepEqual(files.map(f => f.filename), ['good.js', 'next.js']);
+    assert.equal(files.find(f => f.filename === 'good.js').patch, '@@ -1,1 +1,1 @@\n+good');
+    assert.ok(!files.some(f => f.patch.includes('+orphan')));
+    // The failure is loud: exactly one warning that names the offending line.
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes('diff --git something totally malformed'));
+  });
+});
+
+describe('unquoteCStylePath', () => {
+  test('empty string round-trips to empty', () => {
+    assert.equal(unquoteCStylePath(''), '');
+  });
+
+  test('pure ASCII with no escapes is unchanged', () => {
+    assert.equal(unquoteCStylePath('src/hello.js'), 'src/hello.js');
+  });
+
+  test('octal escapes decode as UTF-8 bytes, not per-code-point', () => {
+    // é = U+00E9 = UTF-8 0xC3 0xA9 = \303\251; naive per-octal decoding yields "Ã©".
+    assert.equal(unquoteCStylePath(String.raw`caf\303\251.txt`), 'café.txt');
+  });
+
+  test('named C-style escapes map to their bytes (tab, newline, quote, backslash)', () => {
+    assert.equal(unquoteCStylePath(String.raw`a\tb\nc`), 'a\tb\nc');
+    assert.equal(unquoteCStylePath(String.raw`quote\"back\\slash`), 'quote"back\\slash');
+  });
+
+  test('short octal escape (fewer than 3 digits) at end of string', () => {
+    // \50 = octal 050 = 0x28 = '('. Consumed without over-reading past the digits present.
+    assert.equal(unquoteCStylePath(String.raw`x\50`), 'x(');
+  });
+
+  test('trailing lone backslash is kept literal without over-consuming', () => {
+    assert.equal(unquoteCStylePath('path\\'), 'path\\');
+  });
+
+  test('consecutive escape sequences of mixed kinds', () => {
+    // \\ -> backslash, \164 -> 't' (0x74), \50 -> '(' (0x28).
+    assert.equal(unquoteCStylePath(String.raw`\\\164\50`), '\\t(');
+  });
+});
+
+describe('parseGitDiffHeader', () => {
+  test('unquoted header returns the b-side path', () => {
+    assert.equal(parseGitDiffHeader('diff --git a/src/foo.js b/src/foo.js'), 'src/foo.js');
+  });
+
+  test('rename header returns the new (b-side) path', () => {
+    assert.equal(parseGitDiffHeader('diff --git a/old.js b/new.js'), 'new.js');
+  });
+
+  test('quoted header unescapes the b-side path', () => {
+    assert.equal(parseGitDiffHeader(String.raw`diff --git "a/caf\303\251.txt" "b/caf\303\251.txt"`), 'café.txt');
+  });
+
+  test('mixed header (plain a-side, quoted b-side) returns the quoted b-side', () => {
+    assert.equal(parseGitDiffHeader(String.raw`diff --git a/old.js "b/n\303\253w.js"`), 'nëw.js');
+  });
+
+  test('malformed header returns null so the caller owns no file', () => {
+    assert.equal(parseGitDiffHeader('diff --git something totally malformed'), null);
+    assert.equal(parseGitDiffHeader('diff --git a/only-one-side'), null);
   });
 });

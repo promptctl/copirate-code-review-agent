@@ -30516,10 +30516,59 @@ function annotatePatchWithLines(patch) {
   return lines.join('\n');
 }
 
-// Parse a unified diff into the same {filename, status, patch} shape GitHub's
-// listFiles returns, where `patch` is the hunk text from the first @@ onward.
+// Git prints a path double-quoted with C-style escapes when it holds a byte that needs
+// quoting (a control char, a `"`/`\`, or — by default — any byte >= 0x80, i.e. non-ASCII).
+// Reverse that encoding to recover the real filename. Octal escapes carry raw UTF-8 bytes
+// (é -> \303\251), so accumulate a byte stream and decode it as UTF-8 once at the end;
+// decoding each octal as its own code point would yield mojibake — a wrong filename that
+// would itself mis-anchor. [FRAMING:representation]
+const C_ESCAPE_BYTE = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+function unquoteCStylePath(inner) {
+  const bytes = [];
+  for (let i = 0; i < inner.length; i++) {
+    if (inner[i] !== '\\') {
+      for (const b of Buffer.from(inner[i], 'utf8')) bytes.push(b);
+      continue;
+    }
+    const next = inner[i + 1];
+    if (next >= '0' && next <= '7') {
+      let oct = '';
+      while (oct.length < 3 && inner[i + 1] >= '0' && inner[i + 1] <= '7') {
+        oct += inner[i + 1];
+        i++;
+      }
+      bytes.push(parseInt(oct, 8) & 0xff);
+      continue;
+    }
+    const mapped = C_ESCAPE_BYTE[next];
+    if (mapped !== undefined) {
+      bytes.push(mapped);
+      i++;
+    } else {
+      // Lone/unknown backslash (git never emits one): keep it literal, reprocess `next`.
+      bytes.push(92);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+// The b-side path of a `diff --git` header, honoring git's quoted form. Returns null when
+// the header is malformed FOR US so the caller owns no file rather than the wrong one.
+// [LAW:no-silent-failure]
+function parseGitDiffHeader(line) {
+  const quotedB = /^diff --git .+ "b\/((?:[^"\\]|\\.)*)"$/.exec(line);
+  if (quotedB) return unquoteCStylePath(quotedB[1]);
+  const plainB = /^diff --git a\/.+ b\/(.+)$/.exec(line);
+  if (plainB) return plainB[1];
+  return null;
+}
+
+// Parse a unified diff into the same {filename, status, patch} shape GitHub's listFiles
+// returns (where `patch` is the hunk text from the first @@ onward), plus the warnings the
+// caller must surface. Returns { files, warnings }.
 function parseUnifiedDiff(diff) {
   const files = [];
+  const warnings = [];
   let cur = null;
   const flush = () => {
     if (cur && cur.hunks.length > 0) {
@@ -30527,10 +30576,17 @@ function parseUnifiedDiff(diff) {
     }
   };
   for (const line of diff.split('\n')) {
-    const header = /^diff --git a\/.+ b\/(.+)$/.exec(line);
-    if (header) {
+    // Every file section opens with `diff --git `; treat that prefix as the file boundary
+    // structurally, so a header we cannot parse still closes the previous file (cur=null)
+    // instead of silently bleeding its hunks into the wrong one — which would falsify
+    // patchLines' anchors for both files at once. [LAW:no-silent-failure] [LAW:one-source-of-truth]
+    if (line.startsWith('diff --git ')) {
       flush();
-      cur = { filename: header[1], status: 'modified', hunks: [], inHunk: false };
+      const filename = parseGitDiffHeader(line);
+      if (filename === null) {
+        warnings.push(`parseUnifiedDiff: unparseable diff header; its hunks are dropped rather than attributed to the previous file: ${line}`);
+      }
+      cur = filename === null ? null : { filename, status: 'modified', hunks: [], inHunk: false };
       continue;
     }
     if (!cur) {
@@ -30543,7 +30599,7 @@ function parseUnifiedDiff(diff) {
     if (cur.inHunk) cur.hunks.push(line);
   }
   flush();
-  return files;
+  return { files, warnings };
 }
 
 module.exports = {
@@ -30553,6 +30609,8 @@ module.exports = {
   buildFileAnchors,
   buildReviewAnchors,
   annotatePatchWithLines,
+  unquoteCStylePath,
+  parseGitDiffHeader,
   parseUnifiedDiff,
 };
 
@@ -31876,7 +31934,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 }
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
-const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
+const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, unquoteCStylePath, parseGitDiffHeader } = __nccwpck_require__(9898);
 const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
@@ -31886,6 +31944,8 @@ module.exports = {
   parseUnifiedDiff,
   buildReviewAnchors,
   annotatePatchWithLines,
+  unquoteCStylePath,
+  parseGitDiffHeader,
   gitHubTransport,
   giteaTransport,
   resolveReviewTarget,
@@ -33522,7 +33582,8 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     repo,
     pull_number: pullNumber,
   });
-  const parsed = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  const { files: parsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  warnings.forEach(w => core.warning(w));
   if (parsed.length === 0) {
     throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
   }

@@ -49,7 +49,8 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     repo,
     pull_number: pullNumber,
   });
-  const parsed = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  const { files: parsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  warnings.forEach(w => core.warning(w));
   if (parsed.length === 0) {
     throw new Error(`No reviewable diff for PR #${pullNumber}: listFiles returned no patch and the unified diff was empty.`);
   }
