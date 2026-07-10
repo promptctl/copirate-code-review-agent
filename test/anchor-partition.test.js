@@ -302,6 +302,23 @@ describe('partitionFindings — collapses near-duplicates that snap onto one lin
     assert.equal(anchored[0].severity, 'blocking');
   });
 
+  test('[LAW:no-silent-failure] severity-driven replacement swaps which candidate survives — the snapped blocking one wins AND is annotated', () => {
+    // The first-seen survivor is an EXACT-anchored advisory (no snap note); a later SNAPPED blocking
+    // finding with the same normalized body replaces it via blocking-wins. The survivor must flip both
+    // its severity (→ blocking) and its annotation state (→ carries the snap note of the snapped member).
+    const anchors = anchorsFor([['a.js', 12]]);
+    const findings = [
+      { path: 'a.js', line: 12, body: 'Bug: same issue', severity: 'advisory' }, // exact, first-seen
+      { path: 'a.js', line: 14, body: 'Bug: same issue', severity: 'blocking' }, // snaps to 12, replaces
+    ];
+    const { anchored } = partitionFindings(findings, anchors);
+    assert.equal(anchored.length, 1);
+    assert.equal(anchored[0].line, 12);
+    assert.equal(anchored[0].severity, 'blocking');
+    assert.match(anchored[0].body, /Anchored to line 12; the review referenced line 14/);
+    assert.equal('snappedFromLine' in anchored[0], false);
+  });
+
   test('snappedFromLine scaffolding never leaks onto an anchored finding', () => {
     const anchors = anchorsFor([['a.js', 12]]);
     const { anchored } = partitionFindings([{ path: 'a.js', line: 14, body: 'x' }], anchors);
