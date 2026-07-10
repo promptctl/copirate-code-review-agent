@@ -6,6 +6,8 @@ const {
   buildReviewAnchors,
   annotatePatchWithLines,
   parseUnifiedDiff,
+  unquoteCStylePath,
+  parseGitDiffHeader,
 } = require('../src/index.js');
 
 // The line-anchor invariant:
@@ -285,5 +287,62 @@ describe('parseUnifiedDiff', () => {
     // The failure is loud: exactly one warning that names the offending line.
     assert.equal(warnings.length, 1);
     assert.ok(warnings[0].includes('diff --git something totally malformed'));
+  });
+});
+
+describe('unquoteCStylePath', () => {
+  test('empty string round-trips to empty', () => {
+    assert.equal(unquoteCStylePath(''), '');
+  });
+
+  test('pure ASCII with no escapes is unchanged', () => {
+    assert.equal(unquoteCStylePath('src/hello.js'), 'src/hello.js');
+  });
+
+  test('octal escapes decode as UTF-8 bytes, not per-code-point', () => {
+    // é = U+00E9 = UTF-8 0xC3 0xA9 = \303\251; naive per-octal decoding yields "Ã©".
+    assert.equal(unquoteCStylePath(String.raw`caf\303\251.txt`), 'café.txt');
+  });
+
+  test('named C-style escapes map to their bytes (tab, newline, quote, backslash)', () => {
+    assert.equal(unquoteCStylePath(String.raw`a\tb\nc`), 'a\tb\nc');
+    assert.equal(unquoteCStylePath(String.raw`quote\"back\\slash`), 'quote"back\\slash');
+  });
+
+  test('short octal escape (fewer than 3 digits) at end of string', () => {
+    // \50 = octal 050 = 0x28 = '('. Consumed without over-reading past the digits present.
+    assert.equal(unquoteCStylePath(String.raw`x\50`), 'x(');
+  });
+
+  test('trailing lone backslash is kept literal without over-consuming', () => {
+    assert.equal(unquoteCStylePath('path\\'), 'path\\');
+  });
+
+  test('consecutive escape sequences of mixed kinds', () => {
+    // \\ -> backslash, \164 -> 't' (0x74), \50 -> '(' (0x28).
+    assert.equal(unquoteCStylePath(String.raw`\\\164\50`), '\\t(');
+  });
+});
+
+describe('parseGitDiffHeader', () => {
+  test('unquoted header returns the b-side path', () => {
+    assert.equal(parseGitDiffHeader('diff --git a/src/foo.js b/src/foo.js'), 'src/foo.js');
+  });
+
+  test('rename header returns the new (b-side) path', () => {
+    assert.equal(parseGitDiffHeader('diff --git a/old.js b/new.js'), 'new.js');
+  });
+
+  test('quoted header unescapes the b-side path', () => {
+    assert.equal(parseGitDiffHeader(String.raw`diff --git "a/caf\303\251.txt" "b/caf\303\251.txt"`), 'café.txt');
+  });
+
+  test('mixed header (plain a-side, quoted b-side) returns the quoted b-side', () => {
+    assert.equal(parseGitDiffHeader(String.raw`diff --git a/old.js "b/n\303\253w.js"`), 'nëw.js');
+  });
+
+  test('malformed header returns null so the caller owns no file', () => {
+    assert.equal(parseGitDiffHeader('diff --git something totally malformed'), null);
+    assert.equal(parseGitDiffHeader('diff --git a/only-one-side'), null);
   });
 });

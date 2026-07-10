@@ -158,5 +158,7 @@ module.exports = {
   buildFileAnchors,
   buildReviewAnchors,
   annotatePatchWithLines,
+  unquoteCStylePath,
+  parseGitDiffHeader,
   parseUnifiedDiff,
 };

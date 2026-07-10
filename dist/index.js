@@ -30609,6 +30609,8 @@ module.exports = {
   buildFileAnchors,
   buildReviewAnchors,
   annotatePatchWithLines,
+  unquoteCStylePath,
+  parseGitDiffHeader,
   parseUnifiedDiff,
 };
 
@@ -31932,7 +31934,7 @@ if (process.argv.includes(COLLECTOR_SERVER_ARG)) {
 }
 
 // Re-exports for test imports — all symbols the T1 test suite requires from this path.
-const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines } = __nccwpck_require__(9898);
+const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines, unquoteCStylePath, parseGitDiffHeader } = __nccwpck_require__(9898);
 const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = __nccwpck_require__(7228);
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = __nccwpck_require__(2887);
 const { classifyClaudeError } = __nccwpck_require__(3048);
@@ -31942,6 +31944,8 @@ module.exports = {
   parseUnifiedDiff,
   buildReviewAnchors,
   annotatePatchWithLines,
+  unquoteCStylePath,
+  parseGitDiffHeader,
   gitHubTransport,
   giteaTransport,
   resolveReviewTarget,
