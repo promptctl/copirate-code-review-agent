@@ -31960,8 +31960,18 @@ function workerFocusText(scope, context) {
 }
 
 // [LAW:effects-at-boundaries] Pure: one dedup pass over the MERGED findings (not per worker), since
-// two adjacent scopes can both touch a shared file. Keyed by path:line:body-prefix — the same key the
-// printed report and the PR review treat as "the same finding". [LAW:one-source-of-truth]
+// two adjacent scopes can both touch a shared file. This is the single place "same finding" is decided;
+// downstream (the printed report, the PR review) consume this deduped list, they never re-derive the
+// key. [LAW:single-enforcer]
+//
+// [FRAMING:representation] The key must be an HONEST representation of "the same recorded finding". A
+// body PREFIX lied in both directions: the prompt mandates every body open with a category tag ("Bug,
+// Edge case, …"), so two DISTINCT findings on one line systematically shared a 60-char prefix and the
+// second was silently dropped — a recorded finding lost after collection. [LAW:no-silent-failure] So key
+// on the FULL body, normalized (whitespace collapsed, lowercased) so byte-for-byte re-records — the real
+// double-record case — still collapse, while any genuine difference in wording keeps two findings apart.
+// Cross-worker paraphrases of one issue surviving as near-duplicates is noise, not loss — the accepted
+// direction to err.
 //
 // [LAW:no-silent-failure] Severity decides the merge gate, so a duplicate must never lose its severity
 // to arrival order: when two workers flag the same key with different severities, the merged finding is
@@ -31971,7 +31981,8 @@ function workerFocusText(scope, context) {
 function dedupeFindings(findings) {
   const byKey = new Map();
   for (const f of findings) {
-    const key = `${f.path}:${f.line}:${(f.body || '').slice(0, 60)}`;
+    const normalizedBody = (f.body || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const key = `${f.path}:${f.line}:${normalizedBody}`;
     const existing = byKey.get(key);
     if (!existing) {
       byKey.set(key, f);
