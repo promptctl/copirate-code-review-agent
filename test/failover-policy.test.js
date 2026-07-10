@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 
 const {
   TransientError,
+  ProtocolError,
+  isRetryableSpawnError,
   produceReview,
   buildAttributionFooter,
   retryTransientSpawn,
@@ -110,6 +112,49 @@ describe('retryTransientSpawn', () => {
       { sleepFn: async (ms) => { delays.push(ms); } },
     );
     assert.deepEqual(delays, [4321]);
+  });
+
+  // ProtocolError shares TransientError's retry policy but is a DISTINCT type. A model that forgot
+  // finish_review (or wrote no records) very likely succeeds on a fresh spawn, so it retries in place.
+  it('retries on ProtocolError then returns the eventual success', async () => {
+    let calls = 0;
+    const retries = [];
+    const value = await retryTransientSpawn(
+      async () => { calls++; if (calls < 3) throw new ProtocolError('no finish_review'); return 'recovered'; },
+      { sleepFn: async () => {}, onRetry: (info) => retries.push(info.attempt) },
+    );
+    assert.equal(value, 'recovered');
+    assert.equal(calls, 3);
+    assert.deepEqual(retries, [1, 2]);
+  });
+
+  it('rethrows the last ProtocolError after exhausting the budget, AS ITSELF (never a TransientError)', async () => {
+    // [LAW:one-type-per-behavior] Same retry policy, different identity: an exhausted ProtocolError must
+    // stay a ProtocolError so produceReview's `!instanceof TransientError` gate reds the run with the
+    // precise cause instead of laundering a broken engine into config-level failover.
+    let calls = 0;
+    const last = new ProtocolError('still no finish_review');
+    await assert.rejects(
+      () => retryTransientSpawn(
+        async () => { calls++; throw calls === TRANSIENT_SPAWN_ATTEMPTS ? last : new ProtocolError('slip'); },
+        { sleepFn: async () => {} },
+      ),
+      err => err === last && err instanceof ProtocolError && !(err instanceof TransientError),
+    );
+    assert.equal(calls, TRANSIENT_SPAWN_ATTEMPTS);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// isRetryableSpawnError — the single source of truth for which errors a re-spawn can fix
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('isRetryableSpawnError', () => {
+  it('is true for both retryable spawn types and false for a plain Error', () => {
+    assert.equal(isRetryableSpawnError(new TransientError('net')), true);
+    assert.equal(isRetryableSpawnError(new ProtocolError('slip')), true);
+    assert.equal(isRetryableSpawnError(new Error('code bug')), false);
+    assert.equal(isRetryableSpawnError(new TypeError('bad envelope')), false);
   });
 });
 
@@ -263,6 +308,27 @@ describe('produceReview — non-transient errors', () => {
     const stub = async () => { callCount++; throw new Error('non-transient'); };
     await assert.rejects(() => produceReview(chain, () => 'p', {}, stub, NO_SLEEP));
     assert.equal(callCount, 1);
+  });
+
+  it('throws a ProtocolError immediately — no retry, no config advancement', async () => {
+    // [LAW:verifiable-goals] Locks in the deliberate asymmetry: retryTransientSpawn retries a
+    // ProtocolError in place, but an EXHAUSTED one reaches produceReview as a non-TransientError and
+    // reds the run at once — a persistent model protocol slip is a broken engine, not a provider blip,
+    // so it must NOT trigger config-level failover. Guards against a future refactor of produceReview's
+    // gate to isRetryableSpawnError, which would silently start failing a broken engine over to configs.
+    const chain = [cfg('a'), cfg('b')];
+    const slip = new ProtocolError('no finish_review');
+    let bCalled = false;
+    const stub = async (config) => {
+      if (config.name === 'a') throw slip;
+      bCalled = true;
+      return FAKE_REVIEW;
+    };
+    await assert.rejects(
+      () => produceReview(chain, () => 'p', {}, stub, NO_SLEEP),
+      err => err === slip && err instanceof ProtocolError,
+    );
+    assert.equal(bCalled, false, 'a ProtocolError must never fail over to the next config');
   });
 });
 
