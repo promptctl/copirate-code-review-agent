@@ -20,6 +20,26 @@ class TransientError extends Error {
   }
 }
 
+// [LAW:types-are-the-program] "The model broke the collector protocol" is a distinct error type, not
+// an anonymous Error indistinguishable from a code bug. It is thrown at the collector-read boundary
+// (readCollectedReview) when a worker forgot finish_review (zero finishes) or wrote no records at all
+// — the most common weak-model slip. [LAW:no-ambient-temporal-coupling] Recovery for this class is
+// owned by the retry seam (retryTransientSpawn), not by WHERE the throw happens to originate: a fresh
+// spawn very likely fixes a one-off slip, so this shares TransientError's short-horizon retry policy.
+// [LAW:one-type-per-behavior] It is deliberately a SEPARATE type from TransientError — same retry
+// policy, different meaning (a model protocol slip is not a flaky network) — so the two are never
+// laundered into one. It carries no retryAfterMs: a model slip has no server-specified wait, so the
+// retry loop falls to exponential backoff (err.retryAfterMs is undefined → the ?? default fires).
+class ProtocolError extends Error {}
+
+// [LAW:one-source-of-truth] The single place that names which errors a re-spawn can fix. TransientError
+// and ProtocolError are distinct types that share ONE recovery policy (retry in place, short horizon);
+// this predicate expresses that shared membership once, so retryTransientSpawn dispatches on the POLICY
+// rather than a growing instanceof chain, and adding a future retryable class is a one-line change here.
+function isRetryableSpawnError(err) {
+  return err instanceof TransientError || err instanceof ProtocolError;
+}
+
 // Extract the server's Retry-After hint (seconds form) from CLI text output.
 // Returns the exact value in milliseconds, or null if absent. No cap: the caller
 // must honor the full server-specified window; TRANSIENT_BACKOFF_MAX_MS belongs
@@ -82,11 +102,13 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // [LAW:one-source-of-truth] It owns no new timing math: the backoff curve and Retry-After precedence
 // are the SAME shared primitives produceReview uses (transientBackoffMs, err.retryAfterMs), so retry
 // TIMING lives in exactly one place; only the short-horizon attempt policy is local here.
-// [LAW:no-silent-failure] A non-transient error surfaces immediately; an EXHAUSTED transient is
-// rethrown (never swallowed), so produceReview's config-level failover/budget still takes over — the
-// run only reds when a transient genuinely persists past both layers. onRetry is the injected
-// progress effect; sleepFn is injectable so tests drive the retry path with no real waits.
-// [LAW:effects-at-boundaries]
+// [LAW:no-silent-failure] A non-retryable error surfaces immediately; a retryable one (TransientError
+// or ProtocolError — see isRetryableSpawnError) that EXHAUSTS its attempts is rethrown as itself (never
+// swallowed). The two exhausted types then diverge at produceReview by design: an exhausted Transient
+// still hits config-level failover/budget, while an exhausted Protocol (not a TransientError) reds the
+// run with its precise cause — a persistent model protocol slip is a broken engine, not a provider blip.
+// onRetry is the injected progress effect; sleepFn is injectable so tests drive the retry path with no
+// real waits. [LAW:effects-at-boundaries]
 async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sleepFn = sleep, onRetry = () => {} } = {}) {
   // [LAW:no-silent-failure] A limit < 1 would run zero iterations and fall through to `throw lastErr`
   // with lastErr still undefined — an opaque `throw undefined` crash. Reject it loud with a diagnostic.
@@ -100,9 +122,12 @@ async function retryTransientSpawn(thunk, { limit = TRANSIENT_SPAWN_ATTEMPTS, sl
     try {
       return await thunk();
     } catch (err) {
-      if (!(err instanceof TransientError)) throw err; // non-transient: surface immediately
+      if (!isRetryableSpawnError(err)) throw err; // not retryable-in-place: surface immediately
       lastErr = err;
-      if (attempt === limit) throw lastErr; // exhausted: let the config-level failover take over
+      // [LAW:no-silent-failure] Exhausted: rethrow AS ITSELF, preserving the type. A ProtocolError that
+      // survives every attempt reaches produceReview's `!instanceof TransientError` gate and reds the run
+      // with its precise cause — a genuinely broken engine is not laundered into config-level failover.
+      if (attempt === limit) throw lastErr;
       const delay = err.retryAfterMs ?? transientBackoffMs(attempt);
       onRetry({ attempt, limit, delay, err });
       await sleepFn(delay);
@@ -210,6 +235,8 @@ module.exports = {
   TRANSIENT_RETRY_BUDGET_MS,
   TRANSIENT_SPAWN_ATTEMPTS,
   TransientError,
+  ProtocolError,
+  isRetryableSpawnError,
   parseRetryAfterMs,
   classifyTransient,
   sleep,
