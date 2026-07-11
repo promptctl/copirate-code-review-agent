@@ -33789,7 +33789,8 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, f
   } catch (e) {
     core.warning(
       `Budget: failed to read cost ledger issue #${issueNumber} (${e.message}) — proceeding SPEND-SAFE as if `
-      + 'under budget (full effort). Verify LEDGER_ISSUE and the token\'s issues:read access.',
+      + 'under budget (full effort). Verify LEDGER_ISSUE and the token\'s issues:write access (the gradient '
+      + 'also appends after review, so issues:write — not just read — is the single permission the feature needs).',
     );
   }
 
