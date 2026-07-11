@@ -1,0 +1,133 @@
+'use strict';
+
+// The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
+// budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
+// this review can afford. No IO — the ledger read (spend so far) and the profile override happen at
+// the run() boundary (zai-budget-qzm.5); this module is the pure core between those effects.
+// [LAW:effects-at-boundaries] [LAW:dataflow-not-control-flow] the chosen profile is a VALUE selected
+// from the candidate set, never a branch that skips the review — the epic's bar is a soft GRADIENT
+// (spend less as the day depletes), NEVER a hard cutoff, so this function is TOTAL: it always returns a
+// profile, and the worst case is the cheapest candidate.
+//
+// TWO parts at a real joint [LAW:decomposition]: estimatedCostUsd ranks the cost of ONE profile at a
+// given diff (a reusable ranker); chooseProfile selects the affordable best from a candidate set (it
+// consumes the estimate). Neither fuses with the other's concern.
+
+// [LAW:one-source-of-truth] Calibration constants — the token/price model MEASURED on 21 real review
+// rounds in the spike (zai-budget-qzm.1), mined from this repo's own dogfooded PR reviews (#75–#85,
+// claude-code/deepseek-v4-pro). Like PRICES_PER_MILLION in usage.js this is a representation that
+// DRIFTS from reality and has no machine source — it is hand-maintained and RECALIBRATED per model.
+// Source / last measured: spike zai-budget-qzm.1 findings, 2026-07-11.
+//   FIXED_TOKENS        ~178k input tokens every round pays regardless of diff (scout + instructions
+//                       + reads + reasoning + MCP) — cost is fixed-DOMINATED for small diffs.
+//   MARGINAL_TOKENS/line ~2914 input tokens per churn line (add+del) — the modest per-diff marginal.
+//   BLENDED_USD_PER_TOKEN ~$0.12 per 1M tokens EFFECTIVE (most tokens are cache hits at $0.003625/M
+//                       vs $0.435/M list; the hit RATIO swings run to run → the ~25% absolute noise).
+const CALIBRATION = {
+  FIXED_TOKENS: 178_000,
+  MARGINAL_TOKENS_PER_LINE: 2_914,
+  BLENDED_USD_PER_TOKEN: 0.12 / 1_000_000,
+};
+
+// [LAW:no-silent-failure] The cost rank of roundCap's "unlimited" sentinel (0, per effort.js). An
+// unlimited review runs to CONVERGENCE (empirically ~5–8 rounds), so it is the MOST expensive profile,
+// not the cheapest. A naive `perRoundBase × roundCap` would estimate the sentinel at $0 — always
+// "affordable" — silently defeating the entire budget on the most expensive profile. Mapping 0 to a
+// rank ABOVE any typical finite cap keeps the ranker honest and monotonic (unlimited ≥ any finite cap).
+const UNLIMITED_EFFECTIVE_ROUNDS = 8;
+
+// [LAW:no-mode-explosion] Policy tunables — internal named constants, NOT action inputs. The only knob
+// exposed to consumers is DAILY_BUDGET_USD (wired in zai-budget-qzm.5); everything else is sane
+// documented default, tuned in this one place.
+//   CAP_FRACTION  each review may spend at most this fraction of what REMAINS of the day's budget. A
+//                 fraction-of-remaining cap decays GEOMETRICALLY as the day depletes (it asymptotes to
+//                 zero but never reaches it), so the budget rations itself across the day rather than
+//                 running full effort until a hard wall. This IS the gradient.
+//   MIN_CAP_USD   floor under the cap so it never decays to zero: a low-effort review stays affordable
+//                 deep into the budget. (The ultimate "a review always runs" guarantee is the selection
+//                 fallback below — this floor keeps the cap itself sane; the fallback covers the
+//                 pathological case where even the cheapest candidate exceeds the floored cap.)
+const CAP_FRACTION = 0.1;
+const MIN_CAP_USD = 0.1;
+
+// [LAW:effects-at-boundaries] Pure: the estimated USD cost of running ONE review round at this diff.
+// diffSize is CHURN (added + deleted lines) — the axis the spike measured cost against. The fixed
+// floor dominates for small diffs; the marginal adds a modest per-line term.
+function perRoundBaseUsd(diffSize) {
+  const tokens = CALIBRATION.FIXED_TOKENS + CALIBRATION.MARGINAL_TOKENS_PER_LINE * diffSize;
+  return tokens * CALIBRATION.BLENDED_USD_PER_TOKEN;
+}
+
+// [LAW:effects-at-boundaries] Pure. The number of rounds this profile's roundCap will actually cost.
+// [LAW:dataflow-not-control-flow] the sentinel 0 ("unlimited") is a VALUE mapped to its true cost rank,
+// not a branch that skips the multiply — see UNLIMITED_EFFECTIVE_ROUNDS for why 0 must NOT mean 0 cost.
+function effectiveRounds(roundCap) {
+  return roundCap === 0 ? UNLIMITED_EFFECTIVE_ROUNDS : roundCap;
+}
+
+// [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
+// [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
+// (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
+// candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
+// absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
+// [LAW:types-are-the-program] Today the ONLY cost-bearing axis EffortProfile carries is roundCap (see
+// effort.js — the profile grows an axis only once its consumer migrates). reasoningTier/modelTier
+// become additional monotonic multiplicands HERE when they land as profile fields; reading them before
+// the type carries them would be the same false theorem effort.js refuses.
+function estimatedCostUsd(profile, diffSize) {
+  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap);
+}
+
+// [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
+// remaining is clamped at ≥0 so an already-overspent day (spentToday > dailyBudget) yields the floor,
+// never a negative cap. [LAW:dataflow-not-control-flow] no special "budget is zero/negative" mode — the
+// off-switch (budget unset) is the wiring's concern (zai-budget-qzm.5 never calls this when off); here
+// the value simply flows through and floors.
+function perReviewCapUsd(spentToday, dailyBudget) {
+  const remaining = Math.max(0, dailyBudget - spentToday);
+  return Math.max(MIN_CAP_USD, CAP_FRACTION * remaining);
+}
+
+// [LAW:effects-at-boundaries] Pure. Choose the affordable best effort profile.
+// [LAW:dataflow-not-control-flow] The result is always a VALUE selected from `candidates`: the
+// highest-cost candidate whose estimate fits the cap, or — when even the cheapest exceeds the cap — the
+// cheapest candidate, so a minimal review ALWAYS runs (the epic's gradient, never a cutoff). Ranking by
+// estimate IS ranking by effort at a fixed diff (the cost-bearing axes are monotonic), and it is the
+// cost-truthful ordering because cost is exactly what the cap bounds.
+// [LAW:composability] asks nothing of the caller's ordering — it ranks the candidates itself, so a
+// difficulty proposal (zai-difficulty-0ea) can hand its ladder in any order and get the affordable best.
+// [LAW:no-silent-failure] an empty candidate set has no honest answer; it is a caller contract breach
+// (there is always at least the default profile), so throw loudly rather than return null and push a
+// null-guard onto the wiring. [LAW:no-defensive-null-guards]
+function chooseProfile({ candidates, spentToday, dailyBudget, diffSize }) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new Error('chooseProfile requires a non-empty candidates array (at least the default profile).');
+  }
+  const capUsd = perReviewCapUsd(spentToday, dailyBudget);
+
+  // Rank ascending by estimate (cheapest → most expensive). At a fixed diff this is effort order.
+  const ranked = candidates
+    .map((profile) => ({ profile, estimatedUsd: estimatedCostUsd(profile, diffSize) }))
+    .sort((a, b) => a.estimatedUsd - b.estimatedUsd);
+
+  // The highest-cost candidate within the cap; if none fits, the cheapest — the minimal-review floor.
+  const affordable = ranked.filter((r) => r.estimatedUsd <= capUsd);
+  const chosen = affordable.length > 0 ? affordable[affordable.length - 1] : ranked[0];
+
+  return {
+    profile: chosen.profile,
+    estimatedUsd: chosen.estimatedUsd,
+    capUsd,
+    withinCap: chosen.estimatedUsd <= capUsd,
+  };
+}
+
+module.exports = {
+  CALIBRATION,
+  UNLIMITED_EFFECTIVE_ROUNDS,
+  CAP_FRACTION,
+  MIN_CAP_USD,
+  estimatedCostUsd,
+  perReviewCapUsd,
+  chooseProfile,
+};
