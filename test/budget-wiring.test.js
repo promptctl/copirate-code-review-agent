@@ -64,7 +64,9 @@ describe('defaultBudgetCandidates', () => {
   test('the configured profile is always the most expensive candidate (budget never raises effort)', () => {
     const top = defaultEffortProfile({ roundCap: 5 });
     const candidates = defaultBudgetCandidates(top);
-    assert.ok(candidates.includes(top));
+    // Behavioral (not identity): the configured ceiling is offered as a candidate — asserted by value so
+    // a future copy (`{ ...topProfile }`) that preserves behavior doesn't break the test.
+    assert.ok(candidates.some((c) => c.roundCap === top.roundCap && c.scopeConcurrency === top.scopeConcurrency));
     const maxEst = Math.max(...candidates.map((c) => estimatedCostUsd(c, 100)));
     assert.equal(estimatedCostUsd(top, 100), maxEst);
   });
