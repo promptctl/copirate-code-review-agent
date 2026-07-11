@@ -30641,13 +30641,19 @@ module.exports = {
 // The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
-// now (its consumer, the worker pool, reads it here), and it GROWS a field as each remaining knob's
-// consumer is migrated off its current source: `roundCap` (today the MAX_REVIEW_ROUNDS input),
-// `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today per-config on the chain).
-// Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its
-// consumer exists is a lie. The reasoning AXIS lives here already as a resolver (below) — the
-// vocabulary and per-engine clamping the difficulty/budget epics will feed a profile field through —
-// even though no profile field sources it yet.
+// (its consumer, the worker pool, reads it here) and `roundCap` (its consumer, the pre-spawn round
+// gate in run.js, reads it here); it GROWS a field as each remaining knob's consumer is migrated off
+// its current source: `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today
+// per-config on the chain). Adding a field to a well-formed producer is cheap [LAW:carrying-cost];
+// adding it before its consumer exists is a lie. The reasoning AXIS lives here already as a resolver
+// (below) — the vocabulary and per-engine clamping the difficulty/budget epics will feed a profile
+// field through — even though no profile field sources it yet.
+//
+// `roundCap` is the profile's first COST-BEARING axis, and that is why it lands first: scopeConcurrency
+// is cost-NEUTRAL (parallelism trades runner load for wall time, not spend), so a cost estimate over
+// the profile had nothing to vary until now (spike zai-budget-qzm.1). Measured cost is cleanly ADDITIVE
+// across rounds, so the cap is a clean linear multiplier — the budget epic's most trustworthy estimate
+// axis. The value's meaning is unchanged from MAX_REVIEW_ROUNDS: 0 = the "unlimited" sentinel.
 
 // [LAW:one-source-of-truth] The default scope-worker concurrency. Quality is identical at any
 // concurrency; this only trades runner load for wall time. It lived as DEFAULT_SCOPE_CONCURRENCY in
@@ -30663,12 +30669,20 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number }} EffortProfile
+// @typedef {{ scopeConcurrency: number, roundCap: number }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
-// default-profile run is byte-identical to the pre-profile engine.
-function defaultEffortProfile() {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY };
+// default-profile run is byte-identical to the pre-profile engine. An OPTIONS object (not positional
+// args) because the profile GROWS axes: each future knob is a new named key, so no call site is
+// re-threaded when the shape widens. [LAW:carrying-cost]
+//
+// `roundCap` is SOURCED, not owned: its production default (action.yml's MAX_REVIEW_ROUNDS = "5")
+// lives at the action boundary and flows in through run()'s parsed input, so it is not duplicated
+// here. [LAW:one-source-of-truth] The fallback is the neutral `0` = "unlimited" sentinel — the honest
+// value for "no cap was decided here" (a bare call in a test or an omitted-effort default), never a
+// second copy of the production default.
+function defaultEffortProfile({ roundCap = 0 } = {}) {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap };
 }
 
 // Resolve an ABSTRACT reasoning tier to the concrete value a specific engine supports, given that
@@ -33473,13 +33487,8 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
   // stands. [LAW:no-silent-failure] the skip names the cap so a missing review is never mistaken for a
   // clean pass. A weak model surfaces everything important in the first few rounds; beyond the cap,
   // re-reviewing every push only re-spends the diff's full token cost for diminishing return.
-  let maxReviewRounds;
-  try {
-    maxReviewRounds = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
+  // [LAW:single-enforcer] The cap is read off the effort profile — parsed and validated once at the
+  // producing boundary in run() — never re-parsed here.
   // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the fork-gate
   // fetch above — a bare throw would surface only the generic top-level message, hiding which step
   // failed. A listReviews error fails the run loud rather than silently skipping the cap. One fetch
@@ -33491,10 +33500,10 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
-  if (roundCapReached(prior.count, maxReviewRounds)) {
+  if (roundCapReached(prior.count, effort.roundCap)) {
     core.info(
       `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-      + `the MAX_REVIEW_ROUNDS cap of ${maxReviewRounds}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
+      + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
     );
     return;
   }
@@ -33629,7 +33638,18 @@ async function run() {
   // [LAW:single-enforcer] The review's effort profile is produced ONCE here, at the top of the run,
   // and threaded into whichever mode runs — the single seam where "how much effort to spend on this
   // review" is decided. Simple mode uses the default; the config-file override is a later increment.
-  const effort = defaultEffortProfile();
+  // [LAW:no-silent-failure] roundCap is validated at THIS producing boundary — the raw MAX_REVIEW_ROUNDS
+  // input is parsed strictly here and the integer folded into the profile, so the round-cap consumer
+  // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
+  // guards. A malformed input reds the run loud rather than silently disabling the cap.
+  let roundCap;
+  try {
+    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
     await runPrReview(reviewerName, excludePatterns, effort);

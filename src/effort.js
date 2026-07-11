@@ -11,13 +11,19 @@
 // The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
-// now (its consumer, the worker pool, reads it here), and it GROWS a field as each remaining knob's
-// consumer is migrated off its current source: `roundCap` (today the MAX_REVIEW_ROUNDS input),
-// `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today per-config on the chain).
-// Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its
-// consumer exists is a lie. The reasoning AXIS lives here already as a resolver (below) — the
-// vocabulary and per-engine clamping the difficulty/budget epics will feed a profile field through —
-// even though no profile field sources it yet.
+// (its consumer, the worker pool, reads it here) and `roundCap` (its consumer, the pre-spawn round
+// gate in run.js, reads it here); it GROWS a field as each remaining knob's consumer is migrated off
+// its current source: `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today
+// per-config on the chain). Adding a field to a well-formed producer is cheap [LAW:carrying-cost];
+// adding it before its consumer exists is a lie. The reasoning AXIS lives here already as a resolver
+// (below) — the vocabulary and per-engine clamping the difficulty/budget epics will feed a profile
+// field through — even though no profile field sources it yet.
+//
+// `roundCap` is the profile's first COST-BEARING axis, and that is why it lands first: scopeConcurrency
+// is cost-NEUTRAL (parallelism trades runner load for wall time, not spend), so a cost estimate over
+// the profile had nothing to vary until now (spike zai-budget-qzm.1). Measured cost is cleanly ADDITIVE
+// across rounds, so the cap is a clean linear multiplier — the budget epic's most trustworthy estimate
+// axis. The value's meaning is unchanged from MAX_REVIEW_ROUNDS: 0 = the "unlimited" sentinel.
 
 // [LAW:one-source-of-truth] The default scope-worker concurrency. Quality is identical at any
 // concurrency; this only trades runner load for wall time. It lived as DEFAULT_SCOPE_CONCURRENCY in
@@ -33,12 +39,20 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number }} EffortProfile
+// @typedef {{ scopeConcurrency: number, roundCap: number }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
-// default-profile run is byte-identical to the pre-profile engine.
-function defaultEffortProfile() {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY };
+// default-profile run is byte-identical to the pre-profile engine. An OPTIONS object (not positional
+// args) because the profile GROWS axes: each future knob is a new named key, so no call site is
+// re-threaded when the shape widens. [LAW:carrying-cost]
+//
+// `roundCap` is SOURCED, not owned: its production default (action.yml's MAX_REVIEW_ROUNDS = "5")
+// lives at the action boundary and flows in through run()'s parsed input, so it is not duplicated
+// here. [LAW:one-source-of-truth] The fallback is the neutral `0` = "unlimited" sentinel — the honest
+// value for "no cap was decided here" (a bare call in a test or an omitted-effort default), never a
+// second copy of the production default.
+function defaultEffortProfile({ roundCap = 0 } = {}) {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap };
 }
 
 // Resolve an ABSTRACT reasoning tier to the concrete value a specific engine supports, given that

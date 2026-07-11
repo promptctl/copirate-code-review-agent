@@ -7,13 +7,23 @@ const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
   test('reproduces the pre-profile scope concurrency (4)', () => {
-    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4 });
+    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0 });
   });
 
   test('returns a fresh object each call (no shared mutable default)', () => {
     const a = defaultEffortProfile();
     a.scopeConcurrency = 99;
     assert.equal(defaultEffortProfile().scopeConcurrency, 4);
+  });
+
+  test('folds the supplied roundCap into the profile (the cost-bearing axis)', () => {
+    assert.equal(defaultEffortProfile({ roundCap: 5 }).roundCap, 5);
+    assert.equal(defaultEffortProfile({ roundCap: 0 }).roundCap, 0);
+  });
+
+  test('defaults roundCap to the neutral 0 (unlimited) sentinel when unsupplied', () => {
+    assert.equal(defaultEffortProfile().roundCap, 0);
+    assert.equal(defaultEffortProfile({}).roundCap, 0);
   });
 });
 

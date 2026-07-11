@@ -186,13 +186,8 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
   // stands. [LAW:no-silent-failure] the skip names the cap so a missing review is never mistaken for a
   // clean pass. A weak model surfaces everything important in the first few rounds; beyond the cap,
   // re-reviewing every push only re-spends the diff's full token cost for diminishing return.
-  let maxReviewRounds;
-  try {
-    maxReviewRounds = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
-  } catch (e) {
-    core.setFailed(e.message);
-    return;
-  }
+  // [LAW:single-enforcer] The cap is read off the effort profile — parsed and validated once at the
+  // producing boundary in run() — never re-parsed here.
   // [LAW:no-silent-failure] Name the prior-review summary as the failure point, matching the fork-gate
   // fetch above — a bare throw would surface only the generic top-level message, hiding which step
   // failed. A listReviews error fails the run loud rather than silently skipping the cap. One fetch
@@ -204,10 +199,10 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
-  if (roundCapReached(prior.count, maxReviewRounds)) {
+  if (roundCapReached(prior.count, effort.roundCap)) {
     core.info(
       `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-      + `the MAX_REVIEW_ROUNDS cap of ${maxReviewRounds}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
+      + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
     );
     return;
   }
@@ -342,7 +337,18 @@ async function run() {
   // [LAW:single-enforcer] The review's effort profile is produced ONCE here, at the top of the run,
   // and threaded into whichever mode runs — the single seam where "how much effort to spend on this
   // review" is decided. Simple mode uses the default; the config-file override is a later increment.
-  const effort = defaultEffortProfile();
+  // [LAW:no-silent-failure] roundCap is validated at THIS producing boundary — the raw MAX_REVIEW_ROUNDS
+  // input is parsed strictly here and the integer folded into the profile, so the round-cap consumer
+  // (the pre-spawn gate in runPrReview) reads a trusted value off the profile and never re-parses or
+  // guards. A malformed input reds the run loud rather than silently disabling the cap.
+  let roundCap;
+  try {
+    roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
     await runPrReview(reviewerName, excludePatterns, effort);
