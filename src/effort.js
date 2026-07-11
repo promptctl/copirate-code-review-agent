@@ -56,6 +56,20 @@ function defaultEffortProfile() {
 // [LAW:no-silent-failure] an unknown tier string is a caller bug, not a value to clamp — throw,
 // naming the known tiers, rather than silently picking a rung.
 function resolveReasoningTier(tier, engineEfforts) {
+  // [LAW:no-silent-failure] Validate BOTH inputs against the one tier vocabulary, symmetrically. An
+  // engine range carrying a rung TIER_RANK doesn't know is a programmer error — an adapter added an
+  // effort level without teaching the ladder. Left unchecked it poisons the clamp below (a NaN
+  // distance never wins `dist < bestDist`, so the rung is skipped and the axis silently drops to
+  // null). Catch it loudly here so the clamp loop can trust every `TIER_RANK[e]`. This runs on every
+  // call, including a null tier, so a malformed adapter range reds the run rather than degrading it.
+  for (const e of engineEfforts) {
+    if (!Object.prototype.hasOwnProperty.call(TIER_RANK, e)) {
+      throw new Error(
+        `Engine declares reasoning effort ${JSON.stringify(e)} unknown to the tier ladder ` +
+        `(range: ${engineEfforts.join(', ')}). Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+      );
+    }
+  }
   if (tier === null || tier === undefined) return null;
   if (!Object.prototype.hasOwnProperty.call(TIER_RANK, tier)) {
     throw new Error(

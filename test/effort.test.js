@@ -17,34 +17,42 @@ describe('defaultEffortProfile', () => {
   });
 });
 
+// The resolver's ALGORITHM, exercised on SYNTHETIC fixtures — deliberately not any adapter's real
+// range, so these assertions test the pure math and never quietly track (or drift from) adapter
+// config. The real per-adapter contract is asserted separately, against the live registry, below.
+// [LAW:behavior-not-structure]
 describe('resolveReasoningTier — value-driven resolution', () => {
-  const ANY = ['low', 'medium', 'high', 'max'];
+  // A three-rung fixture matching no adapter (claude is low..max, codex minimal..xhigh).
+  const RANGE = ['low', 'medium', 'high'];
 
   test('null/undefined tier resolves to null (leave the engine default)', () => {
-    assert.equal(resolveReasoningTier(null, ANY), null);
-    assert.equal(resolveReasoningTier(undefined, ANY), null);
+    assert.equal(resolveReasoningTier(null, RANGE), null);
+    assert.equal(resolveReasoningTier(undefined, RANGE), null);
   });
 
-  test('an empty engine range resolves ANY tier to null (axis unsupported)', () => {
+  test('an empty engine range resolves any tier to null (axis unsupported)', () => {
     assert.equal(resolveReasoningTier('high', []), null);
     assert.equal(resolveReasoningTier('minimal', []), null);
     assert.equal(resolveReasoningTier(null, []), null);
   });
 
   test('a tier the engine supports passes through unchanged (identity — the case today)', () => {
-    for (const t of ANY) assert.equal(resolveReasoningTier(t, ANY), t);
+    for (const t of RANGE) assert.equal(resolveReasoningTier(t, RANGE), t);
   });
 
   test('an unknown tier string throws, naming the known tiers (no silent clamp)', () => {
-    assert.throws(() => resolveReasoningTier('turbo', ANY), /Unknown reasoning tier/);
-    assert.throws(() => resolveReasoningTier('turbo', ANY), /minimal, low, medium, high, xhigh, max/);
+    assert.throws(() => resolveReasoningTier('turbo', RANGE), /Unknown reasoning tier/);
+    assert.throws(() => resolveReasoningTier('turbo', RANGE), /minimal, low, medium, high, xhigh, max/);
   });
 
-  test('a supported-elsewhere tier clamps to the nearest rung the engine offers', () => {
-    // 'minimal' is below claude-code's floor ('low') → clamp up to 'low'.
-    assert.equal(resolveReasoningTier('minimal', ANY), 'low');
-    // 'xhigh' is codex's ceiling; claude-code's ceiling 'max' shares its rank → top→top.
-    assert.equal(resolveReasoningTier('xhigh', ANY), 'max');
+  test('a tier below the range floor clamps up to the floor', () => {
+    // 'minimal' (rank 0) is below the fixture's floor 'low' (rank 1) → clamp up to 'low'.
+    assert.equal(resolveReasoningTier('minimal', RANGE), 'low');
+  });
+
+  test('a tier above the range ceiling clamps down to the ceiling', () => {
+    // 'max' (rank 4) is above the fixture's ceiling 'high' (rank 3) → clamp down to 'high'.
+    assert.equal(resolveReasoningTier('max', RANGE), 'high');
   });
 
   test('on a distance tie, the LOWER (cheaper) rung wins', () => {
@@ -52,8 +60,11 @@ describe('resolveReasoningTier — value-driven resolution', () => {
     assert.equal(resolveReasoningTier('medium', ['low', 'high']), 'low');
   });
 
-  test("codex's ceiling 'xhigh' clamps DOWN to claude-code's true rungs, never inventing one", () => {
-    assert.equal(resolveReasoningTier('max', ['minimal', 'low', 'medium', 'high', 'xhigh']), 'xhigh');
+  test('an engine range carrying a rung unknown to the ladder throws (symmetric validation)', () => {
+    // [LAW:no-silent-failure] the mirror of the unknown-tier throw: a malformed range must red the
+    // run, not poison the clamp with a NaN distance and silently drop the axis.
+    assert.throws(() => resolveReasoningTier('high', ['low', 'extreme']), /unknown to the tier ladder/);
+    assert.throws(() => resolveReasoningTier(null, ['bogus']), /unknown to the tier ladder/);
   });
 });
 
@@ -62,6 +73,21 @@ describe('resolveReasoningTier — value-driven resolution', () => {
 describe('resolveReasoningTier — against each adapter’s declared reasoning-effort range', () => {
   const ENGINES = ['claude-code', 'codex', 'opencode'];
   const ALL_TIERS = Object.keys(TIER_RANK);
+
+  // [LAW:no-silent-failure] [LAW:one-source-of-truth] The enforced invariant behind resolveReasoningTier:
+  // every rung an adapter declares must be known to the tier ladder. This is what makes the resolver
+  // safe (no NaN-poisoned clamp) AND ties the adapter ranges to the one vocabulary — an adapter adding
+  // a rung without teaching TIER_RANK reds CI here, not silently at runtime.
+  test('every adapter’s declared range is a subset of the tier ladder', () => {
+    for (const name of ENGINES) {
+      for (const e of registry.get(name).capabilities.reasoningEfforts) {
+        assert.ok(
+          Object.prototype.hasOwnProperty.call(TIER_RANK, e),
+          `${name} declares reasoning effort '${e}', missing from TIER_RANK`,
+        );
+      }
+    }
+  });
 
   for (const name of ENGINES) {
     const range = registry.get(name).capabilities.reasoningEfforts;
