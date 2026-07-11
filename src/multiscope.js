@@ -1,5 +1,6 @@
 'use strict';
 const { produceReview, retryTransientSpawn, sleep } = require('./failover');
+const { defaultEffortProfile } = require('./effort');
 const { dedupeFindings } = require('./review');
 const {
   buildReviewInput,
@@ -29,10 +30,6 @@ const {
 // failover.produceReview per config, so a transient that PERSISTS past a spawn's inner retries
 // escalates to config-level failover/budget as before. Both layers are fail-loud (a scope is never
 // dropped); the run only reds when a transient genuinely survives both. [LAW:no-silent-failure]
-
-// [LAW:no-mode-explosion] One internal constant, not a consumer input: how many scope workers run
-// concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
-const DEFAULT_SCOPE_CONCURRENCY = 4;
 
 // [LAW:types-are-the-program] A scope is the strongest true theorem: a named focus, nothing more.
 // There is deliberately NO `kind` discriminator — module scopes and boundary scopes are reviewed by
@@ -233,7 +230,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-function runMultiScope({ chain, material, registry, instructionsPath, maxConcurrent = DEFAULT_SCOPE_CONCURRENCY, log = () => {}, sleepFn = sleep }) {
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency; the
+// worker pool below takes a plain number, so this seam is where the profile projects onto it. The
+// default profile reproduces the pre-profile constant exactly, so an omitted `effort` is byte-identical.
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
+  const maxConcurrent = effort.scopeConcurrency;
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn });
   return produceReview(chain, null, null, produceOnce);
 }
@@ -271,7 +272,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 }
 
 module.exports = {
-  DEFAULT_SCOPE_CONCURRENCY,
   workerFocusText,
   sumUsage,
   composeSummary,

@@ -169,6 +169,7 @@ async function main() {
   process.env.RUNNER_TEMP = runTemp;
   const { TRANSCRIPT_DIR } = require('../src/debug');
   const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('../src/multiscope');
+  const { defaultEffortProfile } = require('../src/effort');
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
@@ -185,7 +186,10 @@ async function main() {
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
   const { review } = await runMultiScope({
-    chain: [config], material, registry, instructionsPath, maxConcurrent: opts.workers,
+    // The --workers flag is this dev tool's one effort knob; it produces a profile with that scope
+    // concurrency, spread over the default so it stays complete as the profile grows fields.
+    chain: [config], material, registry, instructionsPath,
+    effort: { ...defaultEffortProfile(), scopeConcurrency: opts.workers },
     log: msg => process.stderr.write(`[local-review] ${msg}\n`),
   });
 

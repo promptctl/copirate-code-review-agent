@@ -5,6 +5,7 @@ const os = require('os');
 const { TransientError, classifyTransient } = require('../failover');
 const { computeCostUsd } = require('../usage');
 const { makeCliAdapter } = require('./cli');
+const { resolveReasoningTier } = require('../effort');
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
@@ -12,6 +13,12 @@ const { makeCliAdapter } = require('./cli');
 const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
 const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
+
+// [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
+// referenced by BOTH the capability declaration (config validation) and buildConfigToml (resolving an
+// abstract tier to what this engine supports). The ordering low→high is what resolveReasoningTier's
+// nearest-rung clamp relies on.
+const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
 // [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
 // targets. Declared here next to the adapter; src/provider.js references this constant
@@ -65,8 +72,12 @@ function buildConfigToml(config, collectorSpawn) {
     `model = ${q(config.model)}`,
     `model_provider = ${q(INTERNAL_PROVIDER)}`,
   ];
-  if (config.reasoning) {
-    lines.push(`model_reasoning_effort = ${q(config.reasoning)}`);
+  // [LAW:single-enforcer] Resolve the reasoning tier through the one resolver — a tier this engine
+  // offers passes through unchanged (the case today, config.reasoning being validated in-range), one
+  // it names differently clamps to the nearest rung, and null leaves the engine's own default.
+  const reasoningEffort = resolveReasoningTier(config.reasoning ?? null, CODEX_REASONING_EFFORTS);
+  if (reasoningEffort) {
+    lines.push(`model_reasoning_effort = ${q(reasoningEffort)}`);
   }
 
   lines.push(
@@ -214,7 +225,7 @@ const codexAdapter = makeCliAdapter({
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
-    reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+    reasoningEfforts: CODEX_REASONING_EFFORTS,
     endpointKinds: ['openai-responses'],
   },
   toolNames: TOOL_NAMES,
