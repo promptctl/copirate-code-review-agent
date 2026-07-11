@@ -15,6 +15,7 @@ const { patchLines, parseUnifiedDiff, buildReviewAnchors, annotatePatchWithLines
 const { gitHubTransport, giteaTransport, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds, REVIEW_MARKER } = require('./transport');
 const { TransientError, parseRetryAfterMs, transientBackoffMs } = require('./failover');
 const { classifyClaudeError } = require('./engine/claude-code');
+const { LEDGER_MARKER, ledgerEntryBody, sumCostToday, readSpentToday, appendCost } = require('./ledger');
 
 module.exports = {
   patchLines,
@@ -35,4 +36,9 @@ module.exports = {
   classifyClaudeError,
   parseRetryAfterMs,
   transientBackoffMs,
+  LEDGER_MARKER,
+  ledgerEntryBody,
+  sumCostToday,
+  readSpentToday,
+  appendCost,
 };
