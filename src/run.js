@@ -298,14 +298,19 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
 
   // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the budget-chosen cap
   // when the gradient is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget de-rates
-  // by tripping this same gate sooner on later pushes. [LAW:dataflow-not-control-flow] the off-path skip
-  // message is preserved verbatim (budget unset ⇒ a byte-identical run, down to the log); only when the
-  // gradient set the cap does the message name it as the cause.
+  // by tripping this same gate sooner on later pushes. [LAW:no-silent-failure] the message names the ACTUAL
+  // binding constraint: the gradient is credited only when it genuinely LOWERED the cap below the default
+  // (a rung is always strictly cheaper than the default, so its roundCap never equals the default's — this
+  // holds even for the 0=unlimited default). When the budget was ample and left the cap at the configured
+  // value, MAX_REVIEW_ROUNDS is the real constraint, so the message points there — telling a user to "raise
+  // the budget" when the budget wasn't binding would send them down the wrong path. The off path (budget
+  // unset) takes this same branch and its message is unchanged (a byte-identical run down to the log).
   if (roundCapReached(prior.count, effort.roundCap)) {
-    core.info(dailyBudget > 0
+    const budgetDeRated = dailyBudget > 0 && effort.roundCap !== defaultEffort.roundCap;
+    core.info(budgetDeRated
       ? `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-        + `the DAILY_BUDGET_USD gradient's chosen round cap of ${effort.roundCap}. Raise the daily budget `
-        + '(or MAX_REVIEW_ROUNDS) to review further pushes.'
+        + `the DAILY_BUDGET_USD gradient's de-rated round cap of ${effort.roundCap} (lowered from `
+        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). Raise the daily budget to review further pushes.`
       : `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`);
     return;
