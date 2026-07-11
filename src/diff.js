@@ -64,6 +64,23 @@ function buildReviewAnchors(files) {
   return new Map(files.filter(f => f.patch).flatMap(f => [...buildFileAnchors(f)]));
 }
 
+// [LAW:effects-at-boundaries] Pure. CHURN — the count of changed content lines (added + deleted)
+// across the reviewed files' patches. This is the `diffSize` axis the budget cost estimate is
+// calibrated against (src/budget.js), computed over the SAME filtered file set the engine reviews so
+// excluded files (dist/**, lockfiles) never inflate the estimate. A patch body runs from its first
+// `@@` onward, so a leading '+'/'-' is an added/deleted content line; the hunk header (`@@`) and the
+// no-newline marker ('\') start with neither. A file with no patch (binary/rename-only) contributes 0.
+function diffChurn(files) {
+  let churn = 0;
+  for (const file of files) {
+    if (!file.patch) continue;
+    for (const line of file.patch.split('\n')) {
+      if (line[0] === '+' || line[0] === '-') churn++;
+    }
+  }
+  return churn;
+}
+
 function annotatePatchWithLines(patch) {
   const lines = [];
   for (const entry of patchLines(patch)) {
@@ -164,6 +181,7 @@ module.exports = {
   patchLines,
   buildFileAnchors,
   buildReviewAnchors,
+  diffChurn,
   annotatePatchWithLines,
   unquoteCStylePath,
   parseGitDiffHeader,

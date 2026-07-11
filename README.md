@@ -95,6 +95,8 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `EXCLUDE_PATTERNS` | `*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml` | Comma-separated file patterns to exclude. |
 | `MAX_DIFF_CHARS` | `0` (unlimited) | Max characters of diff sent to the engine. |
 | `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
+| `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
+| `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
@@ -116,6 +118,38 @@ Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to hav
 ## Fork PRs are never reviewed
 
 PRs opened from a fork (head repo ≠ base repo) are skipped cleanly — logged, exit 0, no engine spawned, no review posted — *before any credential is read*. This is unconditional with no opt-in, so an outside contributor's PR can never spend the host's AI credits or meet a secret. Your own branches (head and base in the same repo) review normally.
+
+## Daily budget
+
+Set `DAILY_BUDGET_USD` to cap the action's spend across a day. It is honored **not as a hard cutoff** (full effort until the ceiling, then stop) but as a **gradient**: as the day's remaining budget shrinks, each review deliberately de-rates — today by reviewing a PR fewer times — so the budget lasts the day. A minimal review always runs; the budget lowers effort, it never cancels the review. Off by default (`0`/unset): the action runs at full effort with no ledger I/O.
+
+How it works, per PR review (PR mode only):
+
+1. **Read** the day's spend so far by summing an **append-only ledger** — a dedicated repo issue where every review appends its actual cost as one comment. The day's spend is a sum of immutable records (no shared mutable counter, race-free).
+2. **Choose** the highest-effort profile whose estimated cost fits a per-review cap set to a *fraction of the remaining budget* — a curve that decays as the day depletes, so spend rations itself rather than running full-tilt into a wall.
+3. **Review** at that effort, then **append** the review's actual cost to the ledger.
+
+The estimate is a deterministic ranker calibrated on real runs (`src/budget.js`), not a billed figure. The budget only ever *lowers* effort below what `MAX_REVIEW_ROUNDS` configures — it never raises it.
+
+To enable it:
+
+```yaml
+permissions:
+  contents: read
+  issues: write          # the ledger is a repo issue the action reads and appends to
+  pull-requests: write
+
+jobs:
+  review:
+    steps:
+      - uses: promptctl/copirate-code-review-agent@v1
+        with:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DAILY_BUDGET_USD: "10"
+          LEDGER_ISSUE: ${{ vars.LEDGER_ISSUE }}   # a repo Actions variable: the ledger issue number
+```
+
+Create one issue in the repo to serve as the ledger (its body is ignored; the action only appends comments) and set the repo Actions **variable** `LEDGER_ISSUE` to its number. If `DAILY_BUDGET_USD` is set without a valid `LEDGER_ISSUE`, the run fails loud — the gradient cannot ration spend without a ledger. A failed ledger read is spend-safe (the review proceeds at full effort with a warning); a failed append warns and continues (the ledger becomes a known lower bound). Both are loud, never silent.
 
 ## Whole-repo review
 

@@ -122,12 +122,55 @@ function chooseProfile({ candidates, spentToday, dailyBudget, diffSize }) {
   };
 }
 
+// [LAW:no-silent-failure] Parse the DAILY_BUDGET_USD action input at the run boundary. Unset/empty is
+// the OFF state — the value 0 — NOT an error: the budget gradient is opt-in and its absence is today's
+// default path ([LAW:no-mode-explosion], the off state is not a new mode). A present-but-malformed value
+// (non-numeric, negative) is a config error that reds the run loud, never a silent fall-back to off that
+// would let a fat-fingered budget silently overspend. Returns a number; >0 means the gradient is active.
+function parseDailyBudgetUsd(raw) {
+  const s = (raw || '').trim();
+  if (s === '') return 0;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(
+      `Invalid DAILY_BUDGET_USD ${JSON.stringify(raw)}: expected a non-negative number ` +
+      '(unset or 0 = budget gradient off).',
+    );
+  }
+  return n;
+}
+
+// [LAW:no-silent-failure] The de-rate rungs the budget offers BELOW the configured full effort. Fixed
+// today (the difficulty epic zai-difficulty-0ea will later PROPOSE the candidate set); a rung is kept
+// only when it is strictly cheaper than the top, so the ladder never RAISES effort above the user's cap.
+const DERATE_ROUNDCAPS = [1, 2, 3];
+
+// [LAW:effects-at-boundaries] Pure. The candidate profiles the budget policy ranks: the user's
+// configured full-effort profile (`topProfile`, the ceiling budget must never exceed) plus cheaper
+// de-rated rungs below it. [LAW:dataflow-not-control-flow] the ceiling is a VALUE — effectiveRounds
+// folds the 0="unlimited" sentinel to its true cost rank (8), so a rung is included iff it is genuinely
+// cheaper than the top, whether the top is a finite cap or unlimited. Budget only ever CAPS: because the
+// top is always a candidate and every other is cheaper, chooseProfile's worst case is `topProfile`
+// itself and its best case is the cheapest rung — never anything above the configured effort.
+// [LAW:carrying-cost] de-rating touches only roundCap (the sole cost-bearing axis today); as the profile
+// grows cost-bearing axes, each gets its own de-rating HERE, and the spread carries the rest unchanged.
+function defaultBudgetCandidates(topProfile) {
+  const ceiling = effectiveRounds(topProfile.roundCap);
+  const rungs = DERATE_ROUNDCAPS
+    .filter((roundCap) => roundCap < ceiling)
+    .map((roundCap) => ({ ...topProfile, roundCap }));
+  return [...rungs, topProfile];
+}
+
 module.exports = {
   CALIBRATION,
   UNLIMITED_EFFECTIVE_ROUNDS,
   CAP_FRACTION,
   MIN_CAP_USD,
+  DERATE_ROUNDCAPS,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
+  parseDailyBudgetUsd,
+  defaultBudgetCandidates,
 };

@@ -29922,6 +29922,190 @@ function wrappy (fn, cb) {
 
 /***/ }),
 
+/***/ 5120:
+/***/ ((module) => {
+
+"use strict";
+
+
+// The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
+// budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
+// this review can afford. No IO — the ledger read (spend so far) and the profile override happen at
+// the run() boundary (zai-budget-qzm.5); this module is the pure core between those effects.
+// [LAW:effects-at-boundaries] [LAW:dataflow-not-control-flow] the chosen profile is a VALUE selected
+// from the candidate set, never a branch that skips the review — the epic's bar is a soft GRADIENT
+// (spend less as the day depletes), NEVER a hard cutoff, so this function is TOTAL: it always returns a
+// profile, and the worst case is the cheapest candidate.
+//
+// TWO parts at a real joint [LAW:decomposition]: estimatedCostUsd ranks the cost of ONE profile at a
+// given diff (a reusable ranker); chooseProfile selects the affordable best from a candidate set (it
+// consumes the estimate). Neither fuses with the other's concern.
+
+// [LAW:one-source-of-truth] Calibration constants — the token/price model MEASURED on 21 real review
+// rounds in the spike (zai-budget-qzm.1), mined from this repo's own dogfooded PR reviews (#75–#85,
+// claude-code/deepseek-v4-pro). Like PRICES_PER_MILLION in usage.js this is a representation that
+// DRIFTS from reality and has no machine source — it is hand-maintained and RECALIBRATED per model.
+// Source / last measured: spike zai-budget-qzm.1 findings, 2026-07-11.
+//   FIXED_TOKENS        ~178k input tokens every round pays regardless of diff (scout + instructions
+//                       + reads + reasoning + MCP) — cost is fixed-DOMINATED for small diffs.
+//   MARGINAL_TOKENS/line ~2914 input tokens per churn line (add+del) — the modest per-diff marginal.
+//   BLENDED_USD_PER_TOKEN ~$0.12 per 1M tokens EFFECTIVE (most tokens are cache hits at $0.003625/M
+//                       vs $0.435/M list; the hit RATIO swings run to run → the ~25% absolute noise).
+const CALIBRATION = {
+  FIXED_TOKENS: 178_000,
+  MARGINAL_TOKENS_PER_LINE: 2_914,
+  BLENDED_USD_PER_TOKEN: 0.12 / 1_000_000,
+};
+
+// [LAW:no-silent-failure] The cost rank of roundCap's "unlimited" sentinel (0, per effort.js). An
+// unlimited review runs to CONVERGENCE (empirically ~5–8 rounds), so it is the MOST expensive profile,
+// not the cheapest. A naive `perRoundBase × roundCap` would estimate the sentinel at $0 — always
+// "affordable" — silently defeating the entire budget on the most expensive profile. Mapping 0 to a
+// rank ABOVE any typical finite cap keeps the ranker honest and monotonic (unlimited ≥ any finite cap).
+const UNLIMITED_EFFECTIVE_ROUNDS = 8;
+
+// [LAW:no-mode-explosion] Policy tunables — internal named constants, NOT action inputs. The only knob
+// exposed to consumers is DAILY_BUDGET_USD (wired in zai-budget-qzm.5); everything else is sane
+// documented default, tuned in this one place.
+//   CAP_FRACTION  each review may spend at most this fraction of what REMAINS of the day's budget. A
+//                 fraction-of-remaining cap decays GEOMETRICALLY as the day depletes (it asymptotes to
+//                 zero but never reaches it), so the budget rations itself across the day rather than
+//                 running full effort until a hard wall. This IS the gradient.
+//   MIN_CAP_USD   floor under the cap so it never decays to zero: a low-effort review stays affordable
+//                 deep into the budget. (The ultimate "a review always runs" guarantee is the selection
+//                 fallback below — this floor keeps the cap itself sane; the fallback covers the
+//                 pathological case where even the cheapest candidate exceeds the floored cap.)
+const CAP_FRACTION = 0.1;
+const MIN_CAP_USD = 0.1;
+
+// [LAW:effects-at-boundaries] Pure: the estimated USD cost of running ONE review round at this diff.
+// diffSize is CHURN (added + deleted lines) — the axis the spike measured cost against. The fixed
+// floor dominates for small diffs; the marginal adds a modest per-line term.
+function perRoundBaseUsd(diffSize) {
+  const tokens = CALIBRATION.FIXED_TOKENS + CALIBRATION.MARGINAL_TOKENS_PER_LINE * diffSize;
+  return tokens * CALIBRATION.BLENDED_USD_PER_TOKEN;
+}
+
+// [LAW:effects-at-boundaries] Pure. The number of rounds this profile's roundCap will actually cost.
+// [LAW:dataflow-not-control-flow] the sentinel 0 ("unlimited") is a VALUE mapped to its true cost rank,
+// not a branch that skips the multiply — see UNLIMITED_EFFECTIVE_ROUNDS for why 0 must NOT mean 0 cost.
+function effectiveRounds(roundCap) {
+  return roundCap === 0 ? UNLIMITED_EFFECTIVE_ROUNDS : roundCap;
+}
+
+// [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
+// [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
+// (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
+// candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
+// absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
+// [LAW:types-are-the-program] Today the ONLY cost-bearing axis EffortProfile carries is roundCap (see
+// effort.js — the profile grows an axis only once its consumer migrates). reasoningTier/modelTier
+// become additional monotonic multiplicands HERE when they land as profile fields; reading them before
+// the type carries them would be the same false theorem effort.js refuses.
+function estimatedCostUsd(profile, diffSize) {
+  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap);
+}
+
+// [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
+// remaining is clamped at ≥0 so an already-overspent day (spentToday > dailyBudget) yields the floor,
+// never a negative cap. [LAW:dataflow-not-control-flow] no special "budget is zero/negative" mode — the
+// off-switch (budget unset) is the wiring's concern (zai-budget-qzm.5 never calls this when off); here
+// the value simply flows through and floors.
+function perReviewCapUsd(spentToday, dailyBudget) {
+  const remaining = Math.max(0, dailyBudget - spentToday);
+  return Math.max(MIN_CAP_USD, CAP_FRACTION * remaining);
+}
+
+// [LAW:effects-at-boundaries] Pure. Choose the affordable best effort profile.
+// [LAW:dataflow-not-control-flow] The result is always a VALUE selected from `candidates`: the
+// highest-cost candidate whose estimate fits the cap, or — when even the cheapest exceeds the cap — the
+// cheapest candidate, so a minimal review ALWAYS runs (the epic's gradient, never a cutoff). Ranking by
+// estimate IS ranking by effort at a fixed diff (the cost-bearing axes are monotonic), and it is the
+// cost-truthful ordering because cost is exactly what the cap bounds.
+// [LAW:composability] asks nothing of the caller's ordering — it ranks the candidates itself, so a
+// difficulty proposal (zai-difficulty-0ea) can hand its ladder in any order and get the affordable best.
+// [LAW:no-silent-failure] an empty candidate set has no honest answer; it is a caller contract breach
+// (there is always at least the default profile), so throw loudly rather than return null and push a
+// null-guard onto the wiring. [LAW:no-defensive-null-guards]
+function chooseProfile({ candidates, spentToday, dailyBudget, diffSize }) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new Error('chooseProfile requires a non-empty candidates array (at least the default profile).');
+  }
+  const capUsd = perReviewCapUsd(spentToday, dailyBudget);
+
+  // Rank ascending by estimate (cheapest → most expensive). At a fixed diff this is effort order.
+  const ranked = candidates
+    .map((profile) => ({ profile, estimatedUsd: estimatedCostUsd(profile, diffSize) }))
+    .sort((a, b) => a.estimatedUsd - b.estimatedUsd);
+
+  // The highest-cost candidate within the cap; if none fits, the cheapest — the minimal-review floor.
+  const affordable = ranked.filter((r) => r.estimatedUsd <= capUsd);
+  const chosen = affordable.length > 0 ? affordable[affordable.length - 1] : ranked[0];
+
+  return {
+    profile: chosen.profile,
+    estimatedUsd: chosen.estimatedUsd,
+    capUsd,
+    withinCap: chosen.estimatedUsd <= capUsd,
+  };
+}
+
+// [LAW:no-silent-failure] Parse the DAILY_BUDGET_USD action input at the run boundary. Unset/empty is
+// the OFF state — the value 0 — NOT an error: the budget gradient is opt-in and its absence is today's
+// default path ([LAW:no-mode-explosion], the off state is not a new mode). A present-but-malformed value
+// (non-numeric, negative) is a config error that reds the run loud, never a silent fall-back to off that
+// would let a fat-fingered budget silently overspend. Returns a number; >0 means the gradient is active.
+function parseDailyBudgetUsd(raw) {
+  const s = (raw || '').trim();
+  if (s === '') return 0;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(
+      `Invalid DAILY_BUDGET_USD ${JSON.stringify(raw)}: expected a non-negative number ` +
+      '(unset or 0 = budget gradient off).',
+    );
+  }
+  return n;
+}
+
+// [LAW:no-silent-failure] The de-rate rungs the budget offers BELOW the configured full effort. Fixed
+// today (the difficulty epic zai-difficulty-0ea will later PROPOSE the candidate set); a rung is kept
+// only when it is strictly cheaper than the top, so the ladder never RAISES effort above the user's cap.
+const DERATE_ROUNDCAPS = [1, 2, 3];
+
+// [LAW:effects-at-boundaries] Pure. The candidate profiles the budget policy ranks: the user's
+// configured full-effort profile (`topProfile`, the ceiling budget must never exceed) plus cheaper
+// de-rated rungs below it. [LAW:dataflow-not-control-flow] the ceiling is a VALUE — effectiveRounds
+// folds the 0="unlimited" sentinel to its true cost rank (8), so a rung is included iff it is genuinely
+// cheaper than the top, whether the top is a finite cap or unlimited. Budget only ever CAPS: because the
+// top is always a candidate and every other is cheaper, chooseProfile's worst case is `topProfile`
+// itself and its best case is the cheapest rung — never anything above the configured effort.
+// [LAW:carrying-cost] de-rating touches only roundCap (the sole cost-bearing axis today); as the profile
+// grows cost-bearing axes, each gets its own de-rating HERE, and the spread carries the rest unchanged.
+function defaultBudgetCandidates(topProfile) {
+  const ceiling = effectiveRounds(topProfile.roundCap);
+  const rungs = DERATE_ROUNDCAPS
+    .filter((roundCap) => roundCap < ceiling)
+    .map((roundCap) => ({ ...topProfile, roundCap }));
+  return [...rungs, topProfile];
+}
+
+module.exports = {
+  CALIBRATION,
+  UNLIMITED_EFFECTIVE_ROUNDS,
+  CAP_FRACTION,
+  MIN_CAP_USD,
+  DERATE_ROUNDCAPS,
+  estimatedCostUsd,
+  perReviewCapUsd,
+  chooseProfile,
+  parseDailyBudgetUsd,
+  defaultBudgetCandidates,
+};
+
+
+/***/ }),
+
 /***/ 3932:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -30515,6 +30699,23 @@ function buildReviewAnchors(files) {
   return new Map(files.filter(f => f.patch).flatMap(f => [...buildFileAnchors(f)]));
 }
 
+// [LAW:effects-at-boundaries] Pure. CHURN — the count of changed content lines (added + deleted)
+// across the reviewed files' patches. This is the `diffSize` axis the budget cost estimate is
+// calibrated against (src/budget.js), computed over the SAME filtered file set the engine reviews so
+// excluded files (dist/**, lockfiles) never inflate the estimate. A patch body runs from its first
+// `@@` onward, so a leading '+'/'-' is an added/deleted content line; the hunk header (`@@`) and the
+// no-newline marker ('\') start with neither. A file with no patch (binary/rename-only) contributes 0.
+function diffChurn(files) {
+  let churn = 0;
+  for (const file of files) {
+    if (!file.patch) continue;
+    for (const line of file.patch.split('\n')) {
+      if (line[0] === '+' || line[0] === '-') churn++;
+    }
+  }
+  return churn;
+}
+
 function annotatePatchWithLines(patch) {
   const lines = [];
   for (const entry of patchLines(patch)) {
@@ -30615,6 +30816,7 @@ module.exports = {
   patchLines,
   buildFileAnchors,
   buildReviewAnchors,
+  diffChurn,
   annotatePatchWithLines,
   unquoteCStylePath,
   parseGitDiffHeader,
@@ -33433,13 +33635,15 @@ const github = __nccwpck_require__(3228);
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
-const { filterFiles, buildReviewAnchors } = __nccwpck_require__(9898);
+const { filterFiles, buildReviewAnchors, diffChurn } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, roundCapReached, parseMaxRounds } = __nccwpck_require__(7228);
 const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
+const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile } = __nccwpck_require__(5120);
+const { readSpentToday, appendCost } = __nccwpck_require__(8192);
 const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
@@ -33548,9 +33752,69 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
   return [buildAttributionFooter(configUsed), costLine, marker].filter(Boolean).join('\n\n');
 }
 
+// [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
+// changed files, apply EXCLUDE_PATTERNS, and emit the "fetching"/"excluded" logs. runPrReview calls it
+// exactly once — the budget phase (when active) needs the diff BEFORE the round-cap gate to size the
+// review's cost, so it fetches here early and the downstream review reuses the result; when budget is
+// off, this runs in its original post-preflight position, unchanged. [LAW:one-source-of-truth]
+async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns) {
+  core.info(`Fetching changed files for PR #${pullNumber}...`);
+  const transport = await selectTransport(octokit, owner, repo, pullNumber);
+  const filteredFiles = filterFiles(transport.files, excludePatterns);
+  if (excludePatterns.length > 0) {
+    const excluded = transport.files.length - filteredFiles.length;
+    if (excluded > 0) core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
+  }
+  return { transport, filteredFiles };
+}
+
+// [LAW:effects-at-boundaries] The budget phase (PR mode). The pure decision is chooseProfile; the effect
+// this boundary owns is the ledger read whose failure policy is spend-safe. [LAW:no-silent-failure] a
+// failed read falls back SPEND-SAFE — proceed as if under budget (spentToday 0 ⇒ full remaining ⇒ full
+// effort) with a loud warning, never a silent throttle on missing data; unknown ledger entries make the
+// day's spend a logged LOWER bound (undercount ⇒ spend more, never a false stop). The chosen candidate
+// set is anchored to `defaultEffort` (the user's configured ceiling), so the returned profile can only
+// CAP effort, never raise it. Returns the chosen EffortProfile.
+async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, filteredFiles, defaultEffort, dailyBudget }) {
+  let spentToday = 0;
+  try {
+    const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
+    spentToday = ledger.usd;
+    if (ledger.unknownEntries > 0) {
+      core.warning(
+        `Budget: ledger issue #${issueNumber} has ${ledger.unknownEntries} entr(ies) with unknown cost — `
+        + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
+      );
+    }
+  } catch (e) {
+    core.warning(
+      `Budget: failed to read cost ledger issue #${issueNumber} (${e.message}) — proceeding SPEND-SAFE as if `
+      + 'under budget (full effort). Verify LEDGER_ISSUE and the token\'s issues:write access (the gradient '
+      + 'also appends after review, so issues:write — not just read — is the single permission the feature needs).',
+    );
+  }
+
+  const diffSize = diffChurn(filteredFiles);
+  const decision = chooseProfile({
+    candidates: defaultBudgetCandidates(defaultEffort),
+    spentToday,
+    dailyBudget,
+    diffSize,
+  });
+  const capNote = decision.withinCap
+    ? 'within cap'
+    : 'budget FLOOR — even the cheapest candidate exceeds the cap; running the minimal review';
+  core.info(
+    `Budget: spent today $${spentToday.toFixed(4)} of $${dailyBudget.toFixed(2)} → per-review cap `
+    + `$${decision.capUsd.toFixed(4)}; churn ${diffSize} line(s); chose roundCap ${decision.profile.roundCap} `
+    + `(est. $${decision.estimatedUsd.toFixed(4)}; ${capNote}).`,
+  );
+  return decision.profile;
+}
+
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
 // chain, and submit an inline GitHub review.
-async function runPrReview(reviewerName, excludePatterns, effort) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -33628,11 +33892,58 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
     core.setFailed(`Failed to summarize prior reviews for PR #${pullNumber}: ${e.message}`);
     return;
   }
+
+  // [LAW:no-mode-explosion] Budget gradient (PR mode only). OFF by default: DAILY_BUDGET_USD unset/0 ⇒
+  // effort stays `defaultEffort`, no ledger IO, a byte-identical run. When ON, the budget-chosen roundCap
+  // must reach the round-cap gate below (roundCap's ONLY consumer), so the diff is fetched HERE — before
+  // the gate — to size this review's cost; that fetch is reused downstream (the diff is fetched once).
+  // [LAW:effects-at-boundaries] the ledger read + append are the effects; chooseProfile is the pure core.
+  let dailyBudget;
+  try {
+    dailyBudget = parseDailyBudgetUsd(core.getInput('DAILY_BUDGET_USD'));
+  } catch (e) {
+    core.setFailed(e.message);
+    return;
+  }
+  let effort = defaultEffort;
+  let fetched = null;      // { transport, filteredFiles } — populated early only when the budget is active
+  let ledgerIssue = null;  // the issue this review's actual cost is appended to, after submit
+  if (dailyBudget > 0) {
+    const rawIssue = core.getInput('LEDGER_ISSUE').trim();
+    ledgerIssue = parseInt(rawIssue, 10);
+    if (!rawIssue || !Number.isInteger(ledgerIssue) || ledgerIssue <= 0) {
+      core.setFailed(
+        `DAILY_BUDGET_USD is set (budget gradient enabled) but LEDGER_ISSUE is missing or invalid `
+        + `(${JSON.stringify(rawIssue)}). Set LEDGER_ISSUE to the daily cost-ledger issue number `
+        + '(e.g. from a repo Actions variable) — the gradient cannot ration spend without a ledger.',
+      );
+      return;
+    }
+    const now = new Date(); // [LAW:no-ambient-temporal-coupling] the run boundary owns the clock
+    fetched = await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
+    effort = await resolveBudgetedEffort({
+      octokit, owner, repo, issueNumber: ledgerIssue, now,
+      filteredFiles: fetched.filteredFiles, defaultEffort, dailyBudget,
+    });
+  }
+
+  // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the budget-chosen cap
+  // when the gradient is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget de-rates
+  // by tripping this same gate sooner on later pushes. [LAW:no-silent-failure] the message names the ACTUAL
+  // binding constraint: the gradient is credited only when it genuinely LOWERED the cap below the default
+  // (a rung is always strictly cheaper than the default, so its roundCap never equals the default's — this
+  // holds even for the 0=unlimited default). When the budget was ample and left the cap at the configured
+  // value, MAX_REVIEW_ROUNDS is the real constraint, so the message points there — telling a user to "raise
+  // the budget" when the budget wasn't binding would send them down the wrong path. The off path (budget
+  // unset) takes this same branch and its message is unchanged (a byte-identical run down to the log).
   if (roundCapReached(prior.count, effort.roundCap)) {
-    core.info(
-      `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-      + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`,
-    );
+    const budgetDeRated = dailyBudget > 0 && effort.roundCap !== defaultEffort.roundCap;
+    core.info(budgetDeRated
+      ? `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
+        + `the DAILY_BUDGET_USD gradient's de-rated round cap of ${effort.roundCap} (lowered from `
+        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). Raise the daily budget to review further pushes.`
+      : `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
+        + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`);
     return;
   }
 
@@ -33646,18 +33957,10 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
 
   if (!(await preflightChain(chain))) return;
 
-  core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const transport = await selectTransport(octokit, owner, repo, pullNumber);
-  const files = transport.files;
-
-  const filteredFiles = filterFiles(files, excludePatterns);
-
-  if (excludePatterns.length > 0) {
-    const excluded = files.length - filteredFiles.length;
-    if (excluded > 0) {
-      core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
-    }
-  }
+  // [LAW:one-source-of-truth] The reviewed diff is fetched once: reuse the budget phase's fetch when the
+  // gradient is active, otherwise fetch here in its original post-preflight position (off path unchanged).
+  const { transport, filteredFiles } = fetched
+    || await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
   const patchableFiles = filteredFiles.filter(f => f.patch);
 
@@ -33699,6 +34002,21 @@ async function runPrReview(reviewerName, excludePatterns, effort) {
     { summary: review.summary, findings: anchored, unanchored },
     Boolean(reviewToken), transport, footer,
   );
+
+  // [LAW:effects-at-boundaries] Append THIS review's actual cost to the daily ledger, AFTER submit — the
+  // cost is known only now. Only when the budget gradient is active (ledgerIssue set). [LAW:no-silent-failure]
+  // a failed append warns and continues: the day's ledger becomes a known LOWER bound, never a review
+  // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
+  if (ledgerIssue !== null) {
+    try {
+      await appendCost(octokit, owner, repo, ledgerIssue, review.usage && review.usage.cost);
+    } catch (e) {
+      core.warning(
+        `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `
+        + "the day's ledger now UNDER-counts by this review (a known lower bound). Verify issues:write access.",
+      );
+    }
+  }
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
@@ -33788,7 +34106,7 @@ async function run() {
   }
 }
 
-module.exports = { run };
+module.exports = { run, resolveBudgetedEffort };
 
 
 /***/ }),
