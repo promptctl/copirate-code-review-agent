@@ -6,6 +6,7 @@ const { parseRetryAfterMs, classifyTransient } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail } = require('./run');
 const { makeCliAdapter } = require('./cli');
 const { isAnthropicEndpoint, computeCostUsd } = require('../usage');
+const { resolveReasoningTier } = require('../effort');
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -18,6 +19,12 @@ const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 // [LAW:one-source-of-truth] One owned version value, defined once here.
 const CLAUDE_CODE_VERSION = process.env.CLAUDE_CODE_VERSION || '2.1.0';
 const CLAUDE_TIMEOUT_MS = 3_000_000;
+
+// [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
+// referenced by BOTH the capability declaration (config validation) and buildCommand (resolving an
+// abstract tier to what this engine supports). The ordering low→high is what resolveReasoningTier's
+// nearest-rung clamp relies on.
+const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'];
 
 // [LAW:one-source-of-truth] Declared first so CLAUDE_ALLOWED_TOOLS can derive its MCP
 // entries from here. toolNames feeds the prompt; CLAUDE_ALLOWED_TOOLS feeds --allowedTools.
@@ -119,8 +126,13 @@ function buildCommand({ config, collector, home }) {
     NO_COLOR: '1',
   };
 
-  if (config.reasoning) {
-    env.CLAUDE_CODE_EFFORT_LEVEL = config.reasoning;
+  // [LAW:single-enforcer] Resolve the reasoning tier to what THIS engine supports through the one
+  // resolver — an abstract tier the engine offers passes through unchanged (the case today, since
+  // config.reasoning is already validated in-range), one it names differently clamps to the nearest
+  // rung, and null (unset, or opencode's empty range) leaves the engine's own default.
+  const effortLevel = resolveReasoningTier(config.reasoning ?? null, CLAUDE_REASONING_EFFORTS);
+  if (effortLevel) {
+    env.CLAUDE_CODE_EFFORT_LEVEL = effortLevel;
   }
 
   return { command: 'npx', args, env };
@@ -222,7 +234,7 @@ const claudeCodeAdapter = makeCliAdapter({
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
     // time via these declarations, never discovered at spawn time.
-    reasoningEfforts: ['low', 'medium', 'high', 'max'],
+    reasoningEfforts: CLAUDE_REASONING_EFFORTS,
     endpointKinds: ['anthropic-messages'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.

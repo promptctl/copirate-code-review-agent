@@ -10,6 +10,7 @@ const { buildReviewInput } = require('./prompt');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
+const { defaultEffortProfile } = require('./effort');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
@@ -120,7 +121,7 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
 // chain, and submit an inline GitHub review.
-async function runPrReview(reviewerName, excludePatterns) {
+async function runPrReview(reviewerName, excludePatterns, effort) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -255,7 +256,7 @@ async function runPrReview(reviewerName, excludePatterns) {
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
   });
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
@@ -278,7 +279,7 @@ async function runPrReview(reviewerName, excludePatterns) {
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
-async function runRepoReview(reviewerName, excludePatterns) {
+async function runRepoReview(reviewerName, excludePatterns, effort) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -302,7 +303,7 @@ async function runRepoReview(reviewerName, excludePatterns) {
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
   });
 
   const footer = buildReviewFooter(review.usage, configUsed);
@@ -337,10 +338,16 @@ async function run() {
   // misconfigured PR run into an accidental whole-repo audit. [LAW:no-silent-failure] an unknown
   // value fails loud rather than defaulting silently.
   const mode = (core.getInput('MODE') || 'pr').trim();
+
+  // [LAW:single-enforcer] The review's effort profile is produced ONCE here, at the top of the run,
+  // and threaded into whichever mode runs — the single seam where "how much effort to spend on this
+  // review" is decided. Simple mode uses the default; the config-file override is a later increment.
+  const effort = defaultEffortProfile();
+
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns);
+    await runPrReview(reviewerName, excludePatterns, effort);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns);
+    await runRepoReview(reviewerName, excludePatterns, effort);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }

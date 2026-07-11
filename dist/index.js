@@ -30624,6 +30624,116 @@ module.exports = {
 
 /***/ }),
 
+/***/ 4652:
+/***/ ((module) => {
+
+"use strict";
+
+
+// [FRAMING:parts-and-seams] EffortProfile is the single value answering "how much effort to spend on
+// THIS review". Today the levers that set a review's cost are scattered and independently owned —
+// scope concurrency was a module constant in multiscope.js, reasoning is a per-config field resolved
+// at each adapter, the round cap and diff budget come from action inputs, model tier from the failover
+// chain. This module is the ONE owner of the effort representation, so the difficulty (propose) and
+// budget (cap) epics constrain a single value here instead of reaching into every knob independently.
+// [LAW:single-enforcer] [LAW:no-mode-explosion]
+//
+// The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
+// nothing derives from would be a false theorem — a knob the profile claims to own while its real
+// source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
+// now (its consumer, the worker pool, reads it here), and it GROWS a field as each remaining knob's
+// consumer is migrated off its current source: `roundCap` (today the MAX_REVIEW_ROUNDS input),
+// `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today per-config on the chain).
+// Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its
+// consumer exists is a lie. The reasoning AXIS lives here already as a resolver (below) — the
+// vocabulary and per-engine clamping the difficulty/budget epics will feed a profile field through —
+// even though no profile field sources it yet.
+
+// [LAW:one-source-of-truth] The default scope-worker concurrency. Quality is identical at any
+// concurrency; this only trades runner load for wall time. It lived as DEFAULT_SCOPE_CONCURRENCY in
+// multiscope.js; it is the profile's value now, and the worker pool reads it FROM the profile.
+const DEFAULT_SCOPE_CONCURRENCY = 4;
+
+// [LAW:dataflow-not-control-flow] The abstract reasoning-tier ladder, low→high, keyed to an ordinal
+// RANK. It is the union of every engine's declared reasoning-effort vocabulary: claude-code exposes
+// low..max, codex minimal..xhigh, opencode none. `xhigh` (codex's ceiling) and `max` (claude-code's
+// ceiling) are the SAME rung — each engine's maximum — so both rank 4; that is what makes clamping a
+// tier to an engine that names its ceiling differently resolve top→top instead of dropping a rung.
+const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
+
+// The single representation of review effort. Produced at one seam (a default in simple mode,
+// overridable via the config file later) and consumed uniformly by the engine.
+// @typedef {{ scopeConcurrency: number }} EffortProfile
+
+// [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
+// default-profile run is byte-identical to the pre-profile engine.
+function defaultEffortProfile() {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY };
+}
+
+// Resolve an ABSTRACT reasoning tier to the concrete value a specific engine supports, given that
+// engine's declared reasoning-effort range (the adapter's `capabilities.reasoningEfforts`). This is
+// the per-engine resolution the epic names: the profile speaks one abstract tier; each engine offers
+// a different range, so the tier clamps to what the engine actually supports.
+// [LAW:dataflow-not-control-flow] Every branch is over VALUES, not modes:
+//   - `null`/`undefined` tier  → null: "leave the engine's own default" (today's unset behavior).
+//   - empty engine range       → null: the engine exposes no reasoning axis (opencode), so it is
+//                                 ignored — not an error.
+//   - tier the engine supports → that exact tier (identity; the common case today).
+//   - a supported-elsewhere tier → the nearest rung the engine DOES offer, ties broken toward the
+//                                   LOWER (cheaper) rung, since this substrate feeds a cost-bounding
+//                                   budget epic and rounding effort down is the safe default.
+// [LAW:no-silent-failure] an unknown tier string is a caller bug, not a value to clamp — throw,
+// naming the known tiers, rather than silently picking a rung.
+function resolveReasoningTier(tier, engineEfforts) {
+  // [LAW:no-silent-failure] Validate BOTH inputs against the one tier vocabulary, symmetrically. An
+  // engine range carrying a rung TIER_RANK doesn't know is a programmer error — an adapter added an
+  // effort level without teaching the ladder. Left unchecked it poisons the clamp below (a NaN
+  // distance never wins `dist < bestDist`, so the rung is skipped and the axis silently drops to
+  // null). Catch it loudly here so the clamp loop can trust every `TIER_RANK[e]`. This runs on every
+  // call, including a null tier, so a malformed adapter range reds the run rather than degrading it.
+  for (const e of engineEfforts) {
+    if (!Object.prototype.hasOwnProperty.call(TIER_RANK, e)) {
+      throw new Error(
+        `Engine declares reasoning effort ${JSON.stringify(e)} unknown to the tier ladder ` +
+        `(range: ${engineEfforts.join(', ')}). Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+      );
+    }
+  }
+  if (tier === null || tier === undefined) return null;
+  if (!Object.prototype.hasOwnProperty.call(TIER_RANK, tier)) {
+    throw new Error(
+      `Unknown reasoning tier ${JSON.stringify(tier)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+    );
+  }
+  if (engineEfforts.length === 0) return null;
+  if (engineEfforts.includes(tier)) return tier;
+
+  const target = TIER_RANK[tier];
+  let best = null;
+  let bestDist = Infinity;
+  for (const e of engineEfforts) {
+    const dist = Math.abs(TIER_RANK[e] - target);
+    // Strictly-nearer wins; on a tie keep the LOWER-ranked (cheaper) rung already chosen, since the
+    // loop visits the engine's range low→high as it is declared.
+    if (dist < bestDist) {
+      best = e;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+module.exports = {
+  DEFAULT_SCOPE_CONCURRENCY,
+  TIER_RANK,
+  defaultEffortProfile,
+  resolveReasoningTier,
+};
+
+
+/***/ }),
+
 /***/ 3048:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -30636,6 +30746,7 @@ const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 const { isAnthropicEndpoint, computeCostUsd } = __nccwpck_require__(9614);
+const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -30648,6 +30759,12 @@ const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
 // [LAW:one-source-of-truth] One owned version value, defined once here.
 const CLAUDE_CODE_VERSION = process.env.CLAUDE_CODE_VERSION || '2.1.0';
 const CLAUDE_TIMEOUT_MS = 3_000_000;
+
+// [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
+// referenced by BOTH the capability declaration (config validation) and buildCommand (resolving an
+// abstract tier to what this engine supports). The ordering low→high is what resolveReasoningTier's
+// nearest-rung clamp relies on.
+const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'];
 
 // [LAW:one-source-of-truth] Declared first so CLAUDE_ALLOWED_TOOLS can derive its MCP
 // entries from here. toolNames feeds the prompt; CLAUDE_ALLOWED_TOOLS feeds --allowedTools.
@@ -30749,8 +30866,13 @@ function buildCommand({ config, collector, home }) {
     NO_COLOR: '1',
   };
 
-  if (config.reasoning) {
-    env.CLAUDE_CODE_EFFORT_LEVEL = config.reasoning;
+  // [LAW:single-enforcer] Resolve the reasoning tier to what THIS engine supports through the one
+  // resolver — an abstract tier the engine offers passes through unchanged (the case today, since
+  // config.reasoning is already validated in-range), one it names differently clamps to the nearest
+  // rung, and null (unset, or opencode's empty range) leaves the engine's own default.
+  const effortLevel = resolveReasoningTier(config.reasoning ?? null, CLAUDE_REASONING_EFFORTS);
+  if (effortLevel) {
+    env.CLAUDE_CODE_EFFORT_LEVEL = effortLevel;
   }
 
   return { command: 'npx', args, env };
@@ -30852,7 +30974,7 @@ const claudeCodeAdapter = makeCliAdapter({
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
     // time via these declarations, never discovered at spawn time.
-    reasoningEfforts: ['low', 'medium', 'high', 'max'],
+    reasoningEfforts: CLAUDE_REASONING_EFFORTS,
     endpointKinds: ['anthropic-messages'],
   },
   // [LAW:one-source-of-truth] Reference TOOL_NAMES — do not redeclare the strings here.
@@ -30977,6 +31099,7 @@ const os = __nccwpck_require__(857);
 const { TransientError, classifyTransient } = __nccwpck_require__(2887);
 const { computeCostUsd } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
+const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 // [LAW:no-ambient-temporal-coupling] Pin off '@latest' — the same trap claude-code hit: an unowned,
 // time-varying input that lets an upstream npm release break a run with nothing here changing. Pinned
@@ -30984,6 +31107,12 @@ const { makeCliAdapter } = __nccwpck_require__(2890);
 const CODEX_VERSION = process.env.CODEX_VERSION || '0.141.0';
 const CODEX_PACKAGE = `@openai/codex@${CODEX_VERSION}`;
 const CODEX_TIMEOUT_MS = 3_000_000;
+
+// [LAW:one-source-of-truth] The engine's reasoning-effort range, declared once (low→high) and
+// referenced by BOTH the capability declaration (config validation) and buildConfigToml (resolving an
+// abstract tier to what this engine supports). The ordering low→high is what resolveReasoningTier's
+// nearest-rung clamp relies on.
+const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
 // [LAW:one-source-of-truth] The OpenAI Responses base URL the default 'codex' provider
 // targets. Declared here next to the adapter; src/provider.js references this constant
@@ -31037,8 +31166,12 @@ function buildConfigToml(config, collectorSpawn) {
     `model = ${q(config.model)}`,
     `model_provider = ${q(INTERNAL_PROVIDER)}`,
   ];
-  if (config.reasoning) {
-    lines.push(`model_reasoning_effort = ${q(config.reasoning)}`);
+  // [LAW:single-enforcer] Resolve the reasoning tier through the one resolver — a tier this engine
+  // offers passes through unchanged (the case today, config.reasoning being validated in-range), one
+  // it names differently clamps to the nearest rung, and null leaves the engine's own default.
+  const reasoningEffort = resolveReasoningTier(config.reasoning ?? null, CODEX_REASONING_EFFORTS);
+  if (reasoningEffort) {
+    lines.push(`model_reasoning_effort = ${q(reasoningEffort)}`);
   }
 
   lines.push(
@@ -31186,7 +31319,7 @@ const codexAdapter = makeCliAdapter({
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
     // endpoint with codex) are rejected at load time, never discovered at spawn time.
-    reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+    reasoningEfforts: CODEX_REASONING_EFFORTS,
     endpointKinds: ['openai-responses'],
   },
   toolNames: TOOL_NAMES,
@@ -31988,6 +32121,7 @@ module.exports = {
 "use strict";
 
 const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
+const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { dedupeFindings } = __nccwpck_require__(1565);
 const {
   buildReviewInput,
@@ -32017,10 +32151,6 @@ const {
 // failover.produceReview per config, so a transient that PERSISTS past a spawn's inner retries
 // escalates to config-level failover/budget as before. Both layers are fail-loud (a scope is never
 // dropped); the run only reds when a transient genuinely survives both. [LAW:no-silent-failure]
-
-// [LAW:no-mode-explosion] One internal constant, not a consumer input: how many scope workers run
-// concurrently. Quality is identical at any concurrency; this only trades runner load for wall time.
-const DEFAULT_SCOPE_CONCURRENCY = 4;
 
 // [LAW:types-are-the-program] A scope is the strongest true theorem: a named focus, nothing more.
 // There is deliberately NO `kind` discriminator — module scopes and boundary scopes are reviewed by
@@ -32221,7 +32351,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-function runMultiScope({ chain, material, registry, instructionsPath, maxConcurrent = DEFAULT_SCOPE_CONCURRENCY, log = () => {}, sleepFn = sleep }) {
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency; the
+// worker pool below takes a plain number, so this seam is where the profile projects onto it. The
+// default profile reproduces the pre-profile constant exactly, so an omitted `effort` is byte-identical.
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
+  const maxConcurrent = effort.scopeConcurrency;
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn });
   return produceReview(chain, null, null, produceOnce);
 }
@@ -32259,7 +32393,6 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 }
 
 module.exports = {
-  DEFAULT_SCOPE_CONCURRENCY,
   workerFocusText,
   sumUsage,
   composeSummary,
@@ -33164,6 +33297,7 @@ const { buildReviewInput } = __nccwpck_require__(3479);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
+const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
@@ -33274,7 +33408,7 @@ function buildReviewFooter(usage, configUsed, priorCost = null) {
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
 // chain, and submit an inline GitHub review.
-async function runPrReview(reviewerName, excludePatterns) {
+async function runPrReview(reviewerName, excludePatterns, effort) {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
@@ -33409,7 +33543,7 @@ async function runPrReview(reviewerName, excludePatterns) {
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
   });
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
@@ -33432,7 +33566,7 @@ async function runPrReview(reviewerName, excludePatterns) {
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
-async function runRepoReview(reviewerName, excludePatterns) {
+async function runRepoReview(reviewerName, excludePatterns, effort) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -33456,7 +33590,7 @@ async function runRepoReview(reviewerName, excludePatterns) {
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, log: core.info,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info,
   });
 
   const footer = buildReviewFooter(review.usage, configUsed);
@@ -33491,10 +33625,16 @@ async function run() {
   // misconfigured PR run into an accidental whole-repo audit. [LAW:no-silent-failure] an unknown
   // value fails loud rather than defaulting silently.
   const mode = (core.getInput('MODE') || 'pr').trim();
+
+  // [LAW:single-enforcer] The review's effort profile is produced ONCE here, at the top of the run,
+  // and threaded into whichever mode runs — the single seam where "how much effort to spend on this
+  // review" is decided. Simple mode uses the default; the config-file override is a later increment.
+  const effort = defaultEffortProfile();
+
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns);
+    await runPrReview(reviewerName, excludePatterns, effort);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns);
+    await runRepoReview(reviewerName, excludePatterns, effort);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
