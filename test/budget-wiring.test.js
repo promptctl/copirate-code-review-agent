@@ -106,6 +106,9 @@ describe('resolveBudgetedEffort', () => {
   const today = new Date('2026-07-11T12:00:00Z');
   const smallDiff = [{ filename: 'a.js', patch: '@@ -1 +1 @@\n+x' }]; // churn 1
   const defaultEffort = defaultEffortProfile({ roundCap: 5 });
+  // The proposal is decided UPSTREAM and passed in; the budget path only caps it. Here that proposal is
+  // the default de-rate ladder (difficulty scaling off), exactly what the run() seam passes when off.
+  const candidates = defaultBudgetCandidates(defaultEffort);
 
   const fakeOctokit = (comments, { throwOnRead = false } = {}) => ({
     rest: {
@@ -124,7 +127,7 @@ describe('resolveBudgetedEffort', () => {
     const octokit = fakeOctokit([]); // nothing spent today
     const profile = await resolveBudgetedEffort({
       octokit, owner: 'o', repo: 'r', issueNumber: 1, now: today,
-      filteredFiles: smallDiff, defaultEffort, dailyBudget: 100,
+      filteredFiles: smallDiff, candidates, dailyBudget: 100,
     });
     assert.equal(profile.roundCap, 5);
   });
@@ -138,7 +141,7 @@ describe('resolveBudgetedEffort', () => {
     for (const dailyBudget of [100, 10, 2, 0.5, 0.05]) {
       const profile = await resolveBudgetedEffort({
         octokit: fakeOctokit([]), owner: 'o', repo: 'r', issueNumber: 1, now: today,
-        filteredFiles: smallDiff, defaultEffort, dailyBudget,
+        filteredFiles: smallDiff, candidates, dailyBudget,
       });
       caps.push(profile.roundCap);
     }
@@ -151,7 +154,7 @@ describe('resolveBudgetedEffort', () => {
     const octokit = fakeOctokit([], { throwOnRead: true });
     const profile = await resolveBudgetedEffort({
       octokit, owner: 'o', repo: 'r', issueNumber: 1, now: today,
-      filteredFiles: smallDiff, defaultEffort, dailyBudget: 100,
+      filteredFiles: smallDiff, candidates, dailyBudget: 100,
     });
     // Spend-safe = proceed as if under budget = full effort, despite the read failure.
     assert.equal(profile.roundCap, 5);
@@ -166,7 +169,7 @@ describe('resolveBudgetedEffort', () => {
     const octokit = fakeOctokit([ledgerComment(0.05, '2026-07-11T08:00:00Z')]); // day already over its $0.01 budget
     const profile = await resolveBudgetedEffort({
       octokit, owner: 'o', repo: 'r', issueNumber: 1, now: today,
-      filteredFiles: bigDiff, defaultEffort, dailyBudget: 0.01,
+      filteredFiles: bigDiff, candidates, dailyBudget: 0.01,
     });
     // The cheapest rung is returned despite nothing fitting the cap — the floor fallback ran.
     assert.equal(profile.roundCap, 1);
@@ -177,7 +180,7 @@ describe('resolveBudgetedEffort', () => {
     const octokit = fakeOctokit([ledgerComment(999, '2026-07-10T23:00:00Z')]);
     const profile = await resolveBudgetedEffort({
       octokit, owner: 'o', repo: 'r', issueNumber: 1, now: today,
-      filteredFiles: smallDiff, defaultEffort, dailyBudget: 100,
+      filteredFiles: smallDiff, candidates, dailyBudget: 100,
     });
     assert.equal(profile.roundCap, 5);
   });

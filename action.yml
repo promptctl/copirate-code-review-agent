@@ -84,6 +84,10 @@ inputs:
     description: "Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically wired from a repo Actions variable, e.g. vars.LEDGER_ISSUE, in the calling workflow). Required when DAILY_BUDGET_USD is set; ignored otherwise."
     required: false
     default: ""
+  DIFFICULTY_SCALING:
+    description: "Scale review effort to change difficulty: an easy diff (tiny churn, few files, tests-only/docs-only) draws fewer review rounds; a substantial diff draws the full MAX_REVIEW_ROUNDS. Uses a free, pre-spend proxy of the diff — it only ever LOWERS effort below MAX_REVIEW_ROUNDS, never raises it. Composes with DAILY_BUDGET_USD (difficulty proposes, budget caps) and activates independently. 'false' (default) = off (today's default effort). PR mode only."
+    required: false
+    default: "false"
   GITHUB_TOKEN:
     description: "GitHub token for API access."
     required: false

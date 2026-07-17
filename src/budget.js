@@ -168,6 +168,7 @@ module.exports = {
   CAP_FRACTION,
   MIN_CAP_USD,
   DERATE_ROUNDCAPS,
+  effectiveRounds,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
