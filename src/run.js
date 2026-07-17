@@ -11,7 +11,9 @@ const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
 const { defaultEffortProfile } = require('./effort');
-const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile } = require('./budget');
+const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = require('./budget');
+const { assessDifficulty } = require('./difficulty');
+const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-policy');
 const { readSpentToday, appendCost } = require('./ledger');
 const { renderCostLine, costWarning, costMarker } = require('./usage');
 const { renderRepoReport } = require('./report');
@@ -141,10 +143,11 @@ async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatte
 // this boundary owns is the ledger read whose failure policy is spend-safe. [LAW:no-silent-failure] a
 // failed read falls back SPEND-SAFE — proceed as if under budget (spentToday 0 ⇒ full remaining ⇒ full
 // effort) with a loud warning, never a silent throttle on missing data; unknown ledger entries make the
-// day's spend a logged LOWER bound (undercount ⇒ spend more, never a false stop). The chosen candidate
-// set is anchored to `defaultEffort` (the user's configured ceiling), so the returned profile can only
-// CAP effort, never raise it. Returns the chosen EffortProfile.
-async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, filteredFiles, defaultEffort, dailyBudget }) {
+// day's spend a logged LOWER bound (undercount ⇒ spend more, never a false stop). [LAW:decomposition] the
+// candidate set is PROPOSED upstream (difficulty, or the default de-rate ladder) and passed in — budget
+// only CAPS what it is handed, it does not decide the proposal. Every candidate is ≤ the user's ceiling,
+// so the returned profile can only cap effort, never raise it. Returns the chosen EffortProfile.
+async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, candidates, filteredFiles, dailyBudget }) {
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
@@ -164,12 +167,7 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, f
   }
 
   const diffSize = diffChurn(filteredFiles);
-  const decision = chooseProfile({
-    candidates: defaultBudgetCandidates(defaultEffort),
-    spentToday,
-    dailyBudget,
-    diffSize,
-  });
+  const decision = chooseProfile({ candidates, spentToday, dailyBudget, diffSize });
   const capNote = decision.withinCap
     ? 'within cap'
     : 'budget FLOOR — even the cheapest candidate exceeds the cap; running the minimal review';
@@ -179,6 +177,38 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, f
     + `(est. $${decision.estimatedUsd.toFixed(4)}; ${capNote}).`,
   );
   return decision.profile;
+}
+
+// [LAW:effects-at-boundaries] Difficulty scaling WITHOUT the budget gradient: the difficulty-proposed
+// candidate ladder with no daily spend cap. [LAW:dataflow-not-control-flow] "no budget" is the value
+// Infinity, not a second selector — the SAME chooseProfile ranks the ladder, and an unbounded cap makes
+// every candidate affordable, so it returns the most expensive one: exactly the difficulty-proposed
+// ceiling. No ledger IO (no spend to ration) — a pure decision over the pre-spend proposal, logged.
+// Returns the chosen EffortProfile.
+function resolveDifficultyEffort({ candidates, filteredFiles }) {
+  const diffSize = diffChurn(filteredFiles);
+  const decision = chooseProfile({ candidates, spentToday: 0, dailyBudget: Infinity, diffSize });
+  core.info(
+    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap} `
+    + `(from ${candidates.length} candidate profile(s); no daily budget, so the difficulty proposal stands).`,
+  );
+  return decision.profile;
+}
+
+// [LAW:effects-at-boundaries] Pure. Attribute a round-cap de-rate to the lever(s) that ACTUALLY bound,
+// given the final resolved cap, the ceiling difficulty proposed (before any budget cap), and the user's
+// configured MAX_REVIEW_ROUNDS. Two levers can lower the cap and either/both can bind: difficulty bound
+// iff its proposed ceiling fell below the default; budget bound iff the final cap fell below what
+// difficulty proposed. [LAW:dataflow-not-control-flow] compared in effectiveRounds space so the
+// 0=unlimited sentinel ranks correctly. `deRated` is exactly the union of the two bound flags — since
+// effort ≤ difficultyCeiling ≤ default always, a de-rate can only come from one or both — so a de-rated
+// cap always names at least one binding lever, never an empty list. [LAW:no-silent-failure]
+function bindingLevers({ effortRoundCap, difficultyCeilingRoundCap, defaultRoundCap }) {
+  return {
+    deRated: effectiveRounds(effortRoundCap) < effectiveRounds(defaultRoundCap),
+    budgetBound: effectiveRounds(effortRoundCap) < effectiveRounds(difficultyCeilingRoundCap),
+    difficultyBound: effectiveRounds(difficultyCeilingRoundCap) < effectiveRounds(defaultRoundCap),
+  };
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -262,55 +292,103 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     return;
   }
 
-  // [LAW:no-mode-explosion] Budget gradient (PR mode only). OFF by default: DAILY_BUDGET_USD unset/0 ⇒
-  // effort stays `defaultEffort`, no ledger IO, a byte-identical run. When ON, the budget-chosen roundCap
-  // must reach the round-cap gate below (roundCap's ONLY consumer), so the diff is fetched HERE — before
-  // the gate — to size this review's cost; that fetch is reused downstream (the diff is fetched once).
-  // [LAW:effects-at-boundaries] the ledger read + append are the effects; chooseProfile is the pure core.
+  // [LAW:no-mode-explosion] Two independent opt-ins refine effort (PR mode only), both OFF by default and
+  // both byte-identical when off: DIFFICULTY_SCALING PROPOSES a cheaper roundCap ceiling for easy diffs;
+  // DAILY_BUDGET_USD CAPS effort as the day's budget depletes. They compose at this seam — difficulty
+  // shapes the candidate ladder, budget picks the affordable best from it — and either activates the
+  // other's off-value (difficulty off ⇒ the default de-rate ladder; budget off ⇒ an unbounded cap, so
+  // the difficulty proposal stands). When BOTH are off the whole block is skipped: effort stays
+  // `defaultEffort`, no diff fetch here, no ledger IO — a byte-identical run down to the log.
+  // [LAW:no-silent-failure] each input is parsed strictly and reds the run loud on a malformed value.
   let dailyBudget;
+  let difficultyScaling;
   try {
     dailyBudget = parseDailyBudgetUsd(core.getInput('DAILY_BUDGET_USD'));
+    difficultyScaling = parseDifficultyScaling(core.getInput('DIFFICULTY_SCALING'));
   } catch (e) {
     core.setFailed(e.message);
     return;
   }
+  const budgetOn = dailyBudget > 0;
   let effort = defaultEffort;
-  let fetched = null;      // { transport, filteredFiles } — populated early only when the budget is active
+  let fetched = null;      // { transport, filteredFiles } — populated early only when this block is active
   let ledgerIssue = null;  // the issue this review's actual cost is appended to, after submit
-  if (dailyBudget > 0) {
-    const rawIssue = core.getInput('LEDGER_ISSUE').trim();
-    ledgerIssue = parseInt(rawIssue, 10);
-    if (!rawIssue || !Number.isInteger(ledgerIssue) || ledgerIssue <= 0) {
-      core.setFailed(
-        `DAILY_BUDGET_USD is set (budget gradient enabled) but LEDGER_ISSUE is missing or invalid `
-        + `(${JSON.stringify(rawIssue)}). Set LEDGER_ISSUE to the daily cost-ledger issue number `
-        + '(e.g. from a repo Actions variable) — the gradient cannot ration spend without a ledger.',
-      );
-      return;
-    }
-    const now = new Date(); // [LAW:no-ambient-temporal-coupling] the run boundary owns the clock
+  // [LAW:one-source-of-truth] The ceiling difficulty PROPOSED for this change, before any budget cap —
+  // the most expensive candidate. It is `defaultEffort` unchanged when difficulty is off. The round-cap
+  // gate below compares it against both the configured ceiling and the final effort to attribute a
+  // de-rate to the lever that ACTUALLY bound (difficulty lowered this below the default; budget lowered
+  // the final below this), so the skip message never names a knob that wasn't binding. [LAW:no-silent-failure]
+  let difficultyCeiling = defaultEffort;
+  if (budgetOn || difficultyScaling) {
+    // Both features need the diff BEFORE the round-cap gate below (roundCap's only consumer): budget to
+    // size this review's cost, difficulty to size the change. Fetched once here and reused downstream.
     fetched = await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
-    effort = await resolveBudgetedEffort({
-      octokit, owner, repo, issueNumber: ledgerIssue, now,
-      filteredFiles: fetched.filteredFiles, defaultEffort, dailyBudget,
-    });
+
+    // [LAW:composability] Difficulty PROPOSES the candidate ladder; off ⇒ the default de-rate ladder, so
+    // a budget-only run is byte-identical to before this slice. The proposal is anchored to
+    // `defaultEffort` (the user's ceiling), so it can only LOWER the ceiling, never raise it.
+    const candidates = difficultyScaling
+      ? difficultyCandidates(assessDifficulty(fetched.filteredFiles), defaultEffort)
+      : defaultBudgetCandidates(defaultEffort);
+
+    // The proposed ceiling is the most expensive candidate (defaultBudgetCandidates / difficultyCandidates
+    // both put it there); ranked in effectiveRounds space so the 0="unlimited" sentinel ranks correctly.
+    difficultyCeiling = candidates.reduce((a, b) =>
+      (effectiveRounds(b.roundCap) > effectiveRounds(a.roundCap) ? b : a));
+
+    if (budgetOn) {
+      const rawIssue = core.getInput('LEDGER_ISSUE').trim();
+      ledgerIssue = parseInt(rawIssue, 10);
+      if (!rawIssue || !Number.isInteger(ledgerIssue) || ledgerIssue <= 0) {
+        core.setFailed(
+          `DAILY_BUDGET_USD is set (budget gradient enabled) but LEDGER_ISSUE is missing or invalid `
+          + `(${JSON.stringify(rawIssue)}). Set LEDGER_ISSUE to the daily cost-ledger issue number `
+          + '(e.g. from a repo Actions variable) — the gradient cannot ration spend without a ledger.',
+        );
+        return;
+      }
+      const now = new Date(); // [LAW:no-ambient-temporal-coupling] the run boundary owns the clock
+      effort = await resolveBudgetedEffort({
+        octokit, owner, repo, issueNumber: ledgerIssue, now,
+        candidates, filteredFiles: fetched.filteredFiles, dailyBudget,
+      });
+    } else {
+      // Difficulty-only: no daily budget to ration, so the difficulty-proposed ceiling stands.
+      effort = resolveDifficultyEffort({ candidates, filteredFiles: fetched.filteredFiles });
+    }
   }
 
-  // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the budget-chosen cap
-  // when the gradient is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget de-rates
-  // by tripping this same gate sooner on later pushes. [LAW:no-silent-failure] the message names the ACTUAL
-  // binding constraint: the gradient is credited only when it genuinely LOWERED the cap below the default
-  // (a rung is always strictly cheaper than the default, so its roundCap never equals the default's — this
-  // holds even for the 0=unlimited default). When the budget was ample and left the cap at the configured
-  // value, MAX_REVIEW_ROUNDS is the real constraint, so the message points there — telling a user to "raise
-  // the budget" when the budget wasn't binding would send them down the wrong path. The off path (budget
-  // unset) takes this same branch and its message is unchanged (a byte-identical run down to the log).
+  // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the refined cap when
+  // budget and/or difficulty is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget or
+  // an easy diff de-rates by tripping this same gate sooner. [LAW:no-silent-failure] the message names the
+  // ACTUAL binding constraint, attributed PRECISELY: two levers can lower the cap, but each only when it
+  // genuinely bound. Difficulty bound iff its proposed ceiling fell below MAX_REVIEW_ROUNDS; budget bound
+  // iff the final cap fell below whatever difficulty proposed. Compared in effectiveRounds space so the
+  // 0=unlimited sentinel ranks correctly. Naming a lever that was active-but-non-binding (e.g. "raise the
+  // budget" when an easy diff — not the budget — set the cap) would send the user down the wrong path.
+  // [LAW:dataflow-not-control-flow] the message varies by the VALUE of the binding-lever list; `deRated`
+  // implies exactly the union of the two bound flags (effort is only lowered inside the block above, and
+  // it can only fall via the difficulty ceiling or the budget cap), so the list is never empty here. The
+  // both-off path leaves the cap at the default and takes the MAX_REVIEW_ROUNDS branch (a byte-identical
+  // run down to the log).
   if (roundCapReached(prior.count, effort.roundCap)) {
-    const budgetDeRated = dailyBudget > 0 && effort.roundCap !== defaultEffort.roundCap;
-    core.info(budgetDeRated
+    const { deRated, budgetBound, difficultyBound } = bindingLevers({
+      effortRoundCap: effort.roundCap,
+      difficultyCeilingRoundCap: difficultyCeiling.roundCap,
+      defaultRoundCap: defaultEffort.roundCap,
+    });
+    const setters = [
+      budgetBound && 'the DAILY_BUDGET_USD gradient',
+      difficultyBound && 'DIFFICULTY_SCALING',
+    ].filter(Boolean);
+    const remedies = [
+      budgetBound && 'raise the daily budget',
+      difficultyBound && 'push a larger change (or unset DIFFICULTY_SCALING)',
+    ].filter(Boolean);
+    core.info(deRated
       ? `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-        + `the DAILY_BUDGET_USD gradient's de-rated round cap of ${effort.roundCap} (lowered from `
-        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). Raise the daily budget to review further pushes.`
+        + `the de-rated round cap of ${effort.roundCap} set by ${setters.join(' / ')} (lowered from `
+        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review further pushes, ${remedies.join(' or ')}.`
       : `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`);
     return;
@@ -475,4 +553,4 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers };

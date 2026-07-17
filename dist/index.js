@@ -30096,6 +30096,7 @@ module.exports = {
   CAP_FRACTION,
   MIN_CAP_USD,
   DERATE_ROUNDCAPS,
+  effectiveRounds,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
@@ -30821,6 +30822,231 @@ module.exports = {
   unquoteCStylePath,
   parseGitDiffHeader,
   parseUnifiedDiff,
+};
+
+
+/***/ }),
+
+/***/ 9935:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const { effectiveRounds, defaultBudgetCandidates } = __nccwpck_require__(5120);
+
+// [FRAMING:parts-and-seams] The difficulty POLICY: the part that turns the pure, pre-spend difficulty
+// SIGNALS (assessDifficulty in difficulty.js — churn, spread, kind breakdown) into an EffortProfile
+// candidate ladder for chooseProfile. It is the deliberate counterpart to difficulty.js: that module
+// MEASURES and carries no effort knowledge; this module DECIDES and carries no measurement. [LAW:decomposition]
+// The two epics compose at the run() seam — difficulty PROPOSES the ceiling here, budget CAPS within it
+// via chooseProfile — so this module depends only on budget.js's ladder machinery
+// (defaultBudgetCandidates, effectiveRounds) and the Difficulty value shape, never the reverse. [LAW:one-way-deps]
+//
+// SCOPE, bounded by today's type: roundCap is the ONLY cost-bearing axis EffortProfile carries, and the
+// candidates must never exceed the user's configured ceiling — so this slice can only LOWER the ceiling
+// for easy changes (cheap reviews for trivial diffs). RAISING effort above the ceiling for hard changes
+// is impossible until a new cost-bearing axis lands (slice zai-difficulty-0ea.3); a higher roundCap the
+// profile can't price would be a no-op, so it is not faked here. [LAW:types-are-the-program]
+
+// [LAW:one-source-of-truth] Policy tunables — hand-tuned difficulty thresholds, documented, in this one
+// place. Like PRICES_PER_MILLION (usage.js) and CALIBRATION (budget.js) this is a representation with no
+// machine source: it encodes a REVIEW-EFFORT judgment ("how much scrutiny does a change of this shape
+// warrant"), tuned against this repo's own dogfooded PRs, and is expected to drift and be retuned. It is
+// NOT an action input — the only difficulty knob a consumer sees is the on/off DIFFICULTY_SCALING switch;
+// everything about HOW difficulty maps to effort lives here. [LAW:no-mode-explosion]
+//
+//   SPREAD_WEIGHT       Each touched file adds this many churn-EQUIVALENT lines to the effort magnitude:
+//                       review cost scales with how many distinct files/contexts must be held, not only
+//                       with the raw line count, so a wide change (many files, few lines each — a
+//                       cross-cutting rename or signature change) is not "trivial" the way its churn
+//                       alone would suggest.
+//   NONSOURCE_DISCOUNT  A change touching NO source file (tests-only / docs-only — kinds.source === 0) is
+//                       intrinsically lower review-risk per line, so its magnitude is scaled by this
+//                       factor. It only SHIFTS the bands (a huge tests-only change still earns real
+//                       effort), never a blanket floor. This is the epic's headline signal: a docs typo
+//                       and a concurrency refactor must not draw the same effort.
+const SPREAD_WEIGHT = 8;
+const NONSOURCE_DISCOUNT = 0.4;
+
+// [LAW:dataflow-not-control-flow] The effort ladder as VALUE bands: the band that covers a change's
+// magnitude sets its proposed roundCap ceiling. A magnitude above every band proposes NO lowering — the
+// user's full configured ceiling stands (a substantial change deserves full effort). Bands are the
+// cost-bearing roundCap axis only; each future cost-bearing axis grows its own band table HERE alongside
+// this one. [LAW:carrying-cost] Listed low→high only for human readability — selectBand is
+// order-INDEPENDENT (it picks the smallest covering band by value), so a reorder cannot change behavior.
+const DIFFICULTY_BANDS = [
+  { maxMagnitude: 20, roundCap: 1 },   // trivial: a typo, a one-line tweak, a tiny docs edit
+  { maxMagnitude: 80, roundCap: 2 },   // small: a focused fix
+  { maxMagnitude: 250, roundCap: 3 },  // moderate: a contained feature
+  // above 250 → the user's full ceiling (substantial: a large or cross-cutting change)
+];
+
+// [LAW:effects-at-boundaries] Pure. [LAW:types-are-the-program] The band a magnitude falls in: the one
+// with the SMALLEST maxMagnitude that still covers it, selected regardless of array order — so the band
+// table is an unordered SET, not a list carrying a fragile ascending-order invariant a reorder could
+// silently break. `null` when no band covers the magnitude (it exceeds every band → propose no lowering).
+// The tie-break is EXPLICIT: on equal maxMagnitude the smaller roundCap (the cheaper rung) wins, so the
+// result is deterministic and order-independent even for a degenerate table with duplicate maxMagnitude —
+// the reduce never silently keeps whichever the array order happened to visit first.
+function selectBand(bands, magnitude) {
+  const covering = bands.filter((b) => magnitude <= b.maxMagnitude);
+  return covering.length === 0
+    ? null
+    : covering.reduce((a, b) => {
+      if (b.maxMagnitude !== a.maxMagnitude) return b.maxMagnitude < a.maxMagnitude ? b : a;
+      return b.roundCap < a.roundCap ? b : a;
+    });
+}
+
+// [LAW:effects-at-boundaries] Pure. The churn-equivalent effort magnitude of a change: its raw churn
+// plus a per-file spread surcharge, scaled down when the change touches no source. Deterministic and
+// pre-spend — the same Difficulty value always yields the same magnitude. [LAW:dataflow-not-control-flow]
+// the source discount is a VALUE multiplier chosen from the signal, never a branch that skips a term.
+function effortMagnitude({ churn, kinds }) {
+  const spread = kinds.source + kinds.tests + kinds.docs;
+  const sourceFactor = kinds.source > 0 ? 1 : NONSOURCE_DISCOUNT;
+  return (churn + SPREAD_WEIGHT * spread) * sourceFactor;
+}
+
+// [LAW:effects-at-boundaries] Pure. Propose the EffortProfile candidate ladder for a change of this
+// difficulty, given the user's configured `topProfile` (the ceiling the proposal may never exceed).
+// [LAW:composability] It asks only for the difficulty value and the ceiling, and returns a candidate set
+// chooseProfile can rank in any order — difficulty proposes, budget (or the no-budget identity) caps.
+//
+// The proposal only ever LOWERS the ceiling: the banded roundCap is adopted ONLY when it is genuinely
+// cheaper than the user's configured cap (compared in effectiveRounds space so the 0="unlimited"
+// sentinel ranks above every finite cap — an unlimited ceiling is correctly lowered to a finite band for
+// an easy change, and a small finite user cap is never raised toward a larger band). The settled ceiling
+// then feeds the SAME de-rate ladder the budget path uses (defaultBudgetCandidates), so budget's cap
+// still applies cleanly on top. [LAW:one-source-of-truth] one ladder machinery, two ceilings.
+function difficultyCandidates(difficulty, topProfile) {
+  const magnitude = effortMagnitude(difficulty);
+  const band = selectBand(DIFFICULTY_BANDS, magnitude);
+  const proposed = band ? band.roundCap : topProfile.roundCap;
+  const ceiling = effectiveRounds(proposed) < effectiveRounds(topProfile.roundCap)
+    ? proposed
+    : topProfile.roundCap;
+  return defaultBudgetCandidates({ ...topProfile, roundCap: ceiling });
+}
+
+// [LAW:no-silent-failure] Parse the DIFFICULTY_SCALING action input at the run boundary. Unset/empty is
+// the OFF state — the value false — NOT an error: difficulty scaling is opt-in and its absence is today's
+// default path (byte-identical default-profile run, no new mode [LAW:no-mode-explosion], mirroring
+// parseDailyBudgetUsd's off state). A present-but-unrecognized value is a config typo that reds the run
+// loud, never a silent fall-back to off that would leave a consumer believing the feature is on.
+function parseDifficultyScaling(raw) {
+  const s = (raw || '').trim().toLowerCase();
+  if (s === '' || s === 'false') return false;
+  if (s === 'true') return true;
+  throw new Error(
+    `Invalid DIFFICULTY_SCALING ${JSON.stringify(raw)}: expected 'true' or 'false' `
+    + '(unset or false = difficulty scaling off).',
+  );
+}
+
+module.exports = {
+  SPREAD_WEIGHT,
+  NONSOURCE_DISCOUNT,
+  DIFFICULTY_BANDS,
+  selectBand,
+  effortMagnitude,
+  difficultyCandidates,
+  parseDifficultyScaling,
+};
+
+
+/***/ }),
+
+/***/ 4260:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const { diffChurn } = __nccwpck_require__(9898);
+
+// [FRAMING:parts-and-seams] assessDifficulty is the pure, pre-spend MEASUREMENT half of the difficulty
+// epic (zai-difficulty-0ea): it turns the reviewed file set into an honest description of how much
+// change is here, computed BEFORE any engine spend so it is free and reproducible — the same diff
+// always yields the same value. [LAW:dataflow-not-control-flow] [LAW:effects-at-boundaries] Pure: no
+// IO, no clock, no engine. The POLICY that turns these signals into an effort ladder is a separate
+// part (the candidate-derivation slice, zai-difficulty-0ea.2); this module carries NO knowledge of
+// EffortProfile, roundCap, or thresholds, so it composes with any consumer — candidate derivation, a
+// run-log observation, a future difficulty-driven lens — asking nothing of them. [LAW:composability]
+//
+// It runs on the SAME filteredFiles the engine reviews and diffChurn already sums (the set left after
+// EXCLUDE_PATTERNS), so dist/generated/lockfile files are already gone: re-deriving THOSE as a
+// "trivial" signal here would be redundant with exclusion. The signals that stay honest over the
+// filtered set are diff MAGNITUDE (churn), SPREAD (how many files — the sum of the kind breakdown),
+// and each touched file's KIND.
+
+// [LAW:types-are-the-program] The strongest theorem the domain supports pre-spend — deliberately the
+// RAW signals, never a scalar "score" (false precision the domain can't justify) nor an effort verdict
+// (that is policy). `churn` is exact; `kinds` PARTITIONS every touched file into three risk classes,
+// so a consumer derives spread as their sum and "touches source" as kinds.source > 0 — nothing thrown
+// away, and no second authority to drift from. [LAW:one-source-of-truth] There is deliberately no
+// `fileCount` field: it is kinds.source + kinds.tests + kinds.docs, derived by the consumer, never
+// stored as a value that could disagree with the breakdown it duplicates.
+// @typedef {{ churn: number, kinds: { source: number, tests: number, docs: number } }} Difficulty
+
+// A path is TEST infrastructure when a directory segment marks a test tree, or the basename matches a
+// cross-language test-file convention (js/ts `.test`/`.spec`, go `_test`, python `test_`). Path-based
+// and conservative: this is a factual claim about the file, not an effort decision.
+const TEST_DIR = /(^|\/)(?:tests?|__tests__|__mocks__|spec)\//i;
+const TEST_FILE = /(?:\.(?:test|spec)\.[^/.]+|_test\.[^/.]+|(?:^|\/)test_[^/]*\.py)$/i;
+
+// A path is DOCUMENTATION when it is a prose/markup file, lives under a docs tree, or is a
+// conventional top-level project note (LICENSE/README/CHANGELOG/…). `.txt` is deliberately NOT a
+// standalone doc extension: a bare `.txt` is as often a dependency/data spec (requirements.txt,
+// constraints.txt) as prose, and misclassifying such a supply-chain file as docs-only is the
+// dangerous source→under-review direction. So `.txt` counts as documentation ONLY when attached to a
+// recognized note keyword (README.txt), governed by DOCS_FILE, never on its own.
+const DOCS_DIR = /(^|\/)docs?\//i;
+const DOCS_EXT = /\.(?:md|mdx|markdown|rst|adoc)$/i;
+// The keyword must be the whole basename or carry a note extension — the boundary is `(?:\.note-ext)?$`,
+// not a greedy `[^/]*$`, so `README`/`README.txt` classify as docs while `license.js` and
+// `licensed_users.csv` fall through to source by construction. Case-insensitive, consistent with every
+// other classification pattern, so an extensionless lowercase `readme`/`license` is not missed.
+const DOCS_FILE = /(^|\/)(?:LICENSE|LICENCE|COPYING|NOTICE|AUTHORS|CHANGELOG|README|CONTRIBUTING)(?:\.(?:md|mdx|markdown|rst|adoc|txt))?$/i;
+
+// [LAW:effects-at-boundaries] Pure. Classify ONE file's path into exactly one risk kind. A closed,
+// total partition (every path resolves to one of the three), with a documented precedence — a test
+// tree wins over a doc extension (a markdown fixture under test/ is test infrastructure), and anything
+// neither test nor docs is SOURCE. Source is the conservative default: an unrecognized path (including
+// a patch-less binary asset) is treated as reviewable-risk, never silently discounted. [LAW:no-silent-failure]
+//
+// [LAW:no-silent-failure] A missing or empty filename is a CALLER CONTRACT breach, not an unrecognized
+// path: a non-string RegExp.test would coerce to "undefined" and an empty string matches no pattern —
+// both fall through to 'source', a phantom file silently inflating the source count, a lie about what
+// the change touched. A valid file always has a non-empty path, so throw loudly (as
+// chooseProfile/resolveReasoningTier/parseDailyBudgetUsd do on bad input) rather than launder the error
+// into a plausible classification. This is NOT a defensive skip [LAW:no-defensive-null-guards]: absence
+// is not a genuine value here — a fileless entry can't come from valid transport data — so it fails the
+// run instead of quietly dropping work.
+function classifyFile(filename) {
+  if (typeof filename !== 'string' || filename === '') {
+    throw new Error(`classifyFile requires a non-empty string filename, got ${JSON.stringify(filename)}.`);
+  }
+  if (TEST_DIR.test(filename) || TEST_FILE.test(filename)) return 'tests';
+  if (DOCS_DIR.test(filename) || DOCS_EXT.test(filename) || DOCS_FILE.test(filename)) return 'docs';
+  return 'source';
+}
+
+// [LAW:effects-at-boundaries] Pure. The pre-spend difficulty of a reviewed file set.
+// [LAW:one-source-of-truth] churn is diffChurn over the SAME set — never a second line-counter, so the
+// difficulty magnitude and the budget cost estimate can never disagree about how big the diff is.
+// Every touched file is classified (patch-less files included: they add 0 churn but still widen the
+// change's spread), so the kind counts sum to the file count.
+function assessDifficulty(files) {
+  const kinds = { source: 0, tests: 0, docs: 0 };
+  for (const file of files) kinds[classifyFile(file.filename)]++;
+  return { churn: diffChurn(files), kinds };
+}
+
+module.exports = {
+  classifyFile,
+  assessDifficulty,
 };
 
 
@@ -33642,7 +33868,9 @@ const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
 const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
-const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile } = __nccwpck_require__(5120);
+const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = __nccwpck_require__(5120);
+const { assessDifficulty } = __nccwpck_require__(4260);
+const { difficultyCandidates, parseDifficultyScaling } = __nccwpck_require__(9935);
 const { readSpentToday, appendCost } = __nccwpck_require__(8192);
 const { renderCostLine, costWarning, costMarker } = __nccwpck_require__(9614);
 const { renderRepoReport } = __nccwpck_require__(8959);
@@ -33772,10 +34000,11 @@ async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatte
 // this boundary owns is the ledger read whose failure policy is spend-safe. [LAW:no-silent-failure] a
 // failed read falls back SPEND-SAFE — proceed as if under budget (spentToday 0 ⇒ full remaining ⇒ full
 // effort) with a loud warning, never a silent throttle on missing data; unknown ledger entries make the
-// day's spend a logged LOWER bound (undercount ⇒ spend more, never a false stop). The chosen candidate
-// set is anchored to `defaultEffort` (the user's configured ceiling), so the returned profile can only
-// CAP effort, never raise it. Returns the chosen EffortProfile.
-async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, filteredFiles, defaultEffort, dailyBudget }) {
+// day's spend a logged LOWER bound (undercount ⇒ spend more, never a false stop). [LAW:decomposition] the
+// candidate set is PROPOSED upstream (difficulty, or the default de-rate ladder) and passed in — budget
+// only CAPS what it is handed, it does not decide the proposal. Every candidate is ≤ the user's ceiling,
+// so the returned profile can only cap effort, never raise it. Returns the chosen EffortProfile.
+async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, candidates, filteredFiles, dailyBudget }) {
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
@@ -33795,12 +34024,7 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, f
   }
 
   const diffSize = diffChurn(filteredFiles);
-  const decision = chooseProfile({
-    candidates: defaultBudgetCandidates(defaultEffort),
-    spentToday,
-    dailyBudget,
-    diffSize,
-  });
+  const decision = chooseProfile({ candidates, spentToday, dailyBudget, diffSize });
   const capNote = decision.withinCap
     ? 'within cap'
     : 'budget FLOOR — even the cheapest candidate exceeds the cap; running the minimal review';
@@ -33810,6 +34034,38 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, f
     + `(est. $${decision.estimatedUsd.toFixed(4)}; ${capNote}).`,
   );
   return decision.profile;
+}
+
+// [LAW:effects-at-boundaries] Difficulty scaling WITHOUT the budget gradient: the difficulty-proposed
+// candidate ladder with no daily spend cap. [LAW:dataflow-not-control-flow] "no budget" is the value
+// Infinity, not a second selector — the SAME chooseProfile ranks the ladder, and an unbounded cap makes
+// every candidate affordable, so it returns the most expensive one: exactly the difficulty-proposed
+// ceiling. No ledger IO (no spend to ration) — a pure decision over the pre-spend proposal, logged.
+// Returns the chosen EffortProfile.
+function resolveDifficultyEffort({ candidates, filteredFiles }) {
+  const diffSize = diffChurn(filteredFiles);
+  const decision = chooseProfile({ candidates, spentToday: 0, dailyBudget: Infinity, diffSize });
+  core.info(
+    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap} `
+    + `(from ${candidates.length} candidate profile(s); no daily budget, so the difficulty proposal stands).`,
+  );
+  return decision.profile;
+}
+
+// [LAW:effects-at-boundaries] Pure. Attribute a round-cap de-rate to the lever(s) that ACTUALLY bound,
+// given the final resolved cap, the ceiling difficulty proposed (before any budget cap), and the user's
+// configured MAX_REVIEW_ROUNDS. Two levers can lower the cap and either/both can bind: difficulty bound
+// iff its proposed ceiling fell below the default; budget bound iff the final cap fell below what
+// difficulty proposed. [LAW:dataflow-not-control-flow] compared in effectiveRounds space so the
+// 0=unlimited sentinel ranks correctly. `deRated` is exactly the union of the two bound flags — since
+// effort ≤ difficultyCeiling ≤ default always, a de-rate can only come from one or both — so a de-rated
+// cap always names at least one binding lever, never an empty list. [LAW:no-silent-failure]
+function bindingLevers({ effortRoundCap, difficultyCeilingRoundCap, defaultRoundCap }) {
+  return {
+    deRated: effectiveRounds(effortRoundCap) < effectiveRounds(defaultRoundCap),
+    budgetBound: effectiveRounds(effortRoundCap) < effectiveRounds(difficultyCeilingRoundCap),
+    difficultyBound: effectiveRounds(difficultyCeilingRoundCap) < effectiveRounds(defaultRoundCap),
+  };
 }
 
 // PR-diff review: fetch the PR, gate forks, build the diff material + anchors, run the engine
@@ -33893,55 +34149,103 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     return;
   }
 
-  // [LAW:no-mode-explosion] Budget gradient (PR mode only). OFF by default: DAILY_BUDGET_USD unset/0 ⇒
-  // effort stays `defaultEffort`, no ledger IO, a byte-identical run. When ON, the budget-chosen roundCap
-  // must reach the round-cap gate below (roundCap's ONLY consumer), so the diff is fetched HERE — before
-  // the gate — to size this review's cost; that fetch is reused downstream (the diff is fetched once).
-  // [LAW:effects-at-boundaries] the ledger read + append are the effects; chooseProfile is the pure core.
+  // [LAW:no-mode-explosion] Two independent opt-ins refine effort (PR mode only), both OFF by default and
+  // both byte-identical when off: DIFFICULTY_SCALING PROPOSES a cheaper roundCap ceiling for easy diffs;
+  // DAILY_BUDGET_USD CAPS effort as the day's budget depletes. They compose at this seam — difficulty
+  // shapes the candidate ladder, budget picks the affordable best from it — and either activates the
+  // other's off-value (difficulty off ⇒ the default de-rate ladder; budget off ⇒ an unbounded cap, so
+  // the difficulty proposal stands). When BOTH are off the whole block is skipped: effort stays
+  // `defaultEffort`, no diff fetch here, no ledger IO — a byte-identical run down to the log.
+  // [LAW:no-silent-failure] each input is parsed strictly and reds the run loud on a malformed value.
   let dailyBudget;
+  let difficultyScaling;
   try {
     dailyBudget = parseDailyBudgetUsd(core.getInput('DAILY_BUDGET_USD'));
+    difficultyScaling = parseDifficultyScaling(core.getInput('DIFFICULTY_SCALING'));
   } catch (e) {
     core.setFailed(e.message);
     return;
   }
+  const budgetOn = dailyBudget > 0;
   let effort = defaultEffort;
-  let fetched = null;      // { transport, filteredFiles } — populated early only when the budget is active
+  let fetched = null;      // { transport, filteredFiles } — populated early only when this block is active
   let ledgerIssue = null;  // the issue this review's actual cost is appended to, after submit
-  if (dailyBudget > 0) {
-    const rawIssue = core.getInput('LEDGER_ISSUE').trim();
-    ledgerIssue = parseInt(rawIssue, 10);
-    if (!rawIssue || !Number.isInteger(ledgerIssue) || ledgerIssue <= 0) {
-      core.setFailed(
-        `DAILY_BUDGET_USD is set (budget gradient enabled) but LEDGER_ISSUE is missing or invalid `
-        + `(${JSON.stringify(rawIssue)}). Set LEDGER_ISSUE to the daily cost-ledger issue number `
-        + '(e.g. from a repo Actions variable) — the gradient cannot ration spend without a ledger.',
-      );
-      return;
-    }
-    const now = new Date(); // [LAW:no-ambient-temporal-coupling] the run boundary owns the clock
+  // [LAW:one-source-of-truth] The ceiling difficulty PROPOSED for this change, before any budget cap —
+  // the most expensive candidate. It is `defaultEffort` unchanged when difficulty is off. The round-cap
+  // gate below compares it against both the configured ceiling and the final effort to attribute a
+  // de-rate to the lever that ACTUALLY bound (difficulty lowered this below the default; budget lowered
+  // the final below this), so the skip message never names a knob that wasn't binding. [LAW:no-silent-failure]
+  let difficultyCeiling = defaultEffort;
+  if (budgetOn || difficultyScaling) {
+    // Both features need the diff BEFORE the round-cap gate below (roundCap's only consumer): budget to
+    // size this review's cost, difficulty to size the change. Fetched once here and reused downstream.
     fetched = await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
-    effort = await resolveBudgetedEffort({
-      octokit, owner, repo, issueNumber: ledgerIssue, now,
-      filteredFiles: fetched.filteredFiles, defaultEffort, dailyBudget,
-    });
+
+    // [LAW:composability] Difficulty PROPOSES the candidate ladder; off ⇒ the default de-rate ladder, so
+    // a budget-only run is byte-identical to before this slice. The proposal is anchored to
+    // `defaultEffort` (the user's ceiling), so it can only LOWER the ceiling, never raise it.
+    const candidates = difficultyScaling
+      ? difficultyCandidates(assessDifficulty(fetched.filteredFiles), defaultEffort)
+      : defaultBudgetCandidates(defaultEffort);
+
+    // The proposed ceiling is the most expensive candidate (defaultBudgetCandidates / difficultyCandidates
+    // both put it there); ranked in effectiveRounds space so the 0="unlimited" sentinel ranks correctly.
+    difficultyCeiling = candidates.reduce((a, b) =>
+      (effectiveRounds(b.roundCap) > effectiveRounds(a.roundCap) ? b : a));
+
+    if (budgetOn) {
+      const rawIssue = core.getInput('LEDGER_ISSUE').trim();
+      ledgerIssue = parseInt(rawIssue, 10);
+      if (!rawIssue || !Number.isInteger(ledgerIssue) || ledgerIssue <= 0) {
+        core.setFailed(
+          `DAILY_BUDGET_USD is set (budget gradient enabled) but LEDGER_ISSUE is missing or invalid `
+          + `(${JSON.stringify(rawIssue)}). Set LEDGER_ISSUE to the daily cost-ledger issue number `
+          + '(e.g. from a repo Actions variable) — the gradient cannot ration spend without a ledger.',
+        );
+        return;
+      }
+      const now = new Date(); // [LAW:no-ambient-temporal-coupling] the run boundary owns the clock
+      effort = await resolveBudgetedEffort({
+        octokit, owner, repo, issueNumber: ledgerIssue, now,
+        candidates, filteredFiles: fetched.filteredFiles, dailyBudget,
+      });
+    } else {
+      // Difficulty-only: no daily budget to ration, so the difficulty-proposed ceiling stands.
+      effort = resolveDifficultyEffort({ candidates, filteredFiles: fetched.filteredFiles });
+    }
   }
 
-  // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the budget-chosen cap
-  // when the gradient is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget de-rates
-  // by tripping this same gate sooner on later pushes. [LAW:no-silent-failure] the message names the ACTUAL
-  // binding constraint: the gradient is credited only when it genuinely LOWERED the cap below the default
-  // (a rung is always strictly cheaper than the default, so its roundCap never equals the default's — this
-  // holds even for the 0=unlimited default). When the budget was ample and left the cap at the configured
-  // value, MAX_REVIEW_ROUNDS is the real constraint, so the message points there — telling a user to "raise
-  // the budget" when the budget wasn't binding would send them down the wrong path. The off path (budget
-  // unset) takes this same branch and its message is unchanged (a byte-identical run down to the log).
+  // [LAW:single-enforcer] The round-cap gate reads the RESOLVED effort's roundCap — the refined cap when
+  // budget and/or difficulty is active, else the default from MAX_REVIEW_ROUNDS — so a depleting budget or
+  // an easy diff de-rates by tripping this same gate sooner. [LAW:no-silent-failure] the message names the
+  // ACTUAL binding constraint, attributed PRECISELY: two levers can lower the cap, but each only when it
+  // genuinely bound. Difficulty bound iff its proposed ceiling fell below MAX_REVIEW_ROUNDS; budget bound
+  // iff the final cap fell below whatever difficulty proposed. Compared in effectiveRounds space so the
+  // 0=unlimited sentinel ranks correctly. Naming a lever that was active-but-non-binding (e.g. "raise the
+  // budget" when an easy diff — not the budget — set the cap) would send the user down the wrong path.
+  // [LAW:dataflow-not-control-flow] the message varies by the VALUE of the binding-lever list; `deRated`
+  // implies exactly the union of the two bound flags (effort is only lowered inside the block above, and
+  // it can only fall via the difficulty ceiling or the budget cap), so the list is never empty here. The
+  // both-off path leaves the cap at the default and takes the MAX_REVIEW_ROUNDS branch (a byte-identical
+  // run down to the log).
   if (roundCapReached(prior.count, effort.roundCap)) {
-    const budgetDeRated = dailyBudget > 0 && effort.roundCap !== defaultEffort.roundCap;
-    core.info(budgetDeRated
+    const { deRated, budgetBound, difficultyBound } = bindingLevers({
+      effortRoundCap: effort.roundCap,
+      difficultyCeilingRoundCap: difficultyCeiling.roundCap,
+      defaultRoundCap: defaultEffort.roundCap,
+    });
+    const setters = [
+      budgetBound && 'the DAILY_BUDGET_USD gradient',
+      difficultyBound && 'DIFFICULTY_SCALING',
+    ].filter(Boolean);
+    const remedies = [
+      budgetBound && 'raise the daily budget',
+      difficultyBound && 'push a larger change (or unset DIFFICULTY_SCALING)',
+    ].filter(Boolean);
+    core.info(deRated
       ? `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-        + `the DAILY_BUDGET_USD gradient's de-rated round cap of ${effort.roundCap} (lowered from `
-        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). Raise the daily budget to review further pushes.`
+        + `the de-rated round cap of ${effort.roundCap} set by ${setters.join(' / ')} (lowered from `
+        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review further pushes, ${remedies.join(' or ')}.`
       : `Skipping review: PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`);
     return;
@@ -34106,7 +34410,7 @@ async function run() {
   }
 }
 
-module.exports = { run, resolveBudgetedEffort };
+module.exports = { run, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers };
 
 
 /***/ }),
