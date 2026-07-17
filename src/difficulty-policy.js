@@ -53,11 +53,17 @@ const DIFFICULTY_BANDS = [
 // with the SMALLEST maxMagnitude that still covers it, selected regardless of array order — so the band
 // table is an unordered SET, not a list carrying a fragile ascending-order invariant a reorder could
 // silently break. `null` when no band covers the magnitude (it exceeds every band → propose no lowering).
+// The tie-break is EXPLICIT: on equal maxMagnitude the smaller roundCap (the cheaper rung) wins, so the
+// result is deterministic and order-independent even for a degenerate table with duplicate maxMagnitude —
+// the reduce never silently keeps whichever the array order happened to visit first.
 function selectBand(bands, magnitude) {
   const covering = bands.filter((b) => magnitude <= b.maxMagnitude);
   return covering.length === 0
     ? null
-    : covering.reduce((a, b) => (b.maxMagnitude < a.maxMagnitude ? b : a));
+    : covering.reduce((a, b) => {
+      if (b.maxMagnitude !== a.maxMagnitude) return b.maxMagnitude < a.maxMagnitude ? b : a;
+      return b.roundCap < a.roundCap ? b : a;
+    });
 }
 
 // [LAW:effects-at-boundaries] Pure. The churn-equivalent effort magnitude of a change: its raw churn

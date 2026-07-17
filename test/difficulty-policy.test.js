@@ -80,6 +80,15 @@ describe('selectBand — the covering band, chosen independent of array order', 
       assert.deepEqual(selectBand(scrambled, mag), selectBand(DIFFICULTY_BANDS, mag), `scrambled @ ${mag}`);
     }
   });
+
+  test('[LAW:types-are-the-program] a duplicate-maxMagnitude table selects deterministically — the cheaper rung, any order', () => {
+    // A degenerate table the type admits: two bands share a maxMagnitude. The explicit tie-break (smaller
+    // roundCap wins) makes selection deterministic and order-independent — the reduce never silently keeps
+    // whichever the array happened to list first.
+    const dup = [{ maxMagnitude: 50, roundCap: 3 }, { maxMagnitude: 50, roundCap: 1 }];
+    assert.deepEqual(selectBand(dup, 40), { maxMagnitude: 50, roundCap: 1 });
+    assert.deepEqual(selectBand([...dup].reverse(), 40), { maxMagnitude: 50, roundCap: 1 });
+  });
 });
 
 describe('difficultyCandidates — propose an effort ladder that only ever LOWERS the ceiling', () => {
@@ -219,12 +228,20 @@ describe('bindingLevers — attribute a round-cap de-rate to the lever that boun
     assert.deepEqual(r, { deRated: true, budgetBound: false, difficultyBound: true });
   });
 
-  test('a de-rated cap always names at least one binding lever (never an empty list)', () => {
-    // Every effort ≤ difficultyCeiling ≤ default combination that is de-rated has budgetBound||difficultyBound.
+  test('deRated is exactly the union of the two binding levers (a full iff over valid states)', () => {
+    // Forward (deRated ⇒ a lever bound) holds for ANY inputs: a de-rated cap never renders an empty
+    // setters/remedies list. Reverse (a lever bound ⇒ deRated) holds under the PRODUCTION invariant
+    // effort ≤ difficultyCeiling ≤ default (in effectiveRounds space, so 0=unlimited ranks as 8): effort
+    // is chosen from a ladder whose ceiling is difficultyCeiling, which itself never exceeds the default —
+    // so a bound lever never lands in the MAX_REVIEW_ROUNDS branch that would drop the lever names. The
+    // iff is asserted over exactly that valid domain, per the transitivity the reviewer noted; a future
+    // change letting effort exceed the ceiling would break the invariant and fail this assertion.
     for (let ceiling = 0; ceiling <= 5; ceiling++) {
       for (let effort = 0; effort <= 5; effort++) {
         const r = bindingLevers({ effortRoundCap: effort, difficultyCeilingRoundCap: ceiling, defaultRoundCap: 5 });
         if (r.deRated) assert.ok(r.budgetBound || r.difficultyBound, `empty levers at effort=${effort} ceiling=${ceiling}`);
+        const valid = effectiveRounds(effort) <= effectiveRounds(ceiling) && effectiveRounds(ceiling) <= effectiveRounds(5);
+        if (valid) assert.equal(r.deRated, r.budgetBound || r.difficultyBound, `iff broke at effort=${effort} ceiling=${ceiling}`);
       }
     }
   });
