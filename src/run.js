@@ -139,6 +139,13 @@ async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatte
   return { transport, filteredFiles };
 }
 
+// [LAW:dataflow-not-control-flow] Pure. The log fragment naming a RAISED reasoning tier — a value, empty
+// when nothing was raised (the null baseline needs no mention). Both effort-resolution log lines share it
+// so the operator sees "thorough" reviews the same way in the budget and difficulty-only paths.
+function reasoningNote(reasoningTier) {
+  return reasoningTier ? `, reasoning ${reasoningTier} (raised for a complex diff)` : '';
+}
+
 // [LAW:effects-at-boundaries] The budget phase (PR mode). The pure decision is chooseProfile; the effect
 // this boundary owns is the ledger read whose failure policy is spend-safe. [LAW:no-silent-failure] a
 // failed read falls back SPEND-SAFE — proceed as if under budget (spentToday 0 ⇒ full remaining ⇒ full
@@ -173,7 +180,8 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
     : 'budget FLOOR — even the cheapest candidate exceeds the cap; running the minimal review';
   core.info(
     `Budget: spent today $${spentToday.toFixed(4)} of $${dailyBudget.toFixed(2)} → per-review cap `
-    + `$${decision.capUsd.toFixed(4)}; churn ${diffSize} line(s); chose roundCap ${decision.profile.roundCap} `
+    + `$${decision.capUsd.toFixed(4)}; churn ${diffSize} line(s); chose roundCap ${decision.profile.roundCap}`
+    + `${reasoningNote(decision.profile.reasoningTier)} `
     + `(est. $${decision.estimatedUsd.toFixed(4)}; ${capNote}).`,
   );
   return decision.profile;
@@ -189,7 +197,8 @@ function resolveDifficultyEffort({ candidates, filteredFiles }) {
   const diffSize = diffChurn(filteredFiles);
   const decision = chooseProfile({ candidates, spentToday: 0, dailyBudget: Infinity, diffSize });
   core.info(
-    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap} `
+    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap}`
+    + `${reasoningNote(decision.profile.reasoningTier)} `
     + `(from ${candidates.length} candidate profile(s); no daily budget, so the difficulty proposal stands).`,
   );
   return decision.profile;
@@ -324,15 +333,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     // size this review's cost, difficulty to size the change. Fetched once here and reused downstream.
     fetched = await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
-    // [LAW:composability] Difficulty PROPOSES the candidate ladder; off ⇒ the default de-rate ladder, so
-    // a budget-only run is byte-identical to before this slice. The proposal is anchored to
-    // `defaultEffort` (the user's ceiling), so it can only LOWER the ceiling, never raise it.
+    // [LAW:composability] Difficulty PROPOSES the candidate set; off ⇒ the default de-rate ladder, so a
+    // budget-only run is byte-identical to before this slice. On the roundCap axis the proposal is anchored
+    // to `defaultEffort` (the user's ceiling) so it only LOWERS; on the reasoningTier axis it RAISES a
+    // complex diff above the config baseline (reconciled per-config at the runMultiScope fold).
     const candidates = difficultyScaling
       ? difficultyCandidates(assessDifficulty(fetched.filteredFiles), defaultEffort)
       : defaultBudgetCandidates(defaultEffort);
 
-    // The proposed ceiling is the most expensive candidate (defaultBudgetCandidates / difficultyCandidates
-    // both put it there); ranked in effectiveRounds space so the 0="unlimited" sentinel ranks correctly.
+    // The roundCap CEILING difficulty proposed — the max-roundCap candidate, ranked in effectiveRounds
+    // space so the 0="unlimited" sentinel ranks correctly. Only its roundCap is read (by bindingLevers,
+    // which attributes the round-cap skip); the reasoning axis raises cost but never the round-cap gate,
+    // so ties on roundCap (candidates differing only in reasoningTier) are interchangeable here.
     difficultyCeiling = candidates.reduce((a, b) =>
       (effectiveRounds(b.roundCap) > effectiveRounds(a.roundCap) ? b : a));
 

@@ -11,13 +11,24 @@
 // The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
-// (its consumer, the worker pool, reads it here) and `roundCap` (its consumer, the pre-spawn round
-// gate in run.js, reads it here); it GROWS a field as each remaining knob's consumer is migrated off
-// its current source: `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today
-// per-config on the chain). Adding a field to a well-formed producer is cheap [LAW:carrying-cost];
-// adding it before its consumer exists is a lie. The reasoning AXIS lives here already as a resolver
-// (below) — the vocabulary and per-engine clamping the difficulty/budget epics will feed a profile
-// field through — even though no profile field sources it yet.
+// (its consumer, the worker pool, reads it here), `roundCap` (its consumer, the pre-spawn round
+// gate in run.js, reads it here), and now `reasoningTier` (its consumer is the reasoning fold at the
+// runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
+// profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
+// to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
+// current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today per-config on the chain).
+// Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its consumer
+// exists is a lie — so `reasoningTier` lands together with its fold consumer (multiscope.js) and its
+// price (budget.js estimatedCostUsd), never as an ungoverned placeholder.
+//
+// [LAW:one-source-of-truth] `reasoningTier` on the profile is the difficulty-PROPOSED RAISE, NOT a
+// review's absolute reasoning tier. The absolute per-config baseline stays `config.reasoning` (each
+// config in the failover chain can name its own), because the profile is one value per REVIEW while
+// reasoning is genuinely per-CONFIG — a single profile field cannot faithfully represent a chain whose
+// configs disagree. So the profile carries only the raise, defaulting to `null` = "propose no raise;
+// the config's own tier stands", and the fold resolves the effective tier = maxTier(config baseline,
+// proposed raise) PER CONFIG. This makes difficulty a monotonic FLOOR (it can lift an under-specified
+// config, never lower an explicit one) and keeps a default-profile run byte-identical.
 //
 // `roundCap` is the profile's first COST-BEARING axis, and that is why it lands first: scopeConcurrency
 // is cost-NEUTRAL (parallelism trades runner load for wall time, not spend), so a cost estimate over
@@ -39,7 +50,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number, roundCap: number }} EffortProfile
+// @typedef {{ scopeConcurrency: number, roundCap: number, reasoningTier: (string|null) }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
 // default-profile run is byte-identical to the pre-profile engine. An OPTIONS object (not positional
@@ -51,8 +62,33 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // here. [LAW:one-source-of-truth] The fallback is the neutral `0` = "unlimited" sentinel — the honest
 // value for "no cap was decided here" (a bare call in a test or an omitted-effort default), never a
 // second copy of the production default.
-function defaultEffortProfile({ roundCap = 0 } = {}) {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap };
+//
+// `reasoningTier` defaults to `null` = "propose no raise". It is the difficulty-proposed RAISE, not an
+// absolute tier (see the header): a null profile leaves each config's own `config.reasoning` untouched
+// at the fold, so a default profile is byte-identical. Only difficultyCandidates ever sets it non-null.
+function defaultEffortProfile({ roundCap = 0, reasoningTier = null } = {}) {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap, reasoningTier };
+}
+
+// [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
+// per-config FLOOR reconciliation between a config's own `reasoning` and the profile's proposed raise.
+// [LAW:dataflow-not-control-flow] every branch is over VALUES: a `null`/`undefined` operand contributes
+// nothing (both null → null, the byte-identical no-raise case), and on equal rank the FIRST operand
+// wins so the caller can pass the config's own (already engine-valid) tier first and keep it on a tie
+// (e.g. an engine that names its ceiling `max` is not swapped for the abstract `xhigh` of the same rank).
+// [LAW:no-silent-failure] an unknown tier string is a caller bug (a proposal outside the vocabulary),
+// not a value to coalesce — throw naming the known tiers rather than silently dropping the higher rung.
+function maxTier(a, b) {
+  for (const t of [a, b]) {
+    if (t !== null && t !== undefined && !Object.prototype.hasOwnProperty.call(TIER_RANK, t)) {
+      throw new Error(
+        `Unknown reasoning tier ${JSON.stringify(t)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+      );
+    }
+  }
+  if (a === null || a === undefined) return b ?? null;
+  if (b === null || b === undefined) return a;
+  return TIER_RANK[b] > TIER_RANK[a] ? b : a;
 }
 
 // Resolve an ABSTRACT reasoning tier to the concrete value a specific engine supports, given that
@@ -113,4 +149,5 @@ module.exports = {
   TIER_RANK,
   defaultEffortProfile,
   resolveReasoningTier,
+  maxTier,
 };

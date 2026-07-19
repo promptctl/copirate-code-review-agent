@@ -2,12 +2,21 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { defaultEffortProfile, resolveReasoningTier, TIER_RANK } = require('../src/effort');
+const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK } = require('../src/effort');
 const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
   test('reproduces the pre-profile scope concurrency (4)', () => {
-    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0 });
+    assert.deepEqual(defaultEffortProfile(), { scopeConcurrency: 4, roundCap: 0, reasoningTier: null });
+  });
+
+  test('defaults reasoningTier to null (propose no raise; the config tier stands)', () => {
+    assert.equal(defaultEffortProfile().reasoningTier, null);
+    assert.equal(defaultEffortProfile({ roundCap: 5 }).reasoningTier, null);
+  });
+
+  test('folds a supplied reasoningTier into the profile (the raising axis)', () => {
+    assert.equal(defaultEffortProfile({ reasoningTier: 'high' }).reasoningTier, 'high');
   });
 
   test('returns a fresh object each call (no shared mutable default)', () => {
@@ -24,6 +33,46 @@ describe('defaultEffortProfile', () => {
   test('defaults roundCap to the neutral 0 (unlimited) sentinel when unsupplied', () => {
     assert.equal(defaultEffortProfile().roundCap, 0);
     assert.equal(defaultEffortProfile({}).roundCap, 0);
+  });
+});
+
+// maxTier is the per-config FLOOR reconciliation: difficulty proposes a raise, the config carries a
+// baseline, and the effective tier is the higher of the two. These assert the value semantics that make
+// difficulty a monotonic floor (it lifts an under-specified config, never lowers an explicit one).
+describe('maxTier — the higher reasoning tier, difficulty as a monotonic floor', () => {
+  test('both null → null (the byte-identical no-raise case)', () => {
+    assert.equal(maxTier(null, null), null);
+    assert.equal(maxTier(undefined, undefined), null);
+    assert.equal(maxTier(null, undefined), null);
+  });
+
+  test('one operand null → the other (a raise onto an unset config, or a config with no raise)', () => {
+    assert.equal(maxTier(null, 'high'), 'high');   // difficulty raises an unset config
+    assert.equal(maxTier('low', null), 'low');     // config baseline, no raise proposed
+    assert.equal(maxTier(undefined, 'medium'), 'medium');
+  });
+
+  test('the higher rank wins — difficulty LIFTS an under-specified config', () => {
+    assert.equal(maxTier('low', 'high'), 'high');
+    assert.equal(maxTier('high', 'low'), 'high');
+    assert.equal(maxTier('medium', 'max'), 'max');
+  });
+
+  test('an explicit high config is NEVER lowered by a smaller proposed raise', () => {
+    assert.equal(maxTier('max', 'high'), 'max');   // config wins: difficulty only raises, never caps
+    assert.equal(maxTier('xhigh', 'medium'), 'xhigh');
+  });
+
+  test('equal rank keeps the FIRST operand — pass the (engine-valid) config tier first', () => {
+    // xhigh and max share rank 4 (each engine's ceiling); the config names the one its engine accepts,
+    // so it must survive a same-rank proposal rather than being swapped for the abstract one.
+    assert.equal(maxTier('max', 'xhigh'), 'max');
+    assert.equal(maxTier('xhigh', 'max'), 'xhigh');
+  });
+
+  test('an unknown tier is a caller bug — throws, never silently coalesces to the known one', () => {
+    assert.throws(() => maxTier('turbo', 'high'), /Unknown reasoning tier/);
+    assert.throws(() => maxTier('high', 'ludicrous'), /Unknown reasoning tier/);
   });
 });
 
