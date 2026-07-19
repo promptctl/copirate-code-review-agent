@@ -29992,7 +29992,12 @@ const MIN_CAP_USD = 0.1;
 // is factor 1.0: it prices as the round's unraised cost, which is the correct RANK floor even though the
 // config's real tier is unknown here — consistent with the ranker-not-oracle contract above.
 // Source / last estimated: zai-difficulty-0ea.3, 2026-07-19 (UNMEASURED — recalibrate when metered).
-const REASONING_COST_MULTIPLIER = [1.0, 1.0, 1.3, 1.7, 2.2];
+// STRICTLY increasing across every rank so the data actually satisfies the invariant above — 'minimal'
+// and 'low' differ (more reasoning always costs at least marginally more; equal factors would be a false
+// theorem the comment claims but the data denies). null (baseline) prices at 1.0 like rank-0 'minimal':
+// null is the ABSENCE of a raise, not a rank, so it may share minimal's floor without breaking the
+// per-rank strict order 1.0 < 1.05 < 1.3 < 1.7 < 2.2.
+const REASONING_COST_MULTIPLIER = [1.0, 1.05, 1.3, 1.7, 2.2];
 
 // [LAW:effects-at-boundaries] Pure: the estimated USD cost of running ONE review round at this diff.
 // diffSize is CHURN (added + deleted lines) — the axis the spike measured cost against. The fixed

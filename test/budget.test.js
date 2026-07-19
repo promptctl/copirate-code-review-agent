@@ -62,15 +62,13 @@ describe('estimatedCostUsd — a fixed-diff RANKER, asserted by ordering never b
     assert.equal(estimatedCostUsd(withTier(3, null), diff), estimatedCostUsd(profile(3), diff));
   });
 
-  test('monotonic in reasoningTier at a fixed roundCap+diff (harder reasoning ⇒ higher estimate)', () => {
+  test('STRICTLY monotonic in reasoningTier at a fixed roundCap+diff (harder reasoning ⇒ strictly higher estimate)', () => {
     const diff = 100;
     const tiers = ['minimal', 'low', 'medium', 'high', 'xhigh'];
     const costs = tiers.map((t) => estimatedCostUsd(withTier(3, t), diff));
     for (let i = 1; i < costs.length; i++) {
-      assert.ok(costs[i] >= costs[i - 1], `tier ${tiers[i]} (${costs[i]}) must be ≥ ${tiers[i - 1]} (${costs[i - 1]})`);
+      assert.ok(costs[i] > costs[i - 1], `tier ${tiers[i]} (${costs[i]}) must be STRICTLY > ${tiers[i - 1]} (${costs[i - 1]})`);
     }
-    // and a real raise exists across the span — the axis is not flat
-    assert.ok(costs[costs.length - 1] > costs[0], 'the top tier must cost strictly more than the floor');
   });
 
   test('a raised reasoning tier can cost MORE than the same roundCap at baseline — the RAISE is real', () => {
@@ -78,16 +76,22 @@ describe('estimatedCostUsd — a fixed-diff RANKER, asserted by ordering never b
     assert.ok(estimatedCostUsd(withTier(3, 'high'), diff) > estimatedCostUsd(withTier(3, null), diff));
   });
 
-  test('reasoningFactor: null baseline is 1.0, strictly monotonic in TIER_RANK', () => {
+  test('reasoningFactor: null baseline is 1.0, STRICTLY monotonic across distinct TIER_RANK ranks', () => {
     assert.equal(reasoningFactor(null), 1.0);
     assert.equal(reasoningFactor(undefined), 1.0);
-    const byRank = Object.entries(TIER_RANK).sort((a, b) => a[1] - b[1]).map(([t]) => t);
+    // Group tiers by rank (xhigh and max share rank 4 — same rung, so same factor), then assert the
+    // factor is STRICTLY increasing as the rank increases. A per-tier strict check would wrongly demand
+    // xhigh < max; the invariant is over distinct RANKS, not tier names.
+    const byRank = [...new Set(Object.values(TIER_RANK))].sort((a, b) => a - b);
+    const factorForRank = (rank) => reasoningFactor(Object.keys(TIER_RANK).find((t) => TIER_RANK[t] === rank));
     let prev = 0;
-    for (const t of byRank) {
-      const f = reasoningFactor(t);
-      assert.ok(f >= prev, `factor for ${t} (${f}) must be ≥ the lower rung (${prev})`);
+    for (const rank of byRank) {
+      const f = factorForRank(rank);
+      assert.ok(f > prev, `factor for rank ${rank} (${f}) must be STRICTLY > the lower rank (${prev})`);
       prev = f;
     }
+    // same-rank tiers price identically (xhigh === max)
+    assert.equal(reasoningFactor('xhigh'), reasoningFactor('max'));
   });
 
   test('reasoningFactor: an unknown tier throws — never silently under-prices a raised profile', () => {
