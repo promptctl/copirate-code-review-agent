@@ -76,8 +76,11 @@ const DIFFICULTY_REASONING_BANDS = [
 // and axis-agnostic via `rankOf`: on equal maxMagnitude the band with the smaller cost rank (the cheaper
 // rung) wins, so the result is deterministic and order-independent even for a degenerate table with
 // duplicate maxMagnitude — the reduce never silently keeps whichever the array order happened to visit
-// first. `rankOf` defaults to `roundCap` (the original behavior); the reasoning axis passes TIER_RANK.
-function selectBand(bands, magnitude, rankOf = (b) => b.roundCap) {
+// first. [LAW:composability] `rankOf` is REQUIRED, not defaulted: a default keyed to one axis's field
+// (e.g. roundCap) would make this "axis-agnostic" function silently degenerate for any other axis's
+// table — `undefined < undefined` is always false, collapsing the tie-break back to array order. Each
+// caller names its own cost field (roundCapRank / reasoningBandRank), so the axis is always explicit.
+function selectBand(bands, magnitude, rankOf) {
   const covering = bands.filter((b) => magnitude <= b.maxMagnitude);
   return covering.length === 0
     ? null
@@ -85,6 +88,24 @@ function selectBand(bands, magnitude, rankOf = (b) => b.roundCap) {
       if (b.maxMagnitude !== a.maxMagnitude) return b.maxMagnitude < a.maxMagnitude ? b : a;
       return rankOf(b) < rankOf(a) ? b : a;
     });
+}
+
+// [LAW:effects-at-boundaries] Pure. The two cost-rank extractors selectBand's tie-break needs, one per
+// band axis. Named (not inline) so every selectBand call declares its axis by name, and so the reasoning
+// extractor's loud-failure check lives in one place. [LAW:no-silent-failure] reasoningBandRank throws on
+// an unknown tier STRING (a misspelled band row) exactly as maxTier/reasoningFactor do — a typo can never
+// silently rank as the cheapest rung and get preferred in a tie; the legitimate `null` (no-raise) band is
+// the ONE non-throwing absence, ranked below every real tier so it stays the cheapest.
+const roundCapRank = (band) => band.roundCap;
+function reasoningBandRank(band) {
+  const t = band.tier;
+  if (t === null || t === undefined) return -1;
+  if (!Object.prototype.hasOwnProperty.call(TIER_RANK, t)) {
+    throw new Error(
+      `DIFFICULTY_REASONING_BANDS has unknown tier ${JSON.stringify(t)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+    );
+  }
+  return TIER_RANK[t];
 }
 
 // [LAW:effects-at-boundaries] Pure. The churn-equivalent effort magnitude of a change: its raw churn
@@ -121,14 +142,14 @@ function effortMagnitude({ churn, kinds }) {
 function difficultyCandidates(difficulty, topProfile) {
   const magnitude = effortMagnitude(difficulty);
 
-  const roundBand = selectBand(DIFFICULTY_BANDS, magnitude);
+  const roundBand = selectBand(DIFFICULTY_BANDS, magnitude, roundCapRank);
   const proposedCap = roundBand ? roundBand.roundCap : topProfile.roundCap;
   const ceilingCap = effectiveRounds(proposedCap) < effectiveRounds(topProfile.roundCap)
     ? proposedCap
     : topProfile.roundCap;
   const roundRungs = defaultBudgetCandidates({ ...topProfile, roundCap: ceilingCap });
 
-  const reasonBand = selectBand(DIFFICULTY_REASONING_BANDS, magnitude, (b) => TIER_RANK[b.tier] ?? -1);
+  const reasonBand = selectBand(DIFFICULTY_REASONING_BANDS, magnitude, reasoningBandRank);
   const proposedTier = reasonBand ? reasonBand.tier : null;
   // [LAW:dataflow-not-control-flow] the reasoning rungs are the baseline (null) plus the proposed raise —
   // a two-value set that collapses to just [null] when nothing is raised, keeping the easy path identical.
@@ -158,6 +179,8 @@ module.exports = {
   DIFFICULTY_BANDS,
   DIFFICULTY_REASONING_BANDS,
   selectBand,
+  roundCapRank,
+  reasoningBandRank,
   effortMagnitude,
   difficultyCandidates,
   parseDifficultyScaling,

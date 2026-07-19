@@ -78,11 +78,14 @@ const REASONING_COST_MULTIPLIER = [1.0, 1.05, 1.3, 1.7, 2.2];
 // the coverage ONCE here at module load, so the desync fails loud at startup [LAW:no-silent-failure] — the
 // invariant stated explicitly at the definition site, not left implicit to be caught only at test time and
 // NOT a per-call guard (that would be control-flow in disguise on the hot path [LAW:no-defensive-null-guards]).
+// The check is EXACT (=== ranks+1), not merely "long enough": a too-SHORT array indexes past the end → NaN;
+// a too-LONG array carries a dead multiplier for a rank that doesn't exist — a latent [LAW:one-source-of-truth]
+// drift. Both directions fail loud, keeping the two tables in exact correspondence (one multiplier per rank).
 const MAX_TIER_RANK = Math.max(...Object.values(TIER_RANK));
-if (REASONING_COST_MULTIPLIER.length <= MAX_TIER_RANK) {
+if (REASONING_COST_MULTIPLIER.length !== MAX_TIER_RANK + 1) {
   throw new Error(
-    `REASONING_COST_MULTIPLIER has ${REASONING_COST_MULTIPLIER.length} entries but TIER_RANK reaches rank `
-    + `${MAX_TIER_RANK}; add a multiplier for every rank so reasoningFactor never indexes past the array.`,
+    `REASONING_COST_MULTIPLIER has ${REASONING_COST_MULTIPLIER.length} entries but TIER_RANK needs exactly `
+    + `${MAX_TIER_RANK + 1} (one per rank 0..${MAX_TIER_RANK}); keep the two tables in exact correspondence.`,
   );
 }
 

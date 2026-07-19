@@ -6,6 +6,8 @@ const {
   DIFFICULTY_BANDS,
   DIFFICULTY_REASONING_BANDS,
   selectBand,
+  roundCapRank,
+  reasoningBandRank,
   effortMagnitude,
   difficultyCandidates,
   parseDifficultyScaling,
@@ -61,14 +63,14 @@ describe('effortMagnitude — churn + spread surcharge, discounted when no sourc
 
 describe('selectBand — the covering band, chosen independent of array order', () => {
   test('picks the smallest maxMagnitude that still covers the magnitude', () => {
-    assert.equal(selectBand(DIFFICULTY_BANDS, 5).roundCap, 1);   // covered by 20 (smallest covering)
-    assert.equal(selectBand(DIFFICULTY_BANDS, 20).roundCap, 1);  // boundary is inclusive
-    assert.equal(selectBand(DIFFICULTY_BANDS, 21).roundCap, 2);  // just past 20 → next band
-    assert.equal(selectBand(DIFFICULTY_BANDS, 250).roundCap, 3);
+    assert.equal(selectBand(DIFFICULTY_BANDS, 5, roundCapRank).roundCap, 1);   // covered by 20 (smallest covering)
+    assert.equal(selectBand(DIFFICULTY_BANDS, 20, roundCapRank).roundCap, 1);  // boundary is inclusive
+    assert.equal(selectBand(DIFFICULTY_BANDS, 21, roundCapRank).roundCap, 2);  // just past 20 → next band
+    assert.equal(selectBand(DIFFICULTY_BANDS, 250, roundCapRank).roundCap, 3);
   });
 
   test('null when no band covers the magnitude (it exceeds every band)', () => {
-    assert.equal(selectBand(DIFFICULTY_BANDS, 10_000), null);
+    assert.equal(selectBand(DIFFICULTY_BANDS, 10_000, roundCapRank), null);
   });
 
   test('[LAW:types-are-the-program] a shuffled band table yields the IDENTICAL selection — order carries no meaning', () => {
@@ -77,8 +79,8 @@ describe('selectBand — the covering band, chosen independent of array order', 
     const reversed = [...DIFFICULTY_BANDS].reverse();
     const scrambled = [DIFFICULTY_BANDS[1], DIFFICULTY_BANDS[2], DIFFICULTY_BANDS[0]];
     for (const mag of [0, 5, 20, 21, 79, 80, 81, 250, 251, 9999]) {
-      assert.deepEqual(selectBand(reversed, mag), selectBand(DIFFICULTY_BANDS, mag), `reversed @ ${mag}`);
-      assert.deepEqual(selectBand(scrambled, mag), selectBand(DIFFICULTY_BANDS, mag), `scrambled @ ${mag}`);
+      assert.deepEqual(selectBand(reversed, mag, roundCapRank), selectBand(DIFFICULTY_BANDS, mag, roundCapRank), `reversed @ ${mag}`);
+      assert.deepEqual(selectBand(scrambled, mag, roundCapRank), selectBand(DIFFICULTY_BANDS, mag, roundCapRank), `scrambled @ ${mag}`);
     }
   });
 
@@ -87,8 +89,8 @@ describe('selectBand — the covering band, chosen independent of array order', 
     // roundCap wins) makes selection deterministic and order-independent — the reduce never silently keeps
     // whichever the array happened to list first.
     const dup = [{ maxMagnitude: 50, roundCap: 3 }, { maxMagnitude: 50, roundCap: 1 }];
-    assert.deepEqual(selectBand(dup, 40), { maxMagnitude: 50, roundCap: 1 });
-    assert.deepEqual(selectBand([...dup].reverse(), 40), { maxMagnitude: 50, roundCap: 1 });
+    assert.deepEqual(selectBand(dup, 40, roundCapRank), { maxMagnitude: 50, roundCap: 1 });
+    assert.deepEqual(selectBand([...dup].reverse(), 40, roundCapRank), { maxMagnitude: 50, roundCap: 1 });
   });
 });
 
@@ -157,9 +159,17 @@ describe('difficultyCandidates — propose an effort ladder that only ever LOWER
 // The SECOND axis (zai-difficulty-0ea.3): reasoningTier RAISES for complex diffs. The reasoning bands use
 // the same selectBand machinery with the TIER_RANK cost extractor, so these assert both the band table
 // and that difficultyCandidates offers a genuinely more-expensive candidate for a hard change.
-describe('DIFFICULTY_REASONING_BANDS — the reasoning-RAISE bands via selectBand(rankOf)', () => {
-  const rankOf = (b) => TIER_RANK[b.tier] ?? -1;
-  const tierAt = (magnitude) => selectBand(DIFFICULTY_REASONING_BANDS, magnitude, rankOf).tier;
+describe('DIFFICULTY_REASONING_BANDS — the reasoning-RAISE bands via selectBand(reasoningBandRank)', () => {
+  // [LAW:verifiable-goals] The table's TOTALITY is an explicit tested invariant, not tierAt's silent
+  // assumption: a magnitude beyond the largest finite band must still name a tier (the Infinity band). With
+  // this asserted, tierAt's direct `.tier` deref is justified — a null here would be a real, loud regression.
+  test('the band table is TOTAL — every magnitude is covered (the Infinity band), so selection is never null', () => {
+    for (const mag of [0, 250, 251, 600, 601, Number.MAX_VALUE]) {
+      assert.notEqual(selectBand(DIFFICULTY_REASONING_BANDS, mag, reasoningBandRank), null, `uncovered @ ${mag}`);
+    }
+  });
+
+  const tierAt = (magnitude) => selectBand(DIFFICULTY_REASONING_BANDS, magnitude, reasoningBandRank).tier;
 
   test('no raise up to 250, then high, then max — the covering band by magnitude', () => {
     assert.equal(tierAt(10), null);    // trivial: no raise (roundCap may still LOWER here)
@@ -170,12 +180,18 @@ describe('DIFFICULTY_REASONING_BANDS — the reasoning-RAISE bands via selectBan
     assert.equal(tierAt(10_000), 'max'); // the Infinity band makes the table total
   });
 
+  test('[LAW:no-silent-failure] reasoningBandRank throws on an unknown tier string — a typo can never rank silently', () => {
+    assert.equal(reasoningBandRank({ tier: null }), -1);        // the legitimate no-raise band, cheapest
+    assert.equal(reasoningBandRank({ tier: 'high' }), TIER_RANK.high);
+    assert.throws(() => reasoningBandRank({ tier: 'hihg' }), /unknown tier/i); // a misspelled band row
+  });
+
   test('[LAW:types-are-the-program] a shuffled reasoning-band table yields the IDENTICAL selection', () => {
     const scrambled = [DIFFICULTY_REASONING_BANDS[2], DIFFICULTY_REASONING_BANDS[0], DIFFICULTY_REASONING_BANDS[1]];
     for (const mag of [10, 250, 251, 600, 601, 5000]) {
       assert.deepEqual(
-        selectBand(scrambled, mag, rankOf),
-        selectBand(DIFFICULTY_REASONING_BANDS, mag, rankOf),
+        selectBand(scrambled, mag, reasoningBandRank),
+        selectBand(DIFFICULTY_REASONING_BANDS, mag, reasoningBandRank),
         `scrambled @ ${mag}`,
       );
     }
@@ -183,16 +199,16 @@ describe('DIFFICULTY_REASONING_BANDS — the reasoning-RAISE bands via selectBan
 
   test('[LAW:types-are-the-program] a duplicate-maxMagnitude table selects deterministically — the cheaper (lower) tier, any order', () => {
     const dup = [{ maxMagnitude: 400, tier: 'max' }, { maxMagnitude: 400, tier: 'high' }];
-    assert.equal(selectBand(dup, 300, rankOf).tier, 'high');
-    assert.equal(selectBand([...dup].reverse(), 300, rankOf).tier, 'high');
+    assert.equal(selectBand(dup, 300, reasoningBandRank).tier, 'high');
+    assert.equal(selectBand([...dup].reverse(), 300, reasoningBandRank).tier, 'high');
   });
 
   test('the FP boundary is exact — magnitude built through the *0.4 non-source discount path', () => {
     // (churn + 8*spread) * 0.4 = 250 exactly at churn=617, spread=1 (a large tests-only change): still the
     // null band; one churn line more tips it past 250 into 'high'. Guards the ≤ boundary on the discount path.
     assert.equal(effortMagnitude(diff(617, { tests: 1 })), 250);
-    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(617, { tests: 1 })), rankOf).tier, null);
-    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(620, { tests: 1 })), rankOf).tier, 'high');
+    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(617, { tests: 1 })), reasoningBandRank).tier, null);
+    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(620, { tests: 1 })), reasoningBandRank).tier, 'high');
   });
 });
 
