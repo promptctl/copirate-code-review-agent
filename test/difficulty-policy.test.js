@@ -4,12 +4,15 @@ const assert = require('node:assert/strict');
 
 const {
   DIFFICULTY_BANDS,
+  DIFFICULTY_REASONING_BANDS,
   selectBand,
+  roundCapRank,
+  reasoningBandRank,
   effortMagnitude,
   difficultyCandidates,
   parseDifficultyScaling,
 } = require('../src/difficulty-policy');
-const { defaultEffortProfile } = require('../src/effort');
+const { defaultEffortProfile, TIER_RANK } = require('../src/effort');
 const { estimatedCostUsd, effectiveRounds } = require('../src/budget');
 const { resolveDifficultyEffort, bindingLevers } = require('../src/run');
 
@@ -60,14 +63,14 @@ describe('effortMagnitude — churn + spread surcharge, discounted when no sourc
 
 describe('selectBand — the covering band, chosen independent of array order', () => {
   test('picks the smallest maxMagnitude that still covers the magnitude', () => {
-    assert.equal(selectBand(DIFFICULTY_BANDS, 5).roundCap, 1);   // covered by 20 (smallest covering)
-    assert.equal(selectBand(DIFFICULTY_BANDS, 20).roundCap, 1);  // boundary is inclusive
-    assert.equal(selectBand(DIFFICULTY_BANDS, 21).roundCap, 2);  // just past 20 → next band
-    assert.equal(selectBand(DIFFICULTY_BANDS, 250).roundCap, 3);
+    assert.equal(selectBand(DIFFICULTY_BANDS, 5, roundCapRank).roundCap, 1);   // covered by 20 (smallest covering)
+    assert.equal(selectBand(DIFFICULTY_BANDS, 20, roundCapRank).roundCap, 1);  // boundary is inclusive
+    assert.equal(selectBand(DIFFICULTY_BANDS, 21, roundCapRank).roundCap, 2);  // just past 20 → next band
+    assert.equal(selectBand(DIFFICULTY_BANDS, 250, roundCapRank).roundCap, 3);
   });
 
   test('null when no band covers the magnitude (it exceeds every band)', () => {
-    assert.equal(selectBand(DIFFICULTY_BANDS, 10_000), null);
+    assert.equal(selectBand(DIFFICULTY_BANDS, 10_000, roundCapRank), null);
   });
 
   test('[LAW:types-are-the-program] a shuffled band table yields the IDENTICAL selection — order carries no meaning', () => {
@@ -76,8 +79,8 @@ describe('selectBand — the covering band, chosen independent of array order', 
     const reversed = [...DIFFICULTY_BANDS].reverse();
     const scrambled = [DIFFICULTY_BANDS[1], DIFFICULTY_BANDS[2], DIFFICULTY_BANDS[0]];
     for (const mag of [0, 5, 20, 21, 79, 80, 81, 250, 251, 9999]) {
-      assert.deepEqual(selectBand(reversed, mag), selectBand(DIFFICULTY_BANDS, mag), `reversed @ ${mag}`);
-      assert.deepEqual(selectBand(scrambled, mag), selectBand(DIFFICULTY_BANDS, mag), `scrambled @ ${mag}`);
+      assert.deepEqual(selectBand(reversed, mag, roundCapRank), selectBand(DIFFICULTY_BANDS, mag, roundCapRank), `reversed @ ${mag}`);
+      assert.deepEqual(selectBand(scrambled, mag, roundCapRank), selectBand(DIFFICULTY_BANDS, mag, roundCapRank), `scrambled @ ${mag}`);
     }
   });
 
@@ -86,8 +89,8 @@ describe('selectBand — the covering band, chosen independent of array order', 
     // roundCap wins) makes selection deterministic and order-independent — the reduce never silently keeps
     // whichever the array happened to list first.
     const dup = [{ maxMagnitude: 50, roundCap: 3 }, { maxMagnitude: 50, roundCap: 1 }];
-    assert.deepEqual(selectBand(dup, 40), { maxMagnitude: 50, roundCap: 1 });
-    assert.deepEqual(selectBand([...dup].reverse(), 40), { maxMagnitude: 50, roundCap: 1 });
+    assert.deepEqual(selectBand(dup, 40, roundCapRank), { maxMagnitude: 50, roundCap: 1 });
+    assert.deepEqual(selectBand([...dup].reverse(), 40, roundCapRank), { maxMagnitude: 50, roundCap: 1 });
   });
 });
 
@@ -149,6 +152,113 @@ describe('difficultyCandidates — propose an effort ladder that only ever LOWER
 
   test('is reproducible — the same difficulty always yields a deep-equal ladder', () => {
     const d = diff(60, { source: 2, tests: 1 });
+    assert.deepEqual(difficultyCandidates(d, top5), difficultyCandidates(d, top5));
+  });
+});
+
+// The SECOND axis (zai-difficulty-0ea.3): reasoningTier RAISES for complex diffs. The reasoning bands use
+// the same selectBand machinery with the TIER_RANK cost extractor, so these assert both the band table
+// and that difficultyCandidates offers a genuinely more-expensive candidate for a hard change.
+describe('DIFFICULTY_REASONING_BANDS — the reasoning-RAISE bands via selectBand(reasoningBandRank)', () => {
+  // [LAW:verifiable-goals] The table's TOTALITY is an explicit tested invariant, not tierAt's silent
+  // assumption: a magnitude beyond the largest finite band must still name a tier (the Infinity band). With
+  // this asserted, tierAt's direct `.tier` deref is justified — a null here would be a real, loud regression.
+  test('the band table is TOTAL — every magnitude is covered (the Infinity band), so selection is never null', () => {
+    for (const mag of [0, 250, 251, 600, 601, Number.MAX_VALUE]) {
+      assert.notEqual(selectBand(DIFFICULTY_REASONING_BANDS, mag, reasoningBandRank), null, `uncovered @ ${mag}`);
+    }
+  });
+
+  const tierAt = (magnitude) => selectBand(DIFFICULTY_REASONING_BANDS, magnitude, reasoningBandRank).tier;
+
+  test('no raise up to 250, then high, then max — the covering band by magnitude', () => {
+    assert.equal(tierAt(10), null);    // trivial: no raise (roundCap may still LOWER here)
+    assert.equal(tierAt(250), null);   // boundary inclusive → still the null band
+    assert.equal(tierAt(251), 'high'); // just past → substantial: raise
+    assert.equal(tierAt(600), 'high'); // boundary inclusive
+    assert.equal(tierAt(601), 'max');  // just past → very large: full depth
+    assert.equal(tierAt(10_000), 'max'); // the Infinity band makes the table total
+  });
+
+  test('[LAW:no-silent-failure] reasoningBandRank throws on an unknown tier string — a typo can never rank silently', () => {
+    assert.equal(reasoningBandRank({ tier: null }), -1);        // the legitimate no-raise band, cheapest
+    assert.equal(reasoningBandRank({ tier: 'high' }), TIER_RANK.high);
+    assert.throws(() => reasoningBandRank({ tier: 'hihg' }), /unknown tier/i); // a misspelled band row
+  });
+
+  test('[LAW:types-are-the-program] a shuffled reasoning-band table yields the IDENTICAL selection', () => {
+    const scrambled = [DIFFICULTY_REASONING_BANDS[2], DIFFICULTY_REASONING_BANDS[0], DIFFICULTY_REASONING_BANDS[1]];
+    for (const mag of [10, 250, 251, 600, 601, 5000]) {
+      assert.deepEqual(
+        selectBand(scrambled, mag, reasoningBandRank),
+        selectBand(DIFFICULTY_REASONING_BANDS, mag, reasoningBandRank),
+        `scrambled @ ${mag}`,
+      );
+    }
+  });
+
+  test('[LAW:types-are-the-program] a duplicate-maxMagnitude table selects deterministically — the cheaper (lower) tier, any order', () => {
+    const dup = [{ maxMagnitude: 400, tier: 'max' }, { maxMagnitude: 400, tier: 'high' }];
+    assert.equal(selectBand(dup, 300, reasoningBandRank).tier, 'high');
+    assert.equal(selectBand([...dup].reverse(), 300, reasoningBandRank).tier, 'high');
+  });
+
+  test('the FP boundary is exact — magnitude built through the *0.4 non-source discount path', () => {
+    // (churn + 8*spread) * 0.4 = 250 exactly at churn=617, spread=1 (a large tests-only change): still the
+    // null band; one churn line more tips it past 250 into 'high'. Guards the ≤ boundary on the discount path.
+    assert.equal(effortMagnitude(diff(617, { tests: 1 })), 250);
+    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(617, { tests: 1 })), reasoningBandRank).tier, null);
+    assert.equal(selectBand(DIFFICULTY_REASONING_BANDS, effortMagnitude(diff(620, { tests: 1 })), reasoningBandRank).tier, 'high');
+  });
+});
+
+describe('difficultyCandidates — reasoningTier RAISES for complex diffs (the cross product)', () => {
+  const top5 = defaultEffortProfile({ roundCap: 5 });
+  const tiers = (candidates) => new Set(candidates.map((c) => c.reasoningTier));
+  const maxCost = (candidates, diffSize) =>
+    candidates.reduce((a, b) => (estimatedCostUsd(b, diffSize) > estimatedCostUsd(a, diffSize) ? b : a));
+
+  test('an easy/moderate change proposes reasoningTier=null on EVERY candidate (byte-identical spend)', () => {
+    for (const c of difficultyCandidates(diff(100, { source: 1 }), top5)) { // magnitude 108 → no raise
+      assert.equal(c.reasoningTier, null);
+    }
+  });
+
+  test('a substantial change offers BOTH the baseline (null) and the raised tier at each roundCap rung', () => {
+    const candidates = difficultyCandidates(diff(300, { source: 2 }), top5); // magnitude 316 → high
+    assert.deepEqual(tiers(candidates), new Set([null, 'high']));
+    // cross product: the full-effort rung exists at both baseline and the raise
+    assert.ok(candidates.some((c) => c.roundCap === 5 && c.reasoningTier === null));
+    assert.ok(candidates.some((c) => c.roundCap === 5 && c.reasoningTier === 'high'));
+  });
+
+  test('a very large change raises to max', () => {
+    const candidates = difficultyCandidates(diff(700, { source: 2 }), top5); // magnitude 716 → max
+    assert.deepEqual(tiers(candidates), new Set([null, 'max']));
+  });
+
+  test('[ACCEPTANCE] a complex diff proposes a candidate that costs MORE than the user\'s full-effort default — difficulty RAISES', () => {
+    const diffSize = 100;
+    const complex = difficultyCandidates(diff(700, { source: 3 }), top5); // magnitude → max
+    const proposedTop = maxCost(complex, diffSize);
+    // The user's configured ceiling with no raise is the reference; the proposal must exceed it.
+    assert.ok(
+      estimatedCostUsd(proposedTop, diffSize) > estimatedCostUsd(top5, diffSize),
+      `proposed ${JSON.stringify(proposedTop)} must cost more than the default full-effort profile`,
+    );
+    assert.equal(proposedTop.roundCap, 5);       // rounds not lowered for a hard change
+    assert.equal(proposedTop.reasoningTier, 'max'); // reasoning raised
+  });
+
+  test('[ACCEPTANCE] a trivial diff still costs strictly LESS than a complex one — both axes point the same way', () => {
+    const diffSize = 100;
+    const trivial = maxCost(difficultyCandidates(diff(3, { source: 1 }), top5), diffSize);   // roundCap 1, no raise
+    const complex = maxCost(difficultyCandidates(diff(700, { source: 3 }), top5), diffSize); // roundCap 5, max reasoning
+    assert.ok(estimatedCostUsd(trivial, diffSize) < estimatedCostUsd(complex, diffSize));
+  });
+
+  test('is reproducible — the same difficulty always yields a deep-equal cross product', () => {
+    const d = diff(300, { source: 2 });
     assert.deepEqual(difficultyCandidates(d, top5), difficultyCandidates(d, top5));
   });
 });

@@ -1,6 +1,6 @@
 'use strict';
 const { produceReview, retryTransientSpawn, sleep } = require('./failover');
-const { defaultEffortProfile } = require('./effort');
+const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings } = require('./review');
 const {
   buildReviewInput,
@@ -230,13 +230,25 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency; the
-// worker pool below takes a plain number, so this seam is where the profile projects onto it. The
-// default profile reproduces the pre-profile constant exactly, so an omitted `effort` is byte-identical.
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency AND the
+// reasoning raise, and this is the ONE seam where the chain and the profile meet — so both projections
+// happen here: scopeConcurrency onto the worker pool's plain number, and reasoningTier folded onto each
+// config's own reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier
+// down to each adapter — means the effective config flows through produceReview unchanged, so the
+// engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
+// automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
+// each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
 function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
   const maxConcurrent = effort.scopeConcurrency;
+  const effectiveChain = chain.map(config => ({
+    ...config,
+    reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
+  }));
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn });
-  return produceReview(chain, null, null, produceOnce);
+  // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
+  // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
+  // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout

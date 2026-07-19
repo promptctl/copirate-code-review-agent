@@ -29923,10 +29923,12 @@ function wrappy (fn, cb) {
 /***/ }),
 
 /***/ 5120:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+
+const { TIER_RANK } = __nccwpck_require__(4652);
 
 // The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
 // budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
@@ -29978,6 +29980,43 @@ const UNLIMITED_EFFECTIVE_ROUNDS = 8;
 const CAP_FRACTION = 0.1;
 const MIN_CAP_USD = 0.1;
 
+// [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each reasoning tier, indexed by TIER_RANK
+// ordinal (0=minimal … 4=xhigh/max). Higher reasoning spends more output/thinking tokens per round, so
+// it is a monotonic multiplicand on the round cost — the axis that lets difficulty RAISE effort for a
+// complex diff (zai-difficulty-0ea.3). Like CALIBRATION and PRICES_PER_MILLION this is a hand-tuned
+// representation with NO machine source: reasoning-token overhead was not separately metered in the
+// budget spike, so these are conservative ESTIMATES expected to drift and be recalibrated per model.
+// [LAW:verifiable-goals] estimatedCostUsd is a fixed-diff RANKER, not a dollar oracle — what MUST hold
+// is STRICT MONOTONICITY in rank (a higher tier always ranks costlier), which is what tests assert; the
+// absolute factors are secondary. The baseline (`null` tier = "no raise; the config's own tier stands")
+// is factor 1.0: it prices as the round's unraised cost, which is the correct RANK floor even though the
+// config's real tier is unknown here — consistent with the ranker-not-oracle contract above.
+// Source / last estimated: zai-difficulty-0ea.3, 2026-07-19 (UNMEASURED — recalibrate when metered).
+// STRICTLY increasing across every rank so the data actually satisfies the invariant above — 'minimal'
+// and 'low' differ (more reasoning always costs at least marginally more; equal factors would be a false
+// theorem the comment claims but the data denies). null (baseline) prices at 1.0 like rank-0 'minimal':
+// null is the ABSENCE of a raise, not a rank, so it may share minimal's floor without breaking the
+// per-rank strict order 1.0 < 1.05 < 1.3 < 1.7 < 2.2.
+const REASONING_COST_MULTIPLIER = [1.0, 1.05, 1.3, 1.7, 2.2];
+
+// [LAW:single-enforcer] [LAW:one-source-of-truth] The multiplier is indexed by TIER_RANK ordinal, so this
+// array and effort.js's TIER_RANK must cover the SAME rank space. A desync — a rank added to TIER_RANK
+// with no multiplier entry — would index past the array and price that tier as undefined → NaN, silently
+// corrupting budget ranking (a NaN estimate never satisfies `<= cap`, so the candidate is skipped). Assert
+// the coverage ONCE here at module load, so the desync fails loud at startup [LAW:no-silent-failure] — the
+// invariant stated explicitly at the definition site, not left implicit to be caught only at test time and
+// NOT a per-call guard (that would be control-flow in disguise on the hot path [LAW:no-defensive-null-guards]).
+// The check is EXACT (=== ranks+1), not merely "long enough": a too-SHORT array indexes past the end → NaN;
+// a too-LONG array carries a dead multiplier for a rank that doesn't exist — a latent [LAW:one-source-of-truth]
+// drift. Both directions fail loud, keeping the two tables in exact correspondence (one multiplier per rank).
+const MAX_TIER_RANK = Math.max(...Object.values(TIER_RANK));
+if (REASONING_COST_MULTIPLIER.length !== MAX_TIER_RANK + 1) {
+  throw new Error(
+    `REASONING_COST_MULTIPLIER has ${REASONING_COST_MULTIPLIER.length} entries but TIER_RANK needs exactly `
+    + `${MAX_TIER_RANK + 1} (one per rank 0..${MAX_TIER_RANK}); keep the two tables in exact correspondence.`,
+  );
+}
+
 // [LAW:effects-at-boundaries] Pure: the estimated USD cost of running ONE review round at this diff.
 // diffSize is CHURN (added + deleted lines) — the axis the spike measured cost against. The fixed
 // floor dominates for small diffs; the marginal adds a modest per-line term.
@@ -29993,17 +30032,36 @@ function effectiveRounds(roundCap) {
   return roundCap === 0 ? UNLIMITED_EFFECTIVE_ROUNDS : roundCap;
 }
 
+// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a reasoning tier.
+// [LAW:dataflow-not-control-flow] the baseline `null`/`undefined` tier is a VALUE mapped to 1.0 (no
+// raise), not a branch that skips the multiply — so estimatedCostUsd multiplies unconditionally and a
+// default profile prices exactly as before. [LAW:no-silent-failure] an unknown tier string is a caller
+// bug (a proposal outside the vocabulary), not a value to price at 1.0 — throw naming the known tiers,
+// rather than silently under-pricing a raised profile and letting the budget over-spend.
+function reasoningFactor(tier) {
+  if (tier === null || tier === undefined) return 1.0;
+  if (!Object.prototype.hasOwnProperty.call(TIER_RANK, tier)) {
+    throw new Error(
+      `Unknown reasoning tier ${JSON.stringify(tier)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+    );
+  }
+  return REASONING_COST_MULTIPLIER[TIER_RANK[tier]];
+}
+
 // [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
 // [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] Today the ONLY cost-bearing axis EffortProfile carries is roundCap (see
-// effort.js — the profile grows an axis only once its consumer migrates). reasoningTier/modelTier
-// become additional monotonic multiplicands HERE when they land as profile fields; reading them before
-// the type carries them would be the same false theorem effort.js refuses.
+// [LAW:types-are-the-program] EffortProfile now carries TWO cost-bearing axes, both priced HERE as
+// independent monotonic multiplicands on the per-round base: roundCap (how many rounds) and
+// reasoningTier (how hard each round reasons — landed in zai-difficulty-0ea.3 with its consumer, the
+// reasoning fold at the runMultiScope seam). modelTier becomes a third when its consumer migrates;
+// reading an axis before the type carries it would be the false theorem effort.js refuses.
+// [LAW:dataflow-not-control-flow] the product is total — every profile prices, and a null reasoningTier
+// multiplies by 1.0, so a roundCap-only profile is unchanged.
 function estimatedCostUsd(profile, diffSize) {
-  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap);
+  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap) * reasoningFactor(profile.reasoningTier);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -30096,7 +30154,9 @@ module.exports = {
   CAP_FRACTION,
   MIN_CAP_USD,
   DERATE_ROUNDCAPS,
+  REASONING_COST_MULTIPLIER,
   effectiveRounds,
+  reasoningFactor,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
@@ -30834,6 +30894,7 @@ module.exports = {
 
 
 const { effectiveRounds, defaultBudgetCandidates } = __nccwpck_require__(5120);
+const { TIER_RANK } = __nccwpck_require__(4652);
 
 // [FRAMING:parts-and-seams] The difficulty POLICY: the part that turns the pure, pre-spend difficulty
 // SIGNALS (assessDifficulty in difficulty.js — churn, spread, kind breakdown) into an EffortProfile
@@ -30843,11 +30904,14 @@ const { effectiveRounds, defaultBudgetCandidates } = __nccwpck_require__(5120);
 // via chooseProfile — so this module depends only on budget.js's ladder machinery
 // (defaultBudgetCandidates, effectiveRounds) and the Difficulty value shape, never the reverse. [LAW:one-way-deps]
 //
-// SCOPE, bounded by today's type: roundCap is the ONLY cost-bearing axis EffortProfile carries, and the
-// candidates must never exceed the user's configured ceiling — so this slice can only LOWER the ceiling
-// for easy changes (cheap reviews for trivial diffs). RAISING effort above the ceiling for hard changes
-// is impossible until a new cost-bearing axis lands (slice zai-difficulty-0ea.3); a higher roundCap the
-// profile can't price would be a no-op, so it is not faked here. [LAW:types-are-the-program]
+// SCOPE: TWO cost-bearing axes, moving in OPPOSITE directions as difficulty rises. roundCap LOWERS for
+// easy changes (cheap reviews for trivial diffs) and never exceeds the user's configured ceiling.
+// reasoningTier RAISES for hard changes (thorough reviews for complex diffs — slice zai-difficulty-0ea.3):
+// it is priced in budget.js and folded onto each config's own reasoning as a FLOOR at the runMultiScope
+// seam, so a raised tier is real spend, never a no-op the profile can't price. [LAW:types-are-the-program]
+// The two axes are independent bands over the SAME magnitude, and the candidate set is their cross product
+// so budget can cap DOWN either — difficulty proposes the ceiling on both axes; budget picks the
+// affordable best. [LAW:dataflow-not-control-flow]
 
 // [LAW:one-source-of-truth] Policy tunables — hand-tuned difficulty thresholds, documented, in this one
 // place. Like PRICES_PER_MILLION (usage.js) and CALIBRATION (budget.js) this is a representation with no
@@ -30882,21 +30946,59 @@ const DIFFICULTY_BANDS = [
   // above 250 → the user's full ceiling (substantial: a large or cross-cutting change)
 ];
 
+// [LAW:dataflow-not-control-flow] The reasoning-RAISE bands, the counterpart table to DIFFICULTY_BANDS on
+// the second cost-bearing axis. Same selectBand semantics (smallest covering maxMagnitude wins), so a
+// LARGER magnitude falls through the cheap `null` band into a higher-tier band: difficulty raises
+// reasoning only once a change is substantial enough to warrant deeper scrutiny per round. `null` = "no
+// raise; the config's own reasoning stands" (the fold's byte-identical floor). The Infinity band makes
+// the table TOTAL so a huge change always names a tier (selectBand returns null only for an uncovered
+// magnitude — here nothing is uncovered). Thresholds are hand-tuned like DIFFICULTY_BANDS; the raise
+// starts at 250, exactly where roundCap stops lowering, so the two axes hand off cleanly at "substantial".
+const DIFFICULTY_REASONING_BANDS = [
+  { maxMagnitude: 250, tier: null },       // trivial..moderate: no raise (roundCap may still LOWER here)
+  { maxMagnitude: 600, tier: 'high' },     // substantial: reason harder each round
+  { maxMagnitude: Infinity, tier: 'max' }, // very large / cross-cutting: full reasoning depth
+];
+
 // [LAW:effects-at-boundaries] Pure. [LAW:types-are-the-program] The band a magnitude falls in: the one
 // with the SMALLEST maxMagnitude that still covers it, selected regardless of array order — so the band
 // table is an unordered SET, not a list carrying a fragile ascending-order invariant a reorder could
-// silently break. `null` when no band covers the magnitude (it exceeds every band → propose no lowering).
-// The tie-break is EXPLICIT: on equal maxMagnitude the smaller roundCap (the cheaper rung) wins, so the
-// result is deterministic and order-independent even for a degenerate table with duplicate maxMagnitude —
-// the reduce never silently keeps whichever the array order happened to visit first.
-function selectBand(bands, magnitude) {
+// silently break. `null` when no band covers the magnitude (it exceeds every band → propose no change).
+// [LAW:one-type-per-behavior] The SAME selection serves both cost-bearing axes — the roundCap bands and
+// the reasoning-tier bands are one behavior differing only in their cost field. The tie-break is EXPLICIT
+// and axis-agnostic via `rankOf`: on equal maxMagnitude the band with the smaller cost rank (the cheaper
+// rung) wins, so the result is deterministic and order-independent even for a degenerate table with
+// duplicate maxMagnitude — the reduce never silently keeps whichever the array order happened to visit
+// first. [LAW:composability] `rankOf` is REQUIRED, not defaulted: a default keyed to one axis's field
+// (e.g. roundCap) would make this "axis-agnostic" function silently degenerate for any other axis's
+// table — `undefined < undefined` is always false, collapsing the tie-break back to array order. Each
+// caller names its own cost field (roundCapRank / reasoningBandRank), so the axis is always explicit.
+function selectBand(bands, magnitude, rankOf) {
   const covering = bands.filter((b) => magnitude <= b.maxMagnitude);
   return covering.length === 0
     ? null
     : covering.reduce((a, b) => {
       if (b.maxMagnitude !== a.maxMagnitude) return b.maxMagnitude < a.maxMagnitude ? b : a;
-      return b.roundCap < a.roundCap ? b : a;
+      return rankOf(b) < rankOf(a) ? b : a;
     });
+}
+
+// [LAW:effects-at-boundaries] Pure. The two cost-rank extractors selectBand's tie-break needs, one per
+// band axis. Named (not inline) so every selectBand call declares its axis by name, and so the reasoning
+// extractor's loud-failure check lives in one place. [LAW:no-silent-failure] reasoningBandRank throws on
+// an unknown tier STRING (a misspelled band row) exactly as maxTier/reasoningFactor do — a typo can never
+// silently rank as the cheapest rung and get preferred in a tie; the legitimate `null` (no-raise) band is
+// the ONE non-throwing absence, ranked below every real tier so it stays the cheapest.
+const roundCapRank = (band) => band.roundCap;
+function reasoningBandRank(band) {
+  const t = band.tier;
+  if (t === null || t === undefined) return -1;
+  if (!Object.prototype.hasOwnProperty.call(TIER_RANK, t)) {
+    throw new Error(
+      `DIFFICULTY_REASONING_BANDS has unknown tier ${JSON.stringify(t)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+    );
+  }
+  return TIER_RANK[t];
 }
 
 // [LAW:effects-at-boundaries] Pure. The churn-equivalent effort magnitude of a change: its raw churn
@@ -30909,25 +31011,44 @@ function effortMagnitude({ churn, kinds }) {
   return (churn + SPREAD_WEIGHT * spread) * sourceFactor;
 }
 
-// [LAW:effects-at-boundaries] Pure. Propose the EffortProfile candidate ladder for a change of this
-// difficulty, given the user's configured `topProfile` (the ceiling the proposal may never exceed).
-// [LAW:composability] It asks only for the difficulty value and the ceiling, and returns a candidate set
-// chooseProfile can rank in any order — difficulty proposes, budget (or the no-budget identity) caps.
+// [LAW:effects-at-boundaries] Pure. Propose the EffortProfile candidate set for a change of this
+// difficulty, given the user's configured `topProfile` (the roundCap ceiling the proposal may never
+// exceed). [LAW:composability] It asks only for the difficulty value and the ceiling, and returns a
+// candidate set chooseProfile can rank in any order — difficulty proposes, budget (or the no-budget
+// identity) caps. The set is the CROSS PRODUCT of two independent bands over the same magnitude:
 //
-// The proposal only ever LOWERS the ceiling: the banded roundCap is adopted ONLY when it is genuinely
-// cheaper than the user's configured cap (compared in effectiveRounds space so the 0="unlimited"
-// sentinel ranks above every finite cap — an unlimited ceiling is correctly lowered to a finite band for
-// an easy change, and a small finite user cap is never raised toward a larger band). The settled ceiling
-// then feeds the SAME de-rate ladder the budget path uses (defaultBudgetCandidates), so budget's cap
-// still applies cleanly on top. [LAW:one-source-of-truth] one ladder machinery, two ceilings.
+//   roundCap  — LOWERS for easy changes. The banded cap is adopted ONLY when genuinely cheaper than the
+//               user's configured cap (compared in effectiveRounds space so the 0="unlimited" sentinel
+//               ranks above every finite cap — an unlimited ceiling is lowered to a finite band for an
+//               easy change, a small finite user cap is never raised toward a larger band). The settled
+//               ceiling feeds the SAME de-rate ladder the budget path uses (defaultBudgetCandidates).
+//   reasoningTier — RAISES for hard changes. The banded tier is the proposed CEILING raise (null = none).
+//               [LAW:one-source-of-truth] the profile carries only the raise, NOT an absolute tier: the
+//               config's own baseline is unknown here (difficultyCandidates runs BEFORE the chain is
+//               built) and is reconciled per-config via maxTier at the fold. So each roundCap rung is
+//               offered at both the baseline (null) and the proposed raise, and budget — pricing the
+//               raise via estimatedCostUsd — picks the affordable best across the whole product.
+//
+// [LAW:dataflow-not-control-flow] both axes settle to a VALUE (a null band = "no change"), so an easy or
+// moderate change proposes reasoningTier=null on every rung → the set collapses to the .2 roundCap ladder
+// with a null tier field (byte-identical spend). Only a substantial change adds the raised rungs.
 function difficultyCandidates(difficulty, topProfile) {
   const magnitude = effortMagnitude(difficulty);
-  const band = selectBand(DIFFICULTY_BANDS, magnitude);
-  const proposed = band ? band.roundCap : topProfile.roundCap;
-  const ceiling = effectiveRounds(proposed) < effectiveRounds(topProfile.roundCap)
-    ? proposed
+
+  const roundBand = selectBand(DIFFICULTY_BANDS, magnitude, roundCapRank);
+  const proposedCap = roundBand ? roundBand.roundCap : topProfile.roundCap;
+  const ceilingCap = effectiveRounds(proposedCap) < effectiveRounds(topProfile.roundCap)
+    ? proposedCap
     : topProfile.roundCap;
-  return defaultBudgetCandidates({ ...topProfile, roundCap: ceiling });
+  const roundRungs = defaultBudgetCandidates({ ...topProfile, roundCap: ceilingCap });
+
+  const reasonBand = selectBand(DIFFICULTY_REASONING_BANDS, magnitude, reasoningBandRank);
+  const proposedTier = reasonBand ? reasonBand.tier : null;
+  // [LAW:dataflow-not-control-flow] the reasoning rungs are the baseline (null) plus the proposed raise —
+  // a two-value set that collapses to just [null] when nothing is raised, keeping the easy path identical.
+  const reasonRungs = proposedTier === null ? [null] : [null, proposedTier];
+
+  return roundRungs.flatMap((p) => reasonRungs.map((reasoningTier) => ({ ...p, reasoningTier })));
 }
 
 // [LAW:no-silent-failure] Parse the DIFFICULTY_SCALING action input at the run boundary. Unset/empty is
@@ -30949,7 +31070,10 @@ module.exports = {
   SPREAD_WEIGHT,
   NONSOURCE_DISCOUNT,
   DIFFICULTY_BANDS,
+  DIFFICULTY_REASONING_BANDS,
   selectBand,
+  roundCapRank,
+  reasoningBandRank,
   effortMagnitude,
   difficultyCandidates,
   parseDifficultyScaling,
@@ -31069,13 +31193,24 @@ module.exports = {
 // The type carries only the axes it TRULY governs today. [LAW:types-are-the-program] a field that
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `scopeConcurrency`
-// (its consumer, the worker pool, reads it here) and `roundCap` (its consumer, the pre-spawn round
-// gate in run.js, reads it here); it GROWS a field as each remaining knob's consumer is migrated off
-// its current source: `readBudget` (today MAX_DIFF_CHARS), `reasoningTier`/`modelTier` (today
-// per-config on the chain). Adding a field to a well-formed producer is cheap [LAW:carrying-cost];
-// adding it before its consumer exists is a lie. The reasoning AXIS lives here already as a resolver
-// (below) — the vocabulary and per-engine clamping the difficulty/budget epics will feed a profile
-// field through — even though no profile field sources it yet.
+// (its consumer, the worker pool, reads it here), `roundCap` (its consumer, the pre-spawn round
+// gate in run.js, reads it here), and now `reasoningTier` (its consumer is the reasoning fold at the
+// runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
+// profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
+// to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
+// current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today per-config on the chain).
+// Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its consumer
+// exists is a lie — so `reasoningTier` lands together with its fold consumer (multiscope.js) and its
+// price (budget.js estimatedCostUsd), never as an ungoverned placeholder.
+//
+// [LAW:one-source-of-truth] `reasoningTier` on the profile is the difficulty-PROPOSED RAISE, NOT a
+// review's absolute reasoning tier. The absolute per-config baseline stays `config.reasoning` (each
+// config in the failover chain can name its own), because the profile is one value per REVIEW while
+// reasoning is genuinely per-CONFIG — a single profile field cannot faithfully represent a chain whose
+// configs disagree. So the profile carries only the raise, defaulting to `null` = "propose no raise;
+// the config's own tier stands", and the fold resolves the effective tier = maxTier(config baseline,
+// proposed raise) PER CONFIG. This makes difficulty a monotonic FLOOR (it can lift an under-specified
+// config, never lower an explicit one) and keeps a default-profile run byte-identical.
 //
 // `roundCap` is the profile's first COST-BEARING axis, and that is why it lands first: scopeConcurrency
 // is cost-NEUTRAL (parallelism trades runner load for wall time, not spend), so a cost estimate over
@@ -31097,7 +31232,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ scopeConcurrency: number, roundCap: number }} EffortProfile
+// @typedef {{ scopeConcurrency: number, roundCap: number, reasoningTier: (string|null) }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE today's behavior, so a
 // default-profile run is byte-identical to the pre-profile engine. An OPTIONS object (not positional
@@ -31109,8 +31244,33 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // here. [LAW:one-source-of-truth] The fallback is the neutral `0` = "unlimited" sentinel — the honest
 // value for "no cap was decided here" (a bare call in a test or an omitted-effort default), never a
 // second copy of the production default.
-function defaultEffortProfile({ roundCap = 0 } = {}) {
-  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap };
+//
+// `reasoningTier` defaults to `null` = "propose no raise". It is the difficulty-proposed RAISE, not an
+// absolute tier (see the header): a null profile leaves each config's own `config.reasoning` untouched
+// at the fold, so a default profile is byte-identical. Only difficultyCandidates ever sets it non-null.
+function defaultEffortProfile({ roundCap = 0, reasoningTier = null } = {}) {
+  return { scopeConcurrency: DEFAULT_SCOPE_CONCURRENCY, roundCap, reasoningTier };
+}
+
+// [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
+// per-config FLOOR reconciliation between a config's own `reasoning` and the profile's proposed raise.
+// [LAW:dataflow-not-control-flow] every branch is over VALUES: a `null`/`undefined` operand contributes
+// nothing (both null → null, the byte-identical no-raise case), and on equal rank the FIRST operand
+// wins so the caller can pass the config's own (already engine-valid) tier first and keep it on a tie
+// (e.g. an engine that names its ceiling `max` is not swapped for the abstract `xhigh` of the same rank).
+// [LAW:no-silent-failure] an unknown tier string is a caller bug (a proposal outside the vocabulary),
+// not a value to coalesce — throw naming the known tiers rather than silently dropping the higher rung.
+function maxTier(a, b) {
+  for (const t of [a, b]) {
+    if (t !== null && t !== undefined && !Object.prototype.hasOwnProperty.call(TIER_RANK, t)) {
+      throw new Error(
+        `Unknown reasoning tier ${JSON.stringify(t)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+      );
+    }
+  }
+  if (a === null || a === undefined) return b ?? null;
+  if (b === null || b === undefined) return a;
+  return TIER_RANK[b] > TIER_RANK[a] ? b : a;
 }
 
 // Resolve an ABSTRACT reasoning tier to the concrete value a specific engine supports, given that
@@ -31171,6 +31331,7 @@ module.exports = {
   TIER_RANK,
   defaultEffortProfile,
   resolveReasoningTier,
+  maxTier,
 };
 
 
@@ -32691,7 +32852,7 @@ module.exports = {
 "use strict";
 
 const { produceReview, retryTransientSpawn, sleep } = __nccwpck_require__(2887);
-const { defaultEffortProfile } = __nccwpck_require__(4652);
+const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings } = __nccwpck_require__(1565);
 const {
   buildReviewInput,
@@ -32921,13 +33082,25 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency; the
-// worker pool below takes a plain number, so this seam is where the profile projects onto it. The
-// default profile reproduces the pre-profile constant exactly, so an omitted `effort` is byte-identical.
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's scope concurrency AND the
+// reasoning raise, and this is the ONE seam where the chain and the profile meet — so both projections
+// happen here: scopeConcurrency onto the worker pool's plain number, and reasoningTier folded onto each
+// config's own reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier
+// down to each adapter — means the effective config flows through produceReview unchanged, so the
+// engine clamps it per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer)
+// automatically reports the raised tier. [LAW:dataflow-not-control-flow] a null proposed tier folds to
+// each config's own reasoning (byte-identical), so an omitted/default `effort` leaves the chain untouched.
 function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), log = () => {}, sleepFn = sleep }) {
   const maxConcurrent = effort.scopeConcurrency;
+  const effectiveChain = chain.map(config => ({
+    ...config,
+    reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
+  }));
   const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, maxConcurrent, log, sleepFn });
-  return produceReview(chain, null, null, produceOnce);
+  // [LAW:no-ambient-temporal-coupling] Forward the injected clock to produceReview too, so ONE sleepFn
+  // owns the whole pass's retry timing — spawn-level (inside the pass) AND config-level failover here.
+  // Defaults to the real sleep, so production is unchanged; a test injects a stub to drive failover fast.
+  return produceReview(effectiveChain, null, null, produceOnce, sleepFn);
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
@@ -33996,6 +34169,13 @@ async function fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatte
   return { transport, filteredFiles };
 }
 
+// [LAW:dataflow-not-control-flow] Pure. The log fragment naming a RAISED reasoning tier — a value, empty
+// when nothing was raised (the null baseline needs no mention). Both effort-resolution log lines share it
+// so the operator sees "thorough" reviews the same way in the budget and difficulty-only paths.
+function reasoningNote(reasoningTier) {
+  return reasoningTier ? `, reasoning ${reasoningTier} (raised for a complex diff)` : '';
+}
+
 // [LAW:effects-at-boundaries] The budget phase (PR mode). The pure decision is chooseProfile; the effect
 // this boundary owns is the ledger read whose failure policy is spend-safe. [LAW:no-silent-failure] a
 // failed read falls back SPEND-SAFE — proceed as if under budget (spentToday 0 ⇒ full remaining ⇒ full
@@ -34030,7 +34210,8 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
     : 'budget FLOOR — even the cheapest candidate exceeds the cap; running the minimal review';
   core.info(
     `Budget: spent today $${spentToday.toFixed(4)} of $${dailyBudget.toFixed(2)} → per-review cap `
-    + `$${decision.capUsd.toFixed(4)}; churn ${diffSize} line(s); chose roundCap ${decision.profile.roundCap} `
+    + `$${decision.capUsd.toFixed(4)}; churn ${diffSize} line(s); chose roundCap ${decision.profile.roundCap}`
+    + `${reasoningNote(decision.profile.reasoningTier)} `
     + `(est. $${decision.estimatedUsd.toFixed(4)}; ${capNote}).`,
   );
   return decision.profile;
@@ -34046,7 +34227,8 @@ function resolveDifficultyEffort({ candidates, filteredFiles }) {
   const diffSize = diffChurn(filteredFiles);
   const decision = chooseProfile({ candidates, spentToday: 0, dailyBudget: Infinity, diffSize });
   core.info(
-    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap} `
+    `Difficulty: churn ${diffSize} line(s) → proposed roundCap ${decision.profile.roundCap}`
+    + `${reasoningNote(decision.profile.reasoningTier)} `
     + `(from ${candidates.length} candidate profile(s); no daily budget, so the difficulty proposal stands).`,
   );
   return decision.profile;
@@ -34181,15 +34363,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort) {
     // size this review's cost, difficulty to size the change. Fetched once here and reused downstream.
     fetched = await fetchFilteredFiles(octokit, owner, repo, pullNumber, excludePatterns);
 
-    // [LAW:composability] Difficulty PROPOSES the candidate ladder; off ⇒ the default de-rate ladder, so
-    // a budget-only run is byte-identical to before this slice. The proposal is anchored to
-    // `defaultEffort` (the user's ceiling), so it can only LOWER the ceiling, never raise it.
+    // [LAW:composability] Difficulty PROPOSES the candidate set; off ⇒ the default de-rate ladder, so a
+    // budget-only run is byte-identical to before this slice. On the roundCap axis the proposal is anchored
+    // to `defaultEffort` (the user's ceiling) so it only LOWERS; on the reasoningTier axis it RAISES a
+    // complex diff above the config baseline (reconciled per-config at the runMultiScope fold).
     const candidates = difficultyScaling
       ? difficultyCandidates(assessDifficulty(fetched.filteredFiles), defaultEffort)
       : defaultBudgetCandidates(defaultEffort);
 
-    // The proposed ceiling is the most expensive candidate (defaultBudgetCandidates / difficultyCandidates
-    // both put it there); ranked in effectiveRounds space so the 0="unlimited" sentinel ranks correctly.
+    // The roundCap CEILING difficulty proposed — the max-roundCap candidate, ranked in effectiveRounds
+    // space so the 0="unlimited" sentinel ranks correctly. Only its roundCap is read (by bindingLevers,
+    // which attributes the round-cap skip); the reasoning axis raises cost but never the round-cap gate,
+    // so ties on roundCap (candidates differing only in reasoningTier) are interchangeable here.
     difficultyCeiling = candidates.reduce((a, b) =>
       (effectiveRounds(b.roundCap) > effectiveRounds(a.roundCap) ? b : a));
 
