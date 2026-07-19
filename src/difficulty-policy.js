@@ -1,6 +1,7 @@
 'use strict';
 
 const { effectiveRounds, defaultBudgetCandidates } = require('./budget');
+const { TIER_RANK } = require('./effort');
 
 // [FRAMING:parts-and-seams] The difficulty POLICY: the part that turns the pure, pre-spend difficulty
 // SIGNALS (assessDifficulty in difficulty.js — churn, spread, kind breakdown) into an EffortProfile
@@ -10,11 +11,14 @@ const { effectiveRounds, defaultBudgetCandidates } = require('./budget');
 // via chooseProfile — so this module depends only on budget.js's ladder machinery
 // (defaultBudgetCandidates, effectiveRounds) and the Difficulty value shape, never the reverse. [LAW:one-way-deps]
 //
-// SCOPE, bounded by today's type: roundCap is the ONLY cost-bearing axis EffortProfile carries, and the
-// candidates must never exceed the user's configured ceiling — so this slice can only LOWER the ceiling
-// for easy changes (cheap reviews for trivial diffs). RAISING effort above the ceiling for hard changes
-// is impossible until a new cost-bearing axis lands (slice zai-difficulty-0ea.3); a higher roundCap the
-// profile can't price would be a no-op, so it is not faked here. [LAW:types-are-the-program]
+// SCOPE: TWO cost-bearing axes, moving in OPPOSITE directions as difficulty rises. roundCap LOWERS for
+// easy changes (cheap reviews for trivial diffs) and never exceeds the user's configured ceiling.
+// reasoningTier RAISES for hard changes (thorough reviews for complex diffs — slice zai-difficulty-0ea.3):
+// it is priced in budget.js and folded onto each config's own reasoning as a FLOOR at the runMultiScope
+// seam, so a raised tier is real spend, never a no-op the profile can't price. [LAW:types-are-the-program]
+// The two axes are independent bands over the SAME magnitude, and the candidate set is their cross product
+// so budget can cap DOWN either — difficulty proposes the ceiling on both axes; budget picks the
+// affordable best. [LAW:dataflow-not-control-flow]
 
 // [LAW:one-source-of-truth] Policy tunables — hand-tuned difficulty thresholds, documented, in this one
 // place. Like PRICES_PER_MILLION (usage.js) and CALIBRATION (budget.js) this is a representation with no
@@ -49,20 +53,37 @@ const DIFFICULTY_BANDS = [
   // above 250 → the user's full ceiling (substantial: a large or cross-cutting change)
 ];
 
+// [LAW:dataflow-not-control-flow] The reasoning-RAISE bands, the counterpart table to DIFFICULTY_BANDS on
+// the second cost-bearing axis. Same selectBand semantics (smallest covering maxMagnitude wins), so a
+// LARGER magnitude falls through the cheap `null` band into a higher-tier band: difficulty raises
+// reasoning only once a change is substantial enough to warrant deeper scrutiny per round. `null` = "no
+// raise; the config's own reasoning stands" (the fold's byte-identical floor). The Infinity band makes
+// the table TOTAL so a huge change always names a tier (selectBand returns null only for an uncovered
+// magnitude — here nothing is uncovered). Thresholds are hand-tuned like DIFFICULTY_BANDS; the raise
+// starts at 250, exactly where roundCap stops lowering, so the two axes hand off cleanly at "substantial".
+const DIFFICULTY_REASONING_BANDS = [
+  { maxMagnitude: 250, tier: null },       // trivial..moderate: no raise (roundCap may still LOWER here)
+  { maxMagnitude: 600, tier: 'high' },     // substantial: reason harder each round
+  { maxMagnitude: Infinity, tier: 'max' }, // very large / cross-cutting: full reasoning depth
+];
+
 // [LAW:effects-at-boundaries] Pure. [LAW:types-are-the-program] The band a magnitude falls in: the one
 // with the SMALLEST maxMagnitude that still covers it, selected regardless of array order — so the band
 // table is an unordered SET, not a list carrying a fragile ascending-order invariant a reorder could
-// silently break. `null` when no band covers the magnitude (it exceeds every band → propose no lowering).
-// The tie-break is EXPLICIT: on equal maxMagnitude the smaller roundCap (the cheaper rung) wins, so the
-// result is deterministic and order-independent even for a degenerate table with duplicate maxMagnitude —
-// the reduce never silently keeps whichever the array order happened to visit first.
-function selectBand(bands, magnitude) {
+// silently break. `null` when no band covers the magnitude (it exceeds every band → propose no change).
+// [LAW:one-type-per-behavior] The SAME selection serves both cost-bearing axes — the roundCap bands and
+// the reasoning-tier bands are one behavior differing only in their cost field. The tie-break is EXPLICIT
+// and axis-agnostic via `rankOf`: on equal maxMagnitude the band with the smaller cost rank (the cheaper
+// rung) wins, so the result is deterministic and order-independent even for a degenerate table with
+// duplicate maxMagnitude — the reduce never silently keeps whichever the array order happened to visit
+// first. `rankOf` defaults to `roundCap` (the original behavior); the reasoning axis passes TIER_RANK.
+function selectBand(bands, magnitude, rankOf = (b) => b.roundCap) {
   const covering = bands.filter((b) => magnitude <= b.maxMagnitude);
   return covering.length === 0
     ? null
     : covering.reduce((a, b) => {
       if (b.maxMagnitude !== a.maxMagnitude) return b.maxMagnitude < a.maxMagnitude ? b : a;
-      return b.roundCap < a.roundCap ? b : a;
+      return rankOf(b) < rankOf(a) ? b : a;
     });
 }
 
@@ -76,25 +97,44 @@ function effortMagnitude({ churn, kinds }) {
   return (churn + SPREAD_WEIGHT * spread) * sourceFactor;
 }
 
-// [LAW:effects-at-boundaries] Pure. Propose the EffortProfile candidate ladder for a change of this
-// difficulty, given the user's configured `topProfile` (the ceiling the proposal may never exceed).
-// [LAW:composability] It asks only for the difficulty value and the ceiling, and returns a candidate set
-// chooseProfile can rank in any order — difficulty proposes, budget (or the no-budget identity) caps.
+// [LAW:effects-at-boundaries] Pure. Propose the EffortProfile candidate set for a change of this
+// difficulty, given the user's configured `topProfile` (the roundCap ceiling the proposal may never
+// exceed). [LAW:composability] It asks only for the difficulty value and the ceiling, and returns a
+// candidate set chooseProfile can rank in any order — difficulty proposes, budget (or the no-budget
+// identity) caps. The set is the CROSS PRODUCT of two independent bands over the same magnitude:
 //
-// The proposal only ever LOWERS the ceiling: the banded roundCap is adopted ONLY when it is genuinely
-// cheaper than the user's configured cap (compared in effectiveRounds space so the 0="unlimited"
-// sentinel ranks above every finite cap — an unlimited ceiling is correctly lowered to a finite band for
-// an easy change, and a small finite user cap is never raised toward a larger band). The settled ceiling
-// then feeds the SAME de-rate ladder the budget path uses (defaultBudgetCandidates), so budget's cap
-// still applies cleanly on top. [LAW:one-source-of-truth] one ladder machinery, two ceilings.
+//   roundCap  — LOWERS for easy changes. The banded cap is adopted ONLY when genuinely cheaper than the
+//               user's configured cap (compared in effectiveRounds space so the 0="unlimited" sentinel
+//               ranks above every finite cap — an unlimited ceiling is lowered to a finite band for an
+//               easy change, a small finite user cap is never raised toward a larger band). The settled
+//               ceiling feeds the SAME de-rate ladder the budget path uses (defaultBudgetCandidates).
+//   reasoningTier — RAISES for hard changes. The banded tier is the proposed CEILING raise (null = none).
+//               [LAW:one-source-of-truth] the profile carries only the raise, NOT an absolute tier: the
+//               config's own baseline is unknown here (difficultyCandidates runs BEFORE the chain is
+//               built) and is reconciled per-config via maxTier at the fold. So each roundCap rung is
+//               offered at both the baseline (null) and the proposed raise, and budget — pricing the
+//               raise via estimatedCostUsd — picks the affordable best across the whole product.
+//
+// [LAW:dataflow-not-control-flow] both axes settle to a VALUE (a null band = "no change"), so an easy or
+// moderate change proposes reasoningTier=null on every rung → the set collapses to the .2 roundCap ladder
+// with a null tier field (byte-identical spend). Only a substantial change adds the raised rungs.
 function difficultyCandidates(difficulty, topProfile) {
   const magnitude = effortMagnitude(difficulty);
-  const band = selectBand(DIFFICULTY_BANDS, magnitude);
-  const proposed = band ? band.roundCap : topProfile.roundCap;
-  const ceiling = effectiveRounds(proposed) < effectiveRounds(topProfile.roundCap)
-    ? proposed
+
+  const roundBand = selectBand(DIFFICULTY_BANDS, magnitude);
+  const proposedCap = roundBand ? roundBand.roundCap : topProfile.roundCap;
+  const ceilingCap = effectiveRounds(proposedCap) < effectiveRounds(topProfile.roundCap)
+    ? proposedCap
     : topProfile.roundCap;
-  return defaultBudgetCandidates({ ...topProfile, roundCap: ceiling });
+  const roundRungs = defaultBudgetCandidates({ ...topProfile, roundCap: ceilingCap });
+
+  const reasonBand = selectBand(DIFFICULTY_REASONING_BANDS, magnitude, (b) => TIER_RANK[b.tier] ?? -1);
+  const proposedTier = reasonBand ? reasonBand.tier : null;
+  // [LAW:dataflow-not-control-flow] the reasoning rungs are the baseline (null) plus the proposed raise —
+  // a two-value set that collapses to just [null] when nothing is raised, keeping the easy path identical.
+  const reasonRungs = proposedTier === null ? [null] : [null, proposedTier];
+
+  return roundRungs.flatMap((p) => reasonRungs.map((reasoningTier) => ({ ...p, reasoningTier })));
 }
 
 // [LAW:no-silent-failure] Parse the DIFFICULTY_SCALING action input at the run boundary. Unset/empty is
@@ -116,6 +156,7 @@ module.exports = {
   SPREAD_WEIGHT,
   NONSOURCE_DISCOUNT,
   DIFFICULTY_BANDS,
+  DIFFICULTY_REASONING_BANDS,
   selectBand,
   effortMagnitude,
   difficultyCandidates,

@@ -1,5 +1,7 @@
 'use strict';
 
+const { TIER_RANK } = require('./effort');
+
 // The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
 // budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
 // this review can afford. No IO — the ledger read (spend so far) and the profile override happen at
@@ -50,6 +52,20 @@ const UNLIMITED_EFFECTIVE_ROUNDS = 8;
 const CAP_FRACTION = 0.1;
 const MIN_CAP_USD = 0.1;
 
+// [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each reasoning tier, indexed by TIER_RANK
+// ordinal (0=minimal … 4=xhigh/max). Higher reasoning spends more output/thinking tokens per round, so
+// it is a monotonic multiplicand on the round cost — the axis that lets difficulty RAISE effort for a
+// complex diff (zai-difficulty-0ea.3). Like CALIBRATION and PRICES_PER_MILLION this is a hand-tuned
+// representation with NO machine source: reasoning-token overhead was not separately metered in the
+// budget spike, so these are conservative ESTIMATES expected to drift and be recalibrated per model.
+// [LAW:verifiable-goals] estimatedCostUsd is a fixed-diff RANKER, not a dollar oracle — what MUST hold
+// is STRICT MONOTONICITY in rank (a higher tier always ranks costlier), which is what tests assert; the
+// absolute factors are secondary. The baseline (`null` tier = "no raise; the config's own tier stands")
+// is factor 1.0: it prices as the round's unraised cost, which is the correct RANK floor even though the
+// config's real tier is unknown here — consistent with the ranker-not-oracle contract above.
+// Source / last estimated: zai-difficulty-0ea.3, 2026-07-19 (UNMEASURED — recalibrate when metered).
+const REASONING_COST_MULTIPLIER = [1.0, 1.0, 1.3, 1.7, 2.2];
+
 // [LAW:effects-at-boundaries] Pure: the estimated USD cost of running ONE review round at this diff.
 // diffSize is CHURN (added + deleted lines) — the axis the spike measured cost against. The fixed
 // floor dominates for small diffs; the marginal adds a modest per-line term.
@@ -65,17 +81,36 @@ function effectiveRounds(roundCap) {
   return roundCap === 0 ? UNLIMITED_EFFECTIVE_ROUNDS : roundCap;
 }
 
+// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a reasoning tier.
+// [LAW:dataflow-not-control-flow] the baseline `null`/`undefined` tier is a VALUE mapped to 1.0 (no
+// raise), not a branch that skips the multiply — so estimatedCostUsd multiplies unconditionally and a
+// default profile prices exactly as before. [LAW:no-silent-failure] an unknown tier string is a caller
+// bug (a proposal outside the vocabulary), not a value to price at 1.0 — throw naming the known tiers,
+// rather than silently under-pricing a raised profile and letting the budget over-spend.
+function reasoningFactor(tier) {
+  if (tier === null || tier === undefined) return 1.0;
+  if (!Object.prototype.hasOwnProperty.call(TIER_RANK, tier)) {
+    throw new Error(
+      `Unknown reasoning tier ${JSON.stringify(tier)}. Known tiers: ${Object.keys(TIER_RANK).join(', ')}.`,
+    );
+  }
+  return REASONING_COST_MULTIPLIER[TIER_RANK[tier]];
+}
+
 // [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
 // [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] Today the ONLY cost-bearing axis EffortProfile carries is roundCap (see
-// effort.js — the profile grows an axis only once its consumer migrates). reasoningTier/modelTier
-// become additional monotonic multiplicands HERE when they land as profile fields; reading them before
-// the type carries them would be the same false theorem effort.js refuses.
+// [LAW:types-are-the-program] EffortProfile now carries TWO cost-bearing axes, both priced HERE as
+// independent monotonic multiplicands on the per-round base: roundCap (how many rounds) and
+// reasoningTier (how hard each round reasons — landed in zai-difficulty-0ea.3 with its consumer, the
+// reasoning fold at the runMultiScope seam). modelTier becomes a third when its consumer migrates;
+// reading an axis before the type carries it would be the false theorem effort.js refuses.
+// [LAW:dataflow-not-control-flow] the product is total — every profile prices, and a null reasoningTier
+// multiplies by 1.0, so a roundCap-only profile is unchanged.
 function estimatedCostUsd(profile, diffSize) {
-  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap);
+  return perRoundBaseUsd(diffSize) * effectiveRounds(profile.roundCap) * reasoningFactor(profile.reasoningTier);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -168,7 +203,9 @@ module.exports = {
   CAP_FRACTION,
   MIN_CAP_USD,
   DERATE_ROUNDCAPS,
+  REASONING_COST_MULTIPLIER,
   effectiveRounds,
+  reasoningFactor,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,

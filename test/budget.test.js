@@ -7,10 +7,11 @@ const {
   MIN_CAP_USD,
   CAP_FRACTION,
   estimatedCostUsd,
+  reasoningFactor,
   perReviewCapUsd,
   chooseProfile,
 } = require('../src/budget');
-const { defaultEffortProfile } = require('../src/effort');
+const { defaultEffortProfile, TIER_RANK } = require('../src/effort');
 
 // Candidates are real EffortProfile values built through the actual constructor — proving the policy
 // composes with the shipped type, not a hand-rolled stand-in. A ladder of roundCaps is the shape the
@@ -50,6 +51,47 @@ describe('estimatedCostUsd — a fixed-diff RANKER, asserted by ordering never b
 
   test('pure/reproducible — identical inputs yield identical output', () => {
     assert.equal(estimatedCostUsd(profile(3), 250), estimatedCostUsd(profile(3), 250));
+  });
+
+  // reasoningTier is the SECOND cost-bearing axis (zai-difficulty-0ea.3): a monotonic multiplicand that
+  // lets difficulty RAISE effort. As with roundCap, the contract is ORDERING, never absolute dollars.
+  const withTier = (roundCap, reasoningTier) => defaultEffortProfile({ roundCap, reasoningTier });
+
+  test('a null reasoningTier prices EXACTLY as the roundCap-only profile did (byte-identical baseline)', () => {
+    const diff = 100;
+    assert.equal(estimatedCostUsd(withTier(3, null), diff), estimatedCostUsd(profile(3), diff));
+  });
+
+  test('monotonic in reasoningTier at a fixed roundCap+diff (harder reasoning ⇒ higher estimate)', () => {
+    const diff = 100;
+    const tiers = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+    const costs = tiers.map((t) => estimatedCostUsd(withTier(3, t), diff));
+    for (let i = 1; i < costs.length; i++) {
+      assert.ok(costs[i] >= costs[i - 1], `tier ${tiers[i]} (${costs[i]}) must be ≥ ${tiers[i - 1]} (${costs[i - 1]})`);
+    }
+    // and a real raise exists across the span — the axis is not flat
+    assert.ok(costs[costs.length - 1] > costs[0], 'the top tier must cost strictly more than the floor');
+  });
+
+  test('a raised reasoning tier can cost MORE than the same roundCap at baseline — the RAISE is real', () => {
+    const diff = 100;
+    assert.ok(estimatedCostUsd(withTier(3, 'high'), diff) > estimatedCostUsd(withTier(3, null), diff));
+  });
+
+  test('reasoningFactor: null baseline is 1.0, strictly monotonic in TIER_RANK', () => {
+    assert.equal(reasoningFactor(null), 1.0);
+    assert.equal(reasoningFactor(undefined), 1.0);
+    const byRank = Object.entries(TIER_RANK).sort((a, b) => a[1] - b[1]).map(([t]) => t);
+    let prev = 0;
+    for (const t of byRank) {
+      const f = reasoningFactor(t);
+      assert.ok(f >= prev, `factor for ${t} (${f}) must be ≥ the lower rung (${prev})`);
+      prev = f;
+    }
+  });
+
+  test('reasoningFactor: an unknown tier throws — never silently under-prices a raised profile', () => {
+    assert.throws(() => reasoningFactor('turbo'), /Unknown reasoning tier/);
   });
 });
 

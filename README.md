@@ -97,7 +97,7 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `MAX_REVIEW_ROUNDS` | `5` | Max times the action reviews one PR; further pushes skip cleanly with no engine spawned (`0` = unlimited). Bounds cost on PRs pushed many times. |
 | `DAILY_BUDGET_USD` | `0` (off) | Daily spend ceiling honored as a **gradient** — see [Daily budget](#daily-budget). `0`/unset = off (today's default effort, no ledger I/O). PR mode only; requires `LEDGER_ISSUE` and `issues: write`. |
 | `LEDGER_ISSUE` | — | Issue number of the append-only daily cost ledger the budget gradient reads and writes (typically `${{ vars.LEDGER_ISSUE }}`). Required when `DAILY_BUDGET_USD` is set. |
-| `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a substantial diff draws the full `MAX_REVIEW_ROUNDS`. Only ever *lowers* effort. PR mode only. |
+| `DIFFICULTY_SCALING` | `false` (off) | Scale review effort to change difficulty — see [Difficulty scaling](#difficulty-scaling). An easy diff draws fewer review rounds; a complex diff reasons harder each round. PR mode only. |
 | `GITHUB_TOKEN` | `${{ github.token }}` | Token for GitHub API access (fetching the diff, posting the review). Defaults to the workflow's automatic token, which needs `pull-requests: write`. |
 | `GITHUB_REVIEW_TOKEN` | — | Token used for all GitHub calls when set; required to submit a **formal approval** (see [Approvals](#approvals)). |
 | `PR_NUMBER` | from event | PR number. Auto-detected on `pull_request` events; pass explicitly on others (e.g. `workflow_run`). |
@@ -154,9 +154,14 @@ Create one issue in the repo to serve as the ledger (its body is ignored; the ac
 
 ## Difficulty scaling
 
-Set `DIFFICULTY_SCALING: "true"` to match review effort to how hard the change actually is: a one-line typo fix and a concurrency refactor should not draw the same effort. The action derives a **free, pre-spend proxy** of the diff (its churn, how many files it spreads across, and whether it touches source vs. tests/docs only) and, from that, proposes how many review rounds the change warrants — so an easy diff draws fewer rounds while a substantial diff draws the full `MAX_REVIEW_ROUNDS`. Off by default: the action runs at full effort. PR mode only.
+Set `DIFFICULTY_SCALING: "true"` to match review effort to how hard the change actually is: a one-line typo fix and a concurrency refactor should not draw the same effort. The action derives a **free, pre-spend proxy** of the diff (its churn, how many files it spreads across, and whether it touches source vs. tests/docs only) and scales effort along **two axes**:
 
-Like the daily budget, it only ever **lowers** effort below `MAX_REVIEW_ROUNDS`, never raises it. And it composes with the budget: **difficulty proposes, budget caps** — difficulty picks a ceiling for the change, then (if `DAILY_BUDGET_USD` is set) the budget gradient rations within it. The two activate independently — enable either or both.
+- **Cheaper for easy diffs** — a trivial change draws **fewer review rounds** (a substantial change still draws the full `MAX_REVIEW_ROUNDS`).
+- **More thorough for complex diffs** — a substantial change **reasons harder each round** (raising the reasoning effort toward the engine's maximum), so a hard change gets deeper scrutiny per round without adding rounds.
+
+Off by default: the action runs at full effort. PR mode only.
+
+The round count is only ever **lowered** below `MAX_REVIEW_ROUNDS`; the reasoning tier is only ever **raised** above what a config configures — difficulty is a floor there, never a cap, and an explicitly-configured high reasoning tier is never lowered. It composes with the budget: **difficulty proposes, budget caps** — difficulty proposes a ceiling on both axes, then (if `DAILY_BUDGET_USD` is set) the budget gradient rations within it, capping the raised reasoning back down when spend is tight. The two activate independently — enable either or both.
 
 ```yaml
 jobs:

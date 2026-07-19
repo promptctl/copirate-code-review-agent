@@ -9,9 +9,11 @@ const {
   planScopes,
   runScopeWorkers,
   runMultiScopePass,
+  runMultiScope,
   buildPrMaterial,
   buildRepoMaterial,
 } = require('../src/multiscope');
+const { defaultEffortProfile } = require('../src/effort');
 const { buildReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { parseScopeValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
@@ -300,6 +302,64 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
       runMultiScopePass(passArgs({ get: () => alwaysFlaky })),
       err => err instanceof TransientError,
     );
+  });
+});
+
+// ── runMultiScope — the reasoning FOLD: the effort profile's proposed tier meets the chain here ────
+// The migration consumer for reasoningTier (zai-difficulty-0ea.3): runMultiScope folds the profile's
+// proposed raise onto each config's own reasoning as a maxTier FLOOR before the pass runs, so every
+// engine spawn — and configUsed (hence the attribution footer) — carries the effective tier.
+describe('runMultiScope — reasoningTier fold onto the chain', () => {
+  const material = {
+    changedPaths: [],
+    buildScoutPrompt: () => 'SCOUT',
+    buildWorkerPrompt: (focusText) => focusText,
+  };
+  const SCOPES = [{ name: 'a', focus: 'fa' }];
+
+  // A fake adapter that records the `reasoning` of every config it is spawned with.
+  function recordingRegistry(seen) {
+    const adapter = {
+      async produceReview({ config, buildPromptFor }) {
+        seen.push(config.reasoning);
+        if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
+        return { summary: 'sum', findings: [], usage: null };
+      },
+    };
+    return { get: () => adapter };
+  }
+
+  const runWith = async ({ chain, reasoningTier }) => {
+    const seen = [];
+    const { configUsed } = await runMultiScope({
+      chain, material, registry: recordingRegistry(seen), instructionsPath: 'x',
+      effort: defaultEffortProfile({ roundCap: 5, reasoningTier }), log: () => {}, sleepFn: async () => {},
+    });
+    return { seen, configUsed };
+  };
+
+  test('a proposed raise LIFTS an under-specified config — the engine spawns at the raised tier', async () => {
+    const { seen, configUsed } = await runWith({ chain: [{ engine: 'fake', name: 'c1', reasoning: 'low' }], reasoningTier: 'high' });
+    for (const r of seen) assert.equal(r, 'high'); // scout + every worker spawn saw the floor
+    assert.equal(configUsed.reasoning, 'high');     // configUsed (→ footer) reports the raise
+  });
+
+  test('a null proposed tier leaves each config\'s own reasoning untouched (byte-identical)', async () => {
+    const { seen, configUsed } = await runWith({ chain: [{ engine: 'fake', name: 'c1', reasoning: 'low' }], reasoningTier: null });
+    for (const r of seen) assert.equal(r, 'low');
+    assert.equal(configUsed.reasoning, 'low');
+  });
+
+  test('an explicit higher config is NEVER lowered by a smaller proposed raise', async () => {
+    const { seen, configUsed } = await runWith({ chain: [{ engine: 'fake', name: 'c1', reasoning: 'max' }], reasoningTier: 'high' });
+    for (const r of seen) assert.equal(r, 'max');
+    assert.equal(configUsed.reasoning, 'max');
+  });
+
+  test('a config with no reasoning at all takes the raise as its floor (null baseline → raise)', async () => {
+    const { seen, configUsed } = await runWith({ chain: [{ engine: 'fake', name: 'c1' }], reasoningTier: 'high' });
+    for (const r of seen) assert.equal(r, 'high');
+    assert.equal(configUsed.reasoning, 'high');
   });
 });
 
