@@ -105,6 +105,26 @@ jobs:
       # selects the provider and credential presence never steers it, so the unused input
       # is simply never read. The action fails loudly, before spending anything, if the
       # credential for the CURRENT target is the one missing.
+      #
+      # LOCAL MODEL PATH: This workflow runs the review against a local model (mlx_lm.server, LM
+      # Studio, Ollama) by default. The `local` provider uses the `opencode` engine (which
+      # supports the `openai-chat` API format) so the full review engine runs identically to
+      # production — scout, workers, multi-scope, PR posting. Most local models require no API key;
+      # when one is needed, set `LOCAL_API_KEY`. Configure the endpoint with `LOCAL_BASE_URL`
+      # (e.g. `http://127.0.0.1:8090/v1`) and optionally override the model with `LOCAL_MODEL`.
+      #
+      # To use a remote provider instead, set `PROVIDER: auto` (or another provider) and supply
+      # the corresponding credential.
+      #
+      # Example workflow step for local mode (configure the vars you need):
+      #   - name: Code Review (local)
+      #     id: review
+      #     uses: ./
+      #     with:
+      #       LOCAL_BASE_URL: ${{ vars.LOCAL_BASE_URL }}
+      #       LOCAL_MODEL: ${{ vars.LOCAL_MODEL }}
+      #       DEPENDENCY_DIFF: "true"
+      #       EXCLUDE_PATTERNS: "dist/**,build/**,*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
       - name: Code Review
         id: review
         uses: ./

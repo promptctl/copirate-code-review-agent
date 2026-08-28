@@ -35,9 +35,9 @@ the engine explored the repo or reviewed the diff only.
 
 Usage: node scripts/local-review.js [options]
 
-  --provider <name>   Provider: auto (default), deepseek, zai, codex, claude-subscription. Credential
+  --provider <name>   Provider: auto (default), deepseek, zai, codex, claude-subscription, local. Credential
                       read from the matching env var: DEEPSEEK_API_KEY / ZAI_API_KEY /
-                      OPENAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN.
+                      OPENAI_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / (optional) LOCAL_API_KEY.
   --config <file>     Load a CONFIG_FILE-format YAML (the same loader production runs use) instead of
                       a provider preset. Mutually exclusive with --provider/--model/--base-url — those
                       values live in the file.
@@ -56,7 +56,7 @@ Usage: node scripts/local-review.js [options]
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO, no defaults
 // that touch the world. `--flag value` and `--flag=value` both supported.
 function parseArgs(argv) {
-  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
+  const opts = { provider: 'local', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', workers: 4 };
   const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'workers', 'model', 'base-url', 'config', 'use']);
   // The options that pick between two sources via truthiness downstream — see the rejection below.
   const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider']);
@@ -208,13 +208,13 @@ function resolveConfigChain(opts) {
     const { loadConfig } = require('../src/config');
     return loadConfig(path.resolve(opts.config), opts.use, process.env);
   }
-  const { synthesizeProviderConfig } = require('../src/provider');
-  return [synthesizeProviderConfig({
-    provider: opts.provider,
-    openaiApiKey: process.env.OPENAI_API_KEY, openaiModel: opts.model, openaiBaseUrl: opts.baseUrl,
-    zaiApiKey: process.env.ZAI_API_KEY, zaiModel: opts.model, zaiBaseUrl: opts.baseUrl,
-    deepseekApiKey: process.env.DEEPSEEK_API_KEY, deepseekModel: opts.model, deepseekBaseUrl: opts.baseUrl,
-    claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN, claudeModel: opts.model,
+  // [LAW:one-source-of-truth] The per-provider input-key names are NOT restated here. This used to
+  // spell out every provider's credential/model/base-url key by hand, and eval/run-case.js carried a
+  // second copy of the same list that silently fell behind. Both now go through the one seam that
+  // owns the mapping, so a new provider row reaches both the day it lands.
+  const { resolveProviderConfig } = require('../src/provider');
+  return [resolveProviderConfig({
+    provider: opts.provider, model: opts.model, baseUrl: opts.baseUrl, env: process.env,
   })];
 }
 
