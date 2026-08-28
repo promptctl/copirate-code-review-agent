@@ -329,10 +329,76 @@ describe('PROVIDERS rows agree with the real adapter capabilities', () => {
     // they did not. [LAW:no-silent-failure]
     test(`'${name}': reads a base-URL input only if its preset allows an override`, () => {
       const preset = PRESETS[spec.preset];
-      const reads = spec.fields({ openaiBaseUrl: 'X', zaiBaseUrl: 'X', deepseekBaseUrl: 'X' }).baseUrl;
+      // Asserted against the DECLARATION, not a probe call: a pinned row must not name a base-URL
+      // key at all, which is a stronger statement than "a probe bag produced undefined" — it also
+      // means resolveProviderConfig can never WRITE one into a bag for this provider.
       if ('baseUrl' in preset) {
-        assert.equal(reads, undefined, `pinned preset '${spec.preset}' must not read a base-URL input`);
+        assert.ok(
+          !('baseUrl' in spec.inputKeys),
+          `pinned preset '${spec.preset}' must not declare a base-URL input key`,
+        );
       }
     });
   }
+});
+
+describe('local provider', () => {
+  test('without a key produces an opencode config with no credential', () => {
+    const config = synthesizeProviderConfig({ provider: 'local' }, MOCK_REGISTRY);
+    assert.equal(config.engine, 'opencode');
+    assert.equal(config.model, 'openai/local-model');
+    assert.deepEqual(config.endpoint, {
+      apiType: 'openai-responses',
+      baseUrl: 'https://api.openai.com/v1',
+      credential: { kind: 'api-key', value: '' },
+    });
+    assert.equal(config.name, 'local-default');
+  });
+
+  test('with a key includes it in the endpoint', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'local', localApiKey: 'sk-local' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.endpoint.credential.value, 'sk-local');
+  });
+
+  test('model override replaces the default', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'local', localModel: 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.model, 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit');
+  });
+
+  test('base-url override works (local models need it)', () => {
+    const config = synthesizeProviderConfig(
+      { provider: 'local', localBaseUrl: 'http://127.0.0.1:8090/v1' },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.endpoint.baseUrl, 'http://127.0.0.1:8090/v1');
+  });
+
+  test('combining model + base-url + key produces a complete local review config', () => {
+    const config = synthesizeProviderConfig(
+      {
+        provider: 'local',
+        localApiKey: 'optional-key',
+        localModel: 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit',
+        localBaseUrl: 'http://127.0.0.1:8090/v1',
+      },
+      MOCK_REGISTRY,
+    );
+    assert.equal(config.engine, 'opencode');
+    assert.equal(config.model, 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit');
+    assert.equal(config.endpoint.baseUrl, 'http://127.0.0.1:8090/v1');
+    assert.equal(config.endpoint.credential.value, 'optional-key');
+  });
+
+  test('PROVIDER=local is a valid provider name', () => {
+    assert.ok(
+      PROVIDER_NAMES.includes('local'),
+      `local must be in PROVIDER_NAMES; got: ${PROVIDER_NAMES.join(', ')}`,
+    );
+  });
 });

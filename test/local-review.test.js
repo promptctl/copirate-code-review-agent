@@ -44,9 +44,9 @@ test('parseArgs applies defaults and both flag forms', () => {
   assert.equal(o.mode, 'repo');
   assert.equal(o.scope, 'auth');
   assert.equal(o.range, 'HEAD~1 HEAD');
-  assert.equal(parseArgs([]).provider, 'auto');
+  assert.equal(parseArgs([]).provider, 'local');
   // Named against an override-capable provider: bare `--base-url` now takes the DEFAULT provider,
-  // which is 'auto' → the pinned subscription, and is rejected (see the aliased-pinned test below).
+  // which is 'local' — a non-pinned api-key provider, so the flag is accepted (local models need base-url).
   assert.equal(parseArgs(['--provider=deepseek', '--base-url=http://x']).baseUrl, 'http://x');
   assert.equal(parseArgs(['--help']).help, true);
 });
@@ -80,15 +80,17 @@ test('parseArgs keeps --config exclusive with the preset flags, and --use tied t
 // invocation is the COMMON way to reach the pinned case, not an exotic one. A guard that matched the
 // concrete name only would wave this through and silently drop the flag: the same silent failure,
 // reached through the default instead of the explicit name.
-test('parseArgs rejects --base-url for an aliased pinned provider, naming both names', () => {
-  for (const argv of [['--base-url', 'http://x'], ['--provider', 'auto', '--base-url', 'http://x']]) {
+  // [LAW:no-silent-failure] The subscription provider's host is pinned, so --base-url has nothing to
+  // act on. Accepting the flag and dropping it would leave the operator believing they had redirected
+  // an endpoint they had not.
+  // Note: the default provider is now 'local' (not pinned), so we must explicitly name the pinned provider.
+  for (const argv of [['--provider', 'claude-subscription', '--base-url', 'http://x']]) {
     assert.throws(
       () => parseArgs(argv),
-      /--base-url does not apply to --provider 'auto' \(→ 'claude-subscription'\): its endpoint is PINNED to https:\/\/api\.anthropic\.com/,
+      /--base-url does not apply to --provider 'claude-subscription': its endpoint is PINNED to https:\/\/api\.anthropic\.com/,
       `argv ${JSON.stringify(argv)} must be rejected`,
     );
   }
-});
 
 // An unknown provider is synthesizeProviderConfig's to reject, naming every valid value. parseArgs
 // must not grow a second enforcer of that rule — it passes the name through untouched.

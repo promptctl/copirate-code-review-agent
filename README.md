@@ -56,13 +56,14 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 
 | `PROVIDER` | Engine | Credential | Billing | Default model |
 |---|---|---|---|---|
-| `auto` *(default)* | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
+| `auto` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
+| `local` *(default)* | OpenCode → OpenAI (local) | (optional) `LOCAL_API_KEY` | free (local model) | `openai/local-model` |
 | `deepseek` | Claude Code → DeepSeek | `DEEPSEEK_API_KEY` | per token | `deepseek-v4-pro` |
 | `zai` | Claude Code → Z.ai | `ZAI_API_KEY` | per token | `glm-5.1` |
 | `codex` | Codex → OpenAI | `OPENAI_API_KEY` | per token | `gpt-5.4-mini` |
 | `claude-subscription` | Claude Code → Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` | your Claude Pro/Max plan | `claude-sonnet-5` |
 
-`auto` resolves to whichever provider the action currently points at — **`claude-subscription` since 1.42.0**, DeepSeek before that. Pinning `auto` lets the maintainer retarget every consumer with a release, without anyone editing their workflow; supply the credential for whatever `auto` currently resolves to, or supply several and let the retarget be free. A repo missing the current target's credential **fails at startup naming the input to set** — loudly, before any spend — never by silently falling back to another provider whose key happens to be present.
+`auto` resolves to `claude-subscription` (for backward compatibility). Use it when you want a remote provider.
 
 To run Codex instead:
 
@@ -110,8 +111,10 @@ For a failover chain or per-PR engine selection, use the [config file](#multi-en
 | `ZAI_SYSTEM_PROMPT` | — | Optional extra system prompt appended to the reviewer for the `zai` provider. Empty by default; the built-in review charter already carries the whole review standard. |
 | `OPENAI_API_KEY` | — | Required for `codex`. |
 | `OPENAI_MODEL` | `gpt-5.4-mini` | Model for the `codex` provider. |
-| `OPENAI_REASONING_EFFORT` | — | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-Responses-compatible endpoint (e.g. Azure or a gateway). |
+| `LOCAL_API_KEY` | — | Optional API key for the `local` provider (most local models require none). |
+| `LOCAL_MODEL` | `openai/local-model` | Model identifier for the `local` provider (sent as-is to the endpoint). |
+| `LOCAL_BASE_URL` | `https://api.openai.com/v1` | Base URL for the `local` provider's OpenAI-compatible endpoint (e.g. `http://127.0.0.1:8090/v1`). |
 | `MODE` | `pr` | `pr` (review a PR diff, post an inline review) or `repo` ([whole-repo review](#whole-repo-review)). |
 | `SCOPE` | — | Free-text focus for `MODE: repo` (e.g. `the auth layer`). Ignored when `MODE: pr`. |
 | `CONFIG_FILE` | `.github/review-agents.yml` | [Multi-engine config file](#multi-engine-configuration). When present it owns engine selection and the `PROVIDER`/key inputs are ignored. |
