@@ -331,6 +331,9 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   costs a single attempt instead of abandoning the rest of the suite. A lane returns only when
   every job left in the queue is one it has already tried. Which env var the credential travels
   under is derived from `src/provider.js`, not written here.
+  Lanes share one host, so each replay is handed `--memory-budget` = host memory ÷ lane count
+  (`laneMemoryShare`): a lone `run-case.js` plans its engine lanes against the whole machine,
+  and L of them each doing so would multiply the per-lane memory guardrail by L.
   An interrupt (Ctrl-C) is forwarded to every replay still running before the runner exits;
   replays run in their own process groups for the deadline's sake, which also puts them out of
   reach of the terminal's own signal.
