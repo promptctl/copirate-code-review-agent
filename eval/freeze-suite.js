@@ -411,6 +411,17 @@ function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }) 
   };
 }
 
+// [LAW:parse-dont-validate] The memory one replay may plan its lanes against: the host split evenly
+// across the suite's concurrent replays, so L children together respect the per-lane guardrail one
+// child would. A count below one has no share — that is a wiring bug, thrown loudly rather than
+// handed to the child as Infinity. [LAW:no-silent-failure]
+function laneMemoryShare(totalMemBytes, laneCount) {
+  if (!Number.isInteger(laneCount) || laneCount < 1) {
+    throw new Error(`laneMemoryShare: laneCount must be a positive integer (got ${JSON.stringify(laneCount)})`);
+  }
+  return Math.floor(totalMemBytes / laneCount);
+}
+
 // [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
 // it — the deadline, the process group, the log — belongs to superviseSpawn above.
 function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, logPath, timeoutMinutes }) {
@@ -568,11 +579,10 @@ async function main() {
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
-  // Each replay plans its lanes against its SHARE of the host: L concurrent run-case children each sizing
-  // to os.totalmem() would multiply the per-lane memory guardrail by L. The share is the suite's fact
-  // (it knows L), handed to the replay it injects — the lane loop never learns it — and derived inside
-  // the replay, where a lane exists to divide by. [LAW:one-source-of-truth]
-  const replay = args => runReplay({ ...args, memoryBudget: Math.floor(os.totalmem() / lanes.length) });
+  // Each replay plans its lanes against its SHARE of the host (laneMemoryShare). The share is the
+  // suite's fact — it knows L — handed to the replay it injects, so the lane loop never learns it, and
+  // derived inside the replay, where a lane exists to divide by. [LAW:one-source-of-truth]
+  const replay = args => runReplay({ ...args, memoryBudget: laneMemoryShare(os.totalmem(), lanes.length) });
   await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
@@ -591,4 +601,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

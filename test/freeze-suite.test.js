@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -490,6 +490,21 @@ describe('credentialInputFor names the env var a pin travels under', () => {
 // fail, it silently replays on whatever credential the parent happened to be holding, which is the one
 // failure this file's provider-table dependency exists to prevent. Asserted directly rather than through
 // a spawn, where it is invisible.
+// The arithmetic the memory budget exists for: L concurrent replays each planning against the whole
+// host would multiply the per-lane guardrail by L, so each is handed its even share.
+describe('laneMemoryShare splits the host evenly across the concurrent replays', () => {
+  const GiB = 2 ** 30;
+  test('one lane plans against the whole host; three lanes get a third each, floored to whole bytes', () => {
+    assert.equal(laneMemoryShare(8 * GiB, 1), 8 * GiB);
+    assert.equal(laneMemoryShare(8 * GiB, 3), Math.floor((8 * GiB) / 3));
+    assert.equal(laneMemoryShare(7, 2), 3);
+  });
+  test('a lane count below one has no share and is refused, never handed on as Infinity', () => {
+    assert.throws(() => laneMemoryShare(8 * GiB, 0), /laneCount must be a positive integer/);
+    assert.throws(() => laneMemoryShare(8 * GiB, 1.5), /laneCount must be a positive integer/);
+  });
+});
+
 describe('replaySpawnSpec puts the lane credential in the pinned provider slot', () => {
   const spec = () => replaySpawnSpec({
     job: { name: 'alpha', dir: '/cases/alpha', level: 1 },
