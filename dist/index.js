@@ -40070,21 +40070,35 @@ function decodePayload(raw) {
 // `toCost` is the read-side inverse of `figure`: a decoded figure (or null) back into the same
 // discriminated Cost the writer held. It lives in the table for the reason every other column does —
 // so "which basis is this" is answered once, and the answer carries everything that follows from it.
+//
+// `restate` is what a parsed record's own facts reprice to under today's table (restatedCost), and
+// it is a column for the same reason: a subscription round records real tokens and an Anthropic
+// model id, so a restatement that consulted the table regardless of basis would answer `no-price`
+// and send a maintainer to add a model the table can never price — the misattribution this file
+// exists to prevent, one arm over. The basis selects the restatement as it selects everything else.
 const BASIS = {
   dollars: {
     marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: c => c.usd,
     toCost: f => (f === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: f }),
+    restate: record => restatedFromTable(record),
   },
   subscription: {
     marker: 'agent-review-notional-usd', bucket: 'notional', field: 'notionalUsd', figure: c => c.notionalUsd,
     toCost: f => ({ basis: 'subscription', notionalUsd: f }),
+    // Billed to quota, and the list price is Anthropic's own figure, which no row of this table
+    // prices: the honest restatement is the existing "notional not reported" state, never a table
+    // reason. The spend stays zero, exactly as recorded. [LAW:no-silent-failure]
+    restate: () => ({ basis: 'subscription', notionalUsd: null }),
   },
   // A write-side-only row: unpriced shares the dollars marker NAME (that is what keeps an unpriced
   // round inside the spend accounting as a round of unknown cost), so a body never reads back to
   // here — the dollars row's toCost resolves a figureless dollars marker to exactly this basis.
+  // It restates as dollars does: a round the run could not price still recorded its parts, and a
+  // card the table has gained since is exactly what an audit should find.
   unpriced: {
     marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: () => null,
     toCost: f => BASIS.dollars.toCost(f),
+    restate: record => BASIS.dollars.restate(record),
   },
 };
 
@@ -40386,20 +40400,25 @@ function parseCost(body) {
 
 // [LAW:effects-at-boundaries] Pure: what a parsed record's OWN facts reprice to under today's table
 // — the audit the record exists for, to be set beside record.cost, what the run believed at the
-// time. Each part plus the recorded start instant is a spawn, priced by priceFromTable exactly as
-// the run priced each request, and summed by the one rule (sumCost) so a part no card covers makes
-// the restatement unpriced with that part's reason. A record missing any of the three facts — a
-// legacy bare figure, a span-only round, a config that named no model — restates as not-reported
-// rather than guessed. [LAW:no-silent-failure]
+// time. The recorded basis selects the restatement (BASIS.restate); this is the table-priced arm.
+// Each part plus the recorded start instant is a spawn, priced by priceFromTable exactly as the run
+// priced each request, and summed by the one rule (sumCost) so a part no card covers makes the
+// restatement unpriced with that part's reason. A record missing any of the three facts — a legacy
+// bare figure, a span-only round, a config that named no model — restates as not-reported rather
+// than guessed. [LAW:no-silent-failure]
 // Every part is priced at the record's START, because the marker holds the pass envelope and not
 // each spawn's own instant (see THE TOKEN RECORD): a pass straddling a time window restates at its
 // opening rate, as a restatement always has. An unreadable `from` reaches instantMs and throws there
 // — the price lookup's own loud arm, which an audit should hear rather than read around.
-function restatedCost(record) {
+function restatedFromTable(record) {
   const { parts, model, from } = record;
   if (parts === null || model === null || from === null) return { basis: 'unpriced', reason: 'not-reported' };
   const at = new Date(from);
   return sumCost(parts.map(part => priceFromTable({ at, ...part }, model)));
+}
+
+function restatedCost(record) {
+  return basisOf(record.cost).restate(record);
 }
 
 // The spend reader: the dollars figure alone, 'unknown' when a spend-basis marker recorded none, and

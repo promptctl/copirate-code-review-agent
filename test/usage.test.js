@@ -945,6 +945,23 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
     assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
   });
 
+  // [LAW:one-source-of-truth] The basis selects the restatement. A subscription round records real
+  // tokens and an Anthropic model id the table never prices; restating it through the table would
+  // answer no-price and send a maintainer to PRICE_SOURCES for a model that cannot go there.
+  test('a subscription record restates as billed-to-quota with no table figure, never as no-price', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG));
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+    assert.deepEqual(restatedCost(record), { basis: 'subscription', notionalUsd: null });
+  });
+
+  // A round the run could not price still recorded its parts; if the table has since gained the
+  // card, the audit finds a figure — which is the whole point of restating.
+  test('an unpriced dollars record with parts restates through the table', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'unpriced', reason: 'schedule-gap' }), DEEPSEEK_CONFIG));
+    assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
+  });
+
   test('a record missing its model or start instant restates as not-reported, never guessed', () => {
     const noModel = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' }));
     assert.deepEqual(restatedCost(noModel), { basis: 'unpriced', reason: 'not-reported' });
