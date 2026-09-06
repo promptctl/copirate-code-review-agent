@@ -14,7 +14,7 @@
 // time is the model's own stochasticity, which is why -n runs the case repeatedly and each run's
 // artifacts land in their own append-only dir for a downstream scorer/baseline to reduce.
 //
-//   node eval/run-case.js <case-dir> [-n <repeats>] [--out <dir>]
+//   node eval/run-case.js <case-dir> [-n <repeats>] [--out <dir>] [--memory-budget <bytes>]
 //
 // The provider credential is read from the same env var the action uses (CLAUDE_CODE_OAUTH_TOKEN /
 // DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY, selected by the case's pinned provider — the
