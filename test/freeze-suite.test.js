@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -502,6 +502,22 @@ describe('laneMemoryShare splits the host evenly across the concurrent replays',
   test('a lane count below one has no share and is refused, never handed on as Infinity', () => {
     assert.throws(() => laneMemoryShare(8 * GiB, 0), /laneCount must be a positive integer/);
     assert.throws(() => laneMemoryShare(8 * GiB, 1.5), /laneCount must be a positive integer/);
+  });
+});
+
+// The composition main() runs: the share is computed from the host and the LANE count (not the job
+// count, and not with the arguments swapped) and lands on the replay call as memoryBudget.
+describe('laneReplay hands the injected replay its share of the host', () => {
+  test('two lanes on an 8 GiB host: the replay receives the call unchanged plus a 4 GiB budget', async () => {
+    const seen = [];
+    const replay = laneReplay({
+      lanes: [{ name: 'A', value: 'a' }, { name: 'B', value: 'b' }],
+      totalMemBytes: 8 * 2 ** 30,
+      replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
+    });
+    const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
+    assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30 }]);
   });
 });
 
