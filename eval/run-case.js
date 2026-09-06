@@ -14,7 +14,7 @@
 // time is the model's own stochasticity, which is why -n runs the case repeatedly and each run's
 // artifacts land in their own append-only dir for a downstream scorer/baseline to reduce.
 //
-//   node eval/run-case.js <case-dir> [-n <repeats>] [--out <dir>] [--workers <N>]
+//   node eval/run-case.js <case-dir> [-n <repeats>] [--out <dir>] [--memory-budget <bytes>]
 //
 // The provider credential is read from the same env var the action uses (CLAUDE_CODE_OAUTH_TOKEN /
 // DEEPSEEK_API_KEY / ZAI_API_KEY / OPENAI_API_KEY, selected by the case's pinned provider — the
@@ -37,7 +37,10 @@ Usage: node eval/run-case.js <case-dir> [options]
   <case-dir>          Path to a frozen case directory (e.g. eval/cases/cc-candybar-150-transcript-perf).
   -n, --repeats <N>   Number of times to replay the case (default: 1). Each run gets its own dir.
   --out <dir>         Output root (default: eval/out). Artifacts go under <out>/<case>/<ts>-run<i>/.
-  --workers <N>       Max concurrent scope workers (default: 4).
+  --memory-budget <bytes>
+                      Host memory this replay plans its lanes against (default: the whole machine).
+                      freeze-suite passes each concurrent replay its share, so L replays keep the
+                      per-lane memory guardrail instead of each assuming the host is theirs.
   --help              Show this help.
 
 The engine (provider/model/reasoning) is PINNED by case.json and cannot be overridden here — a replay
@@ -47,8 +50,8 @@ on a different model would corrupt any baseline comparison, so a mismatch is ref
 // [LAW:effects-at-boundaries] Pure arg parse: flags + one required positional map to a plain options
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
-  const opts = { caseDir: null, repeats: 1, out: 'eval/out', workers: 4 };
-  const known = new Set(['repeats', 'out', 'workers']);
+  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -60,16 +63,21 @@ function parseArgs(argv) {
     }
     const eq = arg.indexOf('=');
     const rawName = arg.startsWith('--') ? arg.slice(2, eq === -1 ? undefined : eq) : arg.slice(1, eq === -1 ? undefined : eq);
-    const name = aliases[rawName] || rawName;
-    if (!known.has(name)) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
+    // Resolved to the canonical long spelling before anything reads it, so both error messages name a
+    // flag that exists: `-n` reports as --repeats, never --n. The canonical spelling stays hyphenated
+    // (--memory-budget), and keyFor maps it to the options key; freeze-suite.js's parser is the same
+    // shape. [LAW:one-source-of-truth]
+    const canonical = aliases[rawName] || rawName;
+    const name = keyFor[canonical];
+    if (!name) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
-    if (value === undefined) throw new Error(`Option --${name} requires a value.`);
+    if (value === undefined) throw new Error(`Option --${canonical} requires a value.`);
     // [LAW:no-silent-failure] A space-separated value that is itself a long option (starts with `--`)
-    // is a missing value, not a directory literally named '--workers=2'; consuming it would silently
+    // is a missing value, not a directory literally named '--repeats=2'; consuming it would silently
     // swallow the next flag and drop the user's intent. `--` is the exact discriminator — a negative
     // number like `-1` (single dash) is NOT caught here, so it still reaches its own validator
     // (parsePositiveInt) for the accurate "positive integer" error. The `=` form is explicit, so honored.
-    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${name} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
+    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${canonical} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
     opts[name] = value;
   }
   if (opts.caseDir === null) throw new Error('Missing required <case-dir> argument. See --help.');
@@ -77,7 +85,9 @@ function parseArgs(argv) {
   // rejected here, at the boundary, so no downstream code re-checks. parsePositiveInt rejects
   // non-integers outright rather than truncating (a baseline comparison depends on the EXACT repeat count).
   opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
-  opts.workers = parsePositiveInt(opts.workers, '--workers');
+  // null is the recorded absence — "plan against the whole host" — resolved where the host is read, not
+  // here: this parser does no IO. [LAW:effects-at-boundaries]
+  if (opts.memoryBudget !== null) opts.memoryBudget = parsePositiveInt(opts.memoryBudget, '--memory-budget');
   return opts;
 }
 
@@ -345,8 +355,7 @@ async function main() {
     const candidate = workingTree();
     const config = resolvePinnedConfig(manifest.engine, process.env);
     const { TRANSCRIPT_DIR } = require('../src/debug');
-    const { runMultiScope } = require('../src/multiscope');
-    const { defaultEffortProfile } = require('../src/effort');
+    const { runMultiScope, laneCeilingFromMemory } = require('../src/multiscope');
     const registry = require('../src/engine/registry');
     const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
 
@@ -377,9 +386,12 @@ async function main() {
       fs.mkdirSync(runDir, { recursive: true });
 
       process.stderr.write(`[run ${i}/${opts.repeats}] reviewing…\n`);
+      // The lane ceiling is planned against the memory this replay was GIVEN, not the whole host: under
+      // freeze-suite, L replays share one machine, and each one sizing itself to os.totalmem() multiplies
+      // the per-lane guardrail by L. [LAW:one-source-of-truth]
       const { review } = await runMultiScope({
         chain: [config], material, registry, instructionsPath,
-        effort: { ...defaultEffortProfile(), scopeConcurrency: opts.workers },
+        laneCeiling: laneCeilingFromMemory(opts.memoryBudget ?? os.totalmem()),
         log: msg => process.stderr.write(`[run ${i}] ${msg}\n`),
       });
 
@@ -390,7 +402,7 @@ async function main() {
       // applied here; the scorer matches against the frozen diff itself). [LAW:one-source-of-truth]
       writeRunRecord(runDir, {
         meta: {
-          case: manifest.name, timestamp, run: i, repeats: opts.repeats, workers: opts.workers,
+          case: manifest.name, timestamp, run: i, repeats: opts.repeats,
           config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
           candidate,
           findingCount: review.findings.length,

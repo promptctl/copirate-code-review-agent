@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -490,18 +490,52 @@ describe('credentialInputFor names the env var a pin travels under', () => {
 // fail, it silently replays on whatever credential the parent happened to be holding, which is the one
 // failure this file's provider-table dependency exists to prevent. Asserted directly rather than through
 // a spawn, where it is invisible.
+// The arithmetic the memory budget exists for: L concurrent replays each planning against the whole
+// host would multiply the per-lane guardrail by L, so each is handed its even share.
+describe('laneMemoryShare splits the host evenly across the concurrent replays', () => {
+  const GiB = 2 ** 30;
+  test('one lane plans against the whole host; three lanes get a third each, floored to whole bytes', () => {
+    assert.equal(laneMemoryShare(8 * GiB, 1), 8 * GiB);
+    assert.equal(laneMemoryShare(8 * GiB, 3), Math.floor((8 * GiB) / 3));
+    assert.equal(laneMemoryShare(7, 2), 3);
+  });
+  test('a lane count below one has no share and is refused, never handed on as Infinity', () => {
+    assert.throws(() => laneMemoryShare(8 * GiB, 0), /laneCount must be a positive integer/);
+    assert.throws(() => laneMemoryShare(8 * GiB, 1.5), /laneCount must be a positive integer/);
+  });
+});
+
+// The composition main() runs: the share is computed from the host and the LANE count (not the job
+// count, and not with the arguments swapped) and lands on the replay call as memoryBudget.
+describe('laneReplay hands the injected replay its share of the host', () => {
+  test('two lanes on an 8 GiB host: the replay receives the call unchanged plus a 4 GiB budget', async () => {
+    const seen = [];
+    const replay = laneReplay({
+      lanes: [{ name: 'A', value: 'a' }, { name: 'B', value: 'b' }],
+      totalMemBytes: 8 * 2 ** 30,
+      replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
+    });
+    const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
+    assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30 }]);
+  });
+});
+
 describe('replaySpawnSpec puts the lane credential in the pinned provider slot', () => {
   const spec = () => replaySpawnSpec({
     job: { name: 'alpha', dir: '/cases/alpha', level: 1 },
     lane: { name: 'TOKEN_B', value: 'lane-b-credential' },
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     outRoot: '/out/freeze-abc',
+    memoryBudget: 8 * 2 ** 30,
   });
 
-  test('one replay of one case at N=1, into the suite out root', () => {
+  test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
     const s = spec();
     assert.equal(s.command, process.execPath);
-    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc']);
+    // The share arrives as bytes on the child's own flag: L children each defaulting to the whole host
+    // would multiply the per-lane memory guardrail by L.
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30)]);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });
