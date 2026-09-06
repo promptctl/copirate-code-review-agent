@@ -317,6 +317,22 @@ describe('renderTimingBreakdown', () => {
     assert.match(block, /\| review \| unclocked-scope \| failed \| unclocked \|/);
   });
 
+  test("a chain with one unclocked attempt renders its sum as a lower bound, with the phase clauses' '+'", () => {
+    const block = renderTimingBreakdown({
+      laneCount: 2, sweepCap: 1, scopeCount: 2,
+      spawns: [
+        { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
+        worker('mixed', 0, 1, 3),
+        { phase: 'worker', scope: 'mixed', pass: 1, outcome: 'failed', usage: null },
+        worker('whole', 0, 1, 2),
+      ],
+    }, 5 * MIN);
+    // mixed's chain is AT LEAST 2m (its sweep went unclocked) and wins over whole's exact 1m; the '+'
+    // says the figure understates, never leaving it indistinguishable from a chain that is exactly 2m
+    assert.match(block, /slowest scope: mixed \(2m00s\+\)/);
+    assert.match(block, /sweep 1 unclocked/);
+  });
+
   test('a scope name cannot inject table or markdown structure into the rendered block', () => {
     // Scope names are LLM-minted free text; the renderer's one escape kills the characters that
     // ARE the structure (pipes, newlines) and neuters markdown/HTML metacharacters.

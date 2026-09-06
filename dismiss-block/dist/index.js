@@ -31030,17 +31030,23 @@ function renderRunningTotal(elapsedMs, budgetMs) {
   return budgetMs == null ? `${elapsed} (no budget)` : `${elapsed} of ${formatMs(budgetMs)} budget`;
 }
 
-// [LAW:dataflow-not-control-flow] One clause shape for every phase, selected by the VALUES of its
-// durations, not by branches that skip the phase: no records at all is 'missing' (the explicit gap
-// the ticket demands for an absent phase), all-unclocked is 'unclocked', a partial clock renders
-// as the sum marked '+' — the same lower-bound convention the cost tally already uses — and a full
-// clock is the plain figure.
+// [LAW:single-enforcer] The ONE rendering of a set of attempt durations as a figure, selected by the
+// VALUES: all-unclocked is 'unclocked', a partial clock is the sum marked '+' — the lower-bound
+// convention the cost tally already uses — and a full clock is the plain figure. Every clause that
+// shows a summed duration (a phase, a scope's chain) renders through here, so no clause can show a
+// partial sum as if it were whole.
+function clockedText(durations) {
+  const sum = sumMs(durations);
+  const partial = sum != null && durations.some(d => d == null) ? '+' : '';
+  return `${formatMs(sum)}${partial}`;
+}
+
+// [LAW:dataflow-not-control-flow] One clause shape for every phase, not branches that skip the phase:
+// no records at all is 'missing' (the explicit gap the ticket demands for an absent phase); anything
+// else is the phase's clocked figure.
 function phaseClause(label, durations) {
   if (durations.length === 0) return `${label} missing`;
-  const sum = sumMs(durations);
-  if (sum == null) return `${label} unclocked`;
-  const partial = durations.some(d => d == null) ? '+' : '';
-  return `${label} ${formatMs(sum)}${partial}`;
+  return `${label} ${clockedText(durations)}`;
 }
 
 // pass 0 is the review of record; pass 1..N are convergence sweeps — the same vocabulary the run
@@ -31109,14 +31115,15 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
     ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
   ].join(' · ');
   // The slowest CHAIN, not the slowest attempt: a scope's passes run back to back in its lane, so its
-  // wall clock is the sum of its clocked attempts (a partial clock is the same lower bound the phase
-  // clauses carry). Scopes in first-recorded order, so ties keep the first; a scope with no clocked
-  // attempt sums to null and cannot win; all-unclocked stays an explicit 'unclocked', never a
-  // fabricated winner. [LAW:one-source-of-truth]
+  // wall clock is the sum of its clocked attempts, rendered through clockedText so a chain with an
+  // unclocked attempt shows its '+' exactly as a phase does. Scopes in first-recorded order, so ties
+  // keep the first; a scope with no clocked attempt sums to null and cannot win; all-unclocked stays
+  // an explicit 'unclocked', never a fabricated winner. [LAW:one-source-of-truth]
   const chains = [...new Set(workerRows.map(s => s.scope))]
-    .map(scope => ({ scope, ms: sumMs(workerRows.filter(s => s.scope === scope).map(s => s.ms)) }));
+    .map(scope => ({ scope, durations: workerRows.filter(s => s.scope === scope).map(s => s.ms) }))
+    .map(c => ({ ...c, ms: sumMs(c.durations) }));
   const slowest = chains.reduce((best, c) => (c.ms != null && (best == null || c.ms > best.ms) ? c : best), null);
-  const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${formatMs(slowest.ms)})` : 'slowest scope: unclocked';
+  const slowestClause = slowest ? `slowest scope: ${scopeText(slowest.scope)} (${clockedText(slowest.durations)})` : 'slowest scope: unclocked';
   const scheduleSentence = `${d.scopeCount} scope(s) on ${d.laneCount} lane(s), deepest chain ${d.passes.length} pass(es)`;
   const line = `${head} · ${phaseClause('spawns', allDurations)} (${spawnCount} attempt(s))`
     + ` — ${phases} · ${slowestClause} · ${scheduleSentence}_`;
