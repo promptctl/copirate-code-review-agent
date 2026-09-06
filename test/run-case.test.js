@@ -35,6 +35,8 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['a', 'b']), /Unexpected second positional/);
   assert.throws(() => parseArgs(['foo', '--nope', 'v']), /Unknown option/);
   assert.throws(() => parseArgs(['foo', '--repeats']), /requires a value/);
+  // An alias is reported under its canonical spelling — a flag the reader can find, not --n.
+  assert.throws(() => parseArgs(['foo', '-n']), /Option --repeats requires a value/);
   assert.throws(() => parseArgs(['foo', '-n', '0']), /positive integer/);
   assert.throws(() => parseArgs(['foo', '-n', 'x']), /positive integer/);
   // Non-integers are rejected, never silently truncated (parseInt('2.5') would have accepted 2).

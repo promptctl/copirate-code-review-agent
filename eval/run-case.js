@@ -51,8 +51,8 @@ on a different model would corrupt any baseline comparison, so a mismatch is ref
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
   const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null };
-  const known = new Set(['repeats', 'out', 'memoryBudget']);
-  const aliases = { n: 'repeats', 'memory-budget': 'memoryBudget' };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget' };
+  const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') return { help: true };
@@ -63,17 +63,21 @@ function parseArgs(argv) {
     }
     const eq = arg.indexOf('=');
     const rawName = arg.startsWith('--') ? arg.slice(2, eq === -1 ? undefined : eq) : arg.slice(1, eq === -1 ? undefined : eq);
-    const name = aliases[rawName] || rawName;
-    const flag = arg.slice(0, eq === -1 ? undefined : eq);
-    if (!known.has(name)) throw new Error(`Unknown option: ${flag}`);
+    // Resolved to the canonical long spelling before anything reads it, so both error messages name a
+    // flag that exists: `-n` reports as --repeats, never --n. The canonical spelling stays hyphenated
+    // (--memory-budget), and keyFor maps it to the options key; freeze-suite.js's parser is the same
+    // shape. [LAW:one-source-of-truth]
+    const canonical = aliases[rawName] || rawName;
+    const name = keyFor[canonical];
+    if (!name) throw new Error(`Unknown option: ${arg.slice(0, eq === -1 ? undefined : eq)}`);
     const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
-    if (value === undefined) throw new Error(`Option ${flag} requires a value.`);
+    if (value === undefined) throw new Error(`Option --${canonical} requires a value.`);
     // [LAW:no-silent-failure] A space-separated value that is itself a long option (starts with `--`)
     // is a missing value, not a directory literally named '--repeats=2'; consuming it would silently
     // swallow the next flag and drop the user's intent. `--` is the exact discriminator — a negative
     // number like `-1` (single dash) is NOT caught here, so it still reaches its own validator
     // (parsePositiveInt) for the accurate "positive integer" error. The `=` form is explicit, so honored.
-    if (eq === -1 && value.startsWith('--')) throw new Error(`Option ${flag} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
+    if (eq === -1 && value.startsWith('--')) throw new Error(`Option --${canonical} requires a value, but got what looks like another flag: ${JSON.stringify(value)}.`);
     opts[name] = value;
   }
   if (opts.caseDir === null) throw new Error('Missing required <case-dir> argument. See --help.');
