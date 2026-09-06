@@ -64,8 +64,15 @@ const DEEPSEEK_PEAK = [
 // integers, so "≤272,000" and "[0, 272,001)" are the same set, and one convention for every axis beats
 // a second inclusive-end rule that only this axis would use. [LAW:one-type-per-behavior]
 const OPENAI_LONG_CONTEXT_FROM = 272_001;
-const SHORT_CONTEXT = { axis: 'contextTokens', range: [0, OPENAI_LONG_CONTEXT_FROM] };
-const LONG_CONTEXT = { axis: 'contextTokens', range: [OPENAI_LONG_CONTEXT_FROM, Infinity] };
+
+// [LAW:one-source-of-truth] THE ONE PER-REQUEST AXIS. Time constrains a spawn as a whole — every
+// request in it ran at the spawn's instant — while context length is a fact about EACH request,
+// which is why the cost marker folds a spawn's requests along this axis's boundaries and along no
+// other (coalesceParts). The two constraints below and that fold name the axis through one constant
+// rather than a string each could misspell into a tier the matcher throws on.
+const REQUEST_AXIS = 'contextTokens';
+const SHORT_CONTEXT = { axis: REQUEST_AXIS, range: [0, OPENAI_LONG_CONTEXT_FROM] };
+const LONG_CONTEXT = { axis: REQUEST_AXIS, range: [OPENAI_LONG_CONTEXT_FROM, Infinity] };
 
 // [LAW:one-source-of-truth] EVERY priced provider, one table — grouped by the PAGE a human verifies it
 // against, because that page and the date someone last read it are facts ABOUT these rates and not
@@ -309,11 +316,14 @@ function stalenessOf(ageDays, maxAgeDays) {
 // cache-hit, so the class this workload leans on hardest is the one DeepSeek's 2026-08-16 repricing
 // moved hardest — +507% at the off-peak rate and +1114% at the peak one (0.003625 -> 0.022 / 0.044),
 // against ~52% for the miss class. This record is what let that correction land RETROACTIVELY: every
-// review posted from 1.53.0 on records its own disjoint counts, its model and its span. A pass whose
-// recorded span falls wholly inside one rate window reprices EXACTLY from those facts; one that
-// straddles a window boundary reprices to a range, because the marker holds the pass ENVELOPE and
-// not each spawn's own instant (see priceFromTable). A fused total cannot be repriced — auditing PR #108
-// had to BORROW a cache-hit ratio measured from an unrelated local run to restate CI costs at all.
+// review posted from 1.53.0 on records its own disjoint counts, its model and its span, and from
+// 1.61.0 on records them as PARTS — each count beside the context interval it was provably spent
+// within (see THE PART below) — so a context-tiered review reprices at each card rather than reading
+// the schedule gap its total would. A pass whose recorded span falls wholly inside one rate window
+// reprices EXACTLY from those facts; one that straddles a window boundary reprices to a range,
+// because the marker holds the pass ENVELOPE and not each spawn's own instant (see priceFromTable).
+// A fused total cannot be repriced — auditing PR #108 had to BORROW a cache-hit ratio measured from
+// an unrelated local run to restate CI costs at all.
 // Reviews posted BEFORE 1.53.0 carry a bare figure and are a permanent, honest gap: they must be
 // restated as unknown, never quietly repriced as if their tokens had been recorded.
 // [FRAMING:representation]
@@ -403,7 +413,7 @@ function ratesAt(entry, facts) {
 // spawnFromRequest below, and the long card becomes reachable with no change to the matcher.
 // [FRAMING:representation]
 function spawnFromTokens(at, tokens) {
-  return { at, tokens, context: { min: 0, max: totalInputTokens(tokens) } };
+  return { at, ...tokensPart(tokens) };
 }
 
 // spawnFromRequest is the narrower claim an adapter that OBSERVES each model request can make: these
@@ -414,8 +424,22 @@ function spawnFromTokens(at, tokens) {
 // the whole turn at one. The two constructors differ in what their facts PROVE, which is why they
 // are two functions and not one with a flag. [LAW:one-type-per-behavior]
 function spawnFromRequest(at, tokens) {
+  return { at, ...requestPart(tokens) };
+}
+
+// [LAW:types-are-the-program] THE PART — a spawn minus its instant: tokens beside the context
+// interval they were provably spent within. It is the unit the cost marker persists (costRecord)
+// and the unit a restatement prices (restatedCost), and a part plus an instant IS a spawn, which is
+// why the two constructors above are these two plus `at` and not two more derivations of the same
+// interval. [LAW:one-source-of-truth] What each interval PROVES is the spawn constructors' own
+// contract, restated nowhere: the sum's upper bound, or one request's exact context.
+function tokensPart(tokens) {
+  return { tokens, context: { min: 0, max: totalInputTokens(tokens) } };
+}
+
+function requestPart(tokens) {
   const context = totalInputTokens(tokens);
-  return { at, tokens, context: { min: context, max: context } };
+  return { tokens, context: { min: context, max: context } };
 }
 
 // The coordinates a constraint is matched against, parsed from the spawn once per price lookup. The
@@ -606,13 +630,16 @@ function reviewerTag(config) {
 // [LAW:types-are-the-program] The marker payload has exactly two forms, and BOTH are real data in
 // the world — this is a widening, not a migration:
 //
-//   RECORD  {"usd":0.65,"tokens":{...},"model":"…","provider":"…","from":"…","to":"…"}
+//   RECORD  {"usd":0.65,"parts":[{"tokens":{...},"context":{"min":…,"max":…}}],"model":"…","provider":"…","from":"…","to":"…"}
 //   LEGACY  0.651731  |  unknown
 //
-// LEGACY is every marker posted before this feature. Those reviews are permanent — a PR's round
-// count and running total are read back off its own history — so the legacy form is a first-class
-// variant that parses into the same Cost value it always did, never an error and never a silent
-// zero. [LAW:no-silent-failure] A past round whose cost is genuinely unknown must read as unknown.
+// A RECORD posted between 1.53.0 and 1.60.0 carries `tokens` (the sum) where a current one carries
+// `parts`; the reader folds it into one part whose interval is what the sum proved (parseCostRecord),
+// so it is not a third form, only a record with one part. LEGACY is every marker posted before
+// records existed. Those reviews are permanent — a PR's round count and running total are read back
+// off its own history — so the legacy form is a first-class variant that parses into the same Cost
+// value it always did, never an error and never a silent zero. [LAW:no-silent-failure] A past round
+// whose cost is genuinely unknown must read as unknown.
 //
 // The legacy alternative stays a strict non-negative decimal (digits, one optional fractional part)
 // or the literal 'unknown' — NOT a loose `[0-9.]+`, which would match '.', '1.2.3', or '123..456',
@@ -737,18 +764,19 @@ const ANY_MARKER_RE = new RegExp(
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
-// what `tokens` and `model` are for, at full precision, together with an INSTANT the auditor draws
+// what `parts` and `model` are for, at full precision, together with an INSTANT the auditor draws
 // from the span, since `priceFromTable` selects a rate from one instant and never from two ends —
 // which is also why a pass straddling a boundary reprices to a range rather than a figure. The
-// recorded dollars are what this run believed at the time, kept so a restatement can be compared
-// against it.
+// recorded dollars are what this run believed at the time, kept so a restatement (restatedCost) can
+// be compared against it.
 // [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
-// figure and each token class through `recordedQuantity`, each string fact through `recordedString`
-// — so the set of records this function can emit IS the set `parseCostRecord` accepts. A predicate
-// applied on one side only is not one rule but two: the writer emits something the reader silently
-// refuses, and the marker round-trips to a DIFFERENT value than it was written from. A record that
-// disagrees with itself is worse than no record. Screening only the figure was exactly that bug one
-// field wide — a negative token count still went out to be rejected on the way back in.
+// figure through `recordedQuantity`, each token class through `recordedTokens` before it becomes a
+// part (partsOf), each string fact through `recordedString` — so the set of records this function
+// can emit IS the set `parseCostRecord` accepts. A predicate applied on one side only is not one
+// rule but two: the writer emits something the reader silently refuses, and the marker round-trips
+// to a DIFFERENT value than it was written from. A record that disagrees with itself is worse than no
+// record. Screening only the figure was exactly that bug one field wide — a negative token count
+// still went out to be rejected on the way back in.
 // [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
 // upstream, a nonsensical negative, and a config naming no model all reach the same honest end: an
 // absent field, which is what "not recorded" looks like.
@@ -764,7 +792,7 @@ function costRecord(usage, config, totalMs) {
   const span = (usage && usage.span) || {};
   return {
     [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
-    tokens: recorded(usage ? recordedTokens(usage.tokens) : null),
+    parts: recorded(usage ? partsOf(usage, PRICES_PER_MILLION[config.model]) : null),
     model: recorded(recordedString(config.model)),
     provider: recorded(recordedString(providerIdentity(config))),
     // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time IS a
@@ -791,6 +819,77 @@ function costRecord(usage, config, totalMs) {
 // payload a record of facts rather than a roll-call of gaps, on a string paid for at every sink.
 function recorded(v) {
   return v === null ? undefined : v;
+}
+
+// [LAW:parse-dont-validate] The parts a marker is written from. The run's observations — each
+// request, or the one summed record when no request was observed — are stamped through
+// recordedTokens FIRST and all-or-nothing, so one unrecordable count leaves no parts rather than a
+// partial breakdown that would reprice as if it were the whole. Stamping precedes the fold because
+// a fold hides what it sums: -5 beside 10 coalesces to a clean 5. The stamped records then take the
+// claim their observation supports, the same two claims the spawn constructors make, and are folded
+// by context card. A part built this way is one the reader accepts by construction — sums of
+// recorded quantities are recorded quantities, and a hull of intervals with min <= max keeps
+// min <= max — which is what lets the writer screen the counts once and not the fold's output again.
+// [LAW:single-enforcer]
+// [LAW:one-type-per-behavior] The discriminator is the run's own: an engine that OBSERVED requests
+// (codex) or one that reported a sum, and it selects a claim, not a code path — the fold is the same
+// for both. A reported-but-empty request list is a sum, since nothing was observed per request.
+function partsOf(usage, entry) {
+  const { records, partOf } = usage.requests && usage.requests.length > 0
+    ? { records: usage.requests, partOf: requestPart }
+    : { records: [usage.tokens], partOf: tokensPart };
+  const stamped = records.map(recordedTokens);
+  if (stamped.some(tokens => tokens === null)) return null;
+  return coalesceParts(stamped.map(partOf), entry);
+}
+
+// [LAW:one-source-of-truth] The context boundaries a model's schedule prices along — 0 plus every
+// finite endpoint of its per-request constraints — DERIVED from the entry rather than restated, so
+// the fold below moves with the table and no 272K lives anywhere but the constraint that owns it.
+// A model with no entry, or with no constraint on this axis, has the one segment [0, ∞).
+function contextEdges(entry) {
+  const ends = (entry ? entry.tiers : [])
+    .flatMap(tier => tier.when)
+    .filter(constraint => constraint.axis === REQUEST_AXIS)
+    .flatMap(constraint => constraint.range)
+    .filter(Number.isFinite);
+  return [...new Set([0, ...ends])].sort((a, b) => a - b);
+}
+
+// [LAW:single-enforcer] Which segment an interval lies WHOLLY within, decided by the same matcher
+// that prices it — so a part this fold places in segment i is one ratesAt prices at whichever card
+// covers segment i, and the two can never disagree about what "within" means. -1 is the straddlers'
+// group: an interval that proves no single segment here proves no single card there either.
+function segmentOf(edges, context) {
+  const within = CONSTRAINT_MATCHERS[REQUEST_AXIS];
+  return edges.findIndex((start, i) => within({ range: [start, edges[i + 1] ?? Infinity] }, { context }));
+}
+
+function mergeParts(a, b) {
+  return {
+    tokens: addTokens(a.tokens, b.tokens),
+    context: { min: Math.min(a.context.min, b.context.min), max: Math.max(a.context.max, b.context.max) },
+  };
+}
+
+// [LAW:types-are-the-program] Fold a run's parts by context segment: parts inside one segment sum
+// their tokens and take the hull of their intervals, which is still a TRUE claim — every token in
+// the part was spent at a context inside that hull — and one the segment's card prices exactly, so
+// the restatement equals the run's own per-request sum to the cent. That bounds the marker at
+// (segments + 1) parts for any run length — two or three for OpenAI, one for everyone else — where a
+// raw per-request list is unbounded and a repo-mode review could push it past the 65K-character body
+// GitHub accepts. [FRAMING:representation] A per-tier split would be smaller still, but a split keyed
+// to today's table is a derivation and not a fact; a hull is a fact, and it degrades LOUDLY: when a
+// vendor later moves a boundary into a hull, that part straddles the new boundary, matches no card,
+// and restates as schedule-gap — never silently at whichever card the old boundary would have
+// chosen. [LAW:no-silent-failure]
+// [LAW:dataflow-not-control-flow] One fold for every model: a flat schedule has one segment and
+// yields one part; a straddler lands in the -1 group rather than in a case.
+function coalesceParts(parts, entry) {
+  const edges = contextEdges(entry);
+  return [...Map.groupBy(parts, part => segmentOf(edges, part.context)).values()]
+    .map(group => group.reduce(mergeParts))
+    .sort((a, b) => a.context.min - b.context.min);
 }
 
 // `totalMs` is the round's wall clock, or null where the sink has no round to time — see the field's
@@ -855,6 +954,41 @@ function recordedTokens(v) {
   return Object.values(tokens).every(n => n !== null) ? tokens : null;
 }
 
+// [LAW:parse-dont-validate] A recorded interval is two recorded quantities in order, or nothing. An
+// inverted one (min > max) is not a wide interval but no interval: the matcher would price it at no
+// card, and a hand-edit that produces one is a corrupted record rather than a spawn nobody can price.
+function recordedInterval(v) {
+  if (v === null || typeof v !== 'object') return null;
+  const min = recordedQuantity(v.min);
+  const max = recordedQuantity(v.max);
+  return min !== null && max !== null && min <= max ? { min, max } : null;
+}
+
+function recordedPart(v) {
+  if (v === null || typeof v !== 'object') return null;
+  const tokens = recordedTokens(v.tokens);
+  const context = recordedInterval(v.context);
+  return tokens !== null && context !== null ? { tokens, context } : null;
+}
+
+// All-or-nothing and non-empty, for the reason `tokens` is all-three-or-nothing: a breakdown missing
+// one part priced as if complete would understate the run. And a `parts` field that is present but
+// unreadable is refused HERE — never quietly replaced by some other field's figure — because a record
+// that carries the new shape and cannot be read is a corrupted record, not an old one.
+function recordedParts(v) {
+  if (!Array.isArray(v) || v.length === 0) return null;
+  const parts = v.map(recordedPart);
+  return parts.every(part => part !== null) ? parts : null;
+}
+
+// A record written between 1.53.0 and 1.60.0 recorded the sum alone. What that sum proved is exactly
+// what spawnFromTokens claimed for it at the time — an upper bound on any one request's context — so
+// it reads back as one part carrying that claim, through the same constructor. [LAW:one-source-of-truth]
+function legacyParts(tokens) {
+  const recordedSum = recordedTokens(tokens);
+  return recordedSum === null ? null : [tokensPart(recordedSum)];
+}
+
 // [LAW:parse-dont-validate] THE ONE READER. Every marker consumer below is this function plus a
 // projection, so a body one of them scores as unknown can never be a figure to another. Returns null
 // for a body carrying no marker at all — a human review, or a round predating cost reporting.
@@ -865,9 +999,17 @@ function parseCostRecord(body) {
   const basis = BASIS_BY_MARKER[name];
   const facts = payloadFacts(raw, basis.field);
   const figure = facts[basis.field];
+  // The wire form is the discriminator: a record carrying `parts` is read as parts and nothing else;
+  // one that predates them carries `tokens`, the sum, and is read as the one part that sum proved.
+  const parts = facts.parts === undefined ? legacyParts(facts.tokens) : recordedParts(facts.parts);
   return {
     cost: basis.toCost(recordedQuantity(figure)),
-    tokens: recordedTokens(facts.tokens),
+    parts,
+    // DERIVED from the parts, never read off the wire beside them: a token total stored next to the
+    // parts it sums is the second clock. Null when nothing repriceable was recorded, exactly as
+    // before parts existed, so every reader of `tokens` sees the shape it always did.
+    // [LAW:one-source-of-truth]
+    tokens: parts === null ? null : parts.map(part => part.tokens).reduce(addTokens, emptyTokens()),
     model: recordedString(facts.model),
     provider: recordedString(facts.provider),
     from: recordedString(facts.from),
@@ -887,6 +1029,24 @@ function parseCostRecord(body) {
 function parseCost(body) {
   const record = parseCostRecord(body);
   return record === null ? null : record.cost;
+}
+
+// [LAW:effects-at-boundaries] Pure: what a parsed record's OWN facts reprice to under today's table
+// — the audit the record exists for, to be set beside record.cost, what the run believed at the
+// time. Each part plus the recorded start instant is a spawn, priced by priceFromTable exactly as
+// the run priced each request, and summed by the one rule (sumCost) so a part no card covers makes
+// the restatement unpriced with that part's reason. A record missing any of the three facts — a
+// legacy bare figure, a span-only round, a config that named no model — restates as not-reported
+// rather than guessed. [LAW:no-silent-failure]
+// Every part is priced at the record's START, because the marker holds the pass envelope and not
+// each spawn's own instant (see THE TOKEN RECORD): a pass straddling a time window restates at its
+// opening rate, as a restatement always has. An unreadable `from` reaches instantMs and throws there
+// — the price lookup's own loud arm, which an audit should hear rather than read around.
+function restatedCost(record) {
+  const { parts, model, from } = record;
+  if (parts === null || model === null || from === null) return { basis: 'unpriced', reason: 'not-reported' };
+  const at = new Date(from);
+  return sumCost(parts.map(part => priceFromTable({ at, ...part }, model)));
 }
 
 // The spend reader: the dollars figure alone, 'unknown' when a spend-basis marker recorded none, and
@@ -1157,6 +1317,7 @@ module.exports = {
   parseCostMarker,
   parseCost,
   parseCostRecord,
+  restatedCost,
   providerIdentity,
   sumCost,
   emptyTallies,

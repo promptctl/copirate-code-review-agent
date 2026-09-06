@@ -16,6 +16,7 @@ const {
   parseCostMarker,
   parseCost,
   parseCostRecord,
+  restatedCost,
   providerIdentity,
   sumCost,
   costWarning,
@@ -822,6 +823,134 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.equal(record.to, span.to);
     assert.equal(record.tokens, null);
     assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
+  });
+});
+
+// zai-cost-truth-p5o.7 — the marker carries the per-request breakdown FOLDED BY CONTEXT CARD, so a
+// context-tiered codex review (gpt-5.6-*, ≤272K / >272K per request) reprices at audit time to the
+// same figure its footer reported, where the summed record could only read the schedule gap.
+describe('cost marker — the parts reprice a context-tiered review (zai-cost-truth-p5o.7)', () => {
+  const request = (inputTokens, cachedInputTokens, outputTokens) =>
+    ({ totalTokens: inputTokens + outputTokens, inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0 });
+  const codexUsage = (config, ...requests) => ({
+    ...codexExtractUsage({ turn: { status: 'completed', error: null }, requests }, config, OFF_PEAK),
+    span: { from: OFF_PEAK.toISOString(), to: OFF_PEAK.toISOString() },
+  });
+  const LUNA = { ...CODEX_CONFIG, model: 'gpt-5.6-luna' };
+
+  // [LAW:verifiable-goals] THE ACCEPTANCE CRITERION: a mixed turn — one request under 272K and one
+  // over — written to a marker, parsed back, and repriced from the record ALONE equals the USD the
+  // run reported, exactly. And the marker holds one part per card, not one per request.
+  test('a mixed-context codex review restates from its marker to the exact USD its footer reported', () => {
+    const usage = codexUsage(LUNA, request(100_000, 0, 1000), request(300_000, 0, 1000));
+    assert.equal(usage.cost.basis, 'dollars');
+    const record = parseCostRecord(costMarker(usage, LUNA));
+    assert.equal(record.parts.length, 2);
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usage.cost.usd });
+    // …and the summed tokens are still there for every reader that wants the total.
+    assert.deepEqual(record.tokens, usage.tokens);
+  });
+
+  // The marker rides a PR comment, so its size must not grow with the run. Twenty requests inside
+  // one card fold into one part; the restatement is still exact because the hull sits inside the
+  // card that priced every one of them.
+  test('many requests within one card fold into one part, and still restate exactly', () => {
+    const sol = { ...CODEX_CONFIG, model: 'gpt-5.6-sol' };
+    const usage = codexUsage(sol, ...Array.from({ length: 20 }, () => request(20_000, 15_000, 100)));
+    const record = parseCostRecord(costMarker(usage, sol));
+    assert.equal(record.parts.length, 1);
+    assert.deepEqual(record.parts[0].context, { min: 20_000, max: 20_000 });
+    // Twenty separately priced requests and one folded part differ only in float accumulation.
+    const restated = restatedCost(record);
+    assert.equal(restated.basis, 'dollars');
+    assert.ok(Math.abs(restated.usd - usage.cost.usd) < 1e-9, `got ${restated.usd}, run reported ${usage.cost.usd}`);
+  });
+
+  test('a flat-rate model folds every request into one part whatever its context', () => {
+    const usage = codexUsage(CODEX_CONFIG, request(1000, 0, 10), request(500_000, 0, 10));
+    const record = parseCostRecord(costMarker(usage, CODEX_CONFIG));
+    assert.equal(record.parts.length, 1);
+    assert.deepEqual(record.parts[0].context, { min: 1000, max: 500_000 });
+    const restated = restatedCost(record);
+    assert.equal(restated.basis, 'dollars');
+    assert.ok(Math.abs(restated.usd - usage.cost.usd) < 1e-9, `got ${restated.usd}, run reported ${usage.cost.usd}`);
+  });
+
+  // [LAW:no-silent-failure] A marker written between 1.53.0 and 1.60.0 recorded the sum alone. It
+  // must still parse with its tokens intact and restate exactly as it did then: priced from the sum
+  // as an upper bound on any request's context.
+  test('a sum-only record from before parts still parses with tokens intact and restates as it always did', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}"} -->`;
+    const record = parseCostRecord(body);
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+    assert.deepEqual(record.parts, [{ tokens: SAMPLE_TOKENS, context: { min: 0, max: totalInputTokens(SAMPLE_TOKENS) } }]);
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
+  });
+
+  test('a sum-only record whose total exceeds 272K on a context-tiered model restates as schedule-gap, never a guessed card', () => {
+    const tokens = { inputCacheMiss: 400_000, inputCacheHit: 0, output: 100 };
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(tokens)},"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}"} -->`;
+    assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
+  });
+
+  // An engine that reports a sum and no requests (claude-code) writes the one part its sum proves.
+  test('a usage with no per-request breakdown writes one part spanning [0, total], and tokens round-trip', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG));
+    assert.deepEqual(record.parts, [{ tokens: SAMPLE_TOKENS, context: { min: 0, max: totalInputTokens(SAMPLE_TOKENS) } }]);
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+  });
+
+  // [LAW:parse-dont-validate] A breakdown with a part the reader cannot read is no breakdown, and it
+  // is NOT quietly replaced by some other field: a corrupted record stays a corrupted record. The
+  // figure still parses, because the round still happened and its cost was recorded.
+  test('a hand-edited inverted or partial part leaves no parts and no tokens, while the figure still parses', () => {
+    const inverted = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1},"context":{"min":9,"max":1}}]} -->';
+    const partial = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1}}]} -->';
+    const empty = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[]} -->';
+    const mixed = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1},"context":{"min":1,"max":1}},null]} -->';
+    for (const body of [inverted, partial, empty, mixed]) {
+      const record = parseCostRecord(body);
+      assert.equal(record.parts, null, body);
+      assert.equal(record.tokens, null, body);
+      assert.deepEqual(record.cost, { basis: 'dollars', usd: 0.5 });
+      assert.deepEqual(restatedCost(record), { basis: 'unpriced', reason: 'not-reported' });
+    }
+  });
+
+  test('a record carrying parts AND a stale tokens field reads the parts, never the second clock', () => {
+    const body = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":2,"output":3},"context":{"min":3,"max":3}}],"tokens":{"inputCacheMiss":100,"inputCacheHit":100,"output":100}} -->';
+    assert.deepEqual(parseCostRecord(body).tokens, { inputCacheMiss: 1, inputCacheHit: 2, output: 3 });
+  });
+
+  // [LAW:single-enforcer] The writer stamps every request's counts through the reader's predicate
+  // BEFORE folding, so one unrecordable request leaves no parts at all — a fold would have hidden
+  // the -5 inside a clean sum.
+  test('the writer cannot emit a part the reader would refuse: one negative request count means no parts', () => {
+    const usage = {
+      tokens: { inputCacheMiss: 95, inputCacheHit: 10, output: 4 },
+      requests: [{ inputCacheMiss: -5, inputCacheHit: 5, output: 2 }, { inputCacheMiss: 100, inputCacheHit: 5, output: 2 }],
+      span: SAMPLE_SPAN,
+      cost: { basis: 'dollars', usd: 1 },
+    };
+    const marker = costMarker(usage, LUNA);
+    assert.ok(!marker.includes('parts'), `an unrecordable breakdown must not be written: ${marker}`);
+    assert.equal(parseCostRecord(marker).parts, null);
+  });
+
+  // [LAW:no-silent-failure] THE DEGRADATION IS LOUD. A hull is a fact about where the tokens were
+  // spent; if a vendor later moves its boundary INTO that hull, the part matches no card and the
+  // restatement says so, rather than repricing at whichever card the old boundary chose.
+  test('a part whose hull straddles a card boundary restates as schedule-gap', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":10,"inputCacheHit":0,"output":1},"context":{"min":100000,"max":300000}}],"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}"} -->`;
+    assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
+  });
+
+  test('a record missing its model or start instant restates as not-reported, never guessed', () => {
+    const noModel = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' }));
+    assert.deepEqual(restatedCost(noModel), { basis: 'unpriced', reason: 'not-reported' });
+    const noSpan = parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG));
+    assert.deepEqual(restatedCost(noSpan), { basis: 'unpriced', reason: 'not-reported' });
+    assert.deepEqual(restatedCost(parseCostRecord('<!-- agent-review-cost-usd:0.651731 -->')), { basis: 'unpriced', reason: 'not-reported' });
   });
 });
 
