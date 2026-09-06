@@ -291,7 +291,12 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
     if (pass > 0) log(`sweep ${pass} scope '${scope.name}': ${added} new finding(s)`);
     if (added === 0) break;
   }
-  log(`scope '${scope.name}' finished after ${passes.filter(p => !p.curtailed).length} pass(es) — ${runningTotal()}`);
+  // The closing line names the passes as they happened — 'review, sweep 1', or 'review curtailed' for
+  // a scope the budget refused before it was ever reviewed — read straight off the passes value, so
+  // the log never says a never-reviewed scope "finished after 0 pass(es)" a line after saying it was
+  // not reviewed. [LAW:dataflow-not-control-flow]
+  const chain = passes.map((p, i) => `${passLabel(i)}${p.curtailed ? ' curtailed' : ''}`).join(', ');
+  log(`scope '${scope.name}' chain: ${chain} — ${runningTotal()}`);
   return { passes, assessments };
 }
 

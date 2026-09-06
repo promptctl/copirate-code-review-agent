@@ -1476,13 +1476,20 @@ describe('runMultiScopePass — wall-clock time budget', () => {
         return okResult(scope);
       },
     });
-    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    const logs = [];
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000, log: m => logs.push(m) }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
     assert.deepEqual(review.unreviewedScopes, ['b']);
     assert.equal(review.budgetExhausted, true);
     assert.equal(calls.workers.b, 1); // a spent budget is not retried in place
     assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
     assert.match(review.summary, /Time budget exhausted.*2 of 3 scope\(s\).*NOT reviewed: b/);
+    // The chain's closing line describes what happened to the refused scope, never a "finished after
+    // 0 pass(es)" that contradicts the "not reviewed" line before it.
+    assert.ok(logs.includes("scope 'b' not reviewed — time budget exhausted"), JSON.stringify(logs));
+    assert.ok(logs.some(m => /^scope 'b' chain: review curtailed — /.test(m)), JSON.stringify(logs));
+    assert.ok(logs.some(m => /^scope 'a' chain: review — /.test(m)), JSON.stringify(logs));
+    assert.ok(!logs.some(m => /finished after/.test(m)), JSON.stringify(logs));
   });
 
   // The killed spawn's burned wall clock reaches the pass total (zai-timing-31d.4): the span rides
@@ -1887,7 +1894,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
     // The injected clock reads 6m32s after the mint; the deadline is 15m from the same mint.
     const startedAt = 1_000_000;
     const logs = await run({ startedAt, deadline: startedAt + 15 * MIN, now: () => startedAt + 6 * MIN + 32_000, sweepCap: 1 });
-    assert.ok(logs.includes("scope 'a' finished after 2 pass(es) — elapsed 6m32s of 15m00s budget"), JSON.stringify(logs));
+    assert.ok(logs.includes("scope 'a' chain: review, sweep 1 — elapsed 6m32s of 15m00s budget"), JSON.stringify(logs));
     assert.ok(logs.includes('all scopes done — elapsed 6m32s of 15m00s budget'), JSON.stringify(logs));
   });
 
