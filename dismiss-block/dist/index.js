@@ -31071,9 +31071,10 @@ function scopeText(str) {
 // The line answers "why was this slow?" without the run log: total wall clock (the whole run —
 // preflight, diff fetch and host I/O included, which is why it comes from the run's own clock and
 // not from summing spawns); the spawn time inside it (their ratio separates working from waiting);
-// the split by phase; the slowest scope (every scope runs its passes back to back in its own lane,
-// so the clause is that scope's summed chain — the run's wall clock and nothing else); and the
-// schedule sentence that turns spawn time into
+// the split by phase; the slowest scope (a scope runs its passes back to back in one lane, so the
+// clause is that scope's summed chain — the run's wall clock when every scope has its own lane, as
+// every PR review does, and only a floor beneath it when lanes are fewer than scopes and a lane
+// runs several chains in turn); and the schedule sentence that turns spawn time into
 // wall time — lanes below scopes names the one thing that can still queue a ready scope, the
 // machine's capacity.
 //
