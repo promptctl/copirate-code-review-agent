@@ -27,6 +27,7 @@
 // lives inside main() or a helper it calls, so importing this file for the planner tests touches nothing.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -333,7 +334,7 @@ const inFlight = new Set();
 // an honest replay destroys an hour of real work, while one that fires late only idles a lane.
 //
 // `detached` makes the replay its own process-group leader so the deadline can take down the WHOLE tree.
-// The engine spawns four claude-code workers per pass; signalling only the direct child would orphan them
+// The engine spawns one claude-code worker per scope; signalling only the direct child would orphan them
 // to keep burning quota against a parent that is already gone.
 // [LAW:decomposition] Supervising a child under a deadline and DECIDING WHAT TO REPLAY are two jobs, and
 // they were one function. Fused, the supervision could only ever be exercised by really replaying a
@@ -401,19 +402,38 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
 // provider reads is the security-relevant half of this file, and it inherited process.env — so a wrong
 // key does not fail, it silently replays on whatever credential the parent happened to be holding. A
 // mapping only a real spawn can observe is a mapping nothing asserts.
-function replaySpawnSpec({ job, lane, credentialInput, outRoot }) {
+function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }) {
   return {
     command: process.execPath,
-    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot],
+    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget)],
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, [credentialInput]: lane.value },
   };
 }
 
+// [LAW:parse-dont-validate] The memory one replay may plan its lanes against: the host split evenly
+// across the suite's concurrent replays, so L children together respect the per-lane guardrail one
+// child would. A count below one has no share — that is a wiring bug, thrown loudly rather than
+// handed to the child as Infinity. [LAW:no-silent-failure]
+function laneMemoryShare(totalMemBytes, laneCount) {
+  if (!Number.isInteger(laneCount) || laneCount < 1) {
+    throw new Error(`laneMemoryShare: laneCount must be a positive integer (got ${JSON.stringify(laneCount)})`);
+  }
+  return Math.floor(totalMemBytes / laneCount);
+}
+
+// [LAW:one-source-of-truth] The replay the lane loop is handed: `replay` with each call's share of the
+// host folded in. The share is the suite's fact — it knows how many lanes share the machine — so it is
+// bound here, once, and the lane loop never learns it. Derived when a replay runs, not when the closure
+// is built: a suite with nothing to run resolves no lanes, and there is no share of nothing.
+function laneReplay({ lanes, totalMemBytes, replay }) {
+  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length) });
+}
+
 // [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
 // it — the deadline, the process group, the log — belongs to superviseSpawn above.
-function runReplay({ job, lane, credentialInput, outRoot, logPath, timeoutMinutes }) {
-  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot }), logPath, timeoutMinutes });
+function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, logPath, timeoutMinutes }) {
+  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }), logPath, timeoutMinutes });
 }
 
 // A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
@@ -567,7 +587,9 @@ async function main() {
   const queue = jobs.slice();
   const done = [];
   const started = Date.now();
-  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay: runReplay, group })));
+  // Each replay plans its lanes against its share of the host, bound in laneReplay.
+  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), replay: runReplay });
+  await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
   // find is the only fact that matters, and a job that exited 0 without leaving a run dir must show up
@@ -585,4 +607,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
