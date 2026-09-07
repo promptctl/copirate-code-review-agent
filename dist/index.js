@@ -40090,11 +40090,10 @@ const BASIS = {
     // reason. The spend stays zero, exactly as recorded. [LAW:no-silent-failure]
     restate: () => ({ basis: 'subscription', notionalUsd: null }),
   },
-  // A write-side-only row: unpriced shares the dollars marker NAME (that is what keeps an unpriced
-  // round inside the spend accounting as a round of unknown cost), so a body never reads back to
-  // here — the dollars row's toCost resolves a figureless dollars marker to exactly this basis.
-  // It restates as dollars does: a round the run could not price still recorded its parts, and a
-  // card the table has gained since is exactly what an audit should find.
+  // Shares the dollars marker NAME, which keeps an unpriced round inside the spend accounting as a
+  // round of unknown cost. No marker name reads back to this row (the dollars row's toCost yields
+  // this basis for a figureless marker), but a parsed unpriced cost restates through it — as
+  // dollars does, since a card the table has gained since the run is what an audit should find.
   unpriced: {
     marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: () => null,
     toCost: f => BASIS.dollars.toCost(f),
