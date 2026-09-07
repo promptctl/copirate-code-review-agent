@@ -30198,9 +30198,50 @@ function parseReviewableFiles(files) {
   return { files: reviewable, unreviewable };
 }
 
+// [LAW:one-source-of-truth] Two renderings of one change reach this module — the host's file LISTING and
+// its unified DIFF — and they are not peers. The listing is authoritative for WHICH paths changed; the
+// diff is authoritative only for their HUNKS. The Gitea arm returns the diff's files because only those
+// carry hunks to anchor against, so every path the listing named and the diff did not is coverage that
+// run lost, and until this reconciliation existed it left no trace: not in `files`, not in `unreviewable`,
+// not in `warnings`. `submitReview` gates approval on `unreviewableFiles.length === 0`, so "the diff never
+// rendered it" and "the PR does not contain it" were the same value, and the first one approved.
+//
+// It is a set DIFFERENCE, never a union. A path BOTH renderings refuse already carries an identical
+// `refusedPathLabel` stamp on each side, so concatenating the two lists would report it twice — the
+// double-report this arm was right to refuse. Dropping the listing's refusals outright was the wrong
+// conclusion drawn from that right observation.
+//
+// The loss modes are deliberately not enumerated in the predicate, because reconciling against the
+// listing catches the ones nobody has thought of yet. The known four: a file section with zero hunks
+// never reaches `flush` (a binary blob, a 100%-similarity rename, a mode-only change); an unparseable
+// `diff --git` header drops its file with only a run-log warning the PR reader never sees; a header whose
+// b-side split mis-attributes names a path the change does not contain, stranding the real one; and a
+// truncated diff body simply ends. [LAW:no-silent-failure]
+const UNRENDERED_BY_DIFF = 'the host listed it as changed but the unified diff rendered no hunks for it '
+  + '(a binary, a rename- or mode-only change, or a section the diff parser could not attribute)';
+
+function reconcileChangedSet(listed, parsed) {
+  const rendered = new Set(parsed.files.map(f => f.filename));
+  const refused = new Set(parsed.unreviewable.map(u => u.filename));
+  return {
+    files: parsed.files,
+    unreviewable: [
+      ...parsed.unreviewable,
+      // A path that survived the listing's boundary provably renders on one line, so it is named plainly.
+      // Only a REFUSED path needs the quoted label, which is exactly what it already carries.
+      // [FRAMING:representation]
+      ...listed.files
+        .filter(f => !rendered.has(f.filename))
+        .map(f => ({ filename: f.filename, reason: UNRENDERED_BY_DIFF })),
+      ...listed.unreviewable.filter(u => !refused.has(u.filename)),
+    ],
+  };
+}
+
 module.exports = {
   matchesPattern,
   parseReviewableFiles,
+  reconcileChangedSet,
   filterFiles,
   NO_EXCLUSIONS,
   excludedPathList,
@@ -31155,7 +31196,7 @@ module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule,
 "use strict";
 
 const core = __nccwpck_require__(7484);
-const { parseUnifiedDiff, parseReviewableFiles } = __nccwpck_require__(9898);
+const { parseUnifiedDiff, parseReviewableFiles, reconcileChangedSet } = __nccwpck_require__(9898);
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = __nccwpck_require__(1565);
@@ -31404,9 +31445,6 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   });
   const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
-  // The listFiles refusals are NOT carried forward onto the Gitea transport: the unified diff is a
-  // second, complete rendering of the same change, so every path it names crosses this boundary on its
-  // own terms. Merging both lists would double-report each refusal. [LAW:one-source-of-truth]
   const parsed = parseReviewableFiles(rawParsed);
   if (parsed.files.length === 0) {
     // [LAW:no-silent-failure] Warn loudly — but do NOT abort. "No file carries a patch" is not only
@@ -31432,7 +31470,15 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     );
     return gitHubTransport(files, unreviewable);
   }
-  return giteaTransport(parsed.files, parsed.unreviewable);
+  // The diff supplies the FILES — only they carry hunks to anchor against — and the listing supplies the
+  // ground truth for which paths exist, so the two are reconciled rather than merged. Through 1.61.0 this
+  // arm dropped the listing's refusals outright, on the argument that the unified diff is "a second,
+  // complete rendering of the same change". The observation behind it was right (concatenating both
+  // refusal lists double-reports every path both refuse); the premise was not. A diff renders no hunks
+  // for a binary, a rename- or mode-only change, or a section its parser cannot attribute, and each of
+  // those left the run reporting full coverage of a file nothing had read. [LAW:no-silent-failure]
+  const reconciled = reconcileChangedSet({ files, unreviewable }, parsed);
+  return giteaTransport(reconciled.files, reconciled.unreviewable);
 }
 
 // [LAW:parse-dont-validate] The one reader that turns a raw review body into what this action left
