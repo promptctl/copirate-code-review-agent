@@ -528,12 +528,22 @@ describe('resolveReviewTarget', () => {
 // were the same value to every consumer — and the approval gate could not tell them apart.
 const { selectTransport } = require('../src/transport');
 
-function fakeHost(files, diffText) {
+function fakeHost(files, diffAnswer) {
   return {
     rest: { pulls: { listFiles: async () => ({ data: files }) } },
-    request: async () => ({ data: diffText }),
+    request: async () => ({ data: diffAnswer }),
   };
 }
+
+// [FRAMING:representation] What each host ACTUALLY answers at `GET .../pulls/{n}.diff`, MEASURED
+// 2026-09-07 through the same octokit call src/transport.js makes:
+//   Gitea 1.27.3  200 `text/plain`       -> octokit hands back the unified diff as a STRING.
+//   GitHub        200 `application/json` -> the `.diff` suffix is IGNORED and octokit hands back the PR
+//                                           resource as an OBJECT. It does NOT 404.
+// Through 1.61.1 the fixtures below modelled GitHub with an empty STRING, describing a host that exists
+// nowhere — and that false fixture is exactly why "no file carries a patch" could stand in for the host
+// for so long. A GitHub arm must be fed a GitHub answer.
+const GITHUB_DIFF_ROUTE_ANSWER = { url: 'https://api.github.com/repos/o/r/pulls/1', number: 1 };
 
 describe('selectTransport — refused paths reach the caller as data', () => {
   test('a refused path is carried on the transport, not just logged', async () => {
@@ -700,9 +710,10 @@ describe('selectTransport — refused paths reach the caller as data', () => {
 describe('selectTransport — a PR whose files carry no patch', () => {
   test('an empty unified diff does NOT throw — it returns the files unpatched', async () => {
     const files = [{ filename: 'dist/index.js', status: 'modified' }];
-    const transport = await selectTransport(fakeHost(files, ''), 'o', 'r', 111);
+    const transport = await selectTransport(fakeHost(files, GITHUB_DIFF_ROUTE_ANSWER), 'o', 'r', 111);
     assert.deepEqual(transport.files, files);
     assert.equal(transport.files.filter(f => f.patch).length, 0, 'nothing is patchable, which the caller handles');
+    assert.equal(transport.approveEvent, 'APPROVE', 'the host that answered is GitHub, so the dialect is GitHub\'s');
   });
 
   // This arm hands back the listFiles rendering, so it owes that rendering's coverage loss — a refused
@@ -711,7 +722,7 @@ describe('selectTransport — a PR whose files carry no patch', () => {
     const transport = await selectTransport(fakeHost([
       { filename: 'dist/index.js', status: 'modified' },
       { filename: 'src/a\nEVIL.js', status: 'modified' },
-    ], ''), 'o', 'r', 112);
+    ], GITHUB_DIFF_ROUTE_ANSWER), 'o', 'r', 112);
     assert.deepEqual(transport.files.map(f => f.filename), ['dist/index.js']);
     assert.equal(transport.unreviewable.length, 1, 'the refusal survives the empty-diff fallback');
   });
@@ -735,5 +746,95 @@ describe('selectTransport — a PR whose files carry no patch', () => {
       { path: 'a.txt', new_position: 2, body: 'x' },
       'still the Gitea anchor shape',
     );
+  });
+});
+
+// [LAW:verifiable-goals] AC (zai-transport-3pn): a Gitea run cannot receive a GitHub dialect on ANY path,
+// including the zero-parsed-files fallback, and a GitHub run cannot receive a Gitea dialect when every
+// file is oversized. A transport carries TWO independent facts — the host's API dialect and which
+// rendering of the changed set travels — and through 1.61.1 one test produced both, so both illegal
+// pairings were representable. These assert the DIALECT against the host's own answer; the sibling suites
+// above assert the rendering. They are separate tests because they are now separate derivations.
+describe('selectTransport — the dialect follows the host, not the diff that parsed', () => {
+  test('Gitea + a diff that renders no hunks keeps the Gitea dialect', async () => {
+    // The live silent bug. git emits a `diff --git` header for a binary but no @@ hunk, so this parsed to
+    // zero files and took the fallback's GitHub exit — sending 'APPROVE', which Gitea's handler has no
+    // else-error branch for and falls through to ReviewTypePending: 200, no error, the approval parked
+    // forever. A clean binary-only PR read as approved and never was.
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'assets/logo.png', status: 'modified' }],
+      ['diff --git a/assets/logo.png b/assets/logo.png',
+        'Binary files a/assets/logo.png and b/assets/logo.png differ', ''].join('\n'),
+    ), 'o', 'r', 1);
+    assert.equal(t.approveEvent, 'APPROVED', 'the host served a diff, so the host is Gitea');
+    assert.deepEqual(
+      t.toComment({ path: 'assets/logo.png', line: 3, body: 'x' }),
+      { path: 'assets/logo.png', new_position: 3, body: 'x' },
+      'and the anchor shape is Gitea\'s too — one host, one dialect, all of it',
+    );
+  });
+
+  test('Gitea + a body that is not a diff at all keeps the Gitea dialect', async () => {
+    // A truncated body, or a proxy answering 200 with an error page. The host is still Gitea, so the
+    // routing is still Gitea's; an unparseable body costs COVERAGE, never the dialect. This is why the
+    // discriminator is the response's TYPE and not "does it look like a diff": reading an unrecognizable
+    // TEXT body as GitHub restores the silent failure, while reading it as Gitea fails LOUD on the wrong
+    // host (GitHub rejects 'APPROVED'). [LAW:no-silent-failure] picks the loud direction.
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'src/a.js', status: 'modified' }],
+      '<html><body>502 Bad Gateway</body></html>',
+    ), 'o', 'r', 1);
+    assert.equal(t.approveEvent, 'APPROVED');
+  });
+
+  test('an empty changed set resolves the dialect from the host — the dismissal route rides on it', async () => {
+    // releaseUnrevisitableBlocks resolves a transport purely to find a dismissal ROUTE, and reaches here
+    // with whatever the listing holds. Guessing GitHub for an empty listing sent a Gitea PR's dismissal
+    // over GitHub's PUT, which is a 405 — the PR stays deadlocked by this action's own blocking review.
+    const t = await selectTransport(fakeHost([], ''), 'o', 'r', 1);
+    assert.equal(t.approveEvent, 'APPROVED');
+  });
+
+  test('GitHub answering the .diff route with the PR resource keeps the GitHub dialect', async () => {
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'dist/index.js', status: 'modified' }], GITHUB_DIFF_ROUTE_ANSWER,
+    ), 'o', 'r', 1);
+    assert.equal(t.approveEvent, 'APPROVE');
+    assert.deepEqual(t.files.map(f => f.filename), ['dist/index.js'], 'and the oversized file still travels');
+  });
+
+  test('a non-string answer never yields the Gitea dialect, whatever it stringifies to', async () => {
+    // The exact mutation the old `String(data)` coercion permitted: the dialect was read off what the
+    // bytes PARSED INTO, so any body stringifying into a diff selected Gitea. Today's GitHub survived that
+    // only because '[object Object]' contains no `diff --git` — the right dialect by accident of content
+    // negotiation. This pins it to the response TYPE, which is what actually names the host.
+    const stringifiesToADiff = {
+      toString: () => ['diff --git a/a.txt b/a.txt', '--- a/a.txt', '+++ b/a.txt',
+        '@@ -1 +1 @@', '-a', '+b'].join('\n'),
+    };
+    const t = await selectTransport(
+      fakeHost([{ filename: 'a.txt', status: 'modified' }], stringifiesToADiff), 'o', 'r', 1,
+    );
+    assert.equal(t.approveEvent, 'APPROVE');
+  });
+
+  test('the anchorless warning names a cause the host can actually have', async () => {
+    // "every changed file is too large to inline" is true only of a host that inlines patches at all.
+    // Asserting it on Gitea sent operators hunting for a file-size limit Gitea does not have.
+    const warnings = [];
+    const original = core.warning;
+    core.warning = m => warnings.push(m);
+    try {
+      await selectTransport(fakeHost([{ filename: 'assets/logo.png', status: 'modified' }],
+        'diff --git a/assets/logo.png b/assets/logo.png\nBinary files differ\n'), 'o', 'r', 9);
+      await selectTransport(fakeHost([{ filename: 'dist/index.js', status: 'modified' }],
+        GITHUB_DIFF_ROUTE_ANSWER), 'o', 'r', 10);
+    } finally {
+      core.warning = original;
+    }
+    const [gitea, github] = warnings.filter(w => w.includes('anchorable'));
+    assert.match(gitea, /served a unified diff, but it rendered no hunks/);
+    assert.doesNotMatch(gitea, /too large/, 'Gitea has no inline-patch size limit to blame');
+    assert.match(github, /too large for it to inline/);
   });
 });
