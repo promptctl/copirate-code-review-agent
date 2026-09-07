@@ -732,10 +732,9 @@ const BASIS = {
   subscription: {
     marker: 'agent-review-notional-usd', bucket: 'notional', field: 'notionalUsd', figure: c => c.notionalUsd,
     toCost: f => ({ basis: 'subscription', notionalUsd: f }),
-    // Billed to quota, and the list price is Anthropic's own figure, which no row of this table
-    // prices: the honest restatement is the existing "notional not reported" state, never a table
-    // reason. The spend stays zero, exactly as recorded. [LAW:no-silent-failure]
-    restate: () => ({ basis: 'subscription', notionalUsd: null }),
+    // The list price is Claude Code's own figure, which no row of this table can move: the
+    // restatement is the record's cost, never a table reason. [LAW:one-source-of-truth]
+    restate: record => record.cost,
   },
   // Shares the dollars marker NAME, which keeps an unpriced round inside the spend accounting as a
   // round of unknown cost. No marker name reads back to this row (the dollars row's toCost yields

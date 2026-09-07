@@ -947,11 +947,13 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
 
   // [LAW:one-source-of-truth] The basis selects the restatement. A subscription round records real
   // tokens and an Anthropic model id the table never prices; restating it through the table would
-  // answer no-price and send a maintainer to PRICE_SOURCES for a model that cannot go there.
-  test('a subscription record restates as billed-to-quota with no table figure, never as no-price', () => {
+  // answer no-price and send a maintainer to PRICE_SOURCES for a model that cannot go there. Its
+  // list price is Claude Code's own figure, which nothing here can move, so the restatement IS the
+  // recorded cost — never null, which on this arm means the list price was not reported.
+  test('a subscription record restates as its own recorded cost, never as no-price and never as unreported', () => {
     const record = parseCostRecord(costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG));
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
-    assert.deepEqual(restatedCost(record), { basis: 'subscription', notionalUsd: null });
+    assert.deepEqual(restatedCost(record), { basis: 'subscription', notionalUsd: 63.59 });
   });
 
   // A round the run could not price still recorded its parts; if the table has since gained the
