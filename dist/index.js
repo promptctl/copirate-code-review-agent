@@ -39379,10 +39379,11 @@ const { formatMs } = __nccwpck_require__(7932);
 //
 // A CONSTRAINT NAMES ITS AXIS, and a rate is therefore selected by a VECTOR of facts about the spawn
 // — when it ran AND how long its prompts were — rather than by an instant alone. Each axis has one
-// matcher (CONSTRAINT_MATCHERS), so the next vendor to price along a new axis is a new constraint kind
-// plus its matcher, and NOT an edit to any row that does not use it. [LAW:locality-or-seam] An axis
-// with no matcher THROWS rather than silently holding: a constraint nobody can evaluate that reads as
-// "satisfied" would price the spawn off the wrong rate card. [LAW:no-silent-failure]
+// matcher and one rule for where its constraints flip within a span (AXES), so the next vendor to
+// price along a new axis is a new constraint kind plus its AXES row, and NOT an edit to any row that
+// does not use it. [LAW:locality-or-seam] An axis with no row THROWS rather than silently holding: a
+// constraint nobody can evaluate that reads as "satisfied" would price the spawn off the wrong rate
+// card. [LAW:no-silent-failure]
 //
 // THERE IS DELIBERATELY NO ALWAYS-PRESENT `rates` FIELD, and its removal is the point rather than a
 // side effect. The previous shape carried a STANDARD rate beside the tiers, on the theorem that "a
@@ -39586,7 +39587,8 @@ function flattenPrices(sources) {
 
 const PRICES_PER_MILLION = flattenPrices(PRICE_SOURCES);
 
-const MS_PER_DAY = 86_400_000;
+const MS_PER_HOUR = 3_600_000;
+const MS_PER_DAY = 24 * MS_PER_HOUR;
 
 // How long a hand-copied rate may go unconfirmed before the build refuses it. Thirty days is a legible
 // human cadence (open three pricing pages once a month) and it is the number the incident argues for:
@@ -39673,8 +39675,8 @@ function stalenessOf(ageDays, maxAgeDays) {
 // 1.61.0 on records them as PARTS — each count beside the context interval it was provably spent
 // within (see THE PART below) — so a context-tiered review reprices at each card rather than reading
 // the schedule gap its total would. A pass whose recorded span falls wholly inside one rate window
-// reprices EXACTLY from those facts; one that straddles a window boundary reprices to a range,
-// because the marker holds the pass ENVELOPE and not each spawn's own instant (see priceFromTable).
+// reprices EXACTLY from those facts; one that straddles a window boundary restates unpriced
+// (schedule-gap), because the marker holds the pass ENVELOPE and not each spawn's own instant.
 // A fused total cannot be repriced — auditing PR #108 had to BORROW a cache-hit ratio measured from
 // an unrelated local run to restate CI costs at all.
 // Reviews posted BEFORE 1.53.0 carry a bare figure and are a permanent, honest gap: they must be
@@ -39709,46 +39711,87 @@ function instantMs(at, what) {
   return ms;
 }
 
-// [LAW:single-enforcer] ONE matcher per pricing axis, and the only place an axis's meaning is decided.
-// Every matcher answers the same question — "do the spawn's facts PROVE this constraint holds?" — so
-// a fact that is merely consistent with a constraint does not satisfy it. That distinction is what
-// makes the context axis sound; see SPAWN FACTS below.
+// [LAW:single-enforcer] ONE row per pricing axis, and the only place an axis's meaning is decided.
+// `holds` answers the same question for every axis — "do the spawn's facts PROVE this constraint
+// holds?" — so a fact that is merely consistent with a constraint does not satisfy it. That
+// distinction is what makes the context axis sound; see THE SPAWN below. `breakpoints` names every
+// instant strictly inside a span at which the constraint can change its answer, which is what lets a
+// span be priced exactly as a whole (ratesOverSpan) rather than at one of its ends.
 //
 // Half-open [start, end) on every range axis: a boundary value belongs to the window that STARTS
 // there, never the one that ends there, so two adjacent windows can neither both claim it nor leave it
 // unclaimed. [LAW:one-type-per-behavior]
-const CONSTRAINT_MATCHERS = {
-  daysUtc: (constraint, facts) => constraint.days.includes(facts.day),
-  hoursUtc: (constraint, facts) => constraint.ranges.some(([start, end]) => facts.hour >= start && facts.hour < end),
+const AXES = {
+  daysUtc: {
+    holds: (constraint, facts) => constraint.days.includes(facts.day),
+    breakpoints: (constraint, span) => utcHourInstants(span, [0]),
+  },
+  hoursUtc: {
+    holds: (constraint, facts) => constraint.ranges.some(([start, end]) => facts.hour >= start && facts.hour < end),
+    breakpoints: (constraint, span) => utcHourInstants(span, constraint.ranges.flat()),
+  },
   // The fact is an INTERVAL the true context length lies within, so the constraint holds only when the
   // WHOLE interval falls inside the window — "every value it could be is priced at this card". A
-  // spawn whose interval straddles the boundary proves nothing and matches neither side.
-  contextTokens: (constraint, facts) => facts.context.min >= constraint.range[0]
-    && facts.context.max < constraint.range[1],
+  // spawn whose interval straddles the boundary proves nothing and matches neither side. Context is a
+  // fact about the requests and not the clock, so it never flips within a span.
+  contextTokens: {
+    holds: (constraint, facts) => facts.context.min >= constraint.range[0] && facts.context.max < constraint.range[1],
+    breakpoints: () => [],
+  },
 };
+
+// Every UTC instant at the given hours of the day that falls STRICTLY inside the span — the clock
+// boundaries a time constraint can flip at. Strict on both ends: the span's start is sampled by its
+// owner, and a flip exactly at its end lies outside the half-open window it prices.
+function utcHourInstants(span, hours) {
+  const firstDay = Math.floor(span.from / MS_PER_DAY);
+  const dayCount = Math.floor(span.to / MS_PER_DAY) - firstDay + 1;
+  return Array.from({ length: dayCount }, (_, i) => (firstDay + i) * MS_PER_DAY)
+    .flatMap(day => hours.map(hour => day + hour * MS_PER_HOUR))
+    .filter(instant => instant > span.from && instant < span.to);
+}
+
+// An unknown axis throws rather than reading as "holds": a constraint nobody can evaluate is a table
+// someone edited without teaching AXES, and a silent match would price the spawn off whichever card
+// happened to be listed first. [LAW:no-silent-failure]
+function axisOf(constraint) {
+  const axis = AXES[constraint.axis];
+  if (!axis) throw new Error(`price table constrains unknown axis "${constraint.axis}"; add it to AXES`);
+  return axis;
+}
 
 // [LAW:dataflow-not-control-flow] Rate selection with no branch on WHICH axes a model prices along:
 // the first tier whose every constraint holds wins, and a tier constraining nothing holds always, so
 // a flat model, a time-tiered one and a context-tiered one take the identical path.
-//
 // Returns null when NO tier covers the spawn — the schedule declining, which is a real state now that
-// entries may carry a gap (see the OpenAI group). An unknown axis throws instead: a constraint nobody
-// can evaluate is a table someone edited without teaching the matcher, and reading it as "holds" would
-// price the spawn off whichever card happened to be listed first. [LAW:no-silent-failure]
+// entries may carry a gap (see the OpenAI group).
 function ratesAt(entry, facts) {
-  const tier = entry.tiers.find((t) => t.when.every((constraint) => {
-    const matcher = CONSTRAINT_MATCHERS[constraint.axis];
-    if (!matcher) throw new Error(`price table constrains unknown axis "${constraint.axis}"; add a matcher to CONSTRAINT_MATCHERS`);
-    return matcher(constraint, facts);
-  }));
+  const tier = entry.tiers.find((t) => t.when.every((constraint) => axisOf(constraint).holds(constraint, facts)));
   return tier ? tier.rates : null;
 }
 
+// The rates that hold across a WHOLE span, or null when no single tier does. A tier changes only where
+// one of its own constraints flips, so sampling the span's start and every breakpoint strictly inside
+// it visits every tier the span touches — exact, never an estimate from the ends, which a pass can
+// share with a window it left and re-entered in between. A span touching two tiers (or a tier and a
+// gap) is the schedule declining: pricing it at either end would be the confident misprice this
+// table exists to end. [LAW:no-silent-failure]
+function ratesOverSpan(entry, span, context) {
+  const breakpoints = entry.tiers.flatMap(t => t.when).flatMap(c => axisOf(c).breakpoints(c, span));
+  const samples = [span.from, ...breakpoints].map(ms => ratesAt(entry, factsAt(new Date(ms), context)));
+  return samples.every(rates => rates === samples[0]) ? samples[0] : null;
+}
+
 // [LAW:parse-dont-validate] THE SPAWN: everything a price depends on, in one value — the tokens spent,
-// when they started being spent, and what is known about the context length they were spent at. It is
-// an explicit ARGUMENT rather than something priceFromTable derives, because this vector IS the seam:
-// different callers know different amounts about a spawn, and a derivation hidden inside would fix
-// every caller at whatever the least-informed one can prove. [LAW:dataflow-not-control-flow]
+// the span of time they were spent within, and what is known about the context length they were spent
+// at. It is an explicit ARGUMENT rather than something priceFromTable derives, because this vector IS
+// the seam: different callers know different amounts about a spawn, and a derivation hidden inside
+// would fix every caller at whatever the least-informed one can prove. [LAW:dataflow-not-control-flow]
+//
+// `at` is a SPAN {from, to} of Dates for the same reason `context` is an interval: it is what a caller
+// can PROVE. A live spawn knows the instant it started and is the point [start, start] — both
+// constructors below wrap it — while a restatement knows only the pass envelope and prices that span
+// whole. [LAW:one-type-per-behavior]
 //
 // `context` is an INTERVAL, not a number, and that is the whole honesty of this axis. OpenAI bills
 // context length PER REQUEST, while THE TOKEN RECORD counts a SUM over every request in the spawn:
@@ -39765,8 +39808,8 @@ function ratesAt(entry, facts) {
 // than guessed. An adapter that observes a per-request context builds a narrower interval through
 // spawnFromRequest below, and the long card becomes reachable with no change to the matcher.
 // [FRAMING:representation]
-function spawnFromTokens(at, tokens) {
-  return { at, ...tokensPart(tokens) };
+function spawnFromTokens(startedAt, tokens) {
+  return { at: pointSpan(startedAt), ...tokensPart(tokens) };
 }
 
 // spawnFromRequest is the narrower claim an adapter that OBSERVES each model request can make: these
@@ -39776,8 +39819,12 @@ function spawnFromTokens(at, tokens) {
 // results (sumCost), so a turn that straddles 272K prices each request at its own card and never
 // the whole turn at one. The two constructors differ in what their facts PROVE, which is why they
 // are two functions and not one with a flag. [LAW:one-type-per-behavior]
-function spawnFromRequest(at, tokens) {
-  return { at, ...requestPart(tokens) };
+function spawnFromRequest(startedAt, tokens) {
+  return { at: pointSpan(startedAt), ...requestPart(tokens) };
+}
+
+function pointSpan(at) {
+  return { from: at, to: at };
 }
 
 // [LAW:types-are-the-program] THE PART — a spawn minus its instant: tokens beside the context
@@ -39795,22 +39842,30 @@ function requestPart(tokens) {
   return { tokens, context: { min: context, max: context } };
 }
 
-// The coordinates a constraint is matched against, parsed from the spawn once per price lookup. The
-// instant's loud arm is the point: an Invalid Date (or an omitted argument JS quietly turns into one)
-// yields NaN coordinates, NaN falls in no window, and the spawn would read as an unpriceable gap —
-// a caller's threading bug wearing the costume of a vendor's pricing gap. [LAW:no-silent-failure]
-// Fractional hours (not whole ones) because a vendor is free to move a boundary to :30 — the
-// coordinate should not decide what the schedule is allowed to express.
-function spawnFacts(spawn) {
-  instantMs(spawn.at, "price lookup needs the spawn's start instant as a Date");
-  return {
-    day: spawn.at.getUTCDay(),
-    hour: spawn.at.getUTCHours() + spawn.at.getUTCMinutes() / 60,
-    context: contextInterval(spawn.context),
+// [LAW:parse-dont-validate] The spawn's span as two finite epoch instants in order, parsed once per
+// price lookup. The loud arms are the point: an Invalid Date (or an omitted argument JS quietly turns
+// into one) yields NaN coordinates, NaN falls in no window, and the spawn would read as an
+// unpriceable gap — a caller's threading bug wearing the costume of a vendor's pricing gap. An
+// inverted span is the same bug with both ends present: no boundary lies strictly inside it, so it
+// would price at its start as if it were a point. [LAW:no-silent-failure]
+function spawnSpan(at) {
+  const { from, to } = at ?? {};
+  const span = {
+    from: instantMs(from, "price lookup needs the spawn's start instant as a Date"),
+    to: instantMs(to, "price lookup needs the spawn's end instant as a Date"),
   };
+  if (span.from > span.to) throw new RangeError(`price lookup needs the spawn's span in order; got ${from.toISOString()} after ${to.toISOString()}`);
+  return span;
 }
 
-// The context interval is established HERE, beside the instant, because this function is the spawn's
+// The coordinates a constraint is matched against at one instant. Fractional hours (not whole ones)
+// because a vendor is free to move a boundary to :30 — the coordinate should not decide what the
+// schedule is allowed to express.
+function factsAt(date, context) {
+  return { day: date.getUTCDay(), hour: date.getUTCHours() + date.getUTCMinutes() / 60, context };
+}
+
+// The context interval is established beside the span, in priceFromTable, because that is the spawn's
 // parse boundary and a boundary that establishes one of its two facts is not a boundary. Passing
 // `context` through unparsed made a caller's threading bug MODEL-DEPENDENT: a hand-rolled
 // `{at, tokens}` priced cleanly against every flat or time-tiered model, whose tiers never consult
@@ -39843,10 +39898,13 @@ function contextInterval(context) {
 // reading the clock here would price a spawn at the moment its output was parsed rather than the
 // moment it ran.
 //
-// Each SPAWN is priced at its own start, never the run at the run's start: a multi-scope pass runs
-// for many minutes across many spawns and routinely straddles 04:00 UTC, so one rate for the whole
-// pass would misprice every spawn on the far side of the boundary. The pass total is then the sum of
-// individually-priced spawns (sumCost), never the sum repriced at one tier.
+// A spawn is priced over its WHOLE span, and a live spawn's span is the instant it started
+// (spawnFromTokens, spawnFromRequest): a multi-scope pass runs for many minutes across many spawns and
+// routinely straddles 04:00 UTC, so one rate for the whole pass would misprice every spawn on the far
+// side of the boundary. The pass total is then the sum of individually-priced spawns (sumCost), never
+// the sum repriced at one tier. A restatement holds only the pass ENVELOPE and prices that span whole
+// (ratesOverSpan): exactly when one tier holds across it, schedule-gap when it touches two — never at
+// whichever end it happened to read.
 //
 // The residual, stated rather than hidden: a single spawn that itself crosses a boundary is billed by
 // the vendor per request across both tiers, and is priced here wholly at its start tier. Nothing in
@@ -39871,13 +39929,14 @@ function contextInterval(context) {
 // are exactly the billing buckets.
 function priceFromTable(spawn, model) {
   const { tokens } = spawn;
-  const facts = spawnFacts(spawn);
+  const span = spawnSpan(spawn.at);
+  const context = contextInterval(spawn.context);
   // A plain index is safe here only because the table is built with a null prototype (flattenPrices),
   // so a model id like `constructor` or `toString` reads as the absence it is instead of answering
   // with an inherited member that is not a rate schedule.
   const entry = PRICES_PER_MILLION[model];
   if (!entry) return { basis: 'unpriced', reason: 'no-price' };
-  const price = ratesAt(entry, facts);
+  const price = ratesOverSpan(entry, span, context);
   if (!price) return { basis: 'unpriced', reason: 'schedule-gap' };
   const usd = (
     tokens.inputCacheMiss * price.input +
@@ -40129,14 +40188,14 @@ const ANY_MARKER_RE = new RegExp(
 //
 // The figure is quantized to 6 decimal places, exactly as the legacy marker was, so the recorded
 // dollars stay byte-stable across a re-render. It is NOT what a later audit reprices from — that is
-// what `parts` and `model` are for, at full precision, together with an INSTANT the auditor draws
-// from the span, since `priceFromTable` selects a rate from one instant and never from two ends —
-// which is also why a pass straddling a boundary reprices to a range rather than a figure. The
-// recorded dollars are what this run believed at the time, kept so a restatement (restatedCost) can
-// be compared against it.
+// what `parts`, `model` and the span are for, at full precision; `priceFromTable` prices the span
+// whole, which is why a pass straddling a rate boundary restates unpriced rather than at a guessed
+// figure. The recorded dollars are what this run believed at the time, kept so a restatement
+// (restatedCost) can be compared against it.
 // [LAW:single-enforcer] EVERY field is screened through the SAME predicate its reader uses — the
 // figure through `recordedQuantity`, each token class through `recordedTokens` before it becomes a
-// part (partsOf), each string fact through `recordedString` — so the set of records this function
+// part (partsOf), each string fact through `recordedString`, the span through `recordedSpan` — so
+// the set of records this function
 // can emit IS the set `parseCostRecord` accepts. A predicate applied on one side only is not one
 // rule but two: the writer emits something the reader silently refuses, and the marker round-trips
 // to a DIFFERENT value than it was written from. A record that disagrees with itself is worse than no
@@ -40154,7 +40213,7 @@ function costRecord(usage, config, totalMs) {
   const cost = usage && usage.cost;
   const basis = basisOf(cost);
   const figure = recordedQuantity(basis.figure(cost));
-  const span = (usage && usage.span) || {};
+  const span = recordedSpan(usage && usage.span);
   return {
     [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
     parts: recorded(usage ? partsOf(usage, PRICES_PER_MILLION[config.model]) : null),
@@ -40162,10 +40221,9 @@ function costRecord(usage, config, totalMs) {
     provider: recorded(recordedString(providerIdentity(config))),
     // The pass's time SPAN, not one instant. A review's spawns run over many minutes and time IS a
     // pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a single timestamp would
-    // silently misprice every review that straddles a boundary. Two ends let a restatement price
-    // exactly when they fall in one window, and say so when they do not.
-    from: recorded(recordedInstant(span.from)),
-    to: recorded(recordedInstant(span.to)),
+    // silently misprice every review that straddles a boundary. Two ends let a restatement price the
+    // span whole: exactly when one tier holds across it, unpriced when a boundary falls inside it.
+    ...(span ?? {}),
     // THE ROUND'S WALL CLOCK — and deliberately NOT `to - from`. The span above is the SPAWN
     // window, which is what a repricing needs; this is the whole action, which is what an operator
     // asked about when they said 25 minutes is unacceptable. The action fetches a diff, waits on a
@@ -40226,7 +40284,7 @@ function contextEdges(entry) {
 // covers segment i, and the two can never disagree about what "within" means. -1 is the straddlers'
 // group: an interval that proves no single segment here proves no single card there either.
 function segmentOf(edges, context) {
-  const within = CONSTRAINT_MATCHERS[REQUEST_AXIS];
+  const within = AXES[REQUEST_AXIS].holds;
   return edges.findIndex((start, i) => within({ range: [start, edges[i + 1] ?? Infinity] }, { context }));
 }
 
@@ -40339,6 +40397,18 @@ function recordedInterval(v) {
   return min !== null && max !== null && min <= max ? { min, max } : null;
 }
 
+// [LAW:parse-dont-validate] A recorded span is two recorded instants in order, or nothing — the time
+// twin of recordedInterval, for the same reason: a lone end or an inverted pair is not a narrower span
+// but no span, and priceFromTable would throw on it as a threading bug where a hand-edited marker on
+// someone else's PR should read as a record with no span. [LAW:single-enforcer] Both sides of the
+// marker screen through it, so the writer cannot emit a span the reader refuses.
+function recordedSpan(v) {
+  if (v === null || typeof v !== 'object') return null;
+  const from = recordedInstant(v.from);
+  const to = recordedInstant(v.to);
+  return from !== null && to !== null && Date.parse(from) <= Date.parse(to) ? { from, to } : null;
+}
+
 function recordedPart(v) {
   if (v === null || typeof v !== 'object') return null;
   const tokens = recordedTokens(v.tokens);
@@ -40387,8 +40457,7 @@ function parseCostRecord(body) {
     tokens: parts === null ? null : parts.map(part => part.tokens).reduce(addTokens, emptyTokens()),
     model: recordedString(facts.model),
     provider: recordedString(facts.provider),
-    from: recordedInstant(facts.from),
-    to: recordedInstant(facts.to),
+    span: recordedSpan(facts),
     // Screened through the SAME predicate the writer used, so the set of durations costMarker can
     // emit IS the set this accepts, and a marker round-trips to the duration it recorded.
     // [LAW:single-enforcer] A hand-edited negative reads as no duration at all — a cumulative total
@@ -40409,18 +40478,16 @@ function parseCost(body) {
 // [LAW:effects-at-boundaries] Pure: what a parsed record's OWN facts reprice to under today's table
 // — the audit the record exists for, to be set beside record.cost, what the run believed at the
 // time. The recorded basis selects the restatement (BASIS.restate); this is the table-priced arm.
-// Each part plus the recorded start instant is a spawn, priced by priceFromTable exactly as the run
-// priced each request, and summed by the one rule (sumCost) so a part no card covers makes the
-// restatement unpriced with that part's reason. A record missing any of the three facts — a legacy
-// bare figure, a span-only round, a config that named no model — restates as not-reported rather
-// than guessed. [LAW:no-silent-failure]
-// Every part is priced at the record's START, because the marker holds the pass envelope and not
-// each spawn's own instant (see THE TOKEN RECORD): a pass straddling a time window restates at its
-// opening rate, as a restatement always has.
+// Each part plus the recorded span is a spawn, priced over the WHOLE span by priceFromTable — exactly
+// when one tier holds across it, schedule-gap when the pass straddled a rate boundary, since the
+// marker holds the envelope and not each spawn's own instant — and summed by the one rule (sumCost)
+// so a part no card covers makes the restatement unpriced with that part's reason. A record missing
+// any of the three facts — a legacy bare figure, a span-only round, a config that named no model —
+// restates as not-reported rather than guessed. [LAW:no-silent-failure]
 function restatedFromTable(record) {
-  const { parts, model, from } = record;
-  if (parts === null || model === null || from === null) return { basis: 'unpriced', reason: 'not-reported' };
-  const at = new Date(from);
+  const { parts, model, span } = record;
+  if (parts === null || model === null || span === null) return { basis: 'unpriced', reason: 'not-reported' };
+  const at = { from: new Date(span.from), to: new Date(span.to) };
   return sumCost(parts.map(part => priceFromTable({ at, ...part }, model)));
 }
 

@@ -220,11 +220,16 @@ describe('time-varying rates', () => {
     // the same missing `.at`, and neither the Invalid Date nor the string was ever reached. A test
     // that passes for a reason other than the one it names asserts nothing. [LAW:behavior-not-structure]
     const wellFormed = spawnFromTokens(new Date('2026-08-20T02:30:00Z'), TOKENS);
-    const withInstant = (at) => ({ ...wellFormed, at });
+    const withInstant = (at) => ({ ...wellFormed, at: { from: at, to: at } });
 
     assert.throws(() => priceFromTable({ tokens: TOKENS, context: wellFormed.context }, 'deepseek-v4-pro'), /start instant/);
     assert.throws(() => priceFromTable(withInstant(new Date('nonsense')), 'deepseek-v4-pro'), /start instant/);
     assert.throws(() => priceFromTable(withInstant('2026-08-20T02:30:00Z'), 'deepseek-v4-pro'), /start instant/);
+    // The span is two ends in order, and each arm names the end it is missing: a bare Date in the span
+    // position (the pre-span shape every adapter used to build) is a missing start, not a silent point.
+    assert.throws(() => priceFromTable({ ...wellFormed, at: wellFormed.at.from }, 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => priceFromTable({ ...wellFormed, at: { from: wellFormed.at.from } }, 'deepseek-v4-pro'), /end instant/);
+    assert.throws(() => priceFromTable({ ...wellFormed, at: { from: new Date('2026-08-20T03:30:00Z'), to: wellFormed.at.to } }, 'deepseek-v4-pro'), /in order/);
 
     // The control: the same spawn WITH a real instant prices, so the three throws above are
     // attributable to `at` alone and not to anything else about the fixture.
@@ -232,11 +237,11 @@ describe('time-varying rates', () => {
   });
 
   test('pricing needs the context interval too: a spawn missing it throws for every model, not just context-tiered ones', () => {
-    // The regression this guards: `context` used to pass through spawnFacts unparsed, so a hand-rolled
+    // The regression this guards: `context` used to pass through priceFromTable unparsed, so a hand-rolled
     // `{at, tokens}` priced CLEANLY against every flat or time-tiered model and only detonated against
     // a context-tiered one. The same threading bug was invisible in most of the table and fatal in one
     // corner of it — so both a time-tiered and a context-tiered model are asserted here.
-    const at = new Date('2026-08-20T02:30:00Z');
+    const at = spawnFromTokens(new Date('2026-08-20T02:30:00Z'), TOKENS).at;
     assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'deepseek-v4-pro'), /context/);
     assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'gpt-5.6-sol'), /context/);
   });
@@ -254,7 +259,7 @@ describe('context-length rates', () => {
   // A spawn whose context is EXACTLY known — the shape an adapter that can observe a per-request
   // context would build. codex cannot (see the sibling test), so this is the schedule's contract
   // rather than a claim about today's engines.
-  const atContext = (n, tokens) => ({ at: OFF_PEAK, tokens, context: { min: n, max: n } });
+  const atContext = (n, tokens) => ({ at: { from: OFF_PEAK, to: OFF_PEAK }, tokens, context: { min: n, max: n } });
   const usdAtContext = (n, tokens, model) => {
     const cost = priceFromTable(atContext(n, tokens), model);
     assert.equal(cost.basis, 'dollars', `expected a priced result, got ${JSON.stringify(cost)}`);
@@ -683,18 +688,17 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     const record = parseCostRecord(marker);
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.equal(record.model, 'deepseek-v4-pro');
-    // Repriced from the record ALONE — its own tokens, its own model, and its own recorded start
-    // instant. Now that the table is a schedule, the span is not decoration on the record: it is the
-    // third input the price needs, and a restatement that guessed at it would be guessing at the rate.
-    assert.equal(usd(record.tokens, record.model, new Date(record.from)), priced);
+    // Repriced from the record ALONE — its own tokens, its own model, and its own recorded span. Now
+    // that the table is a schedule, the span is not decoration on the record: it is the third input
+    // the price needs, and a restatement that guessed at it would be guessing at the rate.
+    assert.equal(usd(record.tokens, record.model, new Date(record.span.from)), priced);
   });
 
   test('the record carries the provider identity, the model, and the pass time span', () => {
     const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG));
     assert.equal(record.provider, 'api.deepseek.com');
     assert.equal(record.model, 'deepseek-v4-pro');
-    assert.equal(record.from, SAMPLE_SPAN.from);
-    assert.equal(record.to, SAMPLE_SPAN.to);
+    assert.deepEqual(record.span, SAMPLE_SPAN);
   });
 
   // The provider identity must be stable across how a config was LABELLED — `PROVIDER: auto` and
@@ -720,7 +724,7 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.equal(record.tokens, null);
     assert.equal(record.model, null);
     assert.equal(record.provider, null);
-    assert.equal(record.from, null);
+    assert.equal(record.span, null);
   });
 
   test('a legacy unknown marker is still an unknown-cost round, never a free one', () => {
@@ -819,8 +823,7 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
     const marker = costMarker({ span }, DEEPSEEK_CONFIG);
     const record = parseCostRecord(marker);
-    assert.equal(record.from, span.from);
-    assert.equal(record.to, span.to);
+    assert.deepEqual(record.span, span);
     assert.equal(record.tokens, null);
     assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
   });
@@ -880,7 +883,7 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
   // must still parse with its tokens intact and restate exactly as it did then: priced from the sum
   // as an upper bound on any request's context.
   test('a sum-only record from before parts still parses with tokens intact and restates as it always did', () => {
-    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}"} -->`;
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
     const record = parseCostRecord(body);
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.deepEqual(record.parts, [{ tokens: SAMPLE_TOKENS, context: { min: 0, max: totalInputTokens(SAMPLE_TOKENS) } }]);
@@ -889,7 +892,7 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
 
   test('a sum-only record whose total exceeds 272K on a context-tiered model restates as schedule-gap, never a guessed card', () => {
     const tokens = { inputCacheMiss: 400_000, inputCacheHit: 0, output: 100 };
-    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(tokens)},"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}"} -->`;
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(tokens)},"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
     assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
   });
 
@@ -941,7 +944,7 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
   // spent; if a vendor later moves its boundary INTO that hull, the part matches no card and the
   // restatement says so, rather than repricing at whichever card the old boundary chose.
   test('a part whose hull straddles a card boundary restates as schedule-gap', () => {
-    const body = `<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":10,"inputCacheHit":0,"output":1},"context":{"min":100000,"max":300000}}],"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}"} -->`;
+    const body = `<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":10,"inputCacheHit":0,"output":1},"context":{"min":100000,"max":300000}}],"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
     assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
   });
 
@@ -964,26 +967,63 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
     assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
   });
 
-  // [LAW:single-enforcer] An instant is screened by the same predicate on both sides, so a hand-edited
-  // `from` reads as no instant and restates as not-reported — one corrupt record in a batch audit is
+  // [LAW:single-enforcer] The span is screened by the same predicate on both sides, so a hand-edited
+  // `from` reads as no span and restates as not-reported — one corrupt record in a batch audit is
   // one unpriced row, never a throw — and the writer cannot emit a span the reader would refuse.
-  test('an unparseable start instant reads as none and restates as not-reported, never a throw', () => {
+  test('an unparseable start instant reads as no span and restates as not-reported, never a throw', () => {
     const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"garbage","to":"2026-08-22T04:01:00.000Z"} -->`;
     const record = parseCostRecord(body);
-    assert.equal(record.from, null);
-    assert.equal(record.to, '2026-08-22T04:01:00.000Z');
+    assert.equal(record.span, null);
     assert.deepEqual(restatedCost(record), { basis: 'unpriced', reason: 'not-reported' });
 
     const marker = costMarker({ tokens: SAMPLE_TOKENS, span: { from: 'garbage', to: 'also garbage' }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG);
     assert.ok(!marker.includes('"from"') && !marker.includes('"to"'), `an unreadable span must not be written: ${marker}`);
   });
 
-  test('a record missing its model or start instant restates as not-reported, never guessed', () => {
+  test('a record missing its model or span restates as not-reported, never guessed', () => {
     const noModel = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' }));
     assert.deepEqual(restatedCost(noModel), { basis: 'unpriced', reason: 'not-reported' });
     const noSpan = parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG));
     assert.deepEqual(restatedCost(noSpan), { basis: 'unpriced', reason: 'not-reported' });
     assert.deepEqual(restatedCost(parseCostRecord('<!-- agent-review-cost-usd:0.651731 -->')), { basis: 'unpriced', reason: 'not-reported' });
+    // One end is no span: the reader refuses it whole rather than pricing at the end it has.
+    const oneEnd = parseCostRecord(`<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}"} -->`);
+    assert.equal(oneEnd.span, null);
+    assert.deepEqual(restatedCost(oneEnd), { basis: 'unpriced', reason: 'not-reported' });
+  });
+
+  test('an inverted span reads as no span on both sides of the marker', () => {
+    const record = parseCostRecord(`<!-- agent-review-cost-usd:{"usd":1,"from":"${SAMPLE_SPAN.to}","to":"${SAMPLE_SPAN.from}"} -->`);
+    assert.equal(record.span, null);
+    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: { from: SAMPLE_SPAN.to, to: SAMPLE_SPAN.from }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG);
+    assert.ok(!marker.includes('"from"') && !marker.includes('"to"'), `an inverted span must not be written: ${marker}`);
+  });
+
+  // [LAW:no-silent-failure] The marker holds the pass ENVELOPE (multiscope's sumUsage widens it over
+  // every spawn), so a restatement prices that span WHOLE: exactly when one rate holds across it,
+  // unpriced when a boundary falls inside it — never confidently at whichever end it read. The
+  // straddle is found by sampling the schedule at every boundary inside the span, not by comparing
+  // its ends: a pass can leave off-peak and return to it between two off-peak ends.
+  describe('a record spanning a rate boundary restates schedule-gap; one inside a window restates exactly', () => {
+    const spanning = (from, to) => parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, span: { from, to }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG));
+    const exactly = at => ({ basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', at) });
+    const GAP = { basis: 'unpriced', reason: 'schedule-gap' };
+
+    test('a weekday pass crossing 04:00 UTC restates schedule-gap', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T03:30:00.000Z', '2026-08-20T04:30:00.000Z')), GAP);
+    });
+    test('a weekday pass with off-peak ends and a peak window between them restates schedule-gap', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T00:30:00.000Z', '2026-08-20T04:30:00.000Z')), GAP);
+    });
+    test('a Saturday pass crossing 04:00 UTC restates exactly off-peak — no tier changes there', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-22T03:30:00.000Z', '2026-08-22T04:30:00.000Z')), exactly(OFF_PEAK));
+    });
+    test('a pass crossing Friday midnight into Saturday restates exactly off-peak', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-21T23:00:00.000Z', '2026-08-22T02:00:00.000Z')), exactly(OFF_PEAK));
+    });
+    test('a weekday pass wholly inside a peak window restates at the peak rate', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T02:00:00.000Z', '2026-08-20T03:30:00.000Z')), exactly(PEAK));
+    });
   });
 });
 
@@ -1009,7 +1049,7 @@ describe('duration record (zai-timing-31d.2)', () => {
     assert.deepEqual(record.cost, { basis: 'dollars', usd: 1.5 });
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.equal(record.model, 'deepseek-v4-pro');
-    assert.equal(record.from, SAMPLE_SPAN.from);
+    assert.deepEqual(record.span, SAMPLE_SPAN);
   });
 
   // A subscription round is timed like any other — agent time is spent whether or not it is billed.
