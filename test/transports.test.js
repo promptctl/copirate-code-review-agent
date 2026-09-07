@@ -585,6 +585,70 @@ describe('selectTransport — refused paths reach the caller as data', () => {
     assert.match(warnings[0], /reported on the PR and withholds approval/);
   });
 
+  // ── the Gitea arm carries what its diff never rendered ─────────────────────────────────────────
+  // The host's file LISTING says which paths changed; the unified DIFF only carries their hunks. When the
+  // second disagrees with the first, the difference is coverage this run lost, and `submitReview` gates
+  // approval on `unreviewableFiles.length === 0` — so a lost path that reaches nobody reads as full
+  // coverage. These assert the contract (the loss arrives as data), not how it is computed.
+  const GITEA_OK = [
+    'diff --git a/src/ok.js b/src/ok.js',
+    '--- a/src/ok.js',
+    '+++ b/src/ok.js',
+    '@@ -1 +1 @@',
+    '-a',
+    '+b',
+  ];
+
+  test('a file the listing names and the diff renders no hunks for is reported, not dropped', async () => {
+    // A binary section carries no @@ hunk, so it never reaches parseUnifiedDiff's flush. Before this it
+    // vanished from files, unreviewable and warnings alike, and the PR was approved as fully reviewed.
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'src/ok.js', status: 'modified' }, { filename: 'assets/logo.png', status: 'modified' }],
+      [...GITEA_OK,
+        'diff --git a/assets/logo.png b/assets/logo.png',
+        'Binary files a/assets/logo.png and b/assets/logo.png differ',
+      ].join('\n'),
+    ), 'o', 'r', 1);
+    assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
+    assert.deepEqual(t.unreviewable.map(u => u.filename), ['assets/logo.png']);
+    assert.match(t.unreviewable[0].reason, /no hunks/);
+  });
+
+  test('a path BOTH renderings refuse is reported exactly once', async () => {
+    // The double-report this arm was right to avoid — and the reason it wrongly dropped the listing's
+    // refusals wholesale. Both sides stamp the same label, so the set difference collapses them.
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'src/ok.js', status: 'modified' }, { filename: 'src/a\nEVIL.js', status: 'modified' }],
+      [...GITEA_OK,
+        'diff --git "a/src/a\\nEVIL.js" "b/src/a\\nEVIL.js"',
+        '@@ -1 +1 @@',
+        '-a',
+        '+b',
+      ].join('\n'),
+    ), 'o', 'r', 1);
+    assert.equal(t.unreviewable.length, 1, 'one refused path, one report');
+    assert.match(t.unreviewable[0].reason, /line separator/);
+  });
+
+  test("a listing refusal the diff never names survives onto the transport", async () => {
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'src/ok.js', status: 'modified' }, { filename: undefined, status: 'modified' }],
+      GITEA_OK.join('\n'),
+    ), 'o', 'r', 1);
+    assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
+    assert.equal(t.unreviewable.length, 1);
+    assert.match(t.unreviewable[0].reason, /not a string/);
+  });
+
+  test('a diff that renders every listed path reports no loss', async () => {
+    const t = await selectTransport(fakeHost(
+      [{ filename: 'src/ok.js', status: 'modified' }],
+      GITEA_OK.join('\n'),
+    ), 'o', 'r', 1);
+    assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
+    assert.deepEqual(t.unreviewable, [], 'no false coverage loss on a complete diff');
+  });
+
   test('selectTransport itself never warns — listing files is not submitting a review', async () => {
     const warnings = [];
     const original = core.warning;
@@ -599,9 +663,14 @@ describe('selectTransport — refused paths reach the caller as data', () => {
     assert.deepEqual(warnings, []);
   });
 
-  test('the Gitea path refuses on its own parsed diff, and reports only those refusals', async () => {
-    // No file carries a patch, so the transport falls back to the unified diff — a second, complete
-    // rendering of the same change. Merging the listFiles refusals in would double-report each one.
+  test('the Gitea path reports its own refusals AND the coverage the diff never rendered', async () => {
+    // No file carries a patch, so the transport falls back to the unified diff. This test asserted the
+    // opposite through 1.61.0 — that the listFiles refusal is dropped because the diff is "a second,
+    // complete rendering of the same change" — and its own fixture disproves that premise: the diff below
+    // renders ONLY src/ok.js, so the refused path is named by neither rendering and used to reach nobody.
+    // An empty `unreviewable` is what submitReview reads as full coverage. The double-report the old
+    // contract feared is real and still refused; it is a set difference, pinned by the sibling test where
+    // the diff genuinely does name the refused path.
     const diff = [
       'diff --git a/src/ok.js b/src/ok.js',
       'index 111..222 100644',
@@ -618,7 +687,8 @@ describe('selectTransport — refused paths reach the caller as data', () => {
     ], diff), 'o', 'r', 1);
     assert.equal(t.approveEvent, 'APPROVED', 'no per-file patch means the Gitea transport');
     assert.deepEqual(t.files.map(f => f.filename), ['src/ok.js']);
-    assert.deepEqual(t.unreviewable, [], 'the listFiles refusal is not re-reported over the diff\'s own');
+    assert.equal(t.unreviewable.length, 1, 'the refused path is named by neither rendering — it must still be reported');
+    assert.match(t.unreviewable[0].reason, /line separator/);
   });
 });
 

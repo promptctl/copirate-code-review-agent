@@ -1,6 +1,6 @@
 'use strict';
 const core = require('@actions/core');
-const { parseUnifiedDiff, parseReviewableFiles } = require('./diff');
+const { parseUnifiedDiff, parseReviewableFiles, reconcileChangedSet } = require('./diff');
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = require('./review');
@@ -249,9 +249,6 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   });
   const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
   warnings.forEach(w => core.warning(w));
-  // The listFiles refusals are NOT carried forward onto the Gitea transport: the unified diff is a
-  // second, complete rendering of the same change, so every path it names crosses this boundary on its
-  // own terms. Merging both lists would double-report each refusal. [LAW:one-source-of-truth]
   const parsed = parseReviewableFiles(rawParsed);
   if (parsed.files.length === 0) {
     // [LAW:no-silent-failure] Warn loudly — but do NOT abort. "No file carries a patch" is not only
@@ -277,7 +274,15 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
     );
     return gitHubTransport(files, unreviewable);
   }
-  return giteaTransport(parsed.files, parsed.unreviewable);
+  // The diff supplies the FILES — only they carry hunks to anchor against — and the listing supplies the
+  // ground truth for which paths exist, so the two are reconciled rather than merged. Through 1.61.0 this
+  // arm dropped the listing's refusals outright, on the argument that the unified diff is "a second,
+  // complete rendering of the same change". The observation behind it was right (concatenating both
+  // refusal lists double-reports every path both refuse); the premise was not. A diff renders no hunks
+  // for a binary, a rename- or mode-only change, or a section its parser cannot attribute, and each of
+  // those left the run reporting full coverage of a file nothing had read. [LAW:no-silent-failure]
+  const reconciled = reconcileChangedSet({ files, unreviewable }, parsed);
+  return giteaTransport(reconciled.files, reconciled.unreviewable);
 }
 
 // [LAW:parse-dont-validate] The one reader that turns a raw review body into what this action left
