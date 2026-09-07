@@ -964,6 +964,20 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
     assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
   });
 
+  // [LAW:single-enforcer] An instant is screened by the same predicate on both sides, so a hand-edited
+  // `from` reads as no instant and restates as not-reported — one corrupt record in a batch audit is
+  // one unpriced row, never a throw — and the writer cannot emit a span the reader would refuse.
+  test('an unparseable start instant reads as none and restates as not-reported, never a throw', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"garbage","to":"2026-08-22T04:01:00.000Z"} -->`;
+    const record = parseCostRecord(body);
+    assert.equal(record.from, null);
+    assert.equal(record.to, '2026-08-22T04:01:00.000Z');
+    assert.deepEqual(restatedCost(record), { basis: 'unpriced', reason: 'not-reported' });
+
+    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: { from: 'garbage', to: 'also garbage' }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG);
+    assert.ok(!marker.includes('"from"') && !marker.includes('"to"'), `an unreadable span must not be written: ${marker}`);
+  });
+
   test('a record missing its model or start instant restates as not-reported, never guessed', () => {
     const noModel = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' }));
     assert.deepEqual(restatedCost(noModel), { basis: 'unpriced', reason: 'not-reported' });

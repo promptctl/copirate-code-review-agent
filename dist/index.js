@@ -40164,8 +40164,8 @@ function costRecord(usage, config, totalMs) {
     // pricing input (DeepSeek's peak windows begin at 01:00/06:00 UTC), so a single timestamp would
     // silently misprice every review that straddles a boundary. Two ends let a restatement price
     // exactly when they fall in one window, and say so when they do not.
-    from: recorded(recordedString(span.from)),
-    to: recorded(recordedString(span.to)),
+    from: recorded(recordedInstant(span.from)),
+    to: recorded(recordedInstant(span.to)),
     // THE ROUND'S WALL CLOCK — and deliberately NOT `to - from`. The span above is the SPAWN
     // window, which is what a repricing needs; this is the whole action, which is what an operator
     // asked about when they said 25 minutes is unacceptable. The action fetches a diff, waits on a
@@ -40297,6 +40297,16 @@ function recordedString(v) {
   return typeof v === 'string' && v !== '' ? v : null;
 }
 
+// [LAW:parse-dont-validate] A recorded instant is a string Date.parse reads as a finite instant, or
+// nothing — kept as the string it was written as, since the record is the facts as recorded. It is
+// the one screen a restatement's `new Date(from)` needs: instantMs throws for a caller's threading
+// bug, and a hand-edited marker on someone else's PR is not that. [LAW:no-silent-failure] the
+// record still parses; only its instant is unknown.
+function recordedInstant(v) {
+  const s = recordedString(v);
+  return s !== null && Number.isFinite(Date.parse(s)) ? s : null;
+}
+
 // [LAW:parse-dont-validate] A recorded quantity — dollars or a token count — is a NON-NEGATIVE finite
 // number or nothing. The legacy grammar enforced this structurally: its value pattern admits no
 // leading '-', so a negative figure could not be spelled. The record payload is JSON and could, so
@@ -40377,8 +40387,8 @@ function parseCostRecord(body) {
     tokens: parts === null ? null : parts.map(part => part.tokens).reduce(addTokens, emptyTokens()),
     model: recordedString(facts.model),
     provider: recordedString(facts.provider),
-    from: recordedString(facts.from),
-    to: recordedString(facts.to),
+    from: recordedInstant(facts.from),
+    to: recordedInstant(facts.to),
     // Screened through the SAME predicate the writer used, so the set of durations costMarker can
     // emit IS the set this accepts, and a marker round-trips to the duration it recorded.
     // [LAW:single-enforcer] A hand-edited negative reads as no duration at all — a cumulative total
@@ -40406,8 +40416,7 @@ function parseCost(body) {
 // than guessed. [LAW:no-silent-failure]
 // Every part is priced at the record's START, because the marker holds the pass envelope and not
 // each spawn's own instant (see THE TOKEN RECORD): a pass straddling a time window restates at its
-// opening rate, as a restatement always has. An unreadable `from` reaches instantMs and throws there
-// — the price lookup's own loud arm, which an audit should hear rather than read around.
+// opening rate, as a restatement always has.
 function restatedFromTable(record) {
   const { parts, model, from } = record;
   if (parts === null || model === null || from === null) return { basis: 'unpriced', reason: 'not-reported' };
