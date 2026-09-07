@@ -32933,29 +32933,39 @@ function instantMs(at, what) {
 // holds?" — so a fact that is merely consistent with a constraint does not satisfy it. That
 // distinction is what makes the context axis sound; see THE SPAWN below. `breakpoints` names every
 // instant strictly inside a span at which the constraint can change its answer, which is what lets a
-// span be priced exactly as a whole (ratesOverSpan) rather than at one of its ends.
+// span be priced exactly as a whole (ratesOverSpan) rather than at one of its ends, and `period` is
+// how long until the axis repeats itself — the bound on how much of a span is worth sampling.
 //
 // Half-open [start, end) on every range axis: a boundary value belongs to the window that STARTS
 // there, never the one that ends there, so two adjacent windows can neither both claim it nor leave it
 // unclaimed. [LAW:one-type-per-behavior]
-const AXES = {
+// A null prototype for the reason PRICES_PER_MILLION has one: an axis named `constructor` must read
+// as the absence it is, not answer with an inherited member that is not an axis.
+const AXES = Object.assign(Object.create(null), {
   daysUtc: {
     holds: (constraint, facts) => constraint.days.includes(facts.day),
     breakpoints: (constraint, span) => utcHourInstants(span, [0]),
+    period: 7 * MS_PER_DAY,
   },
   hoursUtc: {
     holds: (constraint, facts) => constraint.ranges.some(([start, end]) => facts.hour >= start && facts.hour < end),
     breakpoints: (constraint, span) => utcHourInstants(span, constraint.ranges.flat()),
+    period: MS_PER_DAY,
   },
   // The fact is an INTERVAL the true context length lies within, so the constraint holds only when the
   // WHOLE interval falls inside the window — "every value it could be is priced at this card". A
   // spawn whose interval straddles the boundary proves nothing and matches neither side. Context is a
-  // fact about the requests and not the clock, so it never flips within a span.
+  // fact about the requests and not the clock, so it never flips within a span: it repeats at every
+  // instant, and 1 ms is the period that leaves every other axis's period unchanged (lcm's identity).
   contextTokens: {
     holds: (constraint, facts) => facts.context.min >= constraint.range[0] && facts.context.max < constraint.range[1],
     breakpoints: () => [],
+    period: 1,
   },
-};
+});
+
+const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+const lcm = (a, b) => (a / gcd(a, b)) * b;
 
 // Every UTC instant at the given hours of the day that falls STRICTLY inside the span — the clock
 // boundaries a time constraint can flip at. Strict on both ends: the span's start is sampled by its
@@ -32993,8 +33003,16 @@ function ratesAt(entry, facts) {
 // share with a window it left and re-entered in between. A span touching two tiers (or a tier and a
 // gap) is the schedule declining: pricing it at either end would be the confident misprice this
 // table exists to end. [LAW:no-silent-failure]
+//
+// The sampled window is clamped to the schedule's common period: every axis repeats (hours daily,
+// days weekly), so past one full period a span shows the schedule nothing it has not already shown.
+// The answer is identical either way; what the clamp bounds is the WORK, by the table's own shape
+// rather than by whatever span a hand-edited marker on someone else's PR claims to cover.
 function ratesOverSpan(entry, span, context) {
-  const breakpoints = entry.tiers.flatMap(t => t.when).flatMap(c => axisOf(c).breakpoints(c, span));
+  const constraints = entry.tiers.flatMap(t => t.when);
+  const period = constraints.map(c => axisOf(c).period).reduce(lcm, 1);
+  const window = { from: span.from, to: Math.min(span.to, span.from + period) };
+  const breakpoints = constraints.flatMap(c => axisOf(c).breakpoints(c, window));
   const samples = [span.from, ...breakpoints].map(ms => ratesAt(entry, factsAt(new Date(ms), context)));
   return samples.every(rates => rates === samples[0]) ? samples[0] : null;
 }

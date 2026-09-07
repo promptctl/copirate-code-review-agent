@@ -322,6 +322,12 @@ describe('context-length rates', () => {
     // whichever card happened to be listed first.
     const entry = { tiers: [{ when: [{ axis: 'serviceTier', is: 'flex' }], rates: { input: 1, cachedInput: 1, output: 1 } }] };
     assert.throws(() => ratesAt(entry, { day: 6, hour: 2, context: { min: 0, max: 10 } }), /unknown axis/);
+    // …and an axis named after an inherited member is unknown too, by the same message: the axis
+    // table answers for its own rows only, exactly as the price table does for model ids.
+    for (const axis of ['constructor', 'toString', 'valueOf', '__proto__']) {
+      const inherited = { tiers: [{ when: [{ axis }], rates: { input: 1, cachedInput: 1, output: 1 } }] };
+      assert.throws(() => ratesAt(inherited, { day: 6, hour: 2, context: { min: 0, max: 10 } }), /unknown axis/, axis);
+    }
   });
 });
 
@@ -1023,6 +1029,15 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
     });
     test('a weekday pass wholly inside a peak window restates at the peak rate', () => {
       assert.deepEqual(restatedCost(spanning('2026-08-20T02:00:00.000Z', '2026-08-20T03:30:00.000Z')), exactly(PEAK));
+    });
+    // A hand-edited span of ten millennia is one unpriced row, not fifteen million sampled instants:
+    // the sampled window is bounded by the schedule's own period, so a span longer than a week costs
+    // what a week costs — and answers the same, since a week already shows every tier there is.
+    test('a span of millennia restates at once — schedule-gap on a time-tiered model, exactly on a flat one', () => {
+      const MILLENNIA = ['0001-01-01T00:00:00.000Z', '9999-12-31T00:00:00.000Z'];
+      assert.deepEqual(restatedCost(spanning(...MILLENNIA)), GAP);
+      const flat = parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, span: { from: MILLENNIA[0], to: MILLENNIA[1] }, cost: { basis: 'dollars', usd: 1 } }, ZAI_CONFIG));
+      assert.deepEqual(restatedCost(flat), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'glm-5.1', OFF_PEAK) });
     });
   });
 });
