@@ -262,10 +262,10 @@ function tokensOfRequest(u) {
 // exactly: a review turn totals well over 272K across its requests while no single request need be,
 // and pricing the total at either card would be the confident misprice zai-cost-truth-p5o exists to
 // end. spawnFromRequest is the narrow claim each request supports — its context is exactly its own
-// input count. The usage record keeps the per-request breakdown beside the summed tokens for this
-// run — the pass fold carries it and the transcript holds the notifications — while the persisted
-// cost marker records the sum alone, so an audit-time restatement of a context-tiered review still
-// reads the schedule gap (zai-cost-truth-p5o.7 makes the marker carry it). [FRAMING:representation]
+// input count. The usage record keeps the per-request breakdown beside the summed tokens, and the
+// cost marker persists it folded by context card (costRecord's parts), so an audit-time restatement
+// reprices the review at the same cards this run did instead of reading the schedule gap its total
+// would. [FRAMING:representation]
 //
 // `startedAt` is the spawn's start instant, supplied by makeCliAdapter — the price table is a
 // schedule, so the rate is selected by WHEN this spawn ran, not by a clock read in here.
