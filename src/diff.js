@@ -270,9 +270,50 @@ function parseReviewableFiles(files) {
   return { files: reviewable, unreviewable };
 }
 
+// [LAW:one-source-of-truth] Two renderings of one change reach this module — the host's file LISTING and
+// its unified DIFF — and they are not peers. The listing is authoritative for WHICH paths changed; the
+// diff is authoritative only for their HUNKS. The Gitea arm returns the diff's files because only those
+// carry hunks to anchor against, so every path the listing named and the diff did not is coverage that
+// run lost, and until this reconciliation existed it left no trace: not in `files`, not in `unreviewable`,
+// not in `warnings`. `submitReview` gates approval on `unreviewableFiles.length === 0`, so "the diff never
+// rendered it" and "the PR does not contain it" were the same value, and the first one approved.
+//
+// It is a set DIFFERENCE, never a union. A path BOTH renderings refuse already carries an identical
+// `refusedPathLabel` stamp on each side, so concatenating the two lists would report it twice — the
+// double-report this arm was right to refuse. Dropping the listing's refusals outright was the wrong
+// conclusion drawn from that right observation.
+//
+// The loss modes are deliberately not enumerated in the predicate, because reconciling against the
+// listing catches the ones nobody has thought of yet. The known four: a file section with zero hunks
+// never reaches `flush` (a binary blob, a 100%-similarity rename, a mode-only change); an unparseable
+// `diff --git` header drops its file with only a run-log warning the PR reader never sees; a header whose
+// b-side split mis-attributes names a path the change does not contain, stranding the real one; and a
+// truncated diff body simply ends. [LAW:no-silent-failure]
+const UNRENDERED_BY_DIFF = 'the host listed it as changed but the unified diff rendered no hunks for it '
+  + '(a binary, a rename- or mode-only change, or a section the diff parser could not attribute)';
+
+function reconcileChangedSet(listed, parsed) {
+  const rendered = new Set(parsed.files.map(f => f.filename));
+  const refused = new Set(parsed.unreviewable.map(u => u.filename));
+  return {
+    files: parsed.files,
+    unreviewable: [
+      ...parsed.unreviewable,
+      // A path that survived the listing's boundary provably renders on one line, so it is named plainly.
+      // Only a REFUSED path needs the quoted label, which is exactly what it already carries.
+      // [FRAMING:representation]
+      ...listed.files
+        .filter(f => !rendered.has(f.filename))
+        .map(f => ({ filename: f.filename, reason: UNRENDERED_BY_DIFF })),
+      ...listed.unreviewable.filter(u => !refused.has(u.filename)),
+    ],
+  };
+}
+
 module.exports = {
   matchesPattern,
   parseReviewableFiles,
+  reconcileChangedSet,
   filterFiles,
   NO_EXCLUSIONS,
   excludedPathList,
