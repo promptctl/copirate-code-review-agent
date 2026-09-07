@@ -38049,8 +38049,12 @@ async function listAllFiles(octokit, owner, repo, pullNumber) {
 // sourced, how a finding's new-file line becomes a review comment, which literal string
 // its review-submission API expects for an approval event (approveEvent below), and which
 // route releases a blocking review (dismissReview below).
-// [LAW:dataflow-not-control-flow] Capability — does listFiles carry per-file patch? —
-// selects the instance, not a hardcoded hostname (GitHub & Enterprise carry it; Gitea does not).
+// [LAW:types-are-the-program] WHICH INSTANCE is built is a fact about the HOST, and WHICH RENDERING of
+// the changed set rides on it is a fact about the PR. They are derived separately, from separate
+// evidence — `parseDiffRoute` owns the first, `selectTransport` the second. Through 1.61.1 one test
+// ("does any listed file carry a patch") produced both: it answers the rendering and is only a PROXY for
+// the dialect, so a transport could be built with a dialect its host does not speak. Still a capability
+// and never a hardcoded hostname — the capability is just read at the granularity it actually settles.
 //
 // [LAW:no-silent-failure] approveEvent exists because GitHub and Gitea disagree on this one
 // verb: GitHub's create-review `event` takes the imperative 'APPROVE', but Gitea's is typed as
@@ -38097,6 +38101,46 @@ function giteaTransport(files, unreviewable) {
       { owner, repo, index: pullNumber, id: reviewId, message, priors: false },
     ),
   };
+}
+
+// [LAW:parse-dont-validate] The one place the host's DIALECT is established, and the only producer of a
+// transport factory from a host's own answer. Its output could not have existed before the check, so a
+// caller holding a `dialect` holds a host-identified one — a transport can no longer be constructed with
+// a dialect the host it will post to does not speak.
+//
+// MEASURED 2026-09-07 against the exact route requested below, on both hosts:
+//   Gitea 1.27.3  200 `text/plain; charset=utf-8`   octokit hands back the unified diff as a STRING.
+//   GitHub        200 `application/json`            the `.diff` suffix is IGNORED; octokit hands back the
+//                                                   PR resource as an OBJECT.
+// So the ANSWER'S TYPE names the host, definitively, at no extra request — and it stays a capability
+// ("does this host serve a unified diff here?"), not the hostname table this module refuses to keep.
+// GitHub does NOT 404 the suffix, so a failed fetch is not, and never was, the discriminator.
+//
+// Through 1.61.1 that answer was coerced with `String(data)` — '[object Object]' — which destroyed the
+// one piece of evidence naming the host, and the dialect was then inferred from how many files the
+// non-diff happened to parse into. GitHub survived only because '[object Object]' contains no
+// `diff --git` and so parsed to zero files: the right dialect by accident of content negotiation, not by
+// construction. Gitea did not survive. A diff rendering no hunks — a binary, a rename- or mode-only
+// change, a truncated body, a proxy answering 200 with an error page — took the same zero-files exit and
+// sent 'APPROVE', which Gitea falls through to ReviewTypePending: 200, no error, the approval parked
+// forever (see gitHubTransport above; verified live on Gitea v1.27.1, home-copirate-review-9uj.12).
+//
+// `anchorlessCause` rides along because it is the SAME fact in operator English — what this host answered
+// — and carrying it as a value is what keeps the sentence true on both hosts without a second branch
+// deciding it downstream. [LAW:dataflow-not-control-flow] [LAW:one-source-of-truth]
+function parseDiffRoute(data) {
+  return typeof data === 'string'
+    ? {
+      dialect: giteaTransport,
+      diff: data,
+      anchorlessCause: 'This host served a unified diff, but it rendered no hunks for any changed path.',
+    }
+    : {
+      dialect: gitHubTransport,
+      diff: null,
+      anchorlessCause: 'This host inlines a patch per file in its listing and returned none for any of '
+        + 'them — expected when every changed file is too large for it to inline (e.g. a committed bundle).',
+    };
 }
 
 // [LAW:one-source-of-truth] "This review is still blocking the merge" is ONE rule, not one per host, and
@@ -38216,43 +38260,29 @@ function announceUnreviewable(unreviewable) {
 // unrenderable path still withholds approval. That is the safe direction — the alternative is a pattern
 // deciding the fate of a string nothing can render.
 async function selectTransport(octokit, owner, repo, pullNumber) {
-  const { files, unreviewable } = parseReviewableFiles(await listAllFiles(octokit, owner, repo, pullNumber));
-  if (files.length === 0 || files.some(f => typeof f.patch === 'string')) {
-    return gitHubTransport(files, unreviewable);
+  const listed = await listAllFiles(octokit, owner, repo, pullNumber);
+  const listing = parseReviewableFiles(listed);
+  // An inline `patch` is the host naming itself: Gitea never carries one, so its presence settles the
+  // DIALECT and means the listing is already the complete RENDERING — both facts, no diff to fetch. Read
+  // off the RAW listing rather than the survivors: a path the boundary refused carried its patch from the
+  // same host, so it is evidence about the host just the same. [LAW:types-are-the-program]
+  if (listed.some(f => typeof f.patch === 'string')) {
+    return gitHubTransport(listing.files, listing.unreviewable);
   }
-  // [LAW:no-silent-failure] Gitea omits per-file patch; its unified .diff carries the hunks.
+  // No patch anywhere is not proof of Gitea, only the exhaustion of the cheap evidence — so the host is
+  // asked directly rather than assumed. An EMPTY listing reaches here too, deliberately: it carries no
+  // evidence at all, and guessing GitHub for it routed a Gitea PR's dismissal over GitHub's PUT.
   const { data } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}.diff', {
     owner,
     repo,
     pull_number: pullNumber,
   });
-  const { files: rawParsed, warnings } = parseUnifiedDiff(typeof data === 'string' ? data : String(data));
+  const { dialect, diff, anchorlessCause } = parseDiffRoute(data);
+  // One path whatever the host answered: a host that served no diff parses an empty one to zero files,
+  // so the rendering below is decided by the same expression on both. [LAW:dataflow-not-control-flow]
+  const { files: rawParsed, warnings } = parseUnifiedDiff(diff ?? '');
   warnings.forEach(w => core.warning(w));
   const parsed = parseReviewableFiles(rawParsed);
-  if (parsed.files.length === 0) {
-    // [LAW:no-silent-failure] Warn loudly — but do NOT abort. "No file carries a patch" is not only
-    // Gitea's signature: GitHub omits `patch` for a file too large to inline, so a PR whose every change
-    // is a big generated artifact (this repo's own committed 1.7 MB dist/index.js) lands here on GitHub
-    // and has nothing anchorable rather than nothing changed. Throwing reddened those PRs even when the
-    // artifact was in EXCLUDE_PATTERNS and there was genuinely nothing to review.
-    //
-    // Returning the unpatched files as a value hands the decision to the ONE place that can judge it:
-    // runPrReview REVIEWS them. A changed file with no patch is not unreviewable — buildReviewInput
-    // hands each to the worker as a read-in-full target at its absolute path, and an issue found there
-    // returns as an unanchored finding that still blocks the merge. Only an EMPTY changed set (nothing
-    // changed, or EXCLUDE_PATTERNS matched everything) short-circuits to a posted review with no engine
-    // spawned. Same treatment partitionFindings gives a mis-anchored finding — reconcile as a value,
-    // never abort the whole review over it.
-    //
-    // The refusals that travel with it are listFiles' own, not the diff's: this arm hands back the
-    // listFiles rendering, so it must report exactly that rendering's coverage loss. [FRAMING:representation]
-    core.warning(
-      `PR #${pullNumber}: no per-file patch from listFiles and the unified diff parsed to zero files, so ` +
-      `nothing in it is anchorable. Changed file(s): ${files.map(f => f.filename).join(', ')}. This is ` +
-      'expected when every changed file is too large for the host to return a patch (e.g. a committed bundle).',
-    );
-    return gitHubTransport(files, unreviewable);
-  }
   // The diff supplies the FILES — only they carry hunks to anchor against — and the listing supplies the
   // ground truth for which paths exist, so the two are reconciled rather than merged. Through 1.61.0 this
   // arm dropped the listing's refusals outright, on the argument that the unified diff is "a second,
@@ -38260,8 +38290,25 @@ async function selectTransport(octokit, owner, repo, pullNumber) {
   // refusal lists double-reports every path both refuse); the premise was not. A diff renders no hunks
   // for a binary, a rename- or mode-only change, or a section its parser cannot attribute, and each of
   // those left the run reporting full coverage of a file nothing had read. [LAW:no-silent-failure]
-  const reconciled = reconcileChangedSet({ files, unreviewable }, parsed);
-  return giteaTransport(reconciled.files, reconciled.unreviewable);
+  //
+  // A diff that rendered NOTHING is not a rendering of this change at all, so the listing stands alone —
+  // reconciling against it would report every changed path as coverage lost, which is the opposite lie.
+  const anchored = parsed.files.length > 0;
+  const changed = anchored ? reconcileChangedSet(listing, parsed) : listing;
+  // [LAW:no-silent-failure] Nothing anchorable is WARNED, never aborted: runPrReview hands these files to
+  // the worker as read-in-full targets at their absolute paths, and an issue found there returns as an
+  // unanchored finding that still blocks the merge. Throwing instead reddened PRs whose only change was a
+  // big artifact already in EXCLUDE_PATTERNS. The cause comes from the host's own answer rather than being
+  // asserted over both: "too large to inline" is true only of a host that inlines patches at all, and
+  // stating it on Gitea sent operators hunting for a file-size limit that host does not have.
+  if (!anchored && changed.files.length > 0) {
+    core.warning(
+      `PR #${pullNumber}: nothing in this change is anchorable to a line, so its changed file(s) are `
+      + `handed to the reviewer to be read in full. Changed file(s): `
+      + `${changed.files.map(f => f.filename).join(', ')}. ${anchorlessCause}`,
+    );
+  }
+  return dialect(changed.files, changed.unreviewable);
 }
 
 // [LAW:parse-dont-validate] The one reader that turns a raw review body into what this action left
@@ -39240,7 +39287,7 @@ async function announceReleaseFailure(octokit, {
 // listReviews this is fed from) stays on the ordinary `octokit`. [LAW:single-enforcer] The identity is a
 // CARRIED VALUE, never a host test: whoever the caller hands in dismisses, on either host. Gating it on
 // `transport` would resolve the thunk below just to choose a credential — the exact re-listing this
-// function is shaped to avoid — and re-open the host branch that the two-arm `TRANSPORTS` table exists to
+// function is shaped to avoid — and re-open the host branch that `parseDiffRoute` exists to
 // keep out of here. [LAW:dataflow-not-control-flow] `run.js`'s own review run never supplies one — the
 // only caller that does is `dismiss-block/`'s standalone entrypoint, a second, small action this repo
 // ships specifically so a Gitea-only credential never becomes an input on the action every GitHub
@@ -39296,13 +39343,11 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
     }
   }
   if (failures.length > 0) {
-    // [FRAMING:representation] The message names both candidate causes rather than asserting one it
-    // cannot know. A refusal is usually a token without `pull-requests: write`, but selectTransport
-    // answers "which host is this?" from diff capability and falls back to a GitHub-shaped transport when
-    // no file carries a patch and the unified diff parses to zero files — a state Gitea and a GitHub PR
-    // of oversized files both reach — so a Gitea PR in that state would be dismissed over GitHub's route
-    // and refused. Asserting "check your permissions" there sends the operator after the wrong cause,
-    // the same trap the fork/round-cap postFailureHint split exists to avoid.
+    // [FRAMING:representation] The message names every candidate cause rather than asserting one it
+    // cannot know — asserting "check your permissions" sends the operator after the wrong cause, the same
+    // trap the fork/round-cap postFailureHint split exists to avoid. "The host was misdetected" is no
+    // longer among them: `parseDiffRoute` establishes the dialect from the host's own answer, so a Gitea
+    // PR can no longer be dismissed over GitHub's route.
     const message = `Could not dismiss this action's own blocking review(s) on PR #${pullNumber}: `
       + `${failures.join('; ')}. Each of these was re-read afterwards and is STILL holding the merge, so `
       + 'while the pull request stays open it cannot be merged until someone dismisses them by hand. Causes '
@@ -39310,8 +39355,7 @@ async function releaseUnrevisitableBlocks(octokit, resolveTransport, {
       + 'access — the "write" access that is enough to post a review is NOT enough, and no token scope '
       + 'change fixes this, only a higher collaborator role does (MEASURED against a live Gitea 1.27.1, not '
       + 'assumed); the token may otherwise lack `pull-requests: write` on GitHub; the pull request may be '
-      + 'closed or merged (both hosts refuse a dismissal then); or the host may have been detected as '
-      + 'GitHub because no changed file carried a patch, in which case the dismissal used the wrong host route.';
+      + 'closed or merged (both hosts refuse a dismissal then).';
     core.setFailed(message);
     await announceReleaseFailure(octokit, {
       owner, repo, pullNumber, commitId, reviewerName, message, releaseFailureBodies,
