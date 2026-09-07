@@ -16,6 +16,7 @@ const {
   parseCostMarker,
   parseCost,
   parseCostRecord,
+  restatedCost,
   providerIdentity,
   sumCost,
   costWarning,
@@ -219,11 +220,16 @@ describe('time-varying rates', () => {
     // the same missing `.at`, and neither the Invalid Date nor the string was ever reached. A test
     // that passes for a reason other than the one it names asserts nothing. [LAW:behavior-not-structure]
     const wellFormed = spawnFromTokens(new Date('2026-08-20T02:30:00Z'), TOKENS);
-    const withInstant = (at) => ({ ...wellFormed, at });
+    const withInstant = (at) => ({ ...wellFormed, at: { from: at, to: at } });
 
     assert.throws(() => priceFromTable({ tokens: TOKENS, context: wellFormed.context }, 'deepseek-v4-pro'), /start instant/);
     assert.throws(() => priceFromTable(withInstant(new Date('nonsense')), 'deepseek-v4-pro'), /start instant/);
     assert.throws(() => priceFromTable(withInstant('2026-08-20T02:30:00Z'), 'deepseek-v4-pro'), /start instant/);
+    // The span is two ends in order, and each arm names the end it is missing: a bare Date in the span
+    // position (the pre-span shape every adapter used to build) is a missing start, not a silent point.
+    assert.throws(() => priceFromTable({ ...wellFormed, at: wellFormed.at.from }, 'deepseek-v4-pro'), /start instant/);
+    assert.throws(() => priceFromTable({ ...wellFormed, at: { from: wellFormed.at.from } }, 'deepseek-v4-pro'), /end instant/);
+    assert.throws(() => priceFromTable({ ...wellFormed, at: { from: new Date('2026-08-20T03:30:00Z'), to: wellFormed.at.to } }, 'deepseek-v4-pro'), /in order/);
 
     // The control: the same spawn WITH a real instant prices, so the three throws above are
     // attributable to `at` alone and not to anything else about the fixture.
@@ -231,11 +237,11 @@ describe('time-varying rates', () => {
   });
 
   test('pricing needs the context interval too: a spawn missing it throws for every model, not just context-tiered ones', () => {
-    // The regression this guards: `context` used to pass through spawnFacts unparsed, so a hand-rolled
+    // The regression this guards: `context` used to pass through priceFromTable unparsed, so a hand-rolled
     // `{at, tokens}` priced CLEANLY against every flat or time-tiered model and only detonated against
     // a context-tiered one. The same threading bug was invisible in most of the table and fatal in one
     // corner of it — so both a time-tiered and a context-tiered model are asserted here.
-    const at = new Date('2026-08-20T02:30:00Z');
+    const at = spawnFromTokens(new Date('2026-08-20T02:30:00Z'), TOKENS).at;
     assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'deepseek-v4-pro'), /context/);
     assert.throws(() => priceFromTable({ at, tokens: TOKENS }, 'gpt-5.6-sol'), /context/);
   });
@@ -253,7 +259,7 @@ describe('context-length rates', () => {
   // A spawn whose context is EXACTLY known — the shape an adapter that can observe a per-request
   // context would build. codex cannot (see the sibling test), so this is the schedule's contract
   // rather than a claim about today's engines.
-  const atContext = (n, tokens) => ({ at: OFF_PEAK, tokens, context: { min: n, max: n } });
+  const atContext = (n, tokens) => ({ at: { from: OFF_PEAK, to: OFF_PEAK }, tokens, context: { min: n, max: n } });
   const usdAtContext = (n, tokens, model) => {
     const cost = priceFromTable(atContext(n, tokens), model);
     assert.equal(cost.basis, 'dollars', `expected a priced result, got ${JSON.stringify(cost)}`);
@@ -316,6 +322,12 @@ describe('context-length rates', () => {
     // whichever card happened to be listed first.
     const entry = { tiers: [{ when: [{ axis: 'serviceTier', is: 'flex' }], rates: { input: 1, cachedInput: 1, output: 1 } }] };
     assert.throws(() => ratesAt(entry, { day: 6, hour: 2, context: { min: 0, max: 10 } }), /unknown axis/);
+    // …and an axis named after an inherited member is unknown too, by the same message: the axis
+    // table answers for its own rows only, exactly as the price table does for model ids.
+    for (const axis of ['constructor', 'toString', 'valueOf', '__proto__']) {
+      const inherited = { tiers: [{ when: [{ axis }], rates: { input: 1, cachedInput: 1, output: 1 } }] };
+      assert.throws(() => ratesAt(inherited, { day: 6, hour: 2, context: { min: 0, max: 10 } }), /unknown axis/, axis);
+    }
   });
 });
 
@@ -682,18 +694,17 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     const record = parseCostRecord(marker);
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.equal(record.model, 'deepseek-v4-pro');
-    // Repriced from the record ALONE — its own tokens, its own model, and its own recorded start
-    // instant. Now that the table is a schedule, the span is not decoration on the record: it is the
-    // third input the price needs, and a restatement that guessed at it would be guessing at the rate.
-    assert.equal(usd(record.tokens, record.model, new Date(record.from)), priced);
+    // Repriced from the record ALONE — its own tokens, its own model, and its own recorded span. Now
+    // that the table is a schedule, the span is not decoration on the record: it is the third input
+    // the price needs, and a restatement that guessed at it would be guessing at the rate.
+    assert.equal(usd(record.tokens, record.model, new Date(record.span.from)), priced);
   });
 
   test('the record carries the provider identity, the model, and the pass time span', () => {
     const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG));
     assert.equal(record.provider, 'api.deepseek.com');
     assert.equal(record.model, 'deepseek-v4-pro');
-    assert.equal(record.from, SAMPLE_SPAN.from);
-    assert.equal(record.to, SAMPLE_SPAN.to);
+    assert.deepEqual(record.span, SAMPLE_SPAN);
   });
 
   // The provider identity must be stable across how a config was LABELLED — `PROVIDER: auto` and
@@ -719,7 +730,7 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     assert.equal(record.tokens, null);
     assert.equal(record.model, null);
     assert.equal(record.provider, null);
-    assert.equal(record.from, null);
+    assert.equal(record.span, null);
   });
 
   test('a legacy unknown marker is still an unknown-cost round, never a free one', () => {
@@ -818,10 +829,216 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
     const marker = costMarker({ span }, DEEPSEEK_CONFIG);
     const record = parseCostRecord(marker);
-    assert.equal(record.from, span.from);
-    assert.equal(record.to, span.to);
+    assert.deepEqual(record.span, span);
     assert.equal(record.tokens, null);
     assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
+  });
+});
+
+// zai-cost-truth-p5o.7 — the marker carries the per-request breakdown FOLDED BY CONTEXT CARD, so a
+// context-tiered codex review (gpt-5.6-*, ≤272K / >272K per request) reprices at audit time to the
+// same figure its footer reported, where the summed record could only read the schedule gap.
+describe('cost marker — the parts reprice a context-tiered review (zai-cost-truth-p5o.7)', () => {
+  const request = (inputTokens, cachedInputTokens, outputTokens) =>
+    ({ totalTokens: inputTokens + outputTokens, inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0 });
+  const codexUsage = (config, ...requests) => ({
+    ...codexExtractUsage({ turn: { status: 'completed', error: null }, requests }, config, OFF_PEAK),
+    span: { from: OFF_PEAK.toISOString(), to: OFF_PEAK.toISOString() },
+  });
+  const LUNA = { ...CODEX_CONFIG, model: 'gpt-5.6-luna' };
+
+  // [LAW:verifiable-goals] THE ACCEPTANCE CRITERION: a mixed turn — one request under 272K and one
+  // over — written to a marker, parsed back, and repriced from the record ALONE equals the USD the
+  // run reported, exactly. And the marker holds one part per card, not one per request.
+  test('a mixed-context codex review restates from its marker to the exact USD its footer reported', () => {
+    const usage = codexUsage(LUNA, request(100_000, 0, 1000), request(300_000, 0, 1000));
+    assert.equal(usage.cost.basis, 'dollars');
+    const record = parseCostRecord(costMarker(usage, LUNA));
+    assert.equal(record.parts.length, 2);
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usage.cost.usd });
+    // …and the summed tokens are still there for every reader that wants the total.
+    assert.deepEqual(record.tokens, usage.tokens);
+  });
+
+  // The marker rides a PR comment, so its size must not grow with the run. Twenty requests inside
+  // one card fold into one part; the restatement is still exact because the hull sits inside the
+  // card that priced every one of them.
+  test('many requests within one card fold into one part, and still restate exactly', () => {
+    const sol = { ...CODEX_CONFIG, model: 'gpt-5.6-sol' };
+    const usage = codexUsage(sol, ...Array.from({ length: 20 }, () => request(20_000, 15_000, 100)));
+    const record = parseCostRecord(costMarker(usage, sol));
+    assert.equal(record.parts.length, 1);
+    assert.deepEqual(record.parts[0].context, { min: 20_000, max: 20_000 });
+    // Twenty separately priced requests and one folded part differ only in float accumulation.
+    const restated = restatedCost(record);
+    assert.equal(restated.basis, 'dollars');
+    assert.ok(Math.abs(restated.usd - usage.cost.usd) < 1e-9, `got ${restated.usd}, run reported ${usage.cost.usd}`);
+  });
+
+  test('a flat-rate model folds every request into one part whatever its context', () => {
+    const usage = codexUsage(CODEX_CONFIG, request(1000, 0, 10), request(500_000, 0, 10));
+    const record = parseCostRecord(costMarker(usage, CODEX_CONFIG));
+    assert.equal(record.parts.length, 1);
+    assert.deepEqual(record.parts[0].context, { min: 1000, max: 500_000 });
+    const restated = restatedCost(record);
+    assert.equal(restated.basis, 'dollars');
+    assert.ok(Math.abs(restated.usd - usage.cost.usd) < 1e-9, `got ${restated.usd}, run reported ${usage.cost.usd}`);
+  });
+
+  // [LAW:no-silent-failure] A marker written between 1.53.0 and 1.60.0 recorded the sum alone. It
+  // must still parse with its tokens intact and restate exactly as it did then: priced from the sum
+  // as an upper bound on any request's context.
+  test('a sum-only record from before parts still parses with tokens intact and restates as it always did', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
+    const record = parseCostRecord(body);
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+    assert.deepEqual(record.parts, [{ tokens: SAMPLE_TOKENS, context: { min: 0, max: totalInputTokens(SAMPLE_TOKENS) } }]);
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
+  });
+
+  test('a sum-only record whose total exceeds 272K on a context-tiered model restates as schedule-gap, never a guessed card', () => {
+    const tokens = { inputCacheMiss: 400_000, inputCacheHit: 0, output: 100 };
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(tokens)},"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
+    assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
+  });
+
+  // An engine that reports a sum and no requests (claude-code) writes the one part its sum proves.
+  test('a usage with no per-request breakdown writes one part spanning [0, total], and tokens round-trip', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1.5 }), DEEPSEEK_CONFIG));
+    assert.deepEqual(record.parts, [{ tokens: SAMPLE_TOKENS, context: { min: 0, max: totalInputTokens(SAMPLE_TOKENS) } }]);
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+  });
+
+  // [LAW:parse-dont-validate] A breakdown with a part the reader cannot read is no breakdown, and it
+  // is NOT quietly replaced by some other field: a corrupted record stays a corrupted record. The
+  // figure still parses, because the round still happened and its cost was recorded.
+  test('a hand-edited inverted or partial part leaves no parts and no tokens, while the figure still parses', () => {
+    const inverted = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1},"context":{"min":9,"max":1}}]} -->';
+    const partial = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1}}]} -->';
+    const empty = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[]} -->';
+    const mixed = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":1,"output":1},"context":{"min":1,"max":1}},null]} -->';
+    for (const body of [inverted, partial, empty, mixed]) {
+      const record = parseCostRecord(body);
+      assert.equal(record.parts, null, body);
+      assert.equal(record.tokens, null, body);
+      assert.deepEqual(record.cost, { basis: 'dollars', usd: 0.5 });
+      assert.deepEqual(restatedCost(record), { basis: 'unpriced', reason: 'not-reported' });
+    }
+  });
+
+  test('a record carrying parts AND a stale tokens field reads the parts, never the second clock', () => {
+    const body = '<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":1,"inputCacheHit":2,"output":3},"context":{"min":3,"max":3}}],"tokens":{"inputCacheMiss":100,"inputCacheHit":100,"output":100}} -->';
+    assert.deepEqual(parseCostRecord(body).tokens, { inputCacheMiss: 1, inputCacheHit: 2, output: 3 });
+  });
+
+  // [LAW:single-enforcer] The writer stamps every request's counts through the reader's predicate
+  // BEFORE folding, so one unrecordable request leaves no parts at all — a fold would have hidden
+  // the -5 inside a clean sum.
+  test('the writer cannot emit a part the reader would refuse: one negative request count means no parts', () => {
+    const usage = {
+      tokens: { inputCacheMiss: 95, inputCacheHit: 10, output: 4 },
+      requests: [{ inputCacheMiss: -5, inputCacheHit: 5, output: 2 }, { inputCacheMiss: 100, inputCacheHit: 5, output: 2 }],
+      span: SAMPLE_SPAN,
+      cost: { basis: 'dollars', usd: 1 },
+    };
+    const marker = costMarker(usage, LUNA);
+    assert.ok(!marker.includes('parts'), `an unrecordable breakdown must not be written: ${marker}`);
+    assert.equal(parseCostRecord(marker).parts, null);
+  });
+
+  // [LAW:no-silent-failure] THE DEGRADATION IS LOUD. A hull is a fact about where the tokens were
+  // spent; if a vendor later moves its boundary INTO that hull, the part matches no card and the
+  // restatement says so, rather than repricing at whichever card the old boundary chose.
+  test('a part whose hull straddles a card boundary restates as schedule-gap', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":0.5,"parts":[{"tokens":{"inputCacheMiss":10,"inputCacheHit":0,"output":1},"context":{"min":100000,"max":300000}}],"model":"gpt-5.6-luna","from":"${SAMPLE_SPAN.from}","to":"${SAMPLE_SPAN.to}"} -->`;
+    assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
+  });
+
+  // [LAW:one-source-of-truth] The basis selects the restatement. A subscription round records real
+  // tokens and an Anthropic model id the table never prices; restating it through the table would
+  // answer no-price and send a maintainer to PRICE_SOURCES for a model that cannot go there. Its
+  // list price is Claude Code's own figure, which nothing here can move, so the restatement IS the
+  // recorded cost — never null, which on this arm means the list price was not reported.
+  test('a subscription record restates as its own recorded cost, never as no-price and never as unreported', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG));
+    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
+    assert.deepEqual(restatedCost(record), { basis: 'subscription', notionalUsd: 63.59 });
+  });
+
+  // A round the run could not price still recorded its parts; if the table has since gained the
+  // card, the audit finds a figure — which is the whole point of restating.
+  test('an unpriced dollars record with parts restates through the table', () => {
+    const record = parseCostRecord(costMarker(usageOf({ basis: 'unpriced', reason: 'schedule-gap' }), DEEPSEEK_CONFIG));
+    assert.deepEqual(record.cost, { basis: 'unpriced', reason: 'not-reported' });
+    assert.deepEqual(restatedCost(record), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', new Date(SAMPLE_SPAN.from)) });
+  });
+
+  // [LAW:single-enforcer] The span is screened by the same predicate on both sides, so a hand-edited
+  // `from` reads as no span and restates as not-reported — one corrupt record in a batch audit is
+  // one unpriced row, never a throw — and the writer cannot emit a span the reader would refuse.
+  test('an unparseable start instant reads as no span and restates as not-reported, never a throw', () => {
+    const body = `<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"garbage","to":"2026-08-22T04:01:00.000Z"} -->`;
+    const record = parseCostRecord(body);
+    assert.equal(record.span, null);
+    assert.deepEqual(restatedCost(record), { basis: 'unpriced', reason: 'not-reported' });
+
+    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: { from: 'garbage', to: 'also garbage' }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG);
+    assert.ok(!marker.includes('"from"') && !marker.includes('"to"'), `an unreadable span must not be written: ${marker}`);
+  });
+
+  test('a record missing its model or span restates as not-reported, never guessed', () => {
+    const noModel = parseCostRecord(costMarker(usageOf({ basis: 'dollars', usd: 1 }), { ...DEEPSEEK_CONFIG, model: '' }));
+    assert.deepEqual(restatedCost(noModel), { basis: 'unpriced', reason: 'not-reported' });
+    const noSpan = parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG));
+    assert.deepEqual(restatedCost(noSpan), { basis: 'unpriced', reason: 'not-reported' });
+    assert.deepEqual(restatedCost(parseCostRecord('<!-- agent-review-cost-usd:0.651731 -->')), { basis: 'unpriced', reason: 'not-reported' });
+    // One end is no span: the reader refuses it whole rather than pricing at the end it has.
+    const oneEnd = parseCostRecord(`<!-- agent-review-cost-usd:{"usd":1,"tokens":${JSON.stringify(SAMPLE_TOKENS)},"model":"deepseek-v4-pro","from":"${SAMPLE_SPAN.from}"} -->`);
+    assert.equal(oneEnd.span, null);
+    assert.deepEqual(restatedCost(oneEnd), { basis: 'unpriced', reason: 'not-reported' });
+  });
+
+  test('an inverted span reads as no span on both sides of the marker', () => {
+    const record = parseCostRecord(`<!-- agent-review-cost-usd:{"usd":1,"from":"${SAMPLE_SPAN.to}","to":"${SAMPLE_SPAN.from}"} -->`);
+    assert.equal(record.span, null);
+    const marker = costMarker({ tokens: SAMPLE_TOKENS, span: { from: SAMPLE_SPAN.to, to: SAMPLE_SPAN.from }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG);
+    assert.ok(!marker.includes('"from"') && !marker.includes('"to"'), `an inverted span must not be written: ${marker}`);
+  });
+
+  // [LAW:no-silent-failure] The marker holds the pass ENVELOPE (multiscope's sumUsage widens it over
+  // every spawn), so a restatement prices that span WHOLE: exactly when one rate holds across it,
+  // unpriced when a boundary falls inside it — never confidently at whichever end it read. The
+  // straddle is found by sampling the schedule at every boundary inside the span, not by comparing
+  // its ends: a pass can leave off-peak and return to it between two off-peak ends.
+  describe('a record spanning a rate boundary restates schedule-gap; one inside a window restates exactly', () => {
+    const spanning = (from, to) => parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, span: { from, to }, cost: { basis: 'dollars', usd: 1 } }, DEEPSEEK_CONFIG));
+    const exactly = at => ({ basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'deepseek-v4-pro', at) });
+    const GAP = { basis: 'unpriced', reason: 'schedule-gap' };
+
+    test('a weekday pass crossing 04:00 UTC restates schedule-gap', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T03:30:00.000Z', '2026-08-20T04:30:00.000Z')), GAP);
+    });
+    test('a weekday pass with off-peak ends and a peak window between them restates schedule-gap', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T00:30:00.000Z', '2026-08-20T04:30:00.000Z')), GAP);
+    });
+    test('a Saturday pass crossing 04:00 UTC restates exactly off-peak — no tier changes there', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-22T03:30:00.000Z', '2026-08-22T04:30:00.000Z')), exactly(OFF_PEAK));
+    });
+    test('a pass crossing Friday midnight into Saturday restates exactly off-peak', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-21T23:00:00.000Z', '2026-08-22T02:00:00.000Z')), exactly(OFF_PEAK));
+    });
+    test('a weekday pass wholly inside a peak window restates at the peak rate', () => {
+      assert.deepEqual(restatedCost(spanning('2026-08-20T02:00:00.000Z', '2026-08-20T03:30:00.000Z')), exactly(PEAK));
+    });
+    // A hand-edited span of ten millennia is one unpriced row, not fifteen million sampled instants:
+    // the sampled window is bounded by the schedule's own period, so a span longer than a week costs
+    // what a week costs — and answers the same, since a week already shows every tier there is.
+    test('a span of millennia restates at once — schedule-gap on a time-tiered model, exactly on a flat one', () => {
+      const MILLENNIA = ['0001-01-01T00:00:00.000Z', '9999-12-31T00:00:00.000Z'];
+      assert.deepEqual(restatedCost(spanning(...MILLENNIA)), GAP);
+      const flat = parseCostRecord(costMarker({ tokens: SAMPLE_TOKENS, span: { from: MILLENNIA[0], to: MILLENNIA[1] }, cost: { basis: 'dollars', usd: 1 } }, ZAI_CONFIG));
+      assert.deepEqual(restatedCost(flat), { basis: 'dollars', usd: usd(SAMPLE_TOKENS, 'glm-5.1', OFF_PEAK) });
+    });
   });
 });
 
@@ -847,7 +1064,7 @@ describe('duration record (zai-timing-31d.2)', () => {
     assert.deepEqual(record.cost, { basis: 'dollars', usd: 1.5 });
     assert.deepEqual(record.tokens, SAMPLE_TOKENS);
     assert.equal(record.model, 'deepseek-v4-pro');
-    assert.equal(record.from, SAMPLE_SPAN.from);
+    assert.deepEqual(record.span, SAMPLE_SPAN);
   });
 
   // A subscription round is timed like any other — agent time is spent whether or not it is billed.
