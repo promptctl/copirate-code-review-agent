@@ -14,12 +14,17 @@
 > **subscription quota** (about a day of one account per suite, across a pool that PR
 > reviews draw from too). Optimise those; report the notional figure, never target it.
 >
-> **Why more parallelism is not the answer.** Wall clock is
-> `ceil(replays / lanes) × per-replay`. The suite is 20 replays at 13–27 min; the
-> keychain pool holds four accounts. Under 45 minutes requires depth 1, so
-> `replays ≤ lanes` — at most four replays. **The full N=5 suite cannot fit the budget on
-> these accounts at any lane count.** Only running fewer replays in the common case gets
-> there. The levers, with their measured numbers, are on the ticket.
+> **Why more parallelism is not the answer.** A replay costs **19.78 minutes** measured
+> (13–27 min across the freeze), the keychain pool holds four accounts, and the gate's
+> ceiling is fifteen replays — five waves of three cases, each wave about one replay of
+> wall clock once the lanes cover it. Full depth is therefore **~100 minutes at any lane
+> count**, and four accounts cannot shorten a wave below one replay. The gate now buys
+> depth instead of assuming it (the [ladder](#spending-the-depth-the-answer-costs--the-ladder)
+> stops at the first wave that decides), so a badly-broken candidate reds inside one
+> wave — but **a near-baseline candidate still costs the ceiling or comes back
+> `UNDECIDED`**, so the sub-45-minute gate the ticket asks for does not exist yet.
+> `zai-eval-harness-5ux` stays open until the workflow's refusal is removed by the change
+> that closes it.
 >
 > Everything below describes the harness **as it stands**, which is the thing under ban.
 
@@ -188,12 +193,19 @@ replay material and pools the other rounds' eligible findings as inventory.
 | `cc-candybar-150-transcript-perf` | cc-candybar (TS)          | #150 | perf refactor        | 32 (10 / 15 / 7)            | 17 (7 / 8 / 2)        |
 | `links-317-dolt-telemetry`        | links-issue-tracker (Go)  | #317 | supply-chain removal | 14 (4 / 9 / 1)              | 7 (3 / 3 / 1)         |
 | `copirate-93-dependency-diff`     | copirate-code-review (JS) | #93  | feature              | 9 (4 / 5 / 0)               | 7 (3 / 4 / 0)         |
-| `laws-4-eval-tasks`               | laws (Markdown/shell)     | #4   | eval task specs      | 15 (2 / 12 / 1)             | 6 (2 / 3 / 1)         |
 
-**70 findings total — 20 inventory must-finds (15 of them in the frozen rounds).**
-Diverse across language (TS/Go/JS/Markdown) and change kind (perf, supply-chain,
-feature, spec/CI). `laws-4`'s dribble was entirely low-stakes maintainability notes, so its inventory
-adds nice-to-finds but no must-finds — an honest reflection of that PR, not a curation gap.
+**55 findings total — 18 inventory must-finds (13 of them in the frozen rounds),** so one
+wave of the suite offers 18 must-find opportunities and the N=5 ceiling offers 90. Diverse
+across language (TS/Go/JS) and change kind (perf, supply-chain, feature).
+
+A fourth case, `laws-4-eval-tasks` (`laws` #4, Markdown/shell eval task specs, 15 findings
+with 2 must-finds), was **cut on 2026-09-08**. It scored 0.000 inventory must-find recall
+on all five replays of the freeze — neither of its must-finds was ever found once, and a
+detector already at the bottom cannot detect a fall — while emitting 8.4 noise findings
+per run and consuming about a quarter of every suite run's cost. Cutting it **did not
+sharpen the gate**: it diluted the pooled rate and the pooled floor together, so both
+suites red at 27 finds or fewer (four cases: `0.2754 × 100 = 27.54`; three cases:
+`0.3095 × 90 = 27.85`). The win is 25 % of the suite's wall clock, and nothing else.
 
 ## Replaying a case
 
@@ -336,7 +348,7 @@ node eval/baseline.js --out-dir eval/out/freeze-<sha>
 ```
 
 Step 1 is `eval/freeze-suite.js` and not a shell loop over `run-case.js` because a suite is
-~20 replays over several hours against a subscription that walls for hours at a time, and the
+15 replays over several hours against a subscription that walls for hours at a time, and the
 loop had no way to survive that. The suite runner adds exactly four things and reimplements
 nothing — every job is still `run-case.js -n 1` in its own process:
 
@@ -349,9 +361,9 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   several legs keeps every leg's clock, and a status-check re-run (which plans nothing) cannot
   erase what an earlier one measured. `elapsedMs` is wall clock, never the sum of
   `replays[].durationMs`: the lanes overlap, and wall clock is the figure the gate's
-  45-minute bar is stated in. `readSuiteTiming()` folds the legs into one answer, but it is a
-  library primitive with **no reader today** — no CLI prints the folded total; it exists for the
-  gate (zai-eval-harness-5ux) to size itself against. Read a suite's real cost by folding the
+  45-minute bar is stated in. `readSuiteTiming()` folds the legs into one answer, and the
+  ladder is its reader: each wave is one leg, so the longest leg is what `compare.js` prices
+  the next wave at. No CLI prints the folded total — read a suite's real cost by folding the
   legs yourself, or read a single leg's file directly.
 - **Level-filling order.** A job exists for case *c* at level *r* iff *c* has fewer than *r*
   completed runs, so every case is deepened before any one of them is. An interruption leaves
@@ -361,7 +373,9 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   reliably *fail* — the engine CLI can sit in silent retry — and one lane waiting on it holds the
   queue forever. On expiry the replay's whole process group is killed (the engine's workers are
   grandchildren; signalling only the direct child would orphan them still burning quota) and the job
-  is reported as `TIMED OUT`, never as an ordinary non-zero exit.
+  is reported as `TIMED OUT`, never as an ordinary non-zero exit. The 120 minutes is the
+  freeze's own default; the gate overrides it per wave with whatever is left of its budget, so
+  a replay that cannot finish inside the budget cannot stall a wave past it.
 - **One lane per credential.** `--credentials VAR1,VAR2,…` names environment variables
   holding one credential each and replays on all of them concurrently; each lane is
   sequential. A lane takes the first queued job it has not already attempted, and a failure
@@ -397,7 +411,8 @@ eval/baseline/<date>-<short-sha>/
                     (the one gate number), the frozen-round pooled rate (continuity diagnostic), each case's
                     inventory + frozen-round recall bands (mean/min/max) + diagnostic floor, the suite cost,
                     the pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
-                    compare gate (2fk.5) reuses, and evaluateGate is the one predicate that applies the rule.
+                    compare gate (2fk.5) reuses, evaluateGate is the one predicate that applies the rule, and
+                    decideLadder re-applies that same predicate to a partial candidate (see the ladder below).
   baseline.md     — the same, human-readable: the per-case band table, suite cost, and the rule.
 ```
 
@@ -416,7 +431,10 @@ comparing it to the frozen baseline:
 `evaluateGate` in `eval/baseline.js` is the single enforcer of this rule
 (`[LAW:single-enforcer]`): the compare CLI (2fk.5) wraps it, and its behavior — the gate
 fails a candidate whose pooled inventory recall drops below the frozen floor — is pinned by
-`test/eval-baseline.test.js`. For a case with no inventory rounds the inventory equals the
+`test/eval-baseline.test.js`. This is the **terminal** rule, stated at full depth; the
+[ladder](#spending-the-depth-the-answer-costs--the-ladder) reaches the same verdict from a
+shallower sample by re-applying this same predicate, never by deriving a second threshold.
+For a case with no inventory rounds the inventory equals the
 frozen round, so this gate is a strict generalization of the earlier frozen-round gate; the
 frozen-round pooled rate stays in the baseline as a continuity diagnostic comparable with
 the pre-inventory (v1) baseline.
@@ -435,16 +453,25 @@ on their own.
 ### The current baseline (live engine, inventory-gated)
 
 The gate reference is
-[`eval/baseline/2026-09-06-ebccbd4/`](baseline/2026-09-06-ebccbd4/baseline.md) — the engine
-tree at `ebccbd4`, `claude-subscription` / `claude-sonnet-5`, N=5, schema v2. Headline:
-**pooled inventory must-find recall 37 % (37 of 100 opportunities), gate floor 28 %.** The
-frozen-round pooled rate measured 35 % (26/75).
+[`eval/baseline/2026-09-08-ebccbd4/`](baseline/2026-09-08-ebccbd4/baseline.md) — the engine
+tree at `ebccbd4`, `claude-subscription` / `claude-sonnet-5`, three cases, N=5, schema v2,
+matcher `llm/claude-haiku-4-5-20251001`. Headline: **pooled inventory must-find recall
+41.11 % (37 of 90 opportunities), gate floor 30.95 %** (`gateFloor: 0.3095`). The
+frozen-round pooled rate measured 40 % (26/65).
 
-**Read the jump from 22 % to 37 % as an ENGINE change, not a recall win.** No prompt moved
-between the two freezes. `PROVIDER: auto` was retargeted from `deepseek-v4-pro` to
-`claude-sonnet-5` in 1.42.0, and this is the first measurement of the engine production
-actually runs. The recall epic (`zai-recall-upr`) has still shipped no lever — its work is
-simply now measured against 37 % instead of 22 %.
+**It cost zero replays to freeze.** Its predecessor
+[`eval/baseline/2026-09-06-ebccbd4/`](baseline/2026-09-06-ebccbd4/baseline.md) measured
+37 % (37 of 100) with a 0.2754 floor over four cases; dropping `laws-4-eval-tasks` re-reduced
+**the same runs** over the surviving three. `buildBaseline` is a pure reduction over the
+scored summaries, which were still on disk, so no engine ran. That is why both directories
+carry the same `ebccbd4` — one engine tree, two reductions of one set of runs. The 37 finds
+are literally the same 37: `laws-4` contributed none of its 10 opportunities.
+
+**Read the jump from the retired engine's 22 % as an ENGINE change, not a recall win.** No
+prompt moved between the deepseek freeze and this one. `PROVIDER: auto` was retargeted from
+`deepseek-v4-pro` to `claude-sonnet-5` in 1.42.0, and this is the first measurement of the
+engine production actually runs. The recall epic (`zai-recall-upr`) has still shipped no
+lever — its work is simply now measured against this baseline instead of that one.
 
 **Provenance: the SHA is deliberately not a `main` commit.** `ebccbd4` is a branch commit.
 This repo squash-merges, so the tree that produced these runs never lands on `main` under its
@@ -454,11 +481,12 @@ assumption; `compare.js` ranks baselines by which commit last touched `baseline.
 by reachability, so nothing mechanical depends on it.
 
 **Cost basis: subscription quota, not dollars.** No run reports a cost, so `baseline.js`
-records `costPerFullRunUsd: null` with `uncostedRuns: 20` rather than passing a partial sum
+records `costPerFullRunUsd: null` with `uncostedRuns: 15` rather than passing a partial sum
 off as a total. The CLI's own meter is notional here — one *failed* `links-317` replay
-reported $4.01 that was never billed. The real currency is wall clock and quota: ~13–27 min
-per replay, ~4.5 h for the suite across three subscription lanes, and the daily wall
-(midnight America/Denver) reached on all three accounts before the last replay landed.
+reported $4.01 that was never billed. The real currency is wall clock and quota: 19.78 min
+per replay measured (range 13–27), ~4.5 h for the twenty-replay freeze across three
+subscription lanes, and the daily wall (midnight America/Denver) reached on all three
+accounts before the last replay landed.
 
 ### Superseded: the deepseek baselines
 
@@ -479,7 +507,9 @@ must-find recall 19 % (14 of 75 opportunities), gate floor 10 %.** A full suite 
 cases once) costs ≈ $0.70; the whole N=5 baseline cost **$3.48**.
 
 The per-case variance behind the pooled rule (above) is stark — every case's run-to-run
-spread is large relative to its mean, and for three of the four the spread *exceeds* the mean:
+spread is large relative to its mean, and for three of the four the spread *exceeds* the
+mean. The table is the record of that suite as it stood, `laws-4-eval-tasks` (cut in 2026-09)
+included; editing a case out of it would falsify the measurement the rule was drawn from:
 
 | case | must-find | mean | min–max | per-run finds |
 |------|-----------|------|---------|---------------|
@@ -496,20 +526,21 @@ folds all 75 opportunities into one number instead.
 **For the pooled rate, yes at N=5; for per-case recall, no at any practical N.** The pooled
 rate aggregates 75 Bernoulli trials, so its ~2σ sampling margin is about ±9 points (a 10 %
 floor under a 19 % mean) — tight enough that a candidate dipping below the floor is real
-degradation, not jitter. Per-case recall is the opposite: with denominators of 2–7 findings
-a single finding flipping swings recall 33–50 points, the run-to-run spread exceeds the mean
-for three of four cases, and shrinking a per-case mean's standard error enough to gate would
-take ~30+ repeats per case (~$20 and hours) — not worth it. So the harness gates on the
-pooled suite rate, uses the per-case bands only to localize a regression, and **N=5 is the
-standing baseline depth.**
+degradation, not jitter. The current baseline pools 90 trials, so its margin is tighter
+still. Per-case recall is the opposite: with denominators of 2–7 findings
+a single finding flipping swings recall 33–50 points, the run-to-run spread exceeded the mean
+for three of the first baseline's four cases, and shrinking a per-case mean's standard error
+enough to gate would take ~30+ repeats per case (~$20 and hours) — not worth it. So the
+harness gates on the pooled suite rate, uses the per-case bands only to localize a
+regression, and **N=5 is the standing baseline depth** — which the ladder treats as the gate's
+*ceiling*, not as the depth every gate run buys.
 
-The deeper result is the epic's headline, and it is not a defect in the harness: pooled
-inventory must-find recall is **37 %** on the live engine — the engine reproduces roughly one
-in three of the golden set's hardest findings in a single round (it was ~19–22 % on the
-retired deepseek engine). The instrument is faithful (the LLM judge agreed with hand-matching
-11/11 during `copirate-eval-harness-2fk.3`); the low number is the truth it was built to
-measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not push
-lower, and the bar the quality work must raise.
+The deeper result is the epic's headline, and it is not a defect in the harness: the engine
+reproduces roughly two in five of the golden set's hardest findings in a single round (it was
+~19–22 % on the retired deepseek engine). The instrument is faithful (the LLM judge agreed
+with hand-matching 11/11 during `copirate-eval-harness-2fk.3`); the low number is the truth it
+was built to measure. It is the floor the efficiency epic (`copirate-efficiency-235`) must not
+push lower, and the bar the quality work must raise.
 
 ## Comparing a candidate — the quality gate
 
@@ -530,10 +561,15 @@ ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js
 #            --reuse-candidate, where the reused summaries' own recorded matcher is checked instead),
 #          --out <dir> (default eval/out/candidate-<ts>, git-ignored; mutually exclusive with
 #            --reuse-candidate; an existing root resumes — runs under it recorded on this same clean
-#            commit count toward N — and any run that is not provably this candidate's, or a case holding
-#            more runs than the baseline's N, is refused by name),
+#            commit count toward N, and a root left UNDECIDED resumes at the rung it reached — and any
+#            run that is not provably this candidate's, or a case holding more runs than the baseline's
+#            N, is refused by name),
 #          --credentials <A,B,…> (env var names, one replay lane each, forwarded to freeze-suite.js;
 #            default: one lane on the pinned provider's own input), --cases-dir <dir>, --cache <file>,
+#          --budget-minutes <m> (default 45 — the wall-clock bar for THIS invocation; the first wave
+#            always runs, every later one must fit in what is left, priced at the most expensive wave
+#            this candidate has actually cost; a wave that will not fit is not started and the gate
+#            reports UNDECIDED),
 #          --reuse-candidate <dir> (gate an already-produced candidate root; no replay, no spend; the
 #            verdict names the tree the reused runs record, not the checked-out tree; mutually
 #            exclusive with --out)
@@ -549,31 +585,92 @@ would be a ruler that moves with what it measures.
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:
 
-1. replays every baseline case **N times** (N and the engine come *from the baseline*, and are
-   asserted — a candidate run at a different N or engine measures something else) by spawning
-   `freeze-suite.js` over the baseline's case set — the freeze's own scheduler, driving
-   `run-case.js` once per replay across the `--credentials` lanes — then scores each case with
-   `score.js`, into an isolated candidate root;
+1. replays every baseline case **once per wave** (the case set and the engine come *from the
+   baseline*, and are asserted — a candidate run on a different engine or over a different case
+   set measures something else) by spawning `freeze-suite.js` — the freeze's own scheduler,
+   driving `run-case.js` once per replay across the `--credentials` lanes — then scores each case
+   with `score.js`, into an isolated candidate root;
 2. reduces the candidate's scored summaries into a suite with the **same `buildBaseline`** the
    frozen baseline was built with — so the producer and the comparator can never drift
    (`[LAW:one-source-of-truth]`); and
-3. applies the frozen [degradation rule](#the-degradation-rule) via `baseline.js`'s `evaluateGate`
-   (`[LAW:single-enforcer]`): **candidate pooled inventory must-find recall < the baseline's pooled
-   gate floor ⇒ DEGRADED.**
+3. applies the frozen [degradation rule](#the-degradation-rule) via `baseline.js`'s `decideLadder`,
+   which re-applies `evaluateGate` (`[LAW:single-enforcer]`): **candidate pooled inventory must-find
+   recall < the baseline's pooled gate floor ⇒ DEGRADED.**
 
-It prints the **estimated cost up front** (the baseline's recorded `$/full-run` × the full-suite
-passes still owed — N on a fresh root, the deficit on a resumed one), then a
-per-case verdict table and a final `DEGRADED` / `OK` / `IMPROVED` line — Markdown, so it pastes
-straight into a PR body. The per-case bands are diagnostics that localize *which* case moved a
-pooled regression (a `moved?` ⚠️ marks a case whose candidate mean fell below its baseline
-diagnostic floor); they never gate on their own. Artifacts land at `<out>/verdict.{md,json}`, and
-the per-replay lane logs `freeze-suite.js` writes land in the sibling `<out>-logs/` (a sibling, not a
-child, so every child of `<out>` stays a case run dir the scorer can pool).
+Those three steps are one **rung**, and the gate walks rungs until one of them decides.
 
-**Exit codes are a trichotomy** so a CI gate (`copirate-eval-harness-2fk.6`) can tell the three
-outcomes apart: `0` = ran and OK/IMPROVED, `1` = ran and **DEGRADED** (the gate tripped), `2` =
-could not run (bad args, missing baseline, a matcher/N/engine that isn't comparable — refused
-*before* any spend where possible).
+It prints the **estimated cost up front** — the baseline's recorded `$/full-run` scaled to one
+wave, and what the ceiling would cost if every rung were bought — then a per-case verdict table
+and a final `DEGRADED` / `OK` / `IMPROVED` / `UNDECIDED` line carrying the **basis** of the claim,
+Markdown, so it pastes straight into a PR body. The per-case bands are diagnostics that localize
+*which* case moved a pooled regression (a `moved?` ⚠️ marks a case whose candidate mean fell below
+its baseline diagnostic floor); they never gate on their own. Artifacts land at
+`<out>/verdict.{md,json}`, and the per-replay lane logs `freeze-suite.js` writes land in the
+sibling `<out>-logs/` (a sibling, not a child, so every child of `<out>` stays a case run dir the
+scorer can pool).
+
+**Exit codes name four outcomes** so a CI gate (`copirate-eval-harness-2fk.6`) can tell them
+apart: `0` = ran and OK/IMPROVED, `1` = ran and **DEGRADED** (the gate tripped), `2` = could not
+run (bad args, missing baseline, a matcher/engine/case set that isn't comparable — refused
+*before* any spend where possible), `3` = **UNDECIDED** (it ran, and the sample it could afford
+places the candidate on neither side of the floor). A CI job that treats `3` as green has
+converted "not measured" into "not degraded", which is the one reading the verdict exists to
+prevent.
+
+### Spending the depth the answer costs — the ladder
+
+The gate used to replay the baseline's full N unconditionally — fifteen replays, hours of wall
+clock — whatever the candidate was. It now walks a **ladder**: `main()` loops
+`depth = start … repeats`, and each rung spawns `freeze-suite -n <depth>` (one more replay per
+case), re-scores, re-reduces, and re-decides. It stops at the first wave that decides.
+
+The stopping rule is `decideLadder` in `eval/baseline.js`, sitting beside `evaluateGate` and
+**re-applying** it rather than deriving a second threshold from the floor, so there is still
+exactly one comparison in the gate. A partial candidate has found some of the ceiling's
+opportunities and can still find at most `remaining` more, so its two extreme completions bound
+the terminal verdict, and the terminal rule itself reads them:
+
+- the **worst** finish (it finds nothing more) still clears the floor ⇒ no completion can red it:
+  `OK`, basis `certain`;
+- the **best** finish (it finds everything remaining) still reds ⇒ no completion can save it:
+  `DEGRADED`, basis `certain`.
+
+A decision on either bound is not an estimate of the full-depth verdict — it *is* the full-depth
+verdict, reached without paying for the rest of the sample. At full depth `remaining` is 0, both
+bounds collapse onto the terminal rule, and one of them always fires: **the ladder terminates by
+arithmetic.** There is no `if (depth === N)` branch anywhere in it, and none should be added —
+the top rung deciding is a property of the same two comparisons every other rung makes, not a
+case someone has to remember to write.
+
+Where certainty is out of reach, a **~2σ Wilson interval** on the candidate's pooled rate decides
+whenever the whole interval sits on one side of the floor, and that decision travels as basis
+`screened`: a weaker claim than an adjudication, rendered differently, and never presented as
+one. Wilson deliberately, not the normal approximation the gate floor is cut with. The two are
+not in tension because they answer different questions — the floor freezes a threshold into a
+baseline, while the interval asks where a partial sample sits against that frozen threshold — and
+the normal approximation is falsely narrow exactly where the ladder is cheapest: over wave 1's 18
+opportunities it puts 2 finds at [0, 0.256] and would call that confidently under a 0.31 floor,
+where Wilson's [0.03, 0.33] correctly says "not yet". At zero finds it collapses to [0, 0]
+outright. An interval that overstates its own precision buys early exits by pretending to know
+things.
+
+**`UNDECIDED` is a real fourth verdict, not a soft pass.** A sample that places the candidate on
+neither side of the floor gets it, exits `3`, and says so in the verdict body. Re-running against
+the same `--out` continues the ladder from the rung it reached.
+
+The wall clock is bounded by **measurement, not by a model**. Each rung spawns `freeze-suite.js`
+once, which writes one timing leg carrying that wave's real elapsed wall clock, so the next wave
+is priced at the most expensive wave *this candidate has actually cost*. Nothing in that pricing
+models lane counts, per-replay minutes, or ceil-division. A wave that will not fit what is left
+of `--budget-minutes` is not started, and the gate reports `UNDECIDED` rather than overrunning. A
+**missing** timing leg is refused outright rather than folded to zero — zero would read as "the
+next wave is free" and would spend the whole ceiling (`[LAW:no-silent-failure]`).
+
+The same budget owns the inside of a wave too: each wave is spawned with `--job-timeout` set to
+`jobTimeoutMinutes({elapsedMs, budgetMs})`, the remaining budget in whole minutes. Checking the
+budget only *between* waves left one stalled replay free to overrun a 45-minute bar by
+freeze-suite's 120-minute default; a replay that cannot finish inside the remaining budget cannot
+contribute to a verdict within it, so waiting past that point buys nothing.
 
 ### When to run it
 
@@ -582,6 +679,20 @@ structure** (`src/multiscope.js`), or **effort/reasoning behavior** (`src/effort
 move finding quality. Run `eval/compare.js` and paste the verdict table into the PR body. The
 efficiency epic's quality-sensitive tickets (`copirate-efficiency-235.2`–`.5`) name this as their
 acceptance instrument.
+
+Expect the depth to track how badly the change moved things. A change that guts the reviewer reds
+in the first wave; a real but partial regression took three
+([measured](#the-gates-own-validation-the-sabotage-test)); at ~20 minutes a wave, the default
+45-minute budget buys one — the affordability check prices the next wave against *elapsed* time,
+which carries setup and judging too, so two waves of replay alone (~40 min) do not leave room for
+them. A change that lands *near* the baseline cannot be adjudicated inside
+that budget at all, and that is inherent rather than a bug to fix: **the gate floor sits ~2σ below
+the baseline by construction**, so no partial sample can place a baseline-quality candidate
+*above* the floor — its interval still straddles it. Such a candidate costs the full ceiling or
+comes back `UNDECIDED`; re-running against the same `--out`, or raising `--budget-minutes`, is how
+it gets adjudicated. **The 45-minute bar and full-fidelity adjudication of a near-baseline
+candidate are not simultaneously reachable on these lanes.** Only two levers change that:
+loosening the floor — an owner policy call, not a code change — and many more credential lanes.
 
 ### Running it in CI
 
@@ -598,17 +709,21 @@ minutes, a path that spends it by attaching a label is a path that spends it by 
 of this section documents the shape to **restore** with the moratorium, not the shape in force.
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
-baseline's recorded $/full-run × the full-suite passes still owed) before spending. For the current N=5 × 4-case baseline that
-estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
-baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: 20 replays at 13–27 min
-each, which `compare.js` hands to `freeze-suite.js` to spread across credential lanes. The workflow
-names **three lanes** (`--credentials`, one subscription account each, secrets named after the
-keychain items they came from), so a lane carries at most 7 replays and a full gate run is about
-**1.5–3.5 hours** — where the single-lane serial shape it replaced needed 4–9 and did not fit a
-hosted job's 6-hour ceiling. The job's `timeout-minutes` is derived from that lane math (see its
-comment); a timed-out gate is still possible and must be read as *not measured*, never as *not
-degraded*. The same 20 replays cost roughly a day of one account's quota, so the lanes also share the
-spend — and a run competes with PR reviews on those same accounts while it lasts.
+baseline's recorded $/full-run, scaled to one wave and to the ceiling) before spending. For the
+current three-case baseline that estimate is **no dollar figure at all** — the pinned engine bills
+against subscription quota, so the baseline records `costPerFullRunUsd: null`. The spend is quota
+and wall clock: three replays per wave at 19.78 min each, up to five waves, which `compare.js`
+hands to `freeze-suite.js` to spread across credential lanes. The workflow names **three lanes**
+(`--credentials`, one subscription account each, secrets named after the keychain items they came
+from), so a wave is one replay deep per lane and a run that walks every rung is about **1.5–2
+hours** — where the single-lane serial shape it replaced needed 4–9 and did not fit a hosted job's
+6-hour ceiling. Most runs are shorter, because most stop at the wave that decides them, and
+`--budget-minutes` caps the invocation regardless. The job's `timeout-minutes` still derives from
+the four-case lane math the moratorium froze it at (see its comment) — re-derive it with the
+trigger. A timed-out gate is still possible and must be read as *not measured*, never as *not
+degraded*, which is also what `UNDECIDED` means. A full-ceiling run costs roughly a day of one
+account's quota, so the lanes also share the spend — and a run competes with PR reviews on those
+same accounts while it lasts.
 
 - **On demand**: `gh workflow run eval.yml` (optionally `--ref <branch>`) — pressing the button is
   the spend approval. The candidate is that ref's checkout.
@@ -655,6 +770,23 @@ in full / follow the change to its call sites before judging" directive from `bu
 collapses below the floor. That run is recorded on `copirate-eval-harness-2fk.5`. Self-consistency
 (the baseline's own runs replayed through `compare.js --reuse-candidate` reproduce the baseline rate
 ⇒ `OK`) is the other half.
+
+**How much depth a verdict actually costs was measured, at zero spend.** Real completed runs were
+copied out of `eval/out/freeze-ebccbd4`, their `findings.json` truncated to a fraction of the
+findings, re-scored with the real `eval/score.js`, and gated through
+`eval/compare.js --reuse-candidate` at every rung. Each cell is the verdict the gate returns if it
+stops there; a live run stops at the first non-`UNDECIDED` cell in its row.
+
+| candidate | wave 1 | wave 2 | wave 3 | wave 4 | wave 5 |
+|-----------|--------|--------|--------|--------|--------|
+| the baseline's own runs (37/90) | UNDECIDED | UNDECIDED | UNDECIDED | UNDECIDED | **OK** (certain) |
+| 40 % of findings kept (17/90 = 18.9 %) | UNDECIDED | UNDECIDED | **DEGRADED** (screened) | DEGRADED | DEGRADED (certain) |
+| 0 % of findings kept (0/90) | **DEGRADED** (screened) | DEGRADED | DEGRADED | DEGRADED (certain) | DEGRADED (certain) |
+
+A real regression reds at wave 3 — nine replays, not fifteen — and a catastrophic one at wave 1,
+three replays. Both reach the **same verdict the full-depth rule reaches**; the ladder buys the
+depth, not a different answer. The baseline's own runs are the honest other end: they take all
+five waves, for the reason in [When to run it](#when-to-run-it).
 
 Like the rest of `eval/`, `compare.js` is dev-only tooling and does **not** bump the version.
 
