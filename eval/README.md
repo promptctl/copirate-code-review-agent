@@ -2,7 +2,7 @@
 
 > ## ⛔ MORATORIUM — THE GATE MUST NOT BE RUN
 >
-> **Nobody — agent or human — dispatches `eval.yml` until [`zai-eval-harness-5ux`]
+> **Nobody — agent or human — dispatches `eval.yml` until `zai-eval-harness-5ux`
 > closes.** Owner, 2026-09-08: an eval that takes five hours is not useful. The
 > workflow's first step now refuses and the PR label trigger is deleted, so this is
 > enforced at the point of spend rather than asserted here.

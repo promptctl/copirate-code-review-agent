@@ -7,8 +7,7 @@ name: Eval
 # EVERY RUN SPENDS REAL PROVIDER CREDITS — compare.js prints the exact estimate (the baseline's own
 # recorded $/full-run × N) before spending; that print is the one authoritative figure, so no dollar
 # amount is repeated here to drift from it. This is why there is NO unconditional per-PR trigger and
-# never will be: a PR buys a run only by wearing the 'eval' label, and everything else is a human
-# pressing the dispatch button.
+# never will be.
 #
 # The ticket sketched dispatch inputs for a cases filter and an N override. They are deliberately
 # absent: compare.js derives N and the case set FROM the baseline and refuses any deviation — a
@@ -44,13 +43,6 @@ concurrency:
 
 jobs:
   gate:
-    # Dispatch always runs (a human pressed the button — that IS the spend approval). A PR runs only
-    # when it is from THIS repo (GitHub withholds secrets from fork pull_request events, so a fork run
-    # could only burn setup time before failing on empty credentials in a way that reads like a
-    # misconfigured secret — skip it honestly up front), only while wearing the 'eval' label, and a
-    # 'labeled' event buys a run only when the label being added is 'eval' itself — otherwise attaching
-    # any unrelated label to an eval-labeled PR would silently re-spend the whole suite.
-    # [LAW:no-silent-failure]
     runs-on: ubuntu-latest
     # Derived from the suite, not the platform: N=5 × 4 cases is 20 replays, spread level-by-level over
     # the THREE credential lanes below, so a lane carries at most 7. The pinned engine
@@ -190,13 +182,14 @@ jobs:
 
       - name: Publish the verdict to the Step Summary
         # always(): a DEGRADED gate exits 1 but has already written verdict.md — the red run's
-        # summary is exactly the one reviewers most need to see. When the gate aborted before
-        # comparing (incomparable baseline, replay failure — exit 2, no verdict.md), say so loudly
-        # instead of publishing an empty summary. [LAW:no-silent-failure]
+        # summary is exactly the one reviewers most need to see. When no verdict.md was written
+        # (incomparable baseline, replay failure, a refusal upstream), say so loudly instead of
+        # publishing an empty summary. The fallback names no step: which one stopped the run varies,
+        # and a message that guesses sends the reader to an empty log. [LAW:no-silent-failure]
         if: always()
         run: >-
           cat eval/out/candidate-ci/verdict.md >> "$GITHUB_STEP_SUMMARY" ||
-          echo '**No verdict was produced** — the gate aborted before comparing; see the "Gate the candidate" step log.' >> "$GITHUB_STEP_SUMMARY"
+          echo '**No verdict was produced** — the run stopped before comparing; see the log of the step that failed.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload candidate artifacts
         # always(): the artifacts of a DEGRADED or aborted run (per-run findings, scorecards,
