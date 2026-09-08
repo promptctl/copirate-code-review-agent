@@ -672,6 +672,16 @@ budget only *between* waves left one stalled replay free to overrun a 45-minute 
 freeze-suite's 120-minute default; a replay that cannot finish inside the remaining budget cannot
 contribute to a verdict within it, so waiting past that point buys nothing.
 
+When that deadline fires, freeze-suite kills the overrunning replay, the case's census falls short
+of the wave's target depth, and freeze-suite exits non-zero. The ladder treats that exactly as it
+treats the between-waves budget stop — it stops there, reports `UNDECIDED` from the last wave that
+completed, and names a failed wave in the verdict body as the reason it stopped, where it once
+threw past into exit `2` and wrote no verdict at all. The root is resumable and re-running against
+the same `--out` continues from there: run artifacts under it are append-only, the partial runs a
+killed replay leaves behind are not completed runs by `score.js`'s own predicate, so they neither
+pool into a summary nor block a retry, and `resumeDepth` levels an uneven root. A wave that fails
+before any has completed still exits `2` — nothing was measured, so there is no verdict to write.
+
 ### When to run it
 
 Any PR that changes **prompts** (`src/prompt.js`, `review-agent/instructions.md`), **spawn
