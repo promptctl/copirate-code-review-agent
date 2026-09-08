@@ -701,6 +701,29 @@ describe('readSuiteTiming folds the legs a resumed suite leaves behind', () => {
     assert.throws(() => readSuiteTiming(outRoot), /Unreadable suite timing leg .*suite-timing-truncated\.json/);
     fs.rmSync(root, { recursive: true, force: true });
   });
+
+  test('a leg that parses but has the wrong shape fails as loudly as one that does not parse', () => {
+    // Parsing as JSON proves nothing about the shape, and both wrong shapes corrupt the fold in SILENCE:
+    // a missing elapsedMs makes the sum NaN, and a missing replays splices a bare undefined into the
+    // flattened list. A leg written by an older or newer schema is exactly this, and legs carry no version.
+    for (const [name, bad] of Object.entries({
+      'no-elapsed': { startedAt: '2026-09-08T00:00:00.000Z', replays: [] },
+      'no-replays': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 1000 },
+      'elapsed-not-a-number': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 'quick', replays: [] },
+      'replays-not-an-array': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 1000, replays: {} },
+    })) {
+      const root = tmpTree();
+      const outRoot = path.join(root, 'out');
+      fs.mkdirSync(outRoot, { recursive: true });
+      fs.writeFileSync(path.join(outRoot, `suite-timing-${name}.json`), `${JSON.stringify(bad)}\n`);
+      assert.throws(
+        () => readSuiteTiming(outRoot),
+        new RegExp(`Unreadable suite timing leg .*suite-timing-${name}\\.json`),
+        `${name}: a well-formed but wrong-shaped leg must not reach the arithmetic`,
+      );
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────

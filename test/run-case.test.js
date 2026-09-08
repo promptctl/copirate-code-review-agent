@@ -366,7 +366,10 @@ test('writeRunRecord: an absent fact fails loudly instead of landing as a file t
     // `JSON.stringify(undefined)` is the VALUE undefined, and `undefined + '\n'` is the literal text
     // "undefined" — so an unguarded write lands an artifact that reports as JSON and parses as nothing.
     // Every field carries the same exposure, so every field is checked, not just the newest one.
-    for (const field of ['meta', 'usage', 'schedule', 'findings']) {
+    // summary.txt is raw text rather than JSON, and corrupts by the identical coercion — so it is checked
+    // here with the rest. Every field the record carries, not only the ones that render as JSON.
+    const artifact = { meta: 'meta.json', usage: 'usage.json', schedule: 'schedule.json', findings: 'findings.json', summary: 'summary.txt' };
+    for (const [field, file] of Object.entries(artifact)) {
       const dir = path.join(root, field);
       fs.mkdirSync(dir, { recursive: true });
       assert.throws(
@@ -374,7 +377,7 @@ test('writeRunRecord: an absent fact fails loudly instead of landing as a file t
         new RegExp(`${field} is undefined`),
         `${field}: an absent fact must abort the record, not be written as the text "undefined"`,
       );
-      assert.equal(fs.existsSync(path.join(dir, `${field}.json`)), false, `${field}.json must not exist`);
+      assert.equal(fs.existsSync(path.join(dir, file)), false, `${file} must not exist`);
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

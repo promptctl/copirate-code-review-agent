@@ -231,19 +231,25 @@ function treeIdentity({ sha, dirty }) {
   return dirty ? null : sha;
 }
 
-// [LAW:parse-dont-validate] The one crossing between a live value and a durable artifact, returning BYTES a
-// corrupt record cannot inhabit — so no writer below re-checks what it was handed. `JSON.stringify` answers
-// the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined":
+// [LAW:parse-dont-validate] The crossing between a live value and a durable artifact. `JSON.stringify` answers
+// the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined" —
 // a file that reports as an artifact and parses as nothing. Every field of a run record is a fact the replay
-// observed, so an absent one is a broken producer, and it fails here, named, rather than as a JSON.parse
-// crash in whatever reads the artifact months later. Substituting `null` would be worse than either: it
-// would leave a reader unable to tell a pass that genuinely recorded nothing from a producer that broke.
-// [LAW:no-silent-failure]
-function jsonBytes(field, value) {
+// observed, so an absent one is a broken producer and fails HERE, named, rather than as a parse crash in
+// whatever reads the artifact months later. Substituting `null` would be worse than either: a reader could no
+// longer tell a pass that genuinely recorded nothing from a producer that broke. [LAW:no-silent-failure]
+//
+// The check is lifted out of the rendering because summary.txt is raw text, cannot go through `jsonBytes`,
+// and corrupts identically — so the rule is stated once for every field the record carries, in both
+// renderings. [LAW:single-enforcer]
+function present(field, value) {
   if (value === undefined) {
     throw new Error(`writeRunRecord: ${field} is undefined — a run record cannot record a fact the replay never produced.`);
   }
-  return JSON.stringify(value, null, 2) + '\n';
+  return value;
+}
+
+function jsonBytes(field, value) {
+  return JSON.stringify(present(field, value), null, 2) + '\n';
 }
 
 // One run's record on disk. findings.json is what makes a run dir COMPLETE to every reader (score.js's
@@ -264,7 +270,7 @@ function jsonBytes(field, value) {
 // guess at. [FRAMING:representation]
 function writeRunRecord(runDir, { meta, summary, usage, schedule, findings }) {
   fs.writeFileSync(path.join(runDir, 'meta.json'), jsonBytes('meta', meta));
-  fs.writeFileSync(path.join(runDir, 'summary.txt'), summary + '\n');
+  fs.writeFileSync(path.join(runDir, 'summary.txt'), `${present('summary', summary)}\n`);
   fs.writeFileSync(path.join(runDir, 'usage.json'), jsonBytes('usage', usage));
   fs.writeFileSync(path.join(runDir, 'schedule.json'), jsonBytes('schedule', schedule));
   const findingsPath = path.join(runDir, 'findings.json');

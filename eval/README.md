@@ -347,9 +347,12 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   Timing follows the same shape: each invocation writes its own `suite-timing-<startedAt>.json`
   under the out root — `{ startedAt, elapsedMs, replays: [...] }` — so a suite finished across
   several legs keeps every leg's clock, and a status-check re-run (which plans nothing) cannot
-  erase what an earlier one measured. `readSuiteTiming()` folds the legs into one answer.
-  `elapsedMs` is wall clock, never the sum of `replays[].durationMs`: the lanes overlap, and
-  wall clock is the figure the gate's 45-minute bar is stated in.
+  erase what an earlier one measured. `elapsedMs` is wall clock, never the sum of
+  `replays[].durationMs`: the lanes overlap, and wall clock is the figure the gate's
+  45-minute bar is stated in. `readSuiteTiming()` folds the legs into one answer, but it is a
+  library primitive with **no reader today** — no CLI prints the folded total; it exists for the
+  gate (zai-eval-harness-5ux) to size itself against. Read a suite's real cost by folding the
+  legs yourself, or read a single leg's file directly.
 - **Level-filling order.** A job exists for case *c* at level *r* iff *c* has fewer than *r*
   completed runs, so every case is deepened before any one of them is. An interruption leaves
   an even suite (a valid smaller N — `baseline.js` demands one common N) instead of 5/5/5/0,

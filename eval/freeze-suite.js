@@ -284,11 +284,21 @@ function readSuiteTiming(outRoot) {
     : [];
   const legs = names.map(name => {
     const file = path.join(outRoot, name);
+    let leg;
     try {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
+      leg = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (e) {
       throw new Error(`Unreadable suite timing leg ${file}: ${e.message}`);
     }
+    // Parsing as JSON proves nothing about the SHAPE, and the two ways a well-formed leg can still be wrong
+    // both corrupt the fold in silence: a missing `elapsedMs` turns the sum into NaN, and a missing `replays`
+    // splices a bare undefined into the flattened list, because flatMap only flattens actual arrays. A leg
+    // left by an older or newer schema is exactly that, and these files carry no version. So the shape fails
+    // as loudly as a truncated file, and by the same message.
+    if (!Number.isFinite(leg.elapsedMs) || !Array.isArray(leg.replays)) {
+      throw new Error(`Unreadable suite timing leg ${file}: expected a numeric elapsedMs and an array of replays, got ${JSON.stringify({ elapsedMs: leg.elapsedMs, replays: leg.replays })}.`);
+    }
+    return leg;
   });
   return {
     legs,
