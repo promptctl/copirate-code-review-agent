@@ -16,12 +16,21 @@ name: Eval
 # was computed from ([LAW:no-silent-failure], enforced in compareVerdict). Inputs the gate would
 # reject are not inputs. [LAW:no-mode-explosion]
 
+# UNDER MORATORIUM (zai-eval-harness-5ux). The pull_request trigger is DELETED, not disabled: while
+# the suite cannot finish inside 45 minutes, a path that spends it by attaching a label is a path that
+# spends it by accident. workflow_dispatch remains so the refusal below is reachable and legible —
+# pressing the button now buys a fast, loud explanation instead of a suite.
+#
+# RESTORE THIS BLOCK WITH THE MORATORIUM, NOT BEFORE, and restore its reasoning with it: 'labeled' must
+# be in the types set (attaching the label to an already-open PR has to buy the run; without it a label
+# added after opening does nothing until the next push), and the job's `if:` must re-gate on all three
+# of — the PR being from THIS repo (GitHub withholds secrets from fork pull_request events, so a fork
+# run could only burn setup time before failing on empty credentials in a way that reads like a
+# misconfigured secret), the PR wearing the 'eval' label, and a 'labeled' event naming 'eval' itself
+# (otherwise attaching any unrelated label to an eval-labeled PR silently re-spends the whole suite).
+# [LAW:no-silent-failure]
 on:
   workflow_dispatch:
-  pull_request:
-    # 'labeled' is in the set so attaching the label to an already-open PR buys the run — without
-    # it, a label added after opening would do nothing until the next push.
-    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -42,11 +51,6 @@ jobs:
     # 'labeled' event buys a run only when the label being added is 'eval' itself — otherwise attaching
     # any unrelated label to an eval-labeled PR would silently re-spend the whole suite.
     # [LAW:no-silent-failure]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       contains(github.event.pull_request.labels.*.name, 'eval') &&
-       (github.event.action != 'labeled' || github.event.label.name == 'eval'))
     runs-on: ubuntu-latest
     # Derived from the suite, not the platform: N=5 × 4 cases is 20 replays, spread level-by-level over
     # the THREE credential lanes below, so a lane carries at most 7. The pinned engine
@@ -67,6 +71,47 @@ jobs:
     # be read as "not measured", never as "not degraded". [LAW:no-silent-failure]
     timeout-minutes: 350
     steps:
+      # THE MORATORIUM, ENFORCED WHERE THE SPEND HAPPENS (zai-eval-harness-5ux). This is the FIRST step
+      # and it fails, so no checkout, no credentials, and no replay can run beneath it. It is a failing
+      # step rather than a false `if:` on purpose: a skipped job renders as "did not need to run", which
+      # is the opposite of what this means, and the operator who pressed the button would learn nothing.
+      # A ban that reads as a green skip is a ban nobody obeys. [LAW:no-silent-failure]
+      #
+      # There is deliberately NO override input. An input would be a mode whose only user is somebody
+      # arguing themselves past the ban, which is exactly the failure this exists to stop
+      # ([LAW:no-mode-explosion]). Lifting the moratorium means deleting this step in the same change
+      # that makes the suite fit its budget — a commit, reviewed, not a checkbox at dispatch time.
+      - name: Refuse to run — the eval gate is under moratorium
+        run: |
+          cat >&2 <<'MORATORIUM'
+          ============================================================================
+          THE EVAL GATE IS UNDER MORATORIUM. This run spent nothing and measured nothing.
+          ============================================================================
+          Owner, 2026-09-08: an eval that takes 5 hours is not useful.
+
+          The suite as it stands is N=5 x 4 cases = 20 replays at 13-27 min each, spread
+          over three subscription lanes, so a full gate run takes 1.5-3.5 hours and has
+          been observed to take longer and wall before finishing. The requirement is
+          UNDER 45 MINUTES.
+
+          Arithmetic, so nobody re-derives it hopefully: wall clock is
+          ceil(replays / lanes) x per-replay. Four accounts exist in the pool. Under 45
+          minutes needs depth 1, which means replays <= lanes, which means at most four
+          replays. The full N=5 suite therefore CANNOT fit the budget on these accounts,
+          and adding lanes does not change that. Fewer replays in the common case is the
+          only shape that does.
+
+          Do NOT re-enable this workflow to "just get one number". A run costs about a
+          day of one account's quota and competes with PR reviews on the same pool. Its
+          dollar figure is NOTIONAL, not billed — the pinned engine is a subscription and
+          baseline.json records costPerFullRunUsd: null. Quota and wall clock are the
+          real currency.
+
+          The redesign, its measured levers, and the acceptance that lifts this ban are
+          in ticket zai-eval-harness-5ux. Delete this step as part of THAT change.
+          MORATORIUM
+          exit 1
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Full history, not the fetch-depth:1 default: compare.js resolves the newest committed

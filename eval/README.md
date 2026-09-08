@@ -1,5 +1,28 @@
 # Review-quality eval harness — golden cases
 
+> ## ⛔ MORATORIUM — THE GATE MUST NOT BE RUN
+>
+> **Nobody — agent or human — dispatches `eval.yml` until [`zai-eval-harness-5ux`]
+> closes.** Owner, 2026-09-08: an eval that takes five hours is not useful. The
+> workflow's first step now refuses and the PR label trigger is deleted, so this is
+> enforced at the point of spend rather than asserted here.
+>
+> **The bar is wall clock under 45 minutes.** There is no dollar target, deliberately:
+> the pinned engine is a subscription, `baseline.json` records `costPerFullRunUsd: null`,
+> and the ~$360 figure quoted around this repo is the *notional* list-price equivalent of
+> the quota burned — not money billed. The scarce resources are **wall clock** and
+> **subscription quota** (about a day of one account per suite, across a pool that PR
+> reviews draw from too). Optimise those; report the notional figure, never target it.
+>
+> **Why more parallelism is not the answer.** Wall clock is
+> `ceil(replays / lanes) × per-replay`. The suite is 20 replays at 13–27 min; the
+> keychain pool holds four accounts. Under 45 minutes requires depth 1, so
+> `replays ≤ lanes` — at most four replays. **The full N=5 suite cannot fit the budget on
+> these accounts at any lane count.** Only running fewer replays in the common case gets
+> there. The levers, with their measured numbers, are on the ticket.
+>
+> Everything below describes the harness **as it stands**, which is the thing under ban.
+
 This directory is the **ground truth** for the review-quality eval harness
 (`copirate-eval-harness-2fk`): a frozen set of real, high-finding reviews the agent
 produced against real PRs, so a future engine change can be replayed against them and
@@ -550,6 +573,13 @@ acceptance instrument.
 reviewers look: the verdict table lands in the run's **Step Summary**, `DEGRADED` reds the check
 (exit `1`), and the candidate root (per-run findings, scorecards, transcripts, `verdict.{md,json}`)
 is uploaded as the `eval-candidate` artifact even on a red or aborted run.
+
+**Under the moratorium there is one trigger and it refuses.** `eval.yml` keeps
+`workflow_dispatch` only so the refusal is reachable and legible; its first step exits 1 before
+checkout, so a dispatch buys a fast explanation instead of a suite. The `pull_request` label
+trigger described below is **deleted** from the workflow — while the suite cannot finish inside 45
+minutes, a path that spends it by attaching a label is a path that spends it by accident. The rest
+of this section documents the shape to **restore** with the moratorium, not the shape in force.
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
 baseline's recorded $/full-run × the full-suite passes still owed) before spending. For the current N=5 × 4-case baseline that
