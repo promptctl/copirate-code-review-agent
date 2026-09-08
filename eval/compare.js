@@ -164,10 +164,13 @@ function parseArgs(argv) {
 // is the rung, not the baseline's N: freeze-suite.js fills every case to that level and no further, which
 // is what keeps a partial candidate's case MIXTURE identical to the baseline's at every depth.
 // `credentials` is forwarded verbatim; its shape (names, non-empty, no repeats) is freeze-suite.js's
-// boundary to refuse, and it refuses before any spend. [LAW:single-enforcer]
-function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials }) {
+// boundary to refuse, and it refuses before any spend. [LAW:single-enforcer] `jobTimeout` is likewise
+// always present — every wave is spawned under a budget, so there is no unbounded variant to select
+// between. [LAW:dataflow-not-control-flow]
+function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials, jobTimeout }) {
   return [
     '-n', String(repeats), '--out', candidateRoot, '--cases-dir', casesDir, '--cases', caseNames.join(','),
+    '--job-timeout', String(jobTimeout),
     ...(credentials === null ? [] : ['--credentials', credentials]),
   ];
 }
@@ -370,6 +373,22 @@ function completedDepth(caseNames, prior) {
 // the previous wave IS the measurement, and the model that would have guessed those three is absent.
 function affordsAnotherWave({ elapsedMs, longestWaveMs, budgetMs }) {
   return elapsedMs + longestWaveMs <= budgetMs;
+}
+
+const MS_PER_MINUTE = 60 * 1000;
+
+// [LAW:effects-at-boundaries] Pure: the deadline ONE replay gets, drawn from the same budget that gates
+// the waves — so the budget is the single owner of when the gate stops, inside a wave as well as between
+// them. [LAW:one-source-of-truth] Without it affordsAnotherWave bounds only the transitions and
+// freeze-suite's own 120m default governs what happens inside, so one stalled replay overruns a 45m bar
+// by 75m. A replay that cannot finish inside the remaining budget cannot contribute to a verdict within
+// it, so waiting past that point buys nothing.
+//
+// Whole minutes is the flag's unit: a sub-minute remainder resolves to the shortest deadline that can be
+// expressed, which is a rounding, not a guard. The flag's UPPER bound is freeze-suite's parsePositiveInt
+// to enforce and refuse — a second clamp here would be a second checkpoint. [LAW:single-enforcer]
+function jobTimeoutMinutes({ elapsedMs, budgetMs }) {
+  return Math.max(1, Math.ceil((budgetMs - elapsedMs) / MS_PER_MINUTE));
 }
 
 // [LAW:effects-at-boundaries] Pure: fold the per-run cost records the engine wrote into the ONE spend
@@ -686,7 +705,7 @@ function main() {
   //    time from here — including baseline resolution, scoring, and judging, not just the replays — so
   //    the budget bounds what the operator actually waits for. [LAW:no-ambient-temporal-coupling]
   const startedMs = Date.now();
-  const budgetMs = opts.budgetMinutes * 60 * 1000;
+  const budgetMs = opts.budgetMinutes * MS_PER_MINUTE;
 
   // 1. Flag combinations that contradict each other were refused in parseArgs, before any IO.
 
@@ -835,7 +854,8 @@ function main() {
     //    the bound is never actually the thing that stops it. [LAW:dataflow-not-control-flow]
     for (let depth = startDepth; depth <= repeats; depth++) {
       process.stderr.write(`\n─── wave ${depth}/${repeats}: replaying ${caseNames.length} case(s) to depth ${depth} ───\n`);
-      runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
+      const jobTimeout = jobTimeoutMinutes({ elapsedMs: Date.now() - startedMs, budgetMs });
+      runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials, jobTimeout }), 'freeze-suite');
 
       // 7a. Every run now under --out — inherited and just produced — must record the tree snapshotted
       //     above: each replay wrote the tree it ran on, so a working tree that moved mid-invocation shows
@@ -922,7 +942,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
+  parseArgs, replayArgs, jobTimeoutMinutes, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
   foreignRuns, readPriorRuns, excessRuns, driftedRuns, producedTree,
   completedDepth, affordsAnotherWave, foldSpend,

@@ -7,7 +7,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const {
-  parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
+  parseArgs, replayArgs, jobTimeoutMinutes, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
   completedDepth, affordsAnotherWave, foldSpend,
 } = require('../eval/compare');
@@ -125,14 +125,44 @@ test('parseArgs rejects bad input loudly', () => {
 // candidate replayed over a different set or depth measures a different population.
 
 test('replayArgs pins the baseline case set and N, and forwards the lane roster verbatim', () => {
-  const args = replayArgs({ repeats: 5, candidateRoot: '/c', casesDir: '/g', caseNames: ['b', 'a'], credentials: 'X,Y' });
-  assert.deepEqual(args, ['-n', '5', '--out', '/c', '--cases-dir', '/g', '--cases', 'b,a', '--credentials', 'X,Y']);
+  const args = replayArgs({ repeats: 5, candidateRoot: '/c', casesDir: '/g', caseNames: ['b', 'a'], credentials: 'X,Y', jobTimeout: 45 });
+  assert.deepEqual(args, ['-n', '5', '--out', '/c', '--cases-dir', '/g', '--cases', 'b,a', '--job-timeout', '45', '--credentials', 'X,Y']);
 });
 
 test('replayArgs with no --credentials leaves lane selection to freeze-suite.js (its single-lane default)', () => {
-  const args = replayArgs({ repeats: 2, candidateRoot: '/c', casesDir: '/g', caseNames: ['a'], credentials: null });
-  assert.deepEqual(args, ['-n', '2', '--out', '/c', '--cases-dir', '/g', '--cases', 'a']);
+  const args = replayArgs({ repeats: 2, candidateRoot: '/c', casesDir: '/g', caseNames: ['a'], credentials: null, jobTimeout: 12 });
+  assert.deepEqual(args, ['-n', '2', '--out', '/c', '--cases-dir', '/g', '--cases', 'a', '--job-timeout', '12']);
   assert.ok(!args.includes('--credentials'));
+});
+
+// A replay's deadline is never omitted: an unbudgeted wave is not a state the ladder can reach, so there
+// is no variant for freeze-suite's 120m default to win by.
+test('replayArgs always carries a deadline, whatever else it is given', () => {
+  const args = replayArgs({ repeats: 1, candidateRoot: '/c', casesDir: '/g', caseNames: ['a'], credentials: null, jobTimeout: 1 });
+  assert.ok(args.includes('--job-timeout'));
+});
+
+// ── jobTimeoutMinutes (the budget, applied inside a wave) ─────────────────────────────────────────────
+// The budget bounds when a wave may START; without this it bounds nothing about how long one may RUN,
+// and freeze-suite's 120m per-replay default silently outranks a 45m bar.
+
+test('jobTimeoutMinutes hands a replay what is left of the budget, in whole minutes', () => {
+  assert.equal(jobTimeoutMinutes({ elapsedMs: 0, budgetMs: 45 * 60 * 1000 }), 45);
+  assert.equal(jobTimeoutMinutes({ elapsedMs: 20 * 60 * 1000, budgetMs: 45 * 60 * 1000 }), 25);
+});
+
+test('jobTimeoutMinutes shrinks as the ladder climbs, so a later wave cannot outlive the budget', () => {
+  const budgetMs = 45 * 60 * 1000;
+  const climbing = [0, 10, 25, 40].map(min => jobTimeoutMinutes({ elapsedMs: min * 60 * 1000, budgetMs }));
+  assert.deepEqual(climbing, [45, 35, 20, 5]);
+  climbing.forEach((deadline, i) => assert.ok(deadline * 60 * 1000 + [0, 10, 25, 40][i] * 60 * 1000 <= budgetMs + 60 * 1000));
+});
+
+// Whole minutes is the flag's unit, so a remainder shorter than one is expressed as the shortest legal
+// deadline rather than as 0 — which freeze-suite's parsePositiveInt would refuse outright.
+test('jobTimeoutMinutes never asks freeze-suite for a deadline it would refuse', () => {
+  assert.equal(jobTimeoutMinutes({ elapsedMs: 44 * 60 * 1000 + 59_000, budgetMs: 45 * 60 * 1000 }), 1);
+  assert.equal(jobTimeoutMinutes({ elapsedMs: 90 * 60 * 1000, budgetMs: 45 * 60 * 1000 }), 1);
 });
 
 // ── expectedMatcherLabel (the fast pre-check) ─────────────────────────────────────────────────────────
