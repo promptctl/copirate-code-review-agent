@@ -236,10 +236,22 @@ function treeIdentity({ sha, dirty }) {
 // then renamed — after every file those readers go on to open. A replay killed or failing at any instant
 // leaves a dir that is either complete or ignored, never one that is counted and then unreadable.
 // [LAW:no-ambient-temporal-coupling]
-function writeRunRecord(runDir, { meta, summary, usage, findings }) {
+//
+// schedule.json is the replay's WALL CLOCK, and it is the engine's own host-stamped record (src/schedule.js's
+// scheduleRecord, reached here as review.schedule) rather than a second clock this instrument starts — the
+// same value run.js posts in the PR footer, so a replay and a production review can only agree or disagree
+// about ONE timing fact. [LAW:one-source-of-truth]
+//
+// It is an ARTIFACT and not a printed line because wall clock is what the eval gate is now bound by: the
+// suite has always measured per-replay duration and only ever written it to stdout, where CI log truncation
+// eats it, so the per-replay figure the gate sizes itself against had to be re-derived by archaeology and
+// went stale across #148 unnoticed. A measured fact with no durable map is a fact the next reader must
+// guess at. [FRAMING:representation]
+function writeRunRecord(runDir, { meta, summary, usage, schedule, findings }) {
   fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n');
   fs.writeFileSync(path.join(runDir, 'summary.txt'), summary + '\n');
   fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(usage, null, 2) + '\n');
+  fs.writeFileSync(path.join(runDir, 'schedule.json'), JSON.stringify(schedule, null, 2) + '\n');
   const findingsPath = path.join(runDir, 'findings.json');
   fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(findings, null, 2) + '\n');
   fs.renameSync(`${findingsPath}.partial`, findingsPath);
@@ -409,6 +421,7 @@ async function main() {
         },
         summary: review.summary || '',
         usage: review.usage,
+        schedule: review.schedule,
         findings: review.findings,
       });
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));

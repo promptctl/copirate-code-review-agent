@@ -341,15 +341,43 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
   try {
     const ok = path.join(root, 'case', 'r1');
     fs.mkdirSync(ok, { recursive: true });
-    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, findings: [{ path: 'a', line: 1 }] });
-    assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'summary.txt', 'usage.json']);
+    const schedule = { laneCount: 2, spawns: [{ tag: { phase: 'scout' }, span: { from: '2026-09-08T00:00:00.000Z', to: '2026-09-08T00:01:00.000Z' } }] };
+    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, findings: [{ path: 'a', line: 1 }] });
+    assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'schedule.json', 'summary.txt', 'usage.json']);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ok, 'findings.json'), 'utf8')), [{ path: 'a', line: 1 }]);
 
     const broken = path.join(root, 'case', 'r2');
     fs.mkdirSync(broken, { recursive: true });
-    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, findings: [1n] }), TypeError);
-    assert.deepEqual(fs.readdirSync(broken).sort(), ['meta.json', 'summary.txt', 'usage.json']);
+    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, schedule, findings: [1n] }), TypeError);
+    assert.deepEqual(fs.readdirSync(broken).sort(), ['meta.json', 'schedule.json', 'summary.txt', 'usage.json']);
     assert.deepEqual(listRunDirs(path.join(root, 'case')), [ok]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('writeRunRecord: a replay\'s wall clock survives as an artifact, readable through the same span boundary the rest of the system uses', () => {
+  const { spanMs } = require('../src/schedule');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-clock-'));
+  try {
+    const runDir = path.join(root, 'case', 'r1');
+    fs.mkdirSync(runDir, { recursive: true });
+    // One scout of 60s and one worker of 90s — the shape src/schedule.js's scheduleRecord produces and
+    // run.js already posts, so the eval artifact and the PR footer read one timing fact, not two.
+    const schedule = {
+      laneCount: 1,
+      spawns: [
+        { tag: { phase: 'scout' }, span: { from: '2026-09-08T00:00:00.000Z', to: '2026-09-08T00:01:00.000Z' } },
+        { tag: { phase: 'worker' }, span: { from: '2026-09-08T00:01:00.000Z', to: '2026-09-08T00:02:30.000Z' } },
+      ],
+    };
+    writeRunRecord(runDir, { meta: { case: 'case' }, summary: 's', usage: {}, schedule, findings: [] });
+
+    const recorded = JSON.parse(fs.readFileSync(path.join(runDir, 'schedule.json'), 'utf8'));
+    assert.deepEqual(recorded, schedule);
+    // The point of recording it: a per-replay duration is derivable from the artifact alone, with no CI
+    // log to scrape and nothing to re-measure. This is what LEVER 3 on zai-eval-harness-5ux needs.
+    assert.deepEqual(recorded.spawns.map(s => spanMs(s.span)), [60_000, 90_000]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

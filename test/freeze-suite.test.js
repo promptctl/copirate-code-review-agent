@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, suiteTiming, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -628,5 +628,36 @@ describe('the CLI selects case directories before any manifest is parsed', () =>
     assert.notEqual(r.status, 0);
     assert.match(r.out, /wip.*not valid JSON/);
     fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('suiteTiming', () => {
+  const jobs = [
+    { name: 'alpha', level: 1, lane: 'TOKEN_A', ok: true, outcome: 'ok', durationMs: 65000, log: 'out/logs/alpha.log' },
+    { name: 'beta', level: 1, lane: 'TOKEN_B', ok: false, outcome: 'FAILED (exit 1)', durationMs: 4000, log: 'out/logs/beta.log' },
+  ];
+
+  test('the suite\'s wall clock and every replay\'s duration survive as a record, not just a printed line', () => {
+    const timing = suiteTiming({ jobs, elapsedMs: 69000 });
+    assert.equal(timing.elapsedMs, 69000);
+    assert.deepEqual(timing.replays, [
+      { case: 'alpha', lane: 'TOKEN_A', level: 1, outcome: 'ok', durationMs: 65000 },
+      { case: 'beta', lane: 'TOKEN_B', level: 1, outcome: 'FAILED (exit 1)', durationMs: 4000 },
+    ]);
+  });
+
+  test('elapsed is the pass\'s wall clock, never the sum of its overlapping replays', () => {
+    // Two lanes ran 65s and 4s of spawn work in 69s of wall — the record must not invite a reader to add
+    // the replay durations and call that the suite's duration. This is the distinction the 45-minute bar
+    // on zai-eval-harness-5ux is stated in. [FRAMING:representation]
+    const timing = suiteTiming({ jobs, elapsedMs: 40000 });
+    assert.equal(timing.elapsedMs, 40000);
+    assert.ok(timing.replays.reduce((a, r) => a + r.durationMs, 0) > timing.elapsedMs);
+  });
+
+  test('a failed replay is still a replay the suite spent time on', () => {
+    const timing = suiteTiming({ jobs, elapsedMs: 69000 });
+    assert.equal(timing.replays.length, 2);
+    assert.equal(timing.replays[1].outcome, 'FAILED (exit 1)');
   });
 });

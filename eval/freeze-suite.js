@@ -233,6 +233,24 @@ function renderReport({ jobs, census, repeats, elapsedMs, outDir }) {
   return lines.join('\n') + '\n';
 }
 
+// [LAW:effects-at-boundaries] Pure: the suite's wall clock as a RECORD, folded from the same `jobs` list
+// and the same `elapsedMs` renderReport prints — main() reads the clock once and hands the value to both,
+// so the artifact and the log cannot disagree about what the run cost. [LAW:one-source-of-truth]
+//
+// The suite has always measured this and only ever printed it, which is why the per-replay figure the eval
+// gate sizes itself against (zai-eval-harness-5ux, LEVER 3) went stale across #148 with nobody noticing: a
+// number that lives only in a run log lives only until that log is truncated. `elapsedMs` is the wall clock
+// the 45-minute bar is stated in — the lanes overlap, so it is the pass's real duration and never the sum of
+// `replays[].durationMs`, which is spawn time. [FRAMING:representation]
+function suiteTiming({ jobs, elapsedMs }) {
+  return {
+    elapsedMs,
+    replays: jobs.map(j => ({
+      case: j.name, lane: j.lane, level: j.level, outcome: j.outcome, durationMs: j.durationMs,
+    })),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // effects
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -596,7 +614,23 @@ async function main() {
   // as a case still short. [FRAMING:representation]
   const census = censusCases(cases.map(c => c.dir), outRoot);
   const outDir = path.relative(process.cwd(), outRoot) || '.';
-  process.stdout.write(renderReport({ jobs: done, census, repeats: opts.repeats, elapsedMs: Date.now() - started, outDir }));
+  // [LAW:one-source-of-truth] ONE read of the clock feeds both sinks. Two `Date.now()` calls — one for the
+  // artifact, one for the printed report — would be two clocks for one fact, and the pair would disagree by
+  // however long the write took.
+  const elapsedMs = Date.now() - started;
+  // The timing lands BEFORE the report is printed: the artifact is the durable copy, and a suite that has
+  // already spent hours of quota must not lose its wall clock to a broken pipe on stdout.
+  try {
+    fs.mkdirSync(outRoot, { recursive: true });
+    fs.writeFileSync(path.join(outRoot, 'suite-timing.json'), JSON.stringify(suiteTiming({ jobs: done, elapsedMs }), null, 2) + '\n');
+  } catch (e) {
+    // [LAW:no-silent-failure] Loud, and non-fatal for the same reason compare.js treats its verdict write
+    // this way: the suite's real product is the replay artifacts already on disk, and discarding a completed
+    // suite because its timing file could not be written would cost far more than the file is worth. The
+    // failure is reported, never swallowed.
+    process.stderr.write(`(warning: could not write suite timing under ${outRoot}: ${e.message})\n`);
+  }
+  process.stdout.write(renderReport({ jobs: done, census, repeats: opts.repeats, elapsedMs, outDir }));
   if (census.some(c => c.completed < opts.repeats)) process.exitCode = 1;
 }
 
@@ -607,4 +641,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
