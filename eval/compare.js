@@ -441,6 +441,39 @@ function pct(v) {
   return v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(0)}%`;
 }
 
+function usd(v) {
+  return v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`;
+}
+
+// [LAW:dataflow-not-control-flow] The basis selects a PHRASE, exactly as src/usage.js's COST_PHRASE does,
+// because a ternary chain is where one of a closed set of states goes missing. It went missing here:
+// `subscription` with a null amount — sumCost folds a subscription group to notionalUsd null the moment
+// ONE run reports no list price — fell through an `amountUsd !== null` test and rendered "not reported by
+// the engine **notional** — subscription quota …", a sentence denying its own second clause. `null` (no
+// run priced anything) and `unpriced` (figures that cannot be totalled) are likewise separate facts.
+// The basis set is closed by parseUsage, which stamps it at the border, so there is no fallback arm here
+// — the same trust AMOUNT_BY_BASIS above already places in it. [LAW:parse-dont-validate]
+const SPEND_PHRASE = {
+  null: () => 'not reported by the engine',
+  dollars: s => `${usd(s.amountUsd)} billed`,
+  subscription: s => `${s.amountUsd === null ? '**notional** not reported' : `${usd(s.amountUsd)} **notional**`} — subscription quota at list-price equivalent, not billed`,
+  unpriced: () => 'no single figure — runs reported on bases that cannot be added',
+};
+
+// [LAW:dataflow-not-control-flow] Why the ladder stopped short is a VALUE the verdict names, not a second
+// exit path: a wave killed at its own deadline threw past main() into exit 2 ("the gate could not run"),
+// discarding every wave that HAD completed and the resume guidance for a root that is in fact resumable —
+// the infrastructure-failure reading the budget machinery exists to prevent, reached from inside a wave
+// instead of between two. The `null` arm is written because the top rung is proven to always decide, so
+// an UNDECIDED that stopped for no reason should be unreachable: named, not left a hole.
+// [LAW:no-silent-failure]
+const STOP_PHRASE = {
+  budget: () => 'The budget stopped it: the next wave cost more than the time left.',
+  waveFailed: s => `A replay wave did not finish, and the ladder reports the last one that did — ${s.detail}`,
+  reused: () => 'No replay was run (`--reuse-candidate`): this is the depth the reused artifacts already stood at.',
+  null: () => 'The ladder reached the ceiling without deciding, which the top rung is meant to make impossible — the artifacts under `--out` are the evidence.',
+};
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // Rendering (pure). ONE renderer — Markdown — because the verdict table is meant to be pasted into a PR
 // body (this ticket) and rendered into a GitHub Step Summary (2fk.6), and it reads fine in a terminal too.
@@ -453,7 +486,6 @@ function pct(v) {
 // readable artifact did not, and neither carried wall clock. Two maps of one run that can disagree is one
 // map too many. [LAW:one-source-of-truth] [FRAMING:representation]
 function renderVerdictMarkdown(record) {
-  const usd = (v) => (v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`);
   const signedPct = (v) => (v === null || v === undefined ? 'n/a' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(0)}%`);
   const p = record.pooled;
   const eng = record.engine;
@@ -497,18 +529,21 @@ function renderVerdictMarkdown(record) {
   }
   lines.push('');
 
-  // WHAT IT COST, from the artifacts rather than from a log line that outlives nothing. The wall clock is
-  // the suite's own timing legs (the figure the 45-minute bar is stated in — lanes overlap, so it is
-  // elapsed time and never a sum of spawn durations), and the spend is the engine's own per-run records
-  // with their basis intact.
+  // WHAT IT COST, from the artifacts rather than from a log line that outlives nothing. TWO SCOPES, both
+  // named: the budget bounds THIS invocation (affordsAnotherWave and jobTimeoutMinutes price against it),
+  // while the timing legs under --out are append-only and outlive it — so a resumed root lists waves the
+  // invocation's elapsed accounts for none of, and one sentence carrying both figures unlabelled describes
+  // a run that never happened. The root total is the legs' own sum, never a second figure stored beside
+  // them. [LAW:one-source-of-truth] Lanes overlap, so both are elapsed time, never sums of spawn durations.
   const r = record.run;
+  const invocation = r.waves.filter(w => w.thisInvocation);
   lines.push(
-    `**Wall clock:** ${formatDuration(r.elapsedMs)} of a ${formatDuration(r.budgetMs)} budget, over ${r.waves.length} wave(s)` +
-    `${r.waves.length ? ` (${r.waves.map(w => formatDuration(w.elapsedMs)).join(', ')})` : ''}.`,
+    `**Wall clock:** ${formatDuration(r.elapsedMs)} of a ${formatDuration(r.budgetMs)} budget over ${invocation.length} wave(s) this invocation` +
+    `${invocation.length ? ` (${invocation.map(w => formatDuration(w.elapsedMs)).join(', ')})` : ''}` +
+    `, and ${formatDuration(r.waves.reduce((total, w) => total + w.elapsedMs, 0))} of replay across all ${r.waves.length} wave(s) under this \`--out\`.`,
   );
   lines.push(
-    `**Spend:** ${r.spend.amountUsd !== null ? `${usd(r.spend.amountUsd)}` : r.spend.basis === 'unpriced' ? 'no single figure — runs reported on bases that cannot be added' : 'not reported by the engine'}` +
-    `${r.spend.basis === 'subscription' ? ' **notional** — subscription quota at list-price equivalent, not billed' : r.spend.basis === 'dollars' ? ' billed' : ''}` +
+    `**Spend:** ${SPEND_PHRASE[r.spend.basis === null ? 'null' : r.spend.basis](r.spend)}` +
     ` over ${r.spend.costedRuns} costed run(s)${r.spend.uncostedRuns ? `, ${r.spend.uncostedRuns} uncosted` : ''}.`,
   );
   if (record.cost) {
@@ -527,7 +562,7 @@ function renderVerdictMarkdown(record) {
     lines.push(`**VERDICT: DEGRADED** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} is below the ${pct(p.gateFloor)} gate floor. ${named}`);
   } else if (record.status === 'UNDECIDED') {
     lines.push(
-      `**VERDICT: UNDECIDED — NOT MEASURED, WHICH IS NOT THE SAME AS NOT DEGRADED.** At ${record.replaysSpent} replay(s) the pooled recall ${pct(p.candidate.rate)} sits inside its own sampling error of the ${pct(p.gateFloor)} floor, and the ladder stopped before the ceiling. The wall-clock line above says whether the budget is what stopped it. Re-run against the same \`--out\` to continue from wave ${record.depth + 1}, or raise \`--budget-minutes\` to adjudicate in one pass.`,
+      `**VERDICT: UNDECIDED — NOT MEASURED, WHICH IS NOT THE SAME AS NOT DEGRADED.** At ${record.replaysSpent} replay(s) the pooled recall ${pct(p.candidate.rate)} sits inside its own sampling error of the ${pct(p.gateFloor)} floor, and the ladder stopped before the ceiling. ${STOP_PHRASE[r.stoppedBy === null ? 'null' : r.stoppedBy.reason](r.stoppedBy)} Re-run against the same \`--out\` to continue from wave ${record.depth + 1}, or raise \`--budget-minutes\` to adjudicate in one pass.`,
     );
   } else if (record.status === 'IMPROVED') {
     lines.push(`**VERDICT: OK (improved)** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} floor and exceeds the baseline ${pct(p.baseline.rate)}. (Point estimate only — not significant at this denominator.)`);
@@ -825,6 +860,15 @@ function main() {
     return { tree, suite, verdict: compareVerdict(baseline, suite) };
   };
 
+  // The append-only leg set as it stood BEFORE this invocation replayed anything. Every leg from here on
+  // is one this run produced, which is exact set arithmetic over a name-sorted, append-only set rather
+  // than a `startedAt >=` inference against a second clock. [LAW:one-source-of-truth] Reading the legs
+  // now also puts readSuiteTiming's unreadable-leg refusal ahead of the spend rather than after it.
+  const priorLegs = readSuiteTiming(candidateRoot).legs.length;
+
+  // Why the ladder stopped short of a decision, carried as a value rather than left to a second exit path
+  // or inferred from the wall clock. [LAW:dataflow-not-control-flow]
+  let stoppedBy = null;
   let assessment;
   if (opts.reuseCandidate) {
     // --matcher (default 'llm' even when never passed) has no effect in this branch: no scoring runs here,
@@ -833,6 +877,7 @@ function main() {
     // refusal above — except here there's a principled winner (the reused data), just not the flag's value.
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend). --matcher is ignored in this mode — the reused summaries' own recorded matcher is what's checked.\n`);
     assessment = assess();
+    stoppedBy = { reason: 'reused' };
   } else {
     // 5. An --out that already holds runs is either this candidate's own partial suite — an earlier gate
     //    invocation on the same clean commit that walled, timed out, or stopped UNDECIDED at a rung, which
@@ -874,7 +919,20 @@ function main() {
     for (let depth = startDepth; depth <= repeats; depth++) {
       process.stderr.write(`\n─── wave ${depth}/${repeats}: replaying ${caseNames.length} case(s) to depth ${depth} ───\n`);
       const jobTimeout = jobTimeoutMinutes({ elapsedMs: Date.now() - startedMs, budgetMs });
-      runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials, jobTimeout }), 'freeze-suite');
+      // Scoped to the replay alone. The drift refusal below and a scoring failure stay fatal because they
+      // invalidate the artifacts; a wave that ran out of its deadline merely stops short of them, leaving a
+      // root the next invocation resumes — the runs it did complete are on disk, and resumeDepth levels
+      // them. freeze-suite exits 1 for a census shortfall AND for a hard failure, so these are not
+      // separable by exit code, and they do not need to be: the guidance is true of both.
+      try {
+        runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials, jobTimeout }), 'freeze-suite');
+      } catch (e) {
+        // Nothing has been measured yet, so there is no verdict to report instead. [LAW:no-silent-failure]
+        if (assessment === undefined) throw e;
+        process.stderr.write(`\nStopping at wave ${depth}: ${e.message}\nReporting the wave ${depth - 1} verdict; re-run against the same --out to continue.\n`);
+        stoppedBy = { reason: 'waveFailed', detail: e.message };
+        break;
+      }
 
       // 7a. Every run now under --out — inherited and just produced — must record the tree snapshotted
       //     above: each replay wrote the tree it ran on, so a working tree that moved mid-invocation shows
@@ -905,6 +963,7 @@ function main() {
       const elapsedMs = Date.now() - startedMs;
       if (!affordsAnotherWave({ elapsedMs, longestWaveMs: nextWaveMs, budgetMs })) {
         process.stderr.write(`\nStopping at wave ${depth}: ${formatDuration(elapsedMs)} spent of the ${formatDuration(budgetMs)} budget, and the next wave costs about ${formatDuration(nextWaveMs)}. Reporting UNDECIDED rather than overrunning.\n`);
+        stoppedBy = { reason: 'budget' };
         break;
       }
     }
@@ -927,7 +986,8 @@ function main() {
     run: {
       elapsedMs: Date.now() - startedMs,
       budgetMs,
-      waves: timing.legs.map(leg => ({ startedAt: leg.startedAt, elapsedMs: leg.elapsedMs, replays: leg.replays.length })),
+      waves: timing.legs.map((leg, i) => ({ startedAt: leg.startedAt, elapsedMs: leg.elapsedMs, replays: leg.replays.length, thisInvocation: i >= priorLegs })),
+      stoppedBy,
       spend: readCandidateSpend(candidateRoot, caseNames),
     },
   };

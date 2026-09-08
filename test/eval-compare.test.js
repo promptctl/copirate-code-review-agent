@@ -55,6 +55,7 @@ function candidateSuite(cases, provenance = { sha: 'candsha0', date: '2026-08-02
 // takes this and verdict.json holds this, so a test that renders is also a test of what gets persisted;
 // the two maps have no separate shape to drift apart in. [LAW:one-source-of-truth]
 function verdictRecord(verdict, extra = {}) {
+  const { run, ...rest } = extra;
   return {
     ...verdict,
     candidate: null,
@@ -63,10 +64,12 @@ function verdictRecord(verdict, extra = {}) {
     run: {
       elapsedMs: 12 * 60 * 1000,
       budgetMs: 45 * 60 * 1000,
-      waves: [{ startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 12 * 60 * 1000, replays: 2 }],
+      waves: [{ startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 12 * 60 * 1000, replays: 2, thisInvocation: true }],
+      stoppedBy: null,
       spend: { basis: 'subscription', amountUsd: 13.77, costedRuns: 2, uncostedRuns: 0 },
+      ...run,
     },
-    ...extra,
+    ...rest,
   };
 }
 
@@ -321,11 +324,10 @@ test('compareVerdict reports UNDECIDED — never OK — when the sample places t
   // UNDECIDED must never render or exit as a pass.
   const md = renderVerdictMarkdown(verdictRecord(v));
   assert.match(md, /NOT MEASURED, WHICH IS NOT THE SAME AS NOT DEGRADED/);
-  // It states that the ladder stopped short, and points at the wall-clock line for WHY, rather than
-  // asserting a budget it may never have consulted — --reuse-candidate reaches this verdict with no
-  // budget in play at all. A verdict that names the wrong cause is a map of something that did not happen.
+  // It states that the ladder stopped short and names WHY from the record, rather than asserting a budget
+  // it may never have consulted — --reuse-candidate reaches this verdict with no budget in play at all.
   assert.match(md, /the ladder stopped before the ceiling/);
-  assert.doesNotMatch(md, /the budget could not buy/);
+  assert.match(md, /reached the ceiling without deciding, which the top rung is meant to make impossible/);
 });
 
 test('the ceiling always decides — the ladder terminates without a special case for the top rung', () => {
@@ -381,7 +383,7 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
   assert.match(md, /Localized to: `case-a`, `case-b`/);
   // What the run cost travels WITH the verdict, in the same object verdict.json holds — the wall clock the
   // 45-minute bar is stated in, and the spend with its basis intact rather than dressed as billed dollars.
-  assert.match(md, /\*\*Wall clock:\*\* 12m00s of a 45m00s budget, over 1 wave\(s\)/);
+  assert.match(md, /\*\*Wall clock:\*\* 12m00s of a 45m00s budget over 1 wave\(s\) this invocation \(12m00s\), and 12m00s of replay across all 1 wave\(s\)/);
   assert.match(md, /\*\*Spend:\*\* \$13\.7700 \*\*notional\*\* — subscription quota at list-price equivalent, not billed/);
   // and how strong a claim the badge is making.
   assert.match(md, /\*\*Decided at wave 2 of 2\*\* \(4 replay\(s\) spent, ceiling 4\) · \*\*certain\*\*/);
@@ -405,6 +407,73 @@ test('a screened pass never renders as an adjudicated one', () => {
   assert.match(screened, /\*\*screened\*\* — the candidate's ~2σ interval sits entirely on one side of the floor/);
   assert.match(screened, /A weaker claim than a full-depth adjudication: the sample it rests on is 1\/2 of one/);
   assert.doesNotMatch(renderVerdictMarkdown(verdictRecord(compareVerdict(frozenBaseline(CASES_A()), CASES_A() && candidateSuite(CASES_A())))), /screened/);
+});
+
+test('the spend line names each basis, and never denies a basis it is about to name', () => {
+  const v = compareVerdict(frozenBaseline(CASES_A()), candidateSuite(CASES_A()));
+  const spendLine = (spend) => renderVerdictMarkdown(verdictRecord(v, { run: { spend } }))
+    .split('\n').find(l => l.startsWith('**Spend:**'));
+
+  // The four states foldSpend can produce, one sentence each. The subscription pair is the one a ternary
+  // chain on `amountUsd !== null` collapsed: sumCost folds a subscription group to a null notional as soon
+  // as ONE run reports no list price, so the amount goes missing while the basis stays perfectly known.
+  assert.equal(spendLine({ basis: 'dollars', amountUsd: 1.5, costedRuns: 3, uncostedRuns: 0 }),
+    '**Spend:** $1.5000 billed over 3 costed run(s).');
+  assert.equal(spendLine({ basis: 'subscription', amountUsd: 13.77, costedRuns: 2, uncostedRuns: 0 }),
+    '**Spend:** $13.7700 **notional** — subscription quota at list-price equivalent, not billed over 2 costed run(s).');
+  assert.equal(spendLine({ basis: 'subscription', amountUsd: null, costedRuns: 2, uncostedRuns: 1 }),
+    '**Spend:** **notional** not reported — subscription quota at list-price equivalent, not billed over 2 costed run(s), 1 uncosted.');
+  assert.equal(spendLine({ basis: null, amountUsd: null, costedRuns: 0, uncostedRuns: 4 }),
+    '**Spend:** not reported by the engine over 0 costed run(s), 4 uncosted.');
+  assert.equal(spendLine({ basis: 'unpriced', amountUsd: null, costedRuns: 1, uncostedRuns: 1 }),
+    '**Spend:** no single figure — runs reported on bases that cannot be added over 1 costed run(s), 1 uncosted.');
+
+  // "not reported by the engine" says the BASIS is unknown, so it may never be followed by one.
+  for (const basis of ['dollars', 'subscription', 'unpriced']) {
+    assert.doesNotMatch(spendLine({ basis, amountUsd: null, costedRuns: 0, uncostedRuns: 1 }), /not reported by the engine/);
+  }
+});
+
+test('the wall clock keeps the invocation and the root apart', () => {
+  // A resumed --out: the leg set is append-only, so it holds waves this invocation did not run. The budget
+  // is per-invocation (affordsAnotherWave and jobTimeoutMinutes both price against it), so pairing its
+  // elapsed with the root's wave list describes a run that never happened.
+  const v = compareVerdict(frozenBaseline(CASES_A()), candidateSuite(CASES_A()));
+  const line = renderVerdictMarkdown(verdictRecord(v, {
+    run: {
+      elapsedMs: 6 * 60 * 1000,
+      waves: [
+        { startedAt: 'a', elapsedMs: 8 * 60 * 1000, replays: 2, thisInvocation: false },
+        { startedAt: 'b', elapsedMs: 7 * 60 * 1000, replays: 2, thisInvocation: false },
+        { startedAt: 'c', elapsedMs: 5 * 60 * 1000, replays: 2, thisInvocation: true },
+      ],
+    },
+  })).split('\n').find(l => l.startsWith('**Wall clock:**'));
+  assert.equal(line, '**Wall clock:** 6m00s of a 45m00s budget over 1 wave(s) this invocation (5m00s), '
+    + 'and 20m00s of replay across all 3 wave(s) under this `--out`.');
+
+  // --reuse-candidate replays nothing at all, and the sentence says so rather than claiming the root's.
+  const reused = renderVerdictMarkdown(verdictRecord(v, {
+    run: { elapsedMs: 120, waves: [{ startedAt: 'a', elapsedMs: 8 * 60 * 1000, replays: 2, thisInvocation: false }] },
+  }));
+  assert.match(reused, /budget over 0 wave\(s\) this invocation, and 8m00s of replay across all 1 wave\(s\)/);
+});
+
+test('an UNDECIDED verdict names why the ladder stopped, from the record rather than from the clock', () => {
+  const v = compareVerdict(frozenBaseline(CASES_A()), wave1(1));
+  assert.equal(v.status, 'UNDECIDED');
+  const rendered = (stoppedBy) => renderVerdictMarkdown(verdictRecord(v, { run: { stoppedBy } }));
+
+  assert.match(rendered({ reason: 'budget' }), /The budget stopped it: the next wave cost more than the time left\./);
+  assert.match(rendered({ reason: 'reused' }), /No replay was run \(`--reuse-candidate`\)/);
+  // A wave killed at its own deadline used to throw past main() into exit 2 with no verdict written at
+  // all, so the operator never learned that the root it left behind is resumable. It is a stop, not a
+  // crash, and it carries freeze-suite's own message.
+  const failed = rendered({ reason: 'waveFailed', detail: 'freeze-suite exited with code 1.' });
+  assert.match(failed, /A replay wave did not finish, and the ladder reports the last one that did — freeze-suite exited with code 1\./);
+  assert.match(failed, /Re-run against the same `--out` to continue from wave 2/);
+  // The top rung is proven to always decide, so this arm should be unreachable — written, not left a hole.
+  assert.match(rendered(null), /reached the ceiling without deciding, which the top rung is meant to make impossible/);
 });
 
 // ── resolveBaselineJsonPath (effect code — a real temp git repo, not a pure-core fixture) ──────────────
