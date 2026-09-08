@@ -178,8 +178,11 @@ test('expectedMatcherLabel builds the exact label score.js records', () => {
 
 // ── estimateCandidateCostUsd (the cost guardrail) ─────────────────────────────────────────────────────
 
-test('estimateCandidateCostUsd prices the full-suite passes still owed — fractional on an uneven resume — or null when uncosted', () => {
+test('estimateCandidateCostUsd prices N rungs at the baseline\'s per-full-run cost, or null when uncosted', () => {
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 5), 0.6952 * 5);
+  // The guardrail an operator reads before approving the spend is scoped to the rungs THIS invocation can
+  // still buy: a root resumed at wave 3 of 5 has already paid for the two below it.
+  assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 5 - 3 + 1), 0.6952 * 3);
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: 0.6952 }, 9 / 4), 0.6952 * 9 / 4);
   assert.equal(estimateCandidateCostUsd({ costPerFullRunUsd: null }, 5), null);
   assert.equal(estimateCandidateCostUsd({}, 5), null);

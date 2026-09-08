@@ -186,11 +186,10 @@ function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials, 
 // [LAW:one-source-of-truth]
 const expectedMatcherLabel = matcherLabel;
 
-// The candidate's estimated cost for what THIS invocation will replay: `fullRuns` is the deficit in units
-// of one full suite pass (replays still owed ÷ cases — fractional when a resume left the cases uneven),
-// priced at the baseline's own recorded per-full-run cost (2fk.4's numbers), so the guardrail printed
-// BEFORE spending is the spend about to happen, not the suite's. Null when the baseline never recorded a
-// costed per-run figure (nothing to estimate from).
+// The candidate's estimated cost for what THIS invocation will replay: `fullRuns` rungs priced at the
+// baseline's own recorded per-full-run cost (2fk.4's numbers), so the guardrail printed BEFORE spending is
+// the spend about to happen, not the suite's. Null when the baseline never recorded a costed per-run
+// figure (nothing to estimate from).
 function estimateCandidateCostUsd(rawBaselineSuite, fullRuns) {
   const perRun = rawBaselineSuite && rawBaselineSuite.costPerFullRunUsd;
   if (typeof perRun !== 'number' || !Number.isFinite(perRun)) return null;
@@ -669,9 +668,18 @@ function resolveBaselineJsonPath(arg, gitCwd = __dirname) {
 
 // Spawn a dev CLI (freeze-suite.js / score.js) with stdio inherited so its progress streams live, and abort the
 // whole gate if it fails — a partial or errored candidate must never be silently scored. [LAW:no-silent-failure]
-function runCli(scriptPath, args, label) {
-  const res = spawnSync('node', [scriptPath, ...args], { stdio: 'inherit', env: process.env });
-  if (res.error) throw new Error(`${label} failed to spawn: ${res.error.message}`);
+//
+// `timeoutMs` is the deadline the PARENT enforces, and it is null exactly where the child enforces its own:
+// freeze-suite is handed --job-timeout and must survive to write its timing leg and census, so killing it
+// from out here would destroy the measurement the next wave is priced from as well as being a second
+// enforcer of one rule. [LAW:single-enforcer] spawnSync reports a kill as ETIMEDOUT, which the existing
+// error arm already catches — it says the deadline was overrun rather than "failed to spawn", which would
+// name the wrong cause.
+function runCli(scriptPath, args, label, timeoutMs) {
+  const res = spawnSync('node', [scriptPath, ...args], { stdio: 'inherit', env: process.env, timeout: timeoutMs });
+  if (res.error) throw new Error(res.error.code === 'ETIMEDOUT'
+    ? `${label} overran its ${formatDuration(timeoutMs)} deadline and was killed.`
+    : `${label} failed to spawn: ${res.error.message}`);
   if (res.status !== 0) throw new Error(`${label} exited ${res.status === null ? `on signal ${res.signal}` : `with code ${res.status}`}.`);
 }
 
@@ -906,12 +914,15 @@ function main() {
     }
 
     // 6. SPEND GUARDRAIL, stated as the ladder's shape rather than as one number: the gate buys one wave
-    //    at a time and stops at the first that decides, so the figure that matters up front is what a wave
-    //    costs and what the ceiling would cost if every rung were bought. [LAW:verifiable-goals]
-    const perWaveUsd = estimateCandidateCostUsd(rawBaselineSuite, 1);
+    //    at a time and stops at the first that decides, so the figures that matter up front are what a wave
+    //    costs and what this invocation's remaining rungs would cost if all were bought. [LAW:verifiable-goals]
     const startDepth = Math.max(1, resumeDepth(caseNames, prior));
+    const perWaveUsd = estimateCandidateCostUsd(rawBaselineSuite, 1);
+    // The rungs THIS invocation could still buy, not the ladder's whole lifetime: a resumed root has
+    // already paid for everything below startDepth, and the sentence scopes the budget to the invocation.
+    const remainingUsd = estimateCandidateCostUsd(rawBaselineSuite, repeats - startDepth + 1);
     process.stderr.write(`\nWalking the ladder from wave ${startDepth} to at most ${repeats}: ${caseNames.length} replay(s) per wave against the WORKING TREE, scored and judged after each, stopping at the first wave that decides.\n`);
-    process.stderr.write(`Budget ${opts.budgetMinutes} minute(s) for this invocation. Estimated cost ${perWaveUsd === null ? 'unknown (the baseline recorded no per-run cost — its engine bills quota, not dollars)' : `≈ $${perWaveUsd.toFixed(2)} per wave, ≤ $${(perWaveUsd * repeats).toFixed(2)} if every rung is bought`}.\n\n`);
+    process.stderr.write(`Budget ${opts.budgetMinutes} minute(s) for this invocation. Estimated cost ${perWaveUsd === null ? 'unknown (the baseline recorded no per-run cost — its engine bills quota, not dollars)' : `≈ $${perWaveUsd.toFixed(2)} per wave, ≤ $${remainingUsd.toFixed(2)} if every remaining rung is bought`}.\n\n`);
 
     // 7. THE LADDER. Bounded by the ceiling in the loop header, so it terminates structurally and needs no
     //    guard against running away; decideLadder independently guarantees the top rung always decides, so
@@ -925,11 +936,23 @@ function main() {
       // them. freeze-suite exits 1 for a census shortfall AND for a hard failure, so these are not
       // separable by exit code, and they do not need to be: the guidance is true of both.
       try {
-        runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials, jobTimeout }), 'freeze-suite');
+        runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials, jobTimeout }), 'freeze-suite', null);
       } catch (e) {
-        // Nothing has been measured yet, so there is no verdict to report instead. [LAW:no-silent-failure]
-        if (assessment === undefined) throw e;
-        process.stderr.write(`\nStopping at wave ${depth}: ${e.message}\nReporting the wave ${depth - 1} verdict; re-run against the same --out to continue.\n`);
+        // "This invocation has not assessed yet" is not "nothing is assessable": a resumed root carries the
+        // completed waves of earlier invocations — eval.yml carries one across dispatches — so the FIRST
+        // wave of a resumed run failing must not discard them. Scoring runs only after a successful replay,
+        // so the summaries assess() reads still describe the last scored depth, evenly. A root that assesses
+        // to nothing leaves the replay failure as the honest thing to raise, and both reasons are printed.
+        // [LAW:no-silent-failure]
+        if (assessment === undefined) {
+          try {
+            assessment = assess();
+          } catch (unassessable) {
+            process.stderr.write(`\n${candidateRoot} holds no verdict to report either: ${unassessable.message}\n`);
+            throw e;
+          }
+        }
+        process.stderr.write(`\nStopping at wave ${depth}: ${e.message}\nReporting the verdict the completed waves support; re-run against the same --out to continue.\n`);
         stoppedBy = { reason: 'waveFailed', detail: e.message };
         break;
       }
@@ -947,7 +970,12 @@ function main() {
       //     its content-keyed cache means re-scoring the earlier waves consults no judge again.
       for (const name of caseNames) {
         process.stderr.write(`\n─── ${name}: scoring at depth ${depth} ───\n`);
-        runCli(scoreScript, [path.join(candidateRoot, name), '--matcher', opts.matcher, '--cases-dir', casesDir, '--cache', path.resolve(opts.cache)], `score (${name})`);
+        // The whole budget, as a deadline no legitimate scoring pass can reach — a pass that has run longer
+        // than the bar the entire invocation is judged against is hung. Sizing it from the REMAINING budget
+        // the way the replay's is sized would kill the scoring of a wave already paid for, discarding a
+        // verdict over a step that turns spend into the answer rather than one that spends. Bounding it at
+        // all is what makes the module header's "wall clock is BOUNDED" true across a wave's second half.
+        runCli(scoreScript, [path.join(candidateRoot, name), '--matcher', opts.matcher, '--cases-dir', casesDir, '--cache', path.resolve(opts.cache)], `score (${name})`, budgetMs);
       }
 
       assessment = assess();
