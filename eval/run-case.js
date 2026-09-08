@@ -30,7 +30,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
-artifacts (findings.json, summary.txt, usage.json, transcripts/) for the scorer to reduce.
+artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
 
 Usage: node eval/run-case.js <case-dir> [options]
 
@@ -231,6 +231,21 @@ function treeIdentity({ sha, dirty }) {
   return dirty ? null : sha;
 }
 
+// [LAW:parse-dont-validate] The one crossing between a live value and a durable artifact, returning BYTES a
+// corrupt record cannot inhabit — so no writer below re-checks what it was handed. `JSON.stringify` answers
+// the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined":
+// a file that reports as an artifact and parses as nothing. Every field of a run record is a fact the replay
+// observed, so an absent one is a broken producer, and it fails here, named, rather than as a JSON.parse
+// crash in whatever reads the artifact months later. Substituting `null` would be worse than either: it
+// would leave a reader unable to tell a pass that genuinely recorded nothing from a producer that broke.
+// [LAW:no-silent-failure]
+function jsonBytes(field, value) {
+  if (value === undefined) {
+    throw new Error(`writeRunRecord: ${field} is undefined — a run record cannot record a fact the replay never produced.`);
+  }
+  return JSON.stringify(value, null, 2) + '\n';
+}
+
 // One run's record on disk. findings.json is what makes a run dir COMPLETE to every reader (score.js's
 // listRunDirs, the suite census, the gate's resume), so it lands last and atomically — written beside,
 // then renamed — after every file those readers go on to open. A replay killed or failing at any instant
@@ -248,12 +263,12 @@ function treeIdentity({ sha, dirty }) {
 // went stale across #148 unnoticed. A measured fact with no durable map is a fact the next reader must
 // guess at. [FRAMING:representation]
 function writeRunRecord(runDir, { meta, summary, usage, schedule, findings }) {
-  fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n');
+  fs.writeFileSync(path.join(runDir, 'meta.json'), jsonBytes('meta', meta));
   fs.writeFileSync(path.join(runDir, 'summary.txt'), summary + '\n');
-  fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(usage, null, 2) + '\n');
-  fs.writeFileSync(path.join(runDir, 'schedule.json'), JSON.stringify(schedule, null, 2) + '\n');
+  fs.writeFileSync(path.join(runDir, 'usage.json'), jsonBytes('usage', usage));
+  fs.writeFileSync(path.join(runDir, 'schedule.json'), jsonBytes('schedule', schedule));
   const findingsPath = path.join(runDir, 'findings.json');
-  fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(findings, null, 2) + '\n');
+  fs.writeFileSync(`${findingsPath}.partial`, jsonBytes('findings', findings));
   fs.renameSync(`${findingsPath}.partial`, findingsPath);
 }
 

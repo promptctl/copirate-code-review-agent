@@ -233,21 +233,67 @@ function renderReport({ jobs, census, repeats, elapsedMs, outDir }) {
   return lines.join('\n') + '\n';
 }
 
-// [LAW:effects-at-boundaries] Pure: the suite's wall clock as a RECORD, folded from the same `jobs` list
+// [LAW:effects-at-boundaries] Pure: ONE INVOCATION's wall clock as a record, folded from the same `jobs` list
 // and the same `elapsedMs` renderReport prints — main() reads the clock once and hands the value to both,
 // so the artifact and the log cannot disagree about what the run cost. [LAW:one-source-of-truth]
 //
 // The suite has always measured this and only ever printed it, which is why the per-replay figure the eval
 // gate sizes itself against (zai-eval-harness-5ux, LEVER 3) went stale across #148 with nobody noticing: a
 // number that lives only in a run log lives only until that log is truncated. `elapsedMs` is the wall clock
-// the 45-minute bar is stated in — the lanes overlap, so it is the pass's real duration and never the sum of
-// `replays[].durationMs`, which is spawn time. [FRAMING:representation]
-function suiteTiming({ jobs, elapsedMs }) {
+// the 45-minute bar is stated in — the lanes overlap, so it is the invocation's real duration and never the
+// sum of `replays[].durationMs`, which is spawn time. [FRAMING:representation]
+//
+// A LEG, not the suite: re-invocation is this command's only resume and its only status check, so a suite is
+// finished across however many invocations it takes. `startedAt` is what names this leg's file and what
+// orders the legs on read.
+function suiteTiming({ jobs, elapsedMs, startedAt }) {
   return {
+    startedAt,
     elapsedMs,
     replays: jobs.map(j => ({
       case: j.name, lane: j.lane, level: j.level, outcome: j.outcome, durationMs: j.durationMs,
     })),
+  };
+}
+
+// Each invocation writes its OWN timing file, named by the instant it started. That name is why a leg cannot
+// destroy another leg's record: the clobber is unrepresentable rather than guarded against
+// [LAW:types-are-the-program]. One shared timing file with many writers and no owner is filesystem-shaped
+// shared mutable state [LAW:no-shared-mutable-globals] — and it loses data on the NORMAL path here, because
+// a status-check re-invocation plans no jobs and would rewrite the file as an empty suite.
+//
+// A file, never a dir: every DIRECTORY child of the out root is a case run dir, which is what lets score.js
+// name exactly the things it can score (`listRunDirs` filters `isDirectory`). [LAW:decomposition]
+function suiteTimingPath(outRoot, startedAt) {
+  return path.join(outRoot, `suite-timing-${startedAt.replace(/[:.]/g, '-')}.json`);
+}
+
+// [LAW:one-source-of-truth] The reducer that makes the append-only set answer as ONE fact, the same shape
+// censusCases uses for run dirs: re-read what is on disk rather than trusting what this process happens to
+// remember. `elapsedMs` is the wall clock the suite actually cost across every leg, and `replays` is every
+// replay any leg ran.
+//
+// A corrupt leg is LOUD and names its file [LAW:no-silent-failure]: skipping it would silently under-report
+// the very duration the 45-minute bar is judged on, which is the failure this artifact exists to prevent.
+function readSuiteTiming(outRoot) {
+  const names = fs.existsSync(outRoot)
+    ? fs.readdirSync(outRoot, { withFileTypes: true })
+      .filter(e => e.isFile() && /^suite-timing-.*\.json$/.test(e.name))
+      .map(e => e.name)
+      .sort()
+    : [];
+  const legs = names.map(name => {
+    const file = path.join(outRoot, name);
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) {
+      throw new Error(`Unreadable suite timing leg ${file}: ${e.message}`);
+    }
+  });
+  return {
+    legs,
+    elapsedMs: legs.reduce((total, leg) => total + leg.elapsedMs, 0),
+    replays: legs.flatMap(leg => leg.replays),
   };
 }
 
@@ -618,11 +664,18 @@ async function main() {
   // artifact, one for the printed report — would be two clocks for one fact, and the pair would disagree by
   // however long the write took.
   const elapsedMs = Date.now() - started;
+  // Derived from the SAME `started` the elapsed is measured against, never a second `Date.now()` — the leg's
+  // name and the leg's duration are two readings of one clock. [LAW:one-source-of-truth]
+  const startedAt = new Date(started).toISOString();
   // The timing lands BEFORE the report is printed: the artifact is the durable copy, and a suite that has
   // already spent hours of quota must not lose its wall clock to a broken pipe on stdout.
+  //
+  // Unconditional, including the invocation that planned nothing: a leg that ran no replays contributes no
+  // replays, which is a truthful empty record rather than a case to branch around
+  // [LAW:dataflow-not-control-flow]. It cannot erase an earlier leg, because it writes its own file.
   try {
     fs.mkdirSync(outRoot, { recursive: true });
-    fs.writeFileSync(path.join(outRoot, 'suite-timing.json'), JSON.stringify(suiteTiming({ jobs: done, elapsedMs }), null, 2) + '\n');
+    fs.writeFileSync(suiteTimingPath(outRoot, startedAt), JSON.stringify(suiteTiming({ jobs: done, elapsedMs, startedAt }), null, 2) + '\n');
   } catch (e) {
     // [LAW:no-silent-failure] Loud, and non-fatal for the same reason compare.js treats its verdict write
     // this way: the suite's real product is the replay artifacts already on disk, and discarding a completed
@@ -641,4 +694,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

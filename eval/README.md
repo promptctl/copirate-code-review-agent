@@ -239,6 +239,13 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     { basis:'unpriced', reason }). A run captured before the token split
                     carries a collapsed inputTokens/outputTokens pair instead, and reads
                     back as tokens: null — absent, never zero.
+  schedule.json   — the replay's WALL CLOCK, as the engine's own host-stamped record (src/schedule.js's
+                    scheduleRecord — the same value run.js posts in the PR footer, so a replay and a
+                    production review read one timing fact, not two):
+                    { laneCount, sweepCap, scopeCount, spawns: [...] }, where each spawn is
+                    { phase, outcome, usage } with the span at usage.span — a 'worker' spawn also
+                    names its scope and pass, a 'scout' carries neither. A per-replay duration is the
+                    envelope of those spans, derivable from the artifact with no CI log to scrape.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
                     and candidate ({sha, dirty}: the tree that produced the run; null on runs from
                     before it was recorded).
@@ -337,6 +344,12 @@ nothing — every job is still `run-case.js -n 1` in its own process:
   scorer's own definition, exported from `score.js` so the two cannot disagree). The runner
   counts what is already there and plans only the deficit, so re-running the command after a
   wall picks up where it stopped — there is no resume flag because there is no resume mode.
+  Timing follows the same shape: each invocation writes its own `suite-timing-<startedAt>.json`
+  under the out root — `{ startedAt, elapsedMs, replays: [...] }` — so a suite finished across
+  several legs keeps every leg's clock, and a status-check re-run (which plans nothing) cannot
+  erase what an earlier one measured. `readSuiteTiming()` folds the legs into one answer.
+  `elapsedMs` is wall clock, never the sum of `replays[].durationMs`: the lanes overlap, and
+  wall clock is the figure the gate's 45-minute bar is stated in.
 - **Level-filling order.** A job exists for case *c* at level *r* iff *c* has fewer than *r*
   completed runs, so every case is deepened before any one of them is. An interruption leaves
   an even suite (a valid smaller N — `baseline.js` demands one common N) instead of 5/5/5/0,

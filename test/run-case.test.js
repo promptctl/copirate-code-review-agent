@@ -341,7 +341,9 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
   try {
     const ok = path.join(root, 'case', 'r1');
     fs.mkdirSync(ok, { recursive: true });
-    const schedule = { laneCount: 2, spawns: [{ tag: { phase: 'scout' }, span: { from: '2026-09-08T00:00:00.000Z', to: '2026-09-08T00:01:00.000Z' } }] };
+    // Minted, not fabricated — this test is about write ORDER, but a wrong-shaped schedule sitting in it is
+    // still a shape a reader could copy. [LAW:one-source-of-truth]
+    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
     writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, findings: [{ path: 'a', line: 1 }] });
     assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'schedule.json', 'summary.txt', 'usage.json']);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ok, 'findings.json'), 'utf8')), [{ path: 'a', line: 1 }]);
@@ -356,28 +358,61 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
   }
 });
 
+test('writeRunRecord: an absent fact fails loudly instead of landing as a file that parses as nothing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-undef-'));
+  try {
+    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
+    const record = { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, findings: [] };
+    // `JSON.stringify(undefined)` is the VALUE undefined, and `undefined + '\n'` is the literal text
+    // "undefined" — so an unguarded write lands an artifact that reports as JSON and parses as nothing.
+    // Every field carries the same exposure, so every field is checked, not just the newest one.
+    for (const field of ['meta', 'usage', 'schedule', 'findings']) {
+      const dir = path.join(root, field);
+      fs.mkdirSync(dir, { recursive: true });
+      assert.throws(
+        () => writeRunRecord(dir, { ...record, [field]: undefined }),
+        new RegExp(`${field} is undefined`),
+        `${field}: an absent fact must abort the record, not be written as the text "undefined"`,
+      );
+      assert.equal(fs.existsSync(path.join(dir, `${field}.json`)), false, `${field}.json must not exist`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('writeRunRecord: a replay\'s wall clock survives as an artifact, readable through the same span boundary the rest of the system uses', () => {
-  const { spanMs } = require('../src/schedule');
+  // Built through the REAL mints, never hand-fabricated: this test is the only thing documenting what
+  // schedule.json contains, so a shape invented here is a shape a future reader would code against and a
+  // producer would never emit. Going through scheduleRecord/spawnRecord means the fixture cannot drift from
+  // what src/schedule.js actually writes — it would throw first. [LAW:one-source-of-truth]
+  const { spanMs, scheduleRecord, spawnRecord } = require('../src/schedule');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-clock-'));
   try {
     const runDir = path.join(root, 'case', 'r1');
     fs.mkdirSync(runDir, { recursive: true });
-    // One scout of 60s and one worker of 90s — the shape src/schedule.js's scheduleRecord produces and
-    // run.js already posts, so the eval artifact and the PR footer read one timing fact, not two.
-    const schedule = {
+    // One scout of 60s and one worker of 90s — the shape run.js already posts, so the eval artifact and the
+    // PR footer read one timing fact, not two. The span rides on `usage`, which is where describeSchedule
+    // reads it from.
+    const schedule = scheduleRecord({
       laneCount: 1,
+      sweepCap: 2,
+      scopeCount: 1,
       spawns: [
-        { tag: { phase: 'scout' }, span: { from: '2026-09-08T00:00:00.000Z', to: '2026-09-08T00:01:00.000Z' } },
-        { tag: { phase: 'worker' }, span: { from: '2026-09-08T00:01:00.000Z', to: '2026-09-08T00:02:30.000Z' } },
+        spawnRecord({ phase: 'scout' }, 'completed', { span: { from: '2026-09-08T00:00:00.000Z', to: '2026-09-08T00:01:00.000Z' } }),
+        spawnRecord({ phase: 'worker', scope: 'docs', pass: 0 }, 'completed', { span: { from: '2026-09-08T00:01:00.000Z', to: '2026-09-08T00:02:30.000Z' } }),
       ],
-    };
+    });
     writeRunRecord(runDir, { meta: { case: 'case' }, summary: 's', usage: {}, schedule, findings: [] });
 
     const recorded = JSON.parse(fs.readFileSync(path.join(runDir, 'schedule.json'), 'utf8'));
     assert.deepEqual(recorded, schedule);
     // The point of recording it: a per-replay duration is derivable from the artifact alone, with no CI
     // log to scrape and nothing to re-measure. This is what LEVER 3 on zai-eval-harness-5ux needs.
-    assert.deepEqual(recorded.spawns.map(s => spanMs(s.span)), [60_000, 90_000]);
+    assert.deepEqual(recorded.spawns.map(s => spanMs(s.usage.span)), [60_000, 90_000]);
+    // The discriminator a reader keys on: a worker names its scope and pass, a scout carries neither.
+    assert.deepEqual(recorded.spawns.map(s => s.phase), ['scout', 'worker']);
+    assert.equal(recorded.spawns[1].scope, 'docs');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
