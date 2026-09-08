@@ -30,7 +30,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
-artifacts (findings.json, summary.txt, usage.json, transcripts/) for the scorer to reduce.
+artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
 
 Usage: node eval/run-case.js <case-dir> [options]
 
@@ -231,17 +231,50 @@ function treeIdentity({ sha, dirty }) {
   return dirty ? null : sha;
 }
 
+// [LAW:parse-dont-validate] The crossing between a live value and a durable artifact. `JSON.stringify` answers
+// the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined" —
+// a file that reports as an artifact and parses as nothing. Every field of a run record is a fact the replay
+// observed, so an absent one is a broken producer and fails HERE, named, rather than as a parse crash in
+// whatever reads the artifact months later. Substituting `null` would be worse than either: a reader could no
+// longer tell a pass that genuinely recorded nothing from a producer that broke. [LAW:no-silent-failure]
+//
+// The check is lifted out of the rendering because summary.txt is raw text, cannot go through `jsonBytes`,
+// and corrupts identically — so the rule is stated once for every field the record carries, in both
+// renderings. [LAW:single-enforcer]
+function present(field, value) {
+  if (value === undefined) {
+    throw new Error(`writeRunRecord: ${field} is undefined — a run record cannot record a fact the replay never produced.`);
+  }
+  return value;
+}
+
+function jsonBytes(field, value) {
+  return JSON.stringify(present(field, value), null, 2) + '\n';
+}
+
 // One run's record on disk. findings.json is what makes a run dir COMPLETE to every reader (score.js's
 // listRunDirs, the suite census, the gate's resume), so it lands last and atomically — written beside,
 // then renamed — after every file those readers go on to open. A replay killed or failing at any instant
 // leaves a dir that is either complete or ignored, never one that is counted and then unreadable.
 // [LAW:no-ambient-temporal-coupling]
-function writeRunRecord(runDir, { meta, summary, usage, findings }) {
-  fs.writeFileSync(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n');
-  fs.writeFileSync(path.join(runDir, 'summary.txt'), summary + '\n');
-  fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify(usage, null, 2) + '\n');
+//
+// schedule.json is the replay's WALL CLOCK, and it is the engine's own host-stamped record (src/schedule.js's
+// scheduleRecord, reached here as review.schedule) rather than a second clock this instrument starts — the
+// same value run.js posts in the PR footer, so a replay and a production review can only agree or disagree
+// about ONE timing fact. [LAW:one-source-of-truth]
+//
+// It is an ARTIFACT and not a printed line because wall clock is what the eval gate is now bound by: the
+// suite has always measured per-replay duration and only ever written it to stdout, where CI log truncation
+// eats it, so the per-replay figure the gate sizes itself against had to be re-derived by archaeology and
+// went stale across #148 unnoticed. A measured fact with no durable map is a fact the next reader must
+// guess at. [FRAMING:representation]
+function writeRunRecord(runDir, { meta, summary, usage, schedule, findings }) {
+  fs.writeFileSync(path.join(runDir, 'meta.json'), jsonBytes('meta', meta));
+  fs.writeFileSync(path.join(runDir, 'summary.txt'), `${present('summary', summary)}\n`);
+  fs.writeFileSync(path.join(runDir, 'usage.json'), jsonBytes('usage', usage));
+  fs.writeFileSync(path.join(runDir, 'schedule.json'), jsonBytes('schedule', schedule));
   const findingsPath = path.join(runDir, 'findings.json');
-  fs.writeFileSync(`${findingsPath}.partial`, JSON.stringify(findings, null, 2) + '\n');
+  fs.writeFileSync(`${findingsPath}.partial`, jsonBytes('findings', findings));
   fs.renameSync(`${findingsPath}.partial`, findingsPath);
 }
 
@@ -409,6 +442,7 @@ async function main() {
         },
         summary: review.summary || '',
         usage: review.usage,
+        schedule: review.schedule,
         findings: review.findings,
       });
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));

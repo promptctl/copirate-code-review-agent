@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -628,5 +628,187 @@ describe('the CLI selects case directories before any manifest is parsed', () =>
     assert.notEqual(r.status, 0);
     assert.match(r.out, /wip.*not valid JSON/);
     fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('suiteTiming', () => {
+  const jobs = [
+    { name: 'alpha', level: 1, lane: 'TOKEN_A', ok: true, outcome: 'ok', durationMs: 65000, log: 'out/logs/alpha.log' },
+    { name: 'beta', level: 1, lane: 'TOKEN_B', ok: false, outcome: 'FAILED (exit 1)', durationMs: 4000, log: 'out/logs/beta.log' },
+  ];
+
+  test('the suite\'s wall clock and every replay\'s duration survive as a record, not just a printed line', () => {
+    const timing = suiteTiming({ jobs, elapsedMs: 69000, startedAt: '2026-09-08T00:00:00.000Z' });
+    assert.equal(timing.elapsedMs, 69000);
+    assert.equal(timing.startedAt, '2026-09-08T00:00:00.000Z');
+    assert.deepEqual(timing.replays, [
+      { case: 'alpha', lane: 'TOKEN_A', level: 1, outcome: 'ok', durationMs: 65000 },
+      { case: 'beta', lane: 'TOKEN_B', level: 1, outcome: 'FAILED (exit 1)', durationMs: 4000 },
+    ]);
+  });
+
+  test('elapsed is the pass\'s wall clock, never the sum of its overlapping replays', () => {
+    // Two lanes ran 65s and 4s of spawn work in 69s of wall — the record must not invite a reader to add
+    // the replay durations and call that the suite's duration. This is the distinction the 45-minute bar
+    // on zai-eval-harness-5ux is stated in. [FRAMING:representation]
+    const timing = suiteTiming({ jobs, elapsedMs: 40000 });
+    assert.equal(timing.elapsedMs, 40000);
+    assert.ok(timing.replays.reduce((a, r) => a + r.durationMs, 0) > timing.elapsedMs);
+  });
+
+  test('a failed replay is still a replay the suite spent time on', () => {
+    const timing = suiteTiming({ jobs, elapsedMs: 69000, startedAt: '2026-09-08T00:00:00.000Z' });
+    assert.equal(timing.replays.length, 2);
+    assert.equal(timing.replays[1].outcome, 'FAILED (exit 1)');
+  });
+});
+
+describe('readSuiteTiming folds the legs a resumed suite leaves behind', () => {
+  const leg = (startedAt, elapsedMs, names) => suiteTiming({
+    startedAt,
+    elapsedMs,
+    jobs: names.map(name => ({ name, level: 1, lane: 'TOKEN_A', outcome: 'ok', durationMs: 1000 })),
+  });
+  const write = (outRoot, l) => fs.writeFileSync(suiteTimingPath(outRoot, l.startedAt), `${JSON.stringify(l, null, 2)}\n`);
+
+  test('every leg\'s replays and wall clock are folded into one answer, ordered by when the leg started', () => {
+    const root = tmpTree();
+    const outRoot = path.join(root, 'out');
+    fs.mkdirSync(outRoot, { recursive: true });
+    write(outRoot, leg('2026-09-08T02:00:00.000Z', 40000, ['gamma']));
+    write(outRoot, leg('2026-09-08T00:00:00.000Z', 69000, ['alpha', 'beta']));
+
+    const folded = readSuiteTiming(outRoot);
+    assert.equal(folded.legs.length, 2);
+    // Wall clock is what the 45-minute bar is stated in, and a resumed suite spent every leg's share of it.
+    assert.equal(folded.elapsedMs, 109000);
+    assert.deepEqual(folded.replays.map(r => r.case), ['alpha', 'beta', 'gamma']);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('an out root with no timing yet folds to nothing, not to a crash', () => {
+    const root = tmpTree();
+    assert.deepEqual(readSuiteTiming(path.join(root, 'never-ran')), { legs: [], elapsedMs: 0, replays: [] });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a corrupt leg is loud and names its file — silently skipping it would under-report the duration being judged', () => {
+    const root = tmpTree();
+    const outRoot = path.join(root, 'out');
+    fs.mkdirSync(outRoot, { recursive: true });
+    write(outRoot, leg('2026-09-08T00:00:00.000Z', 69000, ['alpha']));
+    fs.writeFileSync(path.join(outRoot, 'suite-timing-truncated.json'), '{ "elapsedMs":');
+    assert.throws(() => readSuiteTiming(outRoot), /Unreadable suite timing leg .*suite-timing-truncated\.json/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a leg that parses but has the wrong shape fails as loudly as one that does not parse', () => {
+    // Parsing as JSON proves nothing about the shape, and both wrong shapes corrupt the fold in SILENCE:
+    // a missing elapsedMs makes the sum NaN, and a missing replays splices a bare undefined into the
+    // flattened list. A leg written by an older or newer schema is exactly this, and legs carry no version.
+    for (const [name, bad] of Object.entries({
+      'no-elapsed': { startedAt: '2026-09-08T00:00:00.000Z', replays: [] },
+      'no-replays': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 1000 },
+      'elapsed-not-a-number': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 'quick', replays: [] },
+      'replays-not-an-array': { startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 1000, replays: {} },
+    })) {
+      const root = tmpTree();
+      const outRoot = path.join(root, 'out');
+      fs.mkdirSync(outRoot, { recursive: true });
+      fs.writeFileSync(path.join(outRoot, `suite-timing-${name}.json`), `${JSON.stringify(bad)}\n`);
+      assert.throws(
+        () => readSuiteTiming(outRoot),
+        new RegExp(`Unreadable suite timing leg .*suite-timing-${name}\\.json`),
+        `${name}: a well-formed but wrong-shaped leg must not reach the arithmetic`,
+      );
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// The timing artifact through the REAL CLI. suiteTiming is unit-tested as a pure fold above; this pins the
+// effectful wiring in main() — that the file lands, that a second invocation cannot destroy the first one's
+// record, and that a write it cannot perform is reported rather than fatal.
+//
+// Re-invocation is this command's only resume and its only status check, so a suite already at target N
+// plans zero replays and exits before it needs a credential: no engine, no spend.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI records each invocation\'s wall clock without erasing an earlier one', () => {
+  const { spawnSync } = require('node:child_process');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+  const tree = () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true);
+    return { root, casesDir, outRoot };
+  };
+  const run = (casesDir, outRoot) => {
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  };
+  const legFiles = (outRoot) => fs.readdirSync(outRoot).filter(f => /^suite-timing-.*\.json$/.test(f)).sort();
+
+  test('a real run leaves its wall clock on disk, under the out root the gate already uploads', () => {
+    const { root, casesDir, outRoot } = tree();
+    const r = run(casesDir, outRoot);
+    assert.equal(r.status, 0, r.out);
+
+    const files = legFiles(outRoot);
+    assert.equal(files.length, 1, `expected one timing leg, got ${JSON.stringify(files)}`);
+    const recorded = JSON.parse(fs.readFileSync(path.join(outRoot, files[0]), 'utf8'));
+    assert.equal(typeof recorded.elapsedMs, 'number');
+    assert.deepEqual(recorded.replays, []); // nothing left to replay — a truthful empty leg, not a skipped write
+    // The name and the duration are two readings of ONE clock, so the leg's own start must parse.
+    assert.ok(Number.isFinite(Date.parse(recorded.startedAt)), `startedAt must be an instant, got ${recorded.startedAt}`);
+    assert.equal(path.basename(suiteTimingPath(outRoot, recorded.startedAt)), files[0]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a status-check re-invocation does not destroy the timing an earlier leg recorded', () => {
+    // The regression this describe exists for. A single shared timing file made this the NORMAL path to
+    // data loss: the re-run plans no jobs, so it would rewrite the suite's real durations as an empty suite.
+    const { root, casesDir, outRoot } = tree();
+    const prior = suiteTiming({
+      startedAt: '2026-09-08T00:00:00.000Z',
+      elapsedMs: 69000,
+      jobs: [{ name: 'good', level: 1, lane: 'TOKEN_A', outcome: 'ok', durationMs: 65000 }],
+    });
+    fs.writeFileSync(suiteTimingPath(outRoot, prior.startedAt), `${JSON.stringify(prior, null, 2)}\n`);
+
+    const r = run(casesDir, outRoot);
+    assert.equal(r.status, 0, r.out);
+
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(suiteTimingPath(outRoot, prior.startedAt), 'utf8')),
+      prior,
+      'the earlier leg must survive byte-for-byte',
+    );
+    assert.equal(legFiles(outRoot).length, 2);
+    const folded = readSuiteTiming(outRoot);
+    assert.deepEqual(folded.replays.map(x => x.durationMs), [65000]);
+    assert.ok(folded.elapsedMs >= 69000, 'the suite still owns every second the earlier leg spent');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a timing write it cannot perform is reported, and never costs the suite its report or exit code', {
+    // chmod does not bind root, so the unwritable precondition cannot be established there.
+    skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'requires a non-root uid' : false,
+  }, () => {
+    const { root, casesDir, outRoot } = tree();
+    fs.chmodSync(outRoot, 0o555);
+    try {
+      const r = run(casesDir, outRoot);
+      assert.equal(r.status, 0, r.out);
+      assert.match(r.out, /warning: could not write suite timing/);
+      assert.match(r.out, /SUITE COMPLETE at N=1/); // the report still printed — the artifacts are the suite's product
+      assert.deepEqual(legFiles(outRoot), []);
+    } finally {
+      fs.chmodSync(outRoot, 0o755);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
