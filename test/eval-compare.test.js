@@ -9,6 +9,7 @@ const { execFileSync } = require('child_process');
 const {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
+  completedDepth, affordsAnotherWave, foldSpend,
 } = require('../eval/compare');
 const { buildBaseline, parseBaseline } = require('../eval/baseline');
 const { JUDGE_MODEL } = require('../eval/score');
@@ -49,6 +50,32 @@ function frozenBaseline(cases, provenance = { sha: 'basesha0', date: '2026-08-01
 function candidateSuite(cases, provenance = { sha: 'candsha0', date: '2026-08-02' }) {
   return buildBaseline({ cases, provenance });
 }
+
+// The verdict RECORD exactly as main() assembles it — the comparison plus what the run cost. The renderer
+// takes this and verdict.json holds this, so a test that renders is also a test of what gets persisted;
+// the two maps have no separate shape to drift apart in. [LAW:one-source-of-truth]
+function verdictRecord(verdict, extra = {}) {
+  return {
+    ...verdict,
+    candidate: null,
+    baselineSha: 'basesha0deadbeef',
+    cost: null,
+    run: {
+      elapsedMs: 12 * 60 * 1000,
+      budgetMs: 45 * 60 * 1000,
+      waves: [{ startedAt: '2026-09-08T00:00:00.000Z', elapsedMs: 12 * 60 * 1000, replays: 2 }],
+      spend: { basis: 'subscription', amountUsd: 13.77, costedRuns: 2, uncostedRuns: 0 },
+    },
+    ...extra,
+  };
+}
+
+// A candidate at a PARTIAL rung: one run per case, the same 3-opportunity mixture per wave, so the pooled
+// denominator stays 6 per wave exactly as the baseline's 12 over 2 waves does.
+const wave1 = (found) => candidateSuite([
+  caseEntry('case-a', { mean: found ? 1 : 0, min: 0, max: 1, n: 1 }, [[Math.min(found, 3), 3]]),
+  caseEntry('case-b', { mean: 0, min: 0, max: 0, n: 1 }, [[Math.max(0, found - 3), 3]]),
+]);
 
 // A shared two-case shape: pooled 3/6 across each ⇒ suite 6/12 = 0.5, gate floor ≈ 0.22 (2σ under 0.5).
 const CASES_A = () => [
@@ -204,13 +231,14 @@ test('compareVerdict treats a candidate exactly AT the floor as OK (strictly-les
   assert.equal(compareVerdict(baseline, below).degraded, true);
 });
 
-test('compareVerdict refuses incomparable N / engine / matcher / case set', () => {
+test('compareVerdict refuses a rung above the ceiling / incomparable engine / matcher / case set', () => {
   const baseline = frozenBaseline(CASES_A());
-  // Mismatched N (candidate cases each have 3 runs).
+  // A depth PAST the ceiling has no rung: the baseline's N bounds the ladder. (A depth BELOW it is a
+  // legitimate rung — see the ladder tests — which is the whole point of deriving the replay count.)
   assert.throws(() => compareVerdict(baseline, candidateSuite([
     caseEntry('case-a', { mean: 0.5, min: 0.5, max: 0.5, n: 3 }, [[1, 3], [1, 3], [1, 3]]),
     caseEntry('case-b', { mean: 0.5, min: 0.5, max: 0.5, n: 3 }, [[1, 3], [1, 3], [1, 3]]),
-  ])), /Incomparable: candidate ran at N=3 but the baseline is N=2/);
+  ])), /Incomparable: candidate ran at depth 3, outside the ladder's 1\.\.2 rungs/);
   // Mismatched engine.
   const zai = { provider: 'zai', model: 'glm', reasoning: null };
   assert.throws(() => compareVerdict(baseline, candidateSuite([
@@ -232,7 +260,59 @@ test('compareVerdict refuses a candidate whose pooled inventory opportunities di
   const candidate = candidateSuite(CASES_A());
   candidate.suite.pooledInventoryMustFind.opportunities += 1; // simulate expected.json gaining a must-find
   assert.throws(() => compareVerdict(baseline, candidate),
-    /Incomparable: candidate's pooled inventory opportunities \(13\) differ from the baseline's \(12\)/);
+    /Incomparable: candidate holds 13 pooled inventory opportunities over 2 wave\(s\)/);
+  // The check is on opportunities PER WAVE, so a legitimate partial rung — half the depth, half the
+  // denominator, the same mixture — passes it. That is what lets the ladder stop early at all.
+  assert.equal(compareVerdict(baseline, wave1(3)).pooled.candidate.opportunities, 6);
+});
+
+// ── the ladder: how deep the gate has to go ──────────────────────────────────────────────────────────
+
+test('compareVerdict decides at a partial rung when no completion could change the verdict', () => {
+  const baseline = frozenBaseline(CASES_A()); // floor ≈ 0.2172 over 12 terminal opportunities
+  // 3 of 6 at wave 1. Even finding NOTHING in wave 2 lands 3/12 = 25%, still above the floor — so this is
+  // the full-depth verdict, reached at half the spend. [LAW:derive-dont-hardcode]
+  const early = compareVerdict(baseline, wave1(3));
+  assert.equal(early.status, 'OK');
+  assert.equal(early.basis, 'certain');
+  assert.equal(early.depth, 1);
+  assert.equal(early.ceiling, 2);
+  assert.equal(early.replaysSpent, 2);
+});
+
+test('compareVerdict reports UNDECIDED — never OK — when the sample places the candidate on neither side', () => {
+  const baseline = frozenBaseline(CASES_A());
+  // 1 of 6: finding nothing further would red it, finding everything would clear it, and the interval
+  // straddles the floor. The honest answer is that this sample decides nothing.
+  const v = compareVerdict(baseline, wave1(1));
+  assert.equal(v.status, 'UNDECIDED');
+  assert.equal(v.basis, null);
+  assert.equal(v.degraded, false);
+  // UNDECIDED must never render or exit as a pass.
+  const md = renderVerdictMarkdown(verdictRecord(v));
+  assert.match(md, /NOT MEASURED, WHICH IS NOT THE SAME AS NOT DEGRADED/);
+  // It states that the ladder stopped short, and points at the wall-clock line for WHY, rather than
+  // asserting a budget it may never have consulted — --reuse-candidate reaches this verdict with no
+  // budget in play at all. A verdict that names the wrong cause is a map of something that did not happen.
+  assert.match(md, /the ladder stopped before the ceiling/);
+  assert.doesNotMatch(md, /the budget could not buy/);
+});
+
+test('the ceiling always decides — the ladder terminates without a special case for the top rung', () => {
+  const baseline = frozenBaseline(CASES_A());
+  // Every reachable full-depth count, and none of them may come back UNDECIDED: at the ceiling the two
+  // certainty bounds collapse onto the terminal rule, so one of them always fires.
+  for (let found = 0; found <= 6; found++) {
+    const full = candidateSuite([
+      caseEntry('case-a', { mean: 0, min: 0, max: 0, n: 2 }, [[Math.min(found, 3), 3], [0, 3]]),
+      caseEntry('case-b', { mean: 0, min: 0, max: 0, n: 2 }, [[Math.max(0, found - 3), 3], [0, 3]]),
+    ]);
+    const v = compareVerdict(baseline, full);
+    assert.notEqual(v.status, 'UNDECIDED', `full depth with ${found}/12 came back UNDECIDED`);
+    assert.equal(v.basis, 'certain');
+    // and it is exactly the frozen rule: below the floor is degraded, at or above it is not.
+    assert.equal(v.degraded, found / 12 < baseline.pooledInventoryMustFind.gateFloor);
+  }
 });
 
 test('compareVerdict matcher mismatch is refused', () => {
@@ -255,28 +335,46 @@ test('renderVerdictMarkdown surfaces the gate, the per-case table, cost, and a f
     caseEntry('case-b', { mean: 0, min: 0, max: 0, n: 2 }, [[0, 3], [0, 3]]),
   ]);
   const v = compareVerdict(baseline, candidate);
-  const md = renderVerdictMarkdown(v, {
-    candidate: { sha: 'cafe1234', dirty: true }, baselineSha: 'basesha0deadbeef',
+  const md = renderVerdictMarkdown(verdictRecord(v, {
+    candidate: { sha: 'cafe1234', dirty: true },
     cost: { baselinePerRun: 0.7, candidatePerRun: 0.5, delta: -0.2 },
-  });
+  }));
   assert.match(md, /## Eval verdict — 🔴 DEGRADED/);
   assert.match(md, /PRIMARY GATE — pooled inventory must-find recall/);
   assert.match(md, /Candidate \(a dirty tree at commit cafe123\) vs baseline/);
-  assert.match(renderVerdictMarkdown(v, { candidate: { sha: 'cafe1234', dirty: false }, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(commit cafe123\) vs baseline/);
-  assert.match(renderVerdictMarkdown(v, { candidate: null, baselineSha: 'basesha0deadbeef', cost: null }), /Candidate \(no recorded identity/);
+  assert.match(renderVerdictMarkdown(verdictRecord(v, { candidate: { sha: 'cafe1234', dirty: false } })), /Candidate \(commit cafe123\) vs baseline/);
+  assert.match(renderVerdictMarkdown(verdictRecord(v)), /Candidate \(no recorded identity/);
   assert.match(md, /\| `case-a` \|/);
   assert.match(md, /⚠️ yes/);
-  assert.match(md, /\*\*Cost:\*\*/);
+  assert.match(md, /\*\*Cost basis:\*\*/);
   assert.match(md, /\*\*VERDICT: DEGRADED\*\*/);
   assert.match(md, /Localized to: `case-a`, `case-b`/);
+  // What the run cost travels WITH the verdict, in the same object verdict.json holds — the wall clock the
+  // 45-minute bar is stated in, and the spend with its basis intact rather than dressed as billed dollars.
+  assert.match(md, /\*\*Wall clock:\*\* 12m00s of a 45m00s budget, over 1 wave\(s\)/);
+  assert.match(md, /\*\*Spend:\*\* \$13\.7700 \*\*notional\*\* — subscription quota at list-price equivalent, not billed/);
+  // and how strong a claim the badge is making.
+  assert.match(md, /\*\*Decided at wave 2 of 2\*\* \(4 replay\(s\) spent, ceiling 4\) · \*\*certain\*\*/);
 });
 
 test('renderVerdictMarkdown OK path names no cases and reads clean', () => {
   const baseline = frozenBaseline(CASES_A());
-  const md = renderVerdictMarkdown(compareVerdict(baseline, candidateSuite(CASES_A())), { baselineSha: 'basesha0' });
+  const md = renderVerdictMarkdown(verdictRecord(compareVerdict(baseline, candidateSuite(CASES_A()))));
   assert.match(md, /## Eval verdict — 🟢 OK/);
   assert.match(md, /\*\*VERDICT: OK\*\*/);
   assert.doesNotMatch(md, /Localized to/);
+});
+
+test('a screened pass never renders as an adjudicated one', () => {
+  // The claim clause is the whole point of carrying `basis` beside the status: the same green badge means
+  // different things at different depths, and flattening them is the dishonesty this gate was asked to
+  // avoid. A partial rung decided on the interval says so, in the sentence a reader sees first.
+  const screened = renderVerdictMarkdown(verdictRecord({
+    ...compareVerdict(frozenBaseline(CASES_A()), wave1(3)), basis: 'screened',
+  }));
+  assert.match(screened, /\*\*screened\*\* — the candidate's ~2σ interval sits entirely on one side of the floor/);
+  assert.match(screened, /A weaker claim than a full-depth adjudication: the sample it rests on is 1\/2 of one/);
+  assert.doesNotMatch(renderVerdictMarkdown(verdictRecord(compareVerdict(frozenBaseline(CASES_A()), CASES_A() && candidateSuite(CASES_A())))), /screened/);
 });
 
 // ── resolveBaselineJsonPath (effect code — a real temp git repo, not a pure-core fixture) ──────────────
@@ -438,10 +536,36 @@ test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be 
   assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
 });
 
-test('deficitReplays is the census arithmetic: per case, the shortfall to N over the accepted prior runs', () => {
-  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
-  assert.equal(deficitReplays(['a', 'b', 'c', 'd'], prior, 5), 2 + 4 + 0 + 5);
-  assert.equal(deficitReplays(['a', 'b'], [], 5), 10);
+test('completedDepth is the rung every case has reached — the MINIMUM, so an uneven root resumes level', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }];
+  // 'b' has one run, so the suite stands on rung 1 however deep the others go: a suite pooled over
+  // unequal depth measures an unequal mixture.
+  assert.equal(completedDepth(['a', 'b', 'c'], prior), 1);
+  assert.equal(completedDepth(['a', 'c'], prior), 2);
+  assert.equal(completedDepth(['a', 'b', 'd'], prior), 0);
+  assert.equal(completedDepth(['a'], []), 0);
+});
+
+test('affordsAnotherWave prices the next wave at what a wave has already cost, against the elapsed budget', () => {
+  const budgetMs = 45 * 60 * 1000;
+  assert.equal(affordsAnotherWave({ elapsedMs: 20 * 60 * 1000, longestWaveMs: 20 * 60 * 1000, budgetMs }), true);
+  assert.equal(affordsAnotherWave({ elapsedMs: 28 * 60 * 1000, longestWaveMs: 20 * 60 * 1000, budgetMs }), false);
+  // Exactly filling the budget is affordable; overrunning it by a millisecond is not.
+  assert.equal(affordsAnotherWave({ elapsedMs: 25 * 60 * 1000, longestWaveMs: 20 * 60 * 1000, budgetMs }), true);
+  assert.equal(affordsAnotherWave({ elapsedMs: 25 * 60 * 1000 + 1, longestWaveMs: 20 * 60 * 1000, budgetMs }), false);
+});
+
+test('foldSpend keeps the basis with the number and refuses to add two currencies', () => {
+  // Summed as written, never rounded: the renderer decides how many decimals a reader sees, and a fold
+  // that rounded would be a second, lossier map of the same fact. [LAW:one-source-of-truth]
+  const subs = [{ basis: 'subscription', notionalUsd: 13.5 }, { basis: 'subscription', notionalUsd: 12.25 }];
+  assert.deepEqual(foldSpend(subs), { basis: 'subscription', amountUsd: 25.75, costedRuns: 2, uncostedRuns: 0 });
+  assert.deepEqual(foldSpend([{ basis: 'dollars', usd: 0.5 }, null]), { basis: 'dollars', amountUsd: 0.5, costedRuns: 1, uncostedRuns: 1 });
+  assert.deepEqual(foldSpend([]), { basis: null, amountUsd: null, costedRuns: 0, uncostedRuns: 0 });
+  // A notional quota figure and a billed figure are not the same currency; summing them would produce a
+  // number with no meaning, and "$360" being read as cash is the exact confusion this refuses.
+  assert.throws(() => foldSpend([{ basis: 'subscription', notionalUsd: 1 }, { basis: 'dollars', usd: 1 }]),
+    /more than one basis \(subscription, dollars\)/);
 });
 
 test('excessRuns names every case holding more runs than N — the population the gate cannot measure', () => {

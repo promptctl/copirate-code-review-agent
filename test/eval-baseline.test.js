@@ -4,8 +4,8 @@ const assert = require('node:assert/strict');
 
 const {
   parseArgs, parseBand, parseCaseSummary, parseCaseEngine, parseFraction,
-  sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown, DEGRADATION_RULE,
-  BASELINE_SCHEMA,
+  sameEngine, pooledFloor, wilsonInterval, buildBaseline, parseBaseline, evaluateGate, decideLadder,
+  renderBaselineMarkdown, DEGRADATION_RULE, BASELINE_SCHEMA,
 } = require('../eval/baseline');
 
 // [LAW:verifiable-goals] AC: baseline.js reduces the golden cases' scored summaries into one frozen
@@ -341,4 +341,99 @@ test('renderBaselineMarkdown surfaces the headline, per-case band, floor, and ru
   assert.match(md, /3\/9 · 4\/9/); // per-run inventory fractions in the diagnostic table
   assert.match(md, /## Degradation rule/);
   assert.match(md, /candidate\.suite\.pooledInventoryMustFind\.rate </);
+});
+
+// ── the ladder: how deep the gate has to go, and what it costs in fidelity ────────────────────────────
+//
+// [LAW:verifiable-goals] AC (zai-eval-harness-5ux): "the replay count is DERIVED from where the candidate
+// sits against the floor, with N=5 only as a termination ceiling", and "gate sensitivity is not reduced".
+// The second is the one that has to be DEMONSTRATED rather than argued, and the demonstration is
+// exhaustive rather than sampled: every reachable state is enumerated, so this is a proof over the whole
+// state space, not evidence from a lucky draw.
+
+// The real shape the gate ships with: the 2026-09-08 suite is 3 cases contributing 10 + 4 + 4 must-finds
+// per wave over a ceiling of N=5, pooled 37/90 with a ~2σ floor. Written out rather than imported so a
+// re-freeze that moves the numbers cannot quietly move what this proves.
+const LADDER_BASELINE = { pooledInventoryMustFind: { found: 37, opportunities: 90, rate: 0.4111, gateFloor: 0.3095 } };
+const WAVE_OPPORTUNITIES = 18;
+const CEILING = 5;
+
+test('wilsonInterval brackets the rate and stays inside [0,1] at the extremes the normal approximation breaks at', () => {
+  const mid = wilsonInterval(9, 18);
+  assert.ok(mid.lower < 0.5 && mid.upper > 0.5, 'the interval must bracket the point estimate');
+  // The reason this is Wilson and not the normal approximation the floor is cut with: at 0 finds the
+  // normal interval collapses to [0,0] and would claim certainty it has not earned, buying an early exit
+  // on no evidence. Wilson keeps real width, and never leaves the unit interval.
+  assert.equal(wilsonInterval(0, 18).lower, 0);
+  assert.ok(wilsonInterval(0, 18).upper > 0.15, 'zero finds out of 18 is not proof of a zero rate');
+  assert.equal(wilsonInterval(18, 18).upper, 1);
+  assert.ok(wilsonInterval(18, 18).lower < 1);
+  // Wider at smaller samples — the property the whole ladder rests on.
+  assert.ok((wilsonInterval(4, 18).upper - wilsonInterval(4, 18).lower) > (wilsonInterval(20, 90).upper - wilsonInterval(20, 90).lower));
+  assert.throws(() => wilsonInterval(19, 18), /needs 0 <= found <= total/);
+  assert.throws(() => wilsonInterval(0, 0), /total >= 1/);
+});
+
+test('EVERY certain decision is the full-depth verdict — proved over every state and every completion', () => {
+  let certain = 0;
+  for (let depth = 1; depth <= CEILING; depth++) {
+    const opportunities = WAVE_OPPORTUNITIES * depth;
+    const remaining = WAVE_OPPORTUNITIES * (CEILING - depth);
+    for (let found = 0; found <= opportunities; found++) {
+      const decision = decideLadder(LADDER_BASELINE, { found, opportunities });
+      if (decision.basis !== 'certain') continue;
+      certain++;
+      // The claim 'certain' makes is that no way the remaining waves could land changes the answer. So
+      // check every way they could land — not a sample of them.
+      for (let extra = 0; extra <= remaining; extra++) {
+        const atCeiling = evaluateGate(LADDER_BASELINE, { found: found + extra, opportunities: 90 });
+        assert.equal(atCeiling.degraded ? 'degraded' : 'ok', decision.kind,
+          `certain '${decision.kind}' at ${found}/${opportunities} is contradicted by a completion finding ${extra} more`);
+      }
+    }
+  }
+  assert.ok(certain > 100, `expected the certainty bounds to decide many states, decided ${certain}`);
+});
+
+test('a screened decision always puts the point estimate on the side it claims', () => {
+  for (let depth = 1; depth <= CEILING; depth++) {
+    const opportunities = WAVE_OPPORTUNITIES * depth;
+    for (let found = 0; found <= opportunities; found++) {
+      const decision = decideLadder(LADDER_BASELINE, { found, opportunities });
+      if (decision.basis !== 'screened') continue;
+      const rate = found / opportunities;
+      assert.equal(rate < decision.gateFloor, decision.kind === 'degraded',
+        `screened '${decision.kind}' at ${found}/${opportunities} (${rate}) contradicts the floor ${decision.gateFloor}`);
+    }
+  }
+});
+
+test('the ceiling always decides, and decides exactly what evaluateGate does — no special case for the top rung', () => {
+  for (let found = 0; found <= 90; found++) {
+    const decision = decideLadder(LADDER_BASELINE, { found, opportunities: 90 });
+    assert.notEqual(decision.kind, 'continue', `full depth at ${found}/90 failed to terminate`);
+    assert.equal(decision.basis, 'certain');
+    assert.equal(decision.kind === 'degraded', evaluateGate(LADDER_BASELINE, { found, opportunities: 90 }).degraded);
+    assert.equal(decision.remainingOpportunities, 0);
+  }
+});
+
+test('the ladder reds a sabotaged candidate at the first wave, and never at a cost the full suite would not have paid', () => {
+  // A candidate that has lost most of its finding ability — the deliberate sabotage the acceptance asks
+  // for, expressed as counts rather than as a claim about some other program. At 1 of 18 the whole
+  // interval sits under the floor, so it reds on the FIRST wave: 3 replays instead of 15.
+  const sabotaged = decideLadder(LADDER_BASELINE, { found: 1, opportunities: 18 });
+  assert.equal(sabotaged.kind, 'degraded');
+  assert.equal(sabotaged.basis, 'screened');
+  // And it is the same answer the full suite would reach: even finding every one of the 72 remaining
+  // opportunities, 73/90 would clear the floor — so this one is screened, not certain, and the test says
+  // which. What must never happen is the opposite: a sabotaged candidate coming back OK.
+  assert.notEqual(decideLadder(LADDER_BASELINE, { found: 0, opportunities: 18 }).kind, 'ok');
+  assert.notEqual(decideLadder(LADDER_BASELINE, { found: 2, opportunities: 36 }).kind, 'ok');
+  assert.notEqual(decideLadder(LADDER_BASELINE, { found: 5, opportunities: 54 }).kind, 'ok');
+});
+
+test('decideLadder refuses a rung above the ceiling rather than extrapolating past it', () => {
+  assert.throws(() => decideLadder(LADDER_BASELINE, { found: 40, opportunities: 108 }),
+    /past the baseline's full-depth 90 — there is no rung above the ceiling/);
 });

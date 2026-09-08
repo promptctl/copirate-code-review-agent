@@ -64,7 +64,19 @@ test('a committed baseline characterizes the engine PROVIDER=auto resolves to', 
 
 // The golden set is the suite; a baseline that skipped a case measured a different population than the
 // gate will. baseline.js refuses to freeze that, and this holds the refusal true for what is committed.
-test('the live-engine baseline covers every golden case', () => {
+//
+// Scoped to the NEWEST freeze, and that scope is the point rather than a softening. An older baseline
+// describes the suite AS IT THEN WAS, and a suite legitimately changes — zai-eval-harness-5ux cut
+// laws-4-eval-tasks, a case pinned at 0.000 recall that could detect no degradation and cost a quarter of
+// every run. Demanding that every historical freeze match today's case list would make each such change
+// force the deletion of the record it superseded, which is asserting structure (what files exist) over
+// the contract (the gate's own reference covers the suite it will replay). Superseded freezes stay as
+// history here for the same reason the schema-v1 baseline does. [LAW:behavior-not-structure]
+//
+// Newest by DATE PREFIX, not by the commit graph compare.js ranks with: this file runs on a shallow
+// checkout with no history to rank by (see the header). Same-date ties are not resolved, they are all
+// asserted — which is stronger than picking one, and needs no tie-break to be correct.
+test('the newest live-engine baseline covers every golden case', () => {
   const liveProvider = PROVIDER_ALIASES.auto;
   const liveModel = PROVIDERS[liveProvider].defaultModel;
   const casesDir = path.join(__dirname, '..', 'eval', 'cases');
@@ -74,7 +86,11 @@ test('the live-engine baseline covers every golden case', () => {
     .sort();
   const onLiveEngine = committedBaselines()
     .filter(b => b.baseline.engine.provider === liveProvider && b.baseline.engine.model === liveModel);
-  for (const { name, baseline } of onLiveEngine) {
-    assert.deepEqual(baseline.cases.map(c => c.case).sort(), golden, `${name}: baseline cases must be the golden set`);
+  const newestDate = onLiveEngine.map(b => b.name.slice(0, 10)).sort().at(-1);
+  const newest = onLiveEngine.filter(b => b.name.startsWith(newestDate));
+  assert.ok(newest.length > 0, 'no live-engine baseline to check the golden set against');
+  for (const { name, baseline } of newest) {
+    assert.deepEqual(baseline.cases.map(c => c.case).sort(), golden,
+      `${name} is the newest freeze on the live engine, so it is the one compare.js will resolve — its cases must be the golden set. Re-freeze, or the gate refuses before spending (compare.js's pre-spend opportunity check).`);
   }
 });

@@ -399,6 +399,91 @@ function evaluateGate(baseline, candidate) {
   return { degraded: rate < gateFloor, candidateRate: rate, gateFloor };
 }
 
+// A Wilson score interval on a binomial rate at the SAME confidence the gate floor was cut at
+// (POOLED_FLOOR_Z), so the whole gate speaks one confidence level. [LAW:one-source-of-truth]
+//
+// Wilson rather than the normal approximation `pooledFloor` uses, and the two are not in tension because
+// they answer different questions: pooledFloor cuts a THRESHOLD that is frozen into a baseline and must
+// never move, while this measures where a partial candidate sits relative to that fixed threshold at its
+// own sample size. The ladder below spends real quota on the difference, and the normal interval is
+// falsely NARROW exactly where the ladder is cheapest — at n=18 it puts 2/18 at [0, 0.256] and would call
+// that confidently under a 0.31 floor, where Wilson's [0.03, 0.33] correctly says "not yet". An interval
+// that overstates its own precision buys early exits by pretending to know things. [FRAMING:representation]
+function wilsonInterval(found, total, z = POOLED_FLOOR_Z) {
+  if (!Number.isInteger(found) || !Number.isInteger(total) || total < 1 || found < 0 || found > total) {
+    throw new Error(`wilsonInterval: needs 0 <= found <= total with total >= 1 (got ${found}/${total}).`);
+  }
+  const p = found / total;
+  const z2 = z * z;
+  const denominator = 1 + z2 / total;
+  const centre = p + z2 / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total));
+  return { lower: Math.max(0, (centre - margin) / denominator), upper: Math.min(1, (centre + margin) / denominator) };
+}
+
+// [LAW:single-enforcer] THE STOPPING RULE — the one place a PARTIAL candidate is judged, and it re-applies
+// evaluateGate rather than re-deriving a threshold from the floor, so there is exactly one comparison in
+// the gate and this cannot drift from it. [LAW:one-source-of-truth]
+//
+// The gate's terminal question is fixed and known before the first replay: is `found / TERMINAL` below the
+// floor, where TERMINAL is the full-depth opportunity count the baseline froze. A partial candidate has
+// collected `found` of `opportunities` and can still collect at most `remaining` more. So the two extreme
+// completions bound the terminal verdict, and evaluateGate — the terminal rule itself — reads them:
+//   * the worst finish (nothing more found) already clears the floor  ⇒  no completion can red it: OK.
+//   * the best finish (everything remaining found) still reds         ⇒  no completion can save it: DEGRADED.
+// A decision on either bound is not an estimate of the full-depth verdict, it IS the full-depth verdict,
+// reached without paying for the rest of the sample. Basis 'certain'.
+//
+// AT THE CEILING THIS NEEDS NO SPECIAL CASE, and that is the reason the ladder is shaped this way rather
+// than as a loop with a `if (depth === N)` arm: when remaining is 0 the two extremes ARE the sample, both
+// calls collapse to the terminal rule, and exactly one of the first two rules fires. Termination is a
+// property of the arithmetic, not a branch someone has to remember to write. [LAW:dataflow-not-control-flow]
+//
+// The remaining two rules trade certainty for wall clock: a candidate whose whole ~2σ interval sits on one
+// side of the floor is placed there with the same confidence the floor itself was cut at, from a fraction
+// of the sample. Basis 'screened' — a WEAKER claim than 'certain', which is why the basis travels with the
+// decision instead of being flattened into the status. A screened PASS and an adjudicated PASS are not the
+// same sentence and must never render as one. [LAW:no-silent-failure]
+//
+// The four rules are provably disjoint (a certain OK implies found/opportunities is at or above the floor,
+// which forbids a screened DEGRADED, and vice versa), so the order below documents precedence rather than
+// resolving conflicts: the cheaper, stronger claim is simply read first.
+const LADDER_RULES = [
+  { kind: 'ok', basis: 'certain', holds: ({ ifNothingMoreFound }) => !ifNothingMoreFound.degraded },
+  { kind: 'degraded', basis: 'certain', holds: ({ ifEverythingLeftFound }) => ifEverythingLeftFound.degraded },
+  { kind: 'degraded', basis: 'screened', holds: ({ interval, gateFloor }) => interval.upper < gateFloor },
+  { kind: 'ok', basis: 'screened', holds: ({ interval, gateFloor }) => interval.lower >= gateFloor },
+];
+
+// PURE. `candidate` is the partial candidate's pooled inventory must-find counts; the ceiling comes from
+// the baseline's own opportunity count, derived here rather than passed, so a caller cannot hand in a
+// ceiling that disagrees with the floor it is being judged against. [LAW:types-are-the-program]
+function decideLadder(baseline, candidate) {
+  const terminalOpportunities = baseline.pooledInventoryMustFind.opportunities;
+  if (candidate.opportunities > terminalOpportunities) {
+    throw new Error(`decideLadder: candidate holds ${candidate.opportunities} opportunities, past the baseline's full-depth ${terminalOpportunities} — there is no rung above the ceiling.`);
+  }
+  const remaining = terminalOpportunities - candidate.opportunities;
+  const facts = {
+    ifNothingMoreFound: evaluateGate(baseline, { found: candidate.found, opportunities: terminalOpportunities }),
+    ifEverythingLeftFound: evaluateGate(baseline, { found: candidate.found + remaining, opportunities: terminalOpportunities }),
+    interval: wilsonInterval(candidate.found, candidate.opportunities),
+    gateFloor: baseline.pooledInventoryMustFind.gateFloor,
+  };
+  const fired = LADDER_RULES.find(rule => rule.holds(facts));
+  return {
+    // 'continue' is the ladder saying the DATA cannot decide yet. Whether another wave is affordable is a
+    // different question with a different owner (compare.js's budget), and folding the two would put a
+    // wall-clock policy inside the degradation rule. [LAW:decomposition]
+    kind: fired ? fired.kind : 'continue',
+    basis: fired ? fired.basis : null,
+    interval: facts.interval,
+    gateFloor: facts.gateFloor,
+    spentOpportunities: candidate.opportunities,
+    remainingOpportunities: remaining,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // Human-readable rendering (pure).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -526,6 +611,7 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs, parseBand, parseCaseSummary, parseCaseEngine, parseFraction,
-  sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown,
+  sameEngine, pooledFloor, wilsonInterval, buildBaseline, parseBaseline, evaluateGate, decideLadder,
+  renderBaselineMarkdown, LADDER_RULES,
   DEGRADATION_RULE, BASELINE_SCHEMA,
 };

@@ -15,10 +15,23 @@
 //   2. scores each case (spawning eval/score.js),
 //   3. reduces the candidate's scored summaries into a suite with the SAME buildBaseline the frozen baseline
 //      was built with (so producer and comparator can NEVER drift — [LAW:one-source-of-truth]), and
-//   4. applies the frozen pooled degradation rule via baseline.js's evaluateGate: candidate pooled
-//      inventory must-find recall < the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
-// N and the engine are DERIVED FROM the baseline and asserted, because a candidate run at a different N or
-// engine is not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
+//   4. applies the frozen pooled degradation rule via baseline.js's decideLadder: candidate pooled
+//      inventory must-find recall vs the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
+// The engine is DERIVED FROM the baseline and asserted, because a candidate run on a different engine is
+// not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
+//
+// IT SPENDS THE DEPTH THE ANSWER COSTS, NOT THE DEPTH THE BASELINE HAPPENS TO HOLD (zai-eval-harness-5ux).
+// Steps 1-4 are a RUNG, and the gate walks rungs: one replay per case per wave, deepening every case
+// together (freeze-suite.js's level-filling plan is already this shape), stopping the moment the pooled
+// counts decide. The baseline's N is the CEILING that guarantees termination, never a target
+// [LAW:derive-dont-hardcode] — and it is not a special case in the loop either, because at full depth
+// decideLadder's certainty bounds collapse onto the terminal rule and always fire.
+//
+// Its wall clock is BOUNDED, and that bound is measured rather than modelled: each rung spawns
+// freeze-suite.js once, which writes one timing leg carrying that wave's real elapsed wall clock, so the
+// next wave is priced at the most expensive wave this candidate has actually cost. A wave that will not
+// fit the remaining budget is not started, and the gate reports UNDECIDED — a gate that ran out of budget
+// must be read as "not measured", never as "not degraded". [LAW:no-silent-failure]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib and functions imported from baseline.js (the
 // pure reducers), score.js (parsers, the run census) and run-case.js (the tree identity) — nothing runs at
@@ -29,13 +42,15 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync, execFileSync } = require('child_process');
 const {
-  parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
+  parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, decideLadder,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, parseUsage, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { readSuiteTiming, formatDuration } = require('./freeze-suite');
 const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
-suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
+suite one wave at a time, score it, and print a DEGRADED / OK / IMPROVED / UNDECIDED verdict. Exit 1 on
+DEGRADED, 3 on UNDECIDED (the budget ran out before the counts decided), 2 if the gate could not run.
 
 Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [options]
 
@@ -59,6 +74,8 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          run under it that is not provably this candidate's (another commit, a dirty
                          tree, no identity recorded), or a case already holding more runs than the
                          baseline's N, is refused by name before any spend rather than silently blended.
+                         A root left UNDECIDED by an earlier invocation resumes at the rung it reached, so
+                         a second run continues the ladder instead of restarting it.
   --credentials <A,B,…>  Names of env vars holding one engine credential each, forwarded to
                          freeze-suite.js: one replay LANE per name, run concurrently. Default: a single
                          lane on the pinned provider's own credential input. N lanes cut the suite's
@@ -66,6 +83,11 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          figures are in .github/workflows/eval.yml and eval/README.md.
   --cases-dir <dir>      Where the frozen golden cases live (default: eval/cases).
   --cache <file>         Judge-decision cache, forwarded to score.js (default: eval/out/.judge-cache.json).
+  --budget-minutes <m>   Wall-clock budget for THIS invocation (default: 45 — the bar the gate is held to).
+                         The first wave always runs, because nothing has been measured before it; every
+                         later wave must fit inside what is left, priced at the most expensive wave this
+                         candidate has actually cost. A gate that cannot afford the next wave stops and
+                         reports UNDECIDED rather than overrunning or guessing.
   --reuse-candidate <d>  Skip the replay+score entirely and gate an ALREADY-produced candidate root <d>
                          (one <case>/scorecard-summary.json per baseline case). For re-rendering a verdict
                          or validating the gate without re-spending. The verdict names the tree the reused
@@ -74,8 +96,10 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          --credentials (nothing is replayed, so there is nothing for either to shape).
   --help                 Show this help.
 
-The candidate always runs at the baseline's N and pinned engine (a replay at a different N/engine would
-measure something else). Estimated cost is printed up front. The engine credential is read one of two
+The candidate runs on the baseline's pinned engine and stops at whatever DEPTH decides it, up to the
+baseline's N as a ceiling: one replay per case per wave, re-judged after each. Most waves are never bought
+— a candidate far from the floor in either direction is settled by the first. Estimated cost is printed up
+front. The engine credential is read one of two
 ways: with no --credentials, from the pinned provider's own input var (the one the action reads, e.g.
 CLAUDE_CODE_OAUTH_TOKEN for claude-subscription); with --credentials, from each named var in turn, one
 lane each (.github/workflows/eval.yml runs this way) — PLUS, unconditionally, ANTHROPIC_API_KEY for the
@@ -94,11 +118,12 @@ ruler that moved with the thing it measures would measure nothing.
 function parseArgs(argv) {
   const opts = {
     baseline: null, matcher: 'llm', out: null, credentials: null,
-    casesDir: 'eval/cases', cache: 'eval/out/.judge-cache.json', reuseCandidate: null,
+    casesDir: 'eval/cases', cache: 'eval/out/.judge-cache.json', reuseCandidate: null, budgetMinutes: '45',
   };
   const keyFor = {
     baseline: 'baseline', matcher: 'matcher', out: 'out', credentials: 'credentials',
     'cases-dir': 'casesDir', cache: 'cache', 'reuse-candidate': 'reuseCandidate',
+    'budget-minutes': 'budgetMinutes',
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -114,6 +139,11 @@ function parseArgs(argv) {
     opts[keyFor[rawName]] = value;
   }
   if (opts.matcher !== 'llm' && opts.matcher !== 'lexical') throw new Error(`--matcher must be 'llm' or 'lexical' (got ${JSON.stringify(opts.matcher)}).`);
+  // Parsed to a number HERE, at the boundary, so nothing downstream re-reads a string as minutes.
+  // [LAW:parse-dont-validate]
+  const budget = Number(String(opts.budgetMinutes).trim());
+  if (!Number.isFinite(budget) || budget <= 0) throw new Error(`--budget-minutes must be a positive number of minutes (got ${JSON.stringify(opts.budgetMinutes)}).`);
+  opts.budgetMinutes = budget;
   // --reuse-candidate replays nothing, so a flag that only shapes the replay is a contradiction, not a
   // no-op: --out named a root that verdict.{md,json} would then never appear under, and --credentials
   // named lanes that would never run. Refused rather than silently outranked. (--matcher is different:
@@ -130,7 +160,9 @@ function parseArgs(argv) {
 // [LAW:effects-at-boundaries] Pure: the argv the replay step hands eval/freeze-suite.js. Separated from
 // the spawn because this is where the gate's two invariants are pinned as arguments — the BASELINE's case
 // set (--cases: a golden case added since the freeze is not gated, because the baseline does not cover
-// it) at the BASELINE's N — and a wrong argument here silently measures a different population.
+// it) at THIS RUNG's depth — and a wrong argument here silently measures a different population. `repeats`
+// is the rung, not the baseline's N: freeze-suite.js fills every case to that level and no further, which
+// is what keeps a partial candidate's case MIXTURE identical to the baseline's at every depth.
 // `credentials` is forwarded verbatim; its shape (names, non-empty, no repeats) is freeze-suite.js's
 // boundary to refuse, and it refuses before any spend. [LAW:single-enforcer]
 function replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials }) {
@@ -159,13 +191,6 @@ function estimateCandidateCostUsd(rawBaselineSuite, fullRuns) {
   const perRun = rawBaselineSuite && rawBaselineSuite.costPerFullRunUsd;
   if (typeof perRun !== 'number' || !Number.isFinite(perRun)) return null;
   return perRun * fullRuns;
-}
-
-// [LAW:effects-at-boundaries] Pure: how many replays the census will plan — per case, the shortfall to N
-// over the runs already accepted as this candidate's. The same level-filling arithmetic freeze-suite.js
-// runs, reduced to its total. No case holds more than N here: excessRuns refused that before this is read.
-function deficitReplays(caseNames, prior, repeats) {
-  return caseNames.reduce((sum, name) => sum + repeats - prior.filter(r => r.case === name).length, 0);
 }
 
 // [LAW:effects-at-boundaries] Pure: the cases holding MORE runs than the baseline's N — a population the
@@ -222,8 +247,14 @@ function computeExpectedOpportunities(mustFindCountsByCase, repeats) {
 // spending a run. Aborts loudly on any incomparability — a mismatched N, engine, matcher, or case set makes
 // the pooled rates measure different things, so a verdict over them would be a silent lie. [LAW:no-silent-failure]
 function compareVerdict(baseline, candidate) {
-  if (candidate.repeats !== baseline.repeats) {
-    throw new Error(`Incomparable: candidate ran at N=${candidate.repeats} but the baseline is N=${baseline.repeats}. The candidate must replay at the baseline's N — the pooled rate depends on it.`);
+  // A RUNG, not the baseline's N. What the pooled rate actually depends on is the case MIXTURE — which
+  // case contributes which share of the denominator — and a whole number of complete waves holds that
+  // fixed at every depth, because each wave adds every case's must-find count exactly once. Depth changes
+  // only the PRECISION of the estimate, which is what decideLadder prices. What is still refused is a
+  // depth past the ceiling: the baseline's N bounds the ladder, so there is no rung above it.
+  // [LAW:derive-dont-hardcode]
+  if (!Number.isInteger(candidate.repeats) || candidate.repeats < 1 || candidate.repeats > baseline.repeats) {
+    throw new Error(`Incomparable: candidate ran at depth ${candidate.repeats}, outside the ladder's 1..${baseline.repeats} rungs (the baseline's N is the ceiling).`);
   }
   // The baseline's engine/matcher are the pins the candidate must have run under. A pre-v1 baseline could
   // carry a null engine; only assert when the baseline actually pins one.
@@ -252,19 +283,32 @@ function compareVerdict(baseline, candidate) {
   // check, not a full per-case one (that would need parseBaseline to carry each case's raw opportunities,
   // which its deliberately lossy gate subset does not — [LAW:carrying-cost]); it catches the realistic case
   // (a case's inventory changed) but not a contrived net-zero add/remove across cases. [LAW:no-silent-failure]
-  if (candidate.suite.pooledInventoryMustFind.opportunities !== baseline.pooledInventoryMustFind.opportunities) {
-    throw new Error(`Incomparable: candidate's pooled inventory opportunities (${candidate.suite.pooledInventoryMustFind.opportunities}) differ from the baseline's (${baseline.pooledInventoryMustFind.opportunities}) — expected.json likely changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
+  // Stated as the MIXTURE invariant — opportunities PER WAVE must match — so it holds at every rung
+  // rather than only at full depth. Cross-multiplied to keep it in integers: a float division would make
+  // the check depend on rounding at exactly the denominators it exists to protect. At the ceiling this is
+  // the identical equality it replaced. [LAW:one-source-of-truth]
+  const candOpportunities = candidate.suite.pooledInventoryMustFind.opportunities;
+  const baseOpportunities = baseline.pooledInventoryMustFind.opportunities;
+  if (candOpportunities * baseline.repeats !== baseOpportunities * candidate.repeats) {
+    throw new Error(`Incomparable: candidate holds ${candOpportunities} pooled inventory opportunities over ${candidate.repeats} wave(s) (${candOpportunities / candidate.repeats} per wave) but the baseline holds ${baseOpportunities} over ${baseline.repeats} (${baseOpportunities / baseline.repeats} per wave) — expected.json likely changed since the baseline was frozen. Re-freeze the baseline before gating against this expected.json.`);
   }
 
-  // THE GATE — delegated to evaluateGate (baseline.js), the single place DEGRADATION_RULE is applied to a
-  // candidate. [LAW:single-enforcer] This file must never re-derive degraded from raw rate/floor numbers.
+  // THE GATE — delegated to decideLadder (baseline.js), the single place the degradation rule is applied
+  // to a candidate. [LAW:single-enforcer] This file must never re-derive degraded from raw rate/floor
+  // numbers, and must never re-derive the ladder's stopping arithmetic either.
   const candidatePooled = candidate.suite.pooledInventoryMustFind;
   const baselinePooled = baseline.pooledInventoryMustFind;
-  const gate = evaluateGate(baseline, candidatePooled);
-  const { degraded, gateFloor } = gate;
+  const decision = decideLadder(baseline, candidatePooled);
+  const degraded = decision.kind === 'degraded';
+  const gateFloor = decision.gateFloor;
+  // UNDECIDED is the honest third answer, not an error and not a pass: at this depth the counts place the
+  // candidate on neither side of the floor. The caller decides whether another wave is affordable; what
+  // this must never do is round an undecided sample to OK. [LAW:no-silent-failure]
   // IMPROVED / OK are informational labels only (never the gate): the pooled point estimate rising above the
   // baseline's is suggestive, not significant at this denominator. Only DEGRADED reds the run.
-  const status = degraded ? 'DEGRADED' : (baselinePooled.rate !== null && candidatePooled.rate > baselinePooled.rate ? 'IMPROVED' : 'OK');
+  const status = decision.kind === 'continue'
+    ? 'UNDECIDED'
+    : degraded ? 'DEGRADED' : (baselinePooled.rate !== null && candidatePooled.rate > baselinePooled.rate ? 'IMPROVED' : 'OK');
 
   // Per-case localization — for each baseline case, its inventory diagnostic band vs the candidate's. `moved`
   // flags a case whose candidate MEAN recall dipped below the baseline's own observed worst run (its
@@ -289,7 +333,15 @@ function compareVerdict(baseline, candidate) {
   return {
     status,
     degraded,
-    repeats: baseline.repeats,
+    // WHICH CLAIM THIS VERDICT MAKES, carried beside the status rather than folded into it. 'certain' is
+    // the full-depth verdict itself, reached from a partial sample by bounding every completion;
+    // 'screened' is a ~2σ inference from that sample and is a strictly weaker sentence; null is UNDECIDED.
+    // A screened PASS and an adjudicated PASS must never render as the same thing. [LAW:no-silent-failure]
+    basis: decision.basis,
+    depth: candidate.repeats,
+    ceiling: baseline.repeats,
+    replaysSpent: candidate.repeats * candidate.cases.length,
+    interval: decision.interval,
     engine: baseline.engine,
     matcher: baseline.matcher,
     pooled: {
@@ -299,6 +351,46 @@ function compareVerdict(baseline, candidate) {
     },
     movedCases: cases.filter(c => c.moved).map(c => c.case),
     cases,
+  };
+}
+
+// [LAW:effects-at-boundaries] Pure: the cheapest rung this candidate's existing runs already stand on.
+// freeze-suite.js fills levels, so an interrupted or UNDECIDED root can sit UNEVEN (one case at 2, another
+// at 1); the ladder must resume at the level every case has reached, because a suite pooled over unequal
+// depth measures an unequal mixture. The MINIMUM is that level. [LAW:one-source-of-truth]
+function completedDepth(caseNames, prior) {
+  return Math.min(...caseNames.map(name => prior.filter(r => r.case === name).length));
+}
+
+// [LAW:effects-at-boundaries] Pure: can the remaining budget buy one more wave? Priced at the most
+// EXPENSIVE wave this candidate has already cost, never a mean: a wave's wall clock is set by its slowest
+// lane, and a lane that walled and handed its jobs on is exactly the risk a mean would average away. A
+// status-check leg that planned no jobs contributes ~0 and cannot drag the estimate down for the same
+// reason. [LAW:derive-dont-hardcode] — nothing here models lanes, per-replay minutes, or ceil-division;
+// the previous wave IS the measurement, and the model that would have guessed those three is absent.
+function affordsAnotherWave({ elapsedMs, longestWaveMs, budgetMs }) {
+  return elapsedMs + longestWaveMs <= budgetMs;
+}
+
+// [LAW:effects-at-boundaries] Pure: fold the per-run cost records the engine wrote into the ONE spend
+// figure the verdict reports, with its BASIS attached. The basis travels with the number because these
+// are not the same currency: a subscription run reports a NOTIONAL list-price equivalent of the quota it
+// burned and bills nothing, and reporting that as dollars is how "$360" became a number the owner
+// reasonably refused to pay. [FRAMING:representation]
+//
+// Mixed bases are refused rather than summed: two currencies added together is a figure with no meaning,
+// and a suite whose cases ran on one pinned engine cannot legitimately produce them. [LAW:no-silent-failure]
+function foldSpend(costs) {
+  const present = costs.filter(c => c !== null && c !== undefined);
+  const bases = [...new Set(present.map(c => c.basis))];
+  if (bases.length > 1) throw new Error(`The candidate's runs report spend in more than one basis (${bases.join(', ')}) — a suite runs on one pinned engine, so these cannot be added.`);
+  const amountFor = (c) => (c.basis === 'dollars' ? c.usd : c.notionalUsd);
+  const amounts = present.map(amountFor).filter(v => typeof v === 'number' && Number.isFinite(v));
+  return {
+    basis: bases[0] ?? null,
+    amountUsd: amounts.length === 0 ? null : amounts.reduce((a, b) => a + b, 0),
+    costedRuns: amounts.length,
+    uncostedRuns: costs.length - amounts.length,
   };
 }
 
@@ -317,30 +409,48 @@ function pct(v) {
 // No plain/markdown split. [LAW:no-mode-explosion]
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-function renderVerdictMarkdown(verdict, meta = {}) {
+// ONE ARGUMENT, and it is exactly the object written to verdict.json. The human map and the machine map
+// were previously built from different values — main() assembled a `cost` object, handed it to this
+// renderer, and wrote only the verdict beside it, so the rendered page recorded a spend the machine-
+// readable artifact did not, and neither carried wall clock. Two maps of one run that can disagree is one
+// map too many. [LAW:one-source-of-truth] [FRAMING:representation]
+function renderVerdictMarkdown(record) {
   const usd = (v) => (v === null || v === undefined ? 'n/a' : `$${v.toFixed(4)}`);
   const signedPct = (v) => (v === null || v === undefined ? 'n/a' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(0)}%`);
-  const p = verdict.pooled;
-  const eng = verdict.engine;
-  const badge = { DEGRADED: '🔴 DEGRADED', OK: '🟢 OK', IMPROVED: '🟢 IMPROVED' }[verdict.status] || verdict.status;
+  const p = record.pooled;
+  const eng = record.engine;
+  const badge = {
+    DEGRADED: '🔴 DEGRADED', OK: '🟢 OK', IMPROVED: '🟢 IMPROVED', UNDECIDED: '🟡 UNDECIDED',
+  }[record.status] || record.status;
+
+  // HOW MUCH THE VERDICT IS WORTH, in one clause, because the same badge means different things at
+  // different bases. Rendering a screened pass and an adjudicated pass identically is the specific
+  // dishonesty this gate was asked not to commit. [LAW:no-silent-failure]
+  const claim = {
+    certain: `**certain** — bounding every way the remaining ${record.ceiling - record.depth} wave(s) could land leaves the full-depth verdict unchanged, so this IS that verdict, bought early`,
+    screened: `**screened** — the candidate's ~2σ interval sits entirely on one side of the floor at this depth. A weaker claim than a full-depth adjudication: the sample it rests on is ${record.depth}/${record.ceiling} of one`,
+    null: `**undecided** — the interval straddles the floor at this depth and the ladder stopped short of the ceiling`,
+  }[record.basis === null ? 'null' : record.basis];
 
   const lines = [
     `## Eval verdict — ${badge}`,
     '',
-    `Candidate${meta.candidate === undefined ? '' : ` (${describeTree(meta.candidate)})`} vs baseline` +
-      `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
+    `Candidate${record.candidate === undefined ? '' : ` (${describeTree(record.candidate)})`} vs baseline` +
+      `${record.baselineSha ? ` \`${record.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
-      ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
+      `${record.matcher ? ` · matcher \`${record.matcher}\`` : ''}.`,
+    '',
+    `**Decided at wave ${record.depth} of ${record.ceiling}** (${record.replaysSpent} replay(s) spent, ceiling ${record.ceiling * record.cases.length}) · ${claim}.`,
     '',
     `**PRIMARY GATE — pooled inventory must-find recall:** candidate **${pct(p.candidate.rate)}** ` +
-      `(${p.candidate.found}/${p.candidate.opportunities}) vs gate floor **${pct(p.gateFloor)}** ` +
+      `(${p.candidate.found}/${p.candidate.opportunities}, ~2σ ${pct(record.interval.lower)}–${pct(record.interval.upper)}) vs gate floor **${pct(p.gateFloor)}** ` +
       `(baseline ${pct(p.baseline.rate)}, ${p.baseline.found}/${p.baseline.opportunities}) → ` +
-      `${verdict.degraded ? '**below floor**' : 'at/above floor'}.`,
+      `${record.degraded ? '**below floor**' : record.status === 'UNDECIDED' ? '**straddles the floor**' : 'at/above floor'}.`,
     '',
     '| case | baseline recall (mean [min–max]) | candidate recall (mean [min–max]) | Δ mean | moved? |',
     '|------|----------------------------------|-----------------------------------|--------|--------|',
   ];
-  for (const c of verdict.cases) {
+  for (const c of record.cases) {
     const b = c.baselineBand;
     const cd = c.candidateBand;
     lines.push(
@@ -348,21 +458,40 @@ function renderVerdictMarkdown(verdict, meta = {}) {
     );
   }
   lines.push('');
-  if (meta.cost) {
-    lines.push(
-      `**Cost:** baseline ≈ ${usd(meta.cost.baselinePerRun)}/full-run vs candidate ≈ ${usd(meta.cost.candidatePerRun)}/full-run` +
-      `${meta.cost.delta === null ? '' : ` (Δ ${meta.cost.delta >= 0 ? '+' : ''}${usd(meta.cost.delta)})`}.`,
-    );
-    lines.push('');
-  }
 
-  // The final one-line verdict — the sentence a reader (or 2fk.6's Step Summary) reads first.
-  if (verdict.degraded) {
-    const named = verdict.movedCases.length
-      ? `Localized to: ${verdict.movedCases.map(n => `\`${n}\``).join(', ')} (candidate mean below the case's diagnostic floor).`
+  // WHAT IT COST, from the artifacts rather than from a log line that outlives nothing. The wall clock is
+  // the suite's own timing legs (the figure the 45-minute bar is stated in — lanes overlap, so it is
+  // elapsed time and never a sum of spawn durations), and the spend is the engine's own per-run records
+  // with their basis intact.
+  const r = record.run;
+  lines.push(
+    `**Wall clock:** ${formatDuration(r.elapsedMs)} of a ${formatDuration(r.budgetMs)} budget, over ${r.waves.length} wave(s)` +
+    `${r.waves.length ? ` (${r.waves.map(w => formatDuration(w.elapsedMs)).join(', ')})` : ''}.`,
+  );
+  lines.push(
+    `**Spend:** ${r.spend.amountUsd === null ? 'not reported by the engine' : `${usd(r.spend.amountUsd)}`}` +
+    `${r.spend.basis === 'subscription' ? ' **notional** — subscription quota at list-price equivalent, not billed' : r.spend.basis === 'dollars' ? ' billed' : ''}` +
+    ` over ${r.spend.costedRuns} costed run(s)${r.spend.uncostedRuns ? `, ${r.spend.uncostedRuns} uncosted` : ''}.`,
+  );
+  if (record.cost) {
+    lines.push(
+      `**Cost basis:** baseline ≈ ${usd(record.cost.baselinePerRun)}/full-run vs candidate ≈ ${usd(record.cost.candidatePerRun)}/full-run` +
+      `${record.cost.delta === null ? '' : ` (Δ ${record.cost.delta >= 0 ? '+' : ''}${usd(record.cost.delta)})`}.`,
+    );
+  }
+  lines.push('');
+
+  // The final one-line verdict — the sentence a reader (or the Step Summary) reads first.
+  if (record.degraded) {
+    const named = record.movedCases.length
+      ? `Localized to: ${record.movedCases.map(n => `\`${n}\``).join(', ')} (candidate mean below the case's diagnostic floor).`
       : `No single case crossed its diagnostic floor — the pooled recall fell broadly, not in one case.`;
     lines.push(`**VERDICT: DEGRADED** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} is below the ${pct(p.gateFloor)} gate floor. ${named}`);
-  } else if (verdict.status === 'IMPROVED') {
+  } else if (record.status === 'UNDECIDED') {
+    lines.push(
+      `**VERDICT: UNDECIDED — NOT MEASURED, WHICH IS NOT THE SAME AS NOT DEGRADED.** At ${record.replaysSpent} replay(s) the pooled recall ${pct(p.candidate.rate)} sits inside its own sampling error of the ${pct(p.gateFloor)} floor, and the ladder stopped before the ceiling. The wall-clock line above says whether the budget is what stopped it. Re-run against the same \`--out\` to continue from wave ${record.depth + 1}, or raise \`--budget-minutes\` to adjudicate in one pass.`,
+    );
+  } else if (record.status === 'IMPROVED') {
     lines.push(`**VERDICT: OK (improved)** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} floor and exceeds the baseline ${pct(p.baseline.rate)}. (Point estimate only — not significant at this denominator.)`);
   } else {
     lines.push(`**VERDICT: OK** — candidate pooled inventory must-find recall ${pct(p.candidate.rate)} clears the ${pct(p.gateFloor)} gate floor. Finding quality is not degraded.`);
@@ -504,12 +633,60 @@ function readPriorRuns(candidateRoot, caseNames) {
   }));
 }
 
+// The spend the ENGINE reported for every completed run under the root, folded to one figure with its
+// basis. Reads through score.js's parseUsage — the single parser for a usage record — rather than
+// reaching into the JSON here. [LAW:single-enforcer]
+function readCandidateSpend(candidateRoot, caseNames) {
+  return foldSpend(caseNames.flatMap(name => listRunDirs(path.join(candidateRoot, name)).map((dir) => {
+    const usagePath = path.join(dir, 'usage.json');
+    return fs.existsSync(usagePath) ? parseUsage(fs.readFileSync(usagePath, 'utf8'), usagePath).cost : null;
+  })));
+}
+
+// The longest wave this candidate has actually cost — the price the next one is quoted at.
+//
+// [LAW:no-silent-failure] Zero legs after a replay is refused rather than defaulted, and the reason is that
+// the innocent-looking default is the dangerous one: a missing measurement folded to 0 reads as "the next
+// wave is free", which affords every remaining wave and spends the whole ceiling — the exact overrun the
+// budget exists to prevent. A budget derived from an artifact must fail loudly when the artifact is absent.
+function measuredWaveMs(candidateRoot) {
+  const { legs } = readSuiteTiming(candidateRoot);
+  if (legs.length === 0) {
+    throw new Error(`No suite timing leg under ${candidateRoot} after a replay — the wall clock the budget is derived from was never written, so the next wave cannot be priced. Refusing to size it by guess.`);
+  }
+  return legs.reduce((longest, leg) => Math.max(longest, leg.elapsedMs), 0);
+}
+
+// The candidate suite AS IT NOW STANDS on disk: every gated case's scored summary + its pinned engine,
+// reduced by the SAME buildBaseline the frozen baseline was built with, so producer and comparator cannot
+// drift. [LAW:one-source-of-truth] Called once per rung — the ladder re-reads rather than accumulating in
+// memory, so what it judges is always what was actually written.
+function reduceCandidateSuite(candidateRoot, caseNames, casesDir, produced) {
+  const candidateCases = caseNames.map((name) => {
+    const summaryPath = path.join(candidateRoot, name, 'scorecard-summary.json');
+    if (!fs.existsSync(summaryPath)) throw new Error(`No candidate summary for case '${name}' at ${summaryPath}. The replay/score step did not produce it.`);
+    const summary = parseCaseSummary(fs.readFileSync(summaryPath, 'utf8'), summaryPath);
+    if (summary.case !== name) throw new Error(`${summaryPath} names case '${summary.case}' but lives under '${name}'.`);
+    const caseJsonPath = path.join(casesDir, name, 'case.json');
+    return { summary, engine: parseCaseEngine(fs.readFileSync(caseJsonPath, 'utf8'), caseJsonPath) };
+  });
+  return buildBaseline({
+    cases: candidateCases,
+    provenance: { sha: produced === null ? null : produced.sha, date: new Date().toISOString().slice(0, 10) },
+  });
+}
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
     process.stdout.write(USAGE);
     return 0;
   }
+  // 0. THE INVOCATION'S CLOCK, read once and never again. Everything the budget is judged on is elapsed
+  //    time from here — including baseline resolution, scoring, and judging, not just the replays — so
+  //    the budget bounds what the operator actually waits for. [LAW:no-ambient-temporal-coupling]
+  const startedMs = Date.now();
+  const budgetMs = opts.budgetMinutes * 60 * 1000;
 
   // 1. Flag combinations that contradict each other were refused in parseArgs, before any IO.
 
@@ -599,22 +776,35 @@ function main() {
   process.stderr.write(`  ${baseline.mainSha.slice(0, 7)} · engine ${baseline.engine ? `${baseline.engine.provider}/${baseline.engine.model}` : '(unpinned)'} · N=${repeats} · matcher ${baseline.matcher || '(none)'}\n`);
   process.stderr.write(`  gate floor ${pct(baseline.pooledInventoryMustFind.gateFloor)} (baseline pooled ${pct(baseline.pooledInventoryMustFind.rate)}, ${baseline.pooledInventoryMustFind.found}/${baseline.pooledInventoryMustFind.opportunities})\n`);
 
+  // ONE ASSESSMENT, wherever the runs came from: re-read the root, name the tree that produced it, fold
+  // the suite with the baseline's own reducer, and ask decideLadder where it stands. The ladder calls this
+  // once per rung and the reuse path calls it once; there is no second reduction anywhere to disagree
+  // with it. [LAW:one-source-of-truth]
+  const assess = () => {
+    const runs = readPriorRuns(candidateRoot, caseNames);
+    const tree = producedTree(runs);
+    const suite = reduceCandidateSuite(candidateRoot, caseNames, casesDir, tree);
+    return { tree, suite, verdict: compareVerdict(baseline, suite) };
+  };
+
+  let assessment;
   if (opts.reuseCandidate) {
     // --matcher (default 'llm' even when never passed) has no effect in this branch: no scoring runs here,
     // and compareVerdict checks the reused summaries' ACTUAL recorded matcher, not opts.matcher. Loud about
     // it rather than a silent no-op, the same reasoning that made --out + --reuse-candidate an outright
     // refusal above — except here there's a principled winner (the reused data), just not the flag's value.
     process.stderr.write(`\nReusing candidate artifacts under ${candidateRoot} (no replay, no spend). --matcher is ignored in this mode — the reused summaries' own recorded matcher is what's checked.\n`);
+    assessment = assess();
   } else {
     // 5. An --out that already holds runs is either this candidate's own partial suite — an earlier gate
-    //    invocation on the same clean commit that walled or timed out, which freeze-suite.js's census then
-    //    tops up to N (the whole reason a hosted gate can outlive a quota wall: eval.yml carries the root
-    //    across dispatches) — or someone else's. run-case.js is append-only and score.js pools EVERY run
-    //    dir under a case into one summary, so one foreign run would blend two trees into a single
-    //    candidate with no error and possibly no N mismatch. Every prior run must therefore carry the
-    //    identity of the tree under gate, and any that cannot is refused by name, before any spend.
+    //    invocation on the same clean commit that walled, timed out, or stopped UNDECIDED at a rung, which
+    //    freeze-suite.js's census then tops up (the whole reason a hosted gate can outlive a quota wall:
+    //    eval.yml carries the root across dispatches) — or someone else's. run-case.js is append-only and
+    //    score.js pools EVERY run dir under a case into one summary, so one foreign run would blend two
+    //    trees into a single candidate with no error. Every prior run must therefore carry the identity of
+    //    the tree under gate, and any that cannot is refused by name, before any spend.
     //    [LAW:no-silent-failure] [LAW:parse-dont-validate]
-    // The tree under gate, snapshotted once before any replay: the census here and the drift check (7a)
+    // The tree under gate, snapshotted once before any replay: the census here and the drift check below
     // both compare against it. [LAW:one-source-of-truth]
     const candidate = workingTree();
     const prior = readPriorRuns(candidateRoot, caseNames);
@@ -622,85 +812,104 @@ function main() {
     if (foreign.length > 0) {
       throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
     }
+    // The ceiling, not a target: a case holding more runs than the baseline's N is past the top rung, and
+    // a suite pooled over unequal depth measures an unequal mixture.
     const excess = excessRuns(caseNames, prior, repeats);
     if (excess.length > 0) {
-      throw new Error(`--out ${candidateRoot} holds more runs than the baseline's N=${repeats} for ${excess.map(c => `'${c.case}' (${c.completed})`).join(', ')} — a suite scored over unequal N is not comparable. Remove the surplus runs, or pick a fresh --out.`);
+      throw new Error(`--out ${candidateRoot} holds more runs than the baseline's ceiling N=${repeats} for ${excess.map(c => `'${c.case}' (${c.completed})`).join(', ')} — a suite scored past the top rung is not comparable. Remove the surplus runs, or pick a fresh --out.`);
     }
     for (const name of caseNames) {
-      process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out; the replay fills the rest\n`);
+      process.stderr.write(`  ${name}: ${prior.filter(r => r.case === name).length}/${repeats} run(s) of this candidate already under --out\n`);
     }
-    const owed = deficitReplays(caseNames, prior, repeats);
 
-    // 6. COST GUARDRAIL — print the estimate of THIS invocation's spend up front, before it happens: the
-    //    replays still owed, not the suite's size. [LAW:verifiable-goals]
-    const passesOwed = owed / caseNames.length;
-    const estUsd = estimateCandidateCostUsd(rawBaselineSuite, passesOwed);
-    process.stderr.write(`\nAbout to replay the ${owed} replay(s) still owed across the cases above (${passesOwed.toFixed(2)} full-suite pass(es) of ${baseline.cases.length} case(s) at N=${repeats}) against the WORKING TREE, then score.\n`);
-    process.stderr.write(`Estimated cost ≈ ${estUsd === null ? 'unknown (baseline recorded no per-run cost)' : `$${estUsd.toFixed(2)}`} (the baseline's recorded $/full-run × the ${passesOwed.toFixed(2)} full-suite pass(es) owed). Actual varies with model stochasticity.\n\n`);
+    // 6. SPEND GUARDRAIL, stated as the ladder's shape rather than as one number: the gate buys one wave
+    //    at a time and stops at the first that decides, so the figure that matters up front is what a wave
+    //    costs and what the ceiling would cost if every rung were bought. [LAW:verifiable-goals]
+    const perWaveUsd = estimateCandidateCostUsd(rawBaselineSuite, 1);
+    const startDepth = Math.max(1, completedDepth(caseNames, prior));
+    process.stderr.write(`\nWalking the ladder from wave ${startDepth} to at most ${repeats}: ${caseNames.length} replay(s) per wave against the WORKING TREE, scored and judged after each, stopping at the first wave that decides.\n`);
+    process.stderr.write(`Budget ${opts.budgetMinutes} minute(s) for this invocation. Estimated cost ${perWaveUsd === null ? 'unknown (the baseline recorded no per-run cost — its engine bills quota, not dollars)' : `≈ $${perWaveUsd.toFixed(2)} per wave, ≤ $${(perWaveUsd * repeats).toFixed(2)} if every rung is bought`}.\n\n`);
 
-    // 7. Replay the BASELINE's case set into the candidate root through freeze-suite.js — the scheduler the
-    //    baseline itself was frozen with, so the gate replays on as many credential lanes as it is given and
-    //    a 20-replay suite fits a CI job. Every pre-spend guard above already ran as a full pass over this
-    //    same set, so nothing here re-checks case.json existence or the engine pin. freeze-suite.js exits
-    //    non-zero when any case is still short of N, and runCli turns that into an abort here: a partial
-    //    candidate is never scored. [LAW:no-silent-failure]
-    process.stderr.write(`\n─── replaying ${caseNames.length} case(s) × N=${repeats} ───\n`);
-    runCli(freezeSuiteScript, replayArgs({ repeats, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
-    // 7a. Every run now under --out — inherited and just produced — must record the tree snapshotted
-    //     above: each replay wrote the tree it ran on, so a working tree that moved mid-invocation shows
-    //     up here, refused by name before it can be pooled into a verdict that names the snapshot.
-    //     [LAW:verifiable-goals] [LAW:one-source-of-truth]
-    const drifted = driftedRuns(candidate, readPriorRuns(candidateRoot, caseNames));
-    if (drifted.length > 0) {
-      throw new Error(`The working tree changed while the suite replayed: ${drifted.length} run(s) under ${candidateRoot} carry a different identity:\n${drifted.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nNo verdict written — it would name a tree that produced none of these runs.`);
-    }
-    // 7b. Score each case. The judge is one credential and cheap; it needs no lanes.
-    for (const name of caseNames) {
-      process.stderr.write(`\n─── ${name}: scoring ───\n`);
-      runCli(scoreScript, [path.join(candidateRoot, name), '--matcher', opts.matcher, '--cases-dir', casesDir, '--cache', path.resolve(opts.cache)], `score (${name})`);
+    // 7. THE LADDER. Bounded by the ceiling in the loop header, so it terminates structurally and needs no
+    //    guard against running away; decideLadder independently guarantees the top rung always decides, so
+    //    the bound is never actually the thing that stops it. [LAW:dataflow-not-control-flow]
+    for (let depth = startDepth; depth <= repeats; depth++) {
+      process.stderr.write(`\n─── wave ${depth}/${repeats}: replaying ${caseNames.length} case(s) to depth ${depth} ───\n`);
+      runCli(freezeSuiteScript, replayArgs({ repeats: depth, candidateRoot, casesDir, caseNames, credentials: opts.credentials }), 'freeze-suite');
+
+      // 7a. Every run now under --out — inherited and just produced — must record the tree snapshotted
+      //     above: each replay wrote the tree it ran on, so a working tree that moved mid-invocation shows
+      //     up here, refused by name before it can be pooled into a verdict that names the snapshot.
+      //     [LAW:verifiable-goals] [LAW:one-source-of-truth]
+      const drifted = driftedRuns(candidate, readPriorRuns(candidateRoot, caseNames));
+      if (drifted.length > 0) {
+        throw new Error(`The working tree changed while the suite replayed: ${drifted.length} run(s) under ${candidateRoot} carry a different identity:\n${drifted.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nNo verdict written — it would name a tree that produced none of these runs.`);
+      }
+
+      // 7b. Score each case at this rung. The judge is one credential and cheap; it needs no lanes, and
+      //     its content-keyed cache means re-scoring the earlier waves consults no judge again.
+      for (const name of caseNames) {
+        process.stderr.write(`\n─── ${name}: scoring at depth ${depth} ───\n`);
+        runCli(scoreScript, [path.join(candidateRoot, name), '--matcher', opts.matcher, '--cases-dir', casesDir, '--cache', path.resolve(opts.cache)], `score (${name})`);
+      }
+
+      assessment = assess();
+      const { status, basis, pooled, interval } = assessment.verdict;
+      process.stderr.write(`\nwave ${depth}/${repeats}: pooled ${pooled.candidate.found}/${pooled.candidate.opportunities} = ${pct(pooled.candidate.rate)} (~2σ ${pct(interval.lower)}–${pct(interval.upper)}) vs floor ${pct(pooled.gateFloor)} → ${status}${basis ? ` (${basis})` : ''}\n`);
+      if (status !== 'UNDECIDED') break;
+
+      // The next wave is priced at the most expensive one this candidate has actually cost — measured,
+      // never modelled. A wave that will not fit is not started: an overrun gate is killed mid-suite with
+      // real quota spent and no verdict, which reads as infrastructure failure rather than as a gate that
+      // could not finish. [LAW:no-silent-failure]
+      const nextWaveMs = measuredWaveMs(candidateRoot);
+      const elapsedMs = Date.now() - startedMs;
+      if (!affordsAnotherWave({ elapsedMs, longestWaveMs: nextWaveMs, budgetMs })) {
+        process.stderr.write(`\nStopping at wave ${depth}: ${formatDuration(elapsedMs)} spent of the ${formatDuration(budgetMs)} budget, and the next wave costs about ${formatDuration(nextWaveMs)}. Reporting UNDECIDED rather than overrunning.\n`);
+        break;
+      }
     }
   }
 
-  // 8. The tree the verdict names is the one the runs under the root record — in both modes, so a reused
-  //    root is named by the tree that produced it (7a already proved a replayed root's runs equal the
-  //    snapshot). Then reduce the candidate's scored summaries into a suite with the SAME buildBaseline the
-  //    frozen baseline used — producer and comparator can't drift. Read each case's summary + its pinned
-  //    engine, exactly as baseline.js's main() does.
-  const produced = producedTree(readPriorRuns(candidateRoot, caseNames));
-  const candidateCases = baseline.cases.map(({ case: name }) => {
-    const summaryPath = path.join(candidateRoot, name, 'scorecard-summary.json');
-    if (!fs.existsSync(summaryPath)) throw new Error(`No candidate summary for case '${name}' at ${summaryPath}. ${opts.reuseCandidate ? 'The reused root is incomplete.' : 'The replay/score step did not produce it.'}`);
-    const summary = parseCaseSummary(fs.readFileSync(summaryPath, 'utf8'), summaryPath);
-    if (summary.case !== name) throw new Error(`${summaryPath} names case '${summary.case}' but lives under '${name}'.`);
-    const engine = parseCaseEngine(fs.readFileSync(path.join(casesDir, name, 'case.json'), 'utf8'), path.join(casesDir, name, 'case.json'));
-    return { summary, engine };
-  });
-  const candidateSuite = buildBaseline({ cases: candidateCases, provenance: { sha: produced === null ? null : produced.sha, date: new Date().toISOString().slice(0, 10) } });
-
-  // 9. THE VERDICT.
-  const verdict = compareVerdict(baseline, candidateSuite);
+  // 8. THE VERDICT RECORD — one object, written to verdict.json and rendered to verdict.md, so the machine
+  //    map and the human map carry the same facts including what the run cost. [LAW:one-source-of-truth]
+  const timing = readSuiteTiming(candidateRoot);
   const cost = {
     baselinePerRun: rawBaselineSuite ? rawBaselineSuite.costPerFullRunUsd ?? null : null,
-    candidatePerRun: candidateSuite.suite.costPerFullRunUsd,
+    candidatePerRun: assessment.suite.suite.costPerFullRunUsd,
     delta: null,
   };
   if (typeof cost.baselinePerRun === 'number' && typeof cost.candidatePerRun === 'number') cost.delta = cost.candidatePerRun - cost.baselinePerRun;
-  const md = renderVerdictMarkdown(verdict, { candidate: produced, baselineSha: baseline.mainSha, cost });
+  const record = {
+    ...assessment.verdict,
+    candidate: assessment.tree,
+    baselineSha: baseline.mainSha,
+    cost,
+    run: {
+      elapsedMs: Date.now() - startedMs,
+      budgetMs,
+      waves: timing.legs.map(leg => ({ startedAt: leg.startedAt, elapsedMs: leg.elapsedMs, replays: leg.replays.length })),
+      spend: readCandidateSpend(candidateRoot, caseNames),
+    },
+  };
+  const md = renderVerdictMarkdown(record);
 
-  // Write the verdict alongside the candidate artifacts (2fk.6 reads verdict.md into a Step Summary), and
-  // print it to stdout so it's pasteable straight into a PR body.
+  // Write the verdict alongside the candidate artifacts (eval.yml reads verdict.md into a Step Summary),
+  // and print it to stdout so it's pasteable straight into a PR body.
   try {
     fs.mkdirSync(candidateRoot, { recursive: true });
     fs.writeFileSync(path.join(candidateRoot, 'verdict.md'), md);
-    fs.writeFileSync(path.join(candidateRoot, 'verdict.json'), JSON.stringify(verdict, null, 2) + '\n');
+    fs.writeFileSync(path.join(candidateRoot, 'verdict.json'), JSON.stringify(record, null, 2) + '\n');
   } catch (e) {
     process.stderr.write(`(warning: could not write verdict artifacts under ${candidateRoot}: ${e.message})\n`);
   }
   process.stdout.write('\n' + md);
   process.stderr.write(`\nVerdict artifacts → ${candidateRoot}/verdict.{md,json}\n`);
 
-  // Non-zero exit on DEGRADED so the gate is mechanical (CI, 2fk.6). OK/IMPROVED exit 0.
-  return verdict.degraded ? 1 : 0;
+  // The exit code is the gate's contract, and UNDECIDED needs its own: it is neither a pass (nothing was
+  // proven) nor a degradation (nothing was disproven), and collapsing it onto either is the lie this
+  // verdict exists to avoid. 0 = OK/IMPROVED, 1 = DEGRADED, 2 = the gate could not run, 3 = UNDECIDED.
+  return { OK: 0, IMPROVED: 0, DEGRADED: 1, UNDECIDED: 3 }[record.status];
 }
 
 if (require.main === module) {
@@ -715,5 +924,6 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
+  foreignRuns, readPriorRuns, excessRuns, driftedRuns, producedTree,
+  completedDepth, affordsAnotherWave, foldSpend,
 };
