@@ -9,7 +9,7 @@ const { execFileSync } = require('child_process');
 const {
   parseArgs, replayArgs, jobTimeoutMinutes, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  completedDepth, affordsAnotherWave, foldSpend,
+  resumeDepth, affordsAnotherWave, foldSpend,
 } = require('../eval/compare');
 const { buildBaseline, parseBaseline } = require('../eval/baseline');
 const { JUDGE_MODEL } = require('../eval/score');
@@ -566,14 +566,31 @@ test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be 
   assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
 });
 
-test('completedDepth is the rung every case has reached — the MINIMUM, so an uneven root resumes level', () => {
-  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }];
-  // 'b' has one run, so the suite stands on rung 1 however deep the others go: a suite pooled over
-  // unequal depth measures an unequal mixture.
-  assert.equal(completedDepth(['a', 'b', 'c'], prior), 1);
-  assert.equal(completedDepth(['a', 'c'], prior), 2);
-  assert.equal(completedDepth(['a', 'b', 'd'], prior), 0);
-  assert.equal(completedDepth(['a'], []), 0);
+// An uneven root is what an interrupted wave leaves behind, and levelling it is the whole point of
+// resuming. freeze-suite fills UPWARD, so the leader's depth is the only target that tops the laggards up.
+test('resumeDepth is the DEEPEST rung any case reached, because freeze-suite levels a root upward', () => {
+  const prior = [{ case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }];
+  assert.equal(resumeDepth(['a', 'b', 'c'], prior), 2);
+  assert.equal(resumeDepth(['a', 'c'], prior), 2);
+  assert.equal(resumeDepth(['a'], []), 0);
+});
+
+// The regression this replaces: resuming at the MINIMUM is a no-op for the leader as well as the laggard,
+// so the root stayed uneven and buildBaseline refused it ("a baseline needs one common N") on every retry.
+test('resumeDepth levels an uneven root instead of leaving the leader ahead forever', () => {
+  const uneven = [{ case: 'a' }, { case: 'a' }, { case: 'b' }];
+  const target = resumeDepth(['a', 'b'], uneven);
+  assert.equal(target, 2);
+  // freeze-suite adds a job only where completed < level, so this target tops 'b' up and leaves 'a' alone —
+  // and every case ends the wave at the same depth, which is what the pooled mixture requires.
+  const completedAfter = ['a', 'b'].map(name => Math.max(uneven.filter(r => r.case === name).length, target));
+  assert.deepEqual(completedAfter, [2, 2]);
+});
+
+// An even root is every non-interrupted case, and its behavior must not move.
+test('resumeDepth leaves an even root exactly where it stands', () => {
+  const even = [{ case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'b' }];
+  assert.equal(resumeDepth(['a', 'b'], even), 2);
 });
 
 test('affordsAnotherWave prices the next wave at what a wave has already cost, against the elapsed budget', () => {
@@ -592,10 +609,27 @@ test('foldSpend keeps the basis with the number and refuses to add two currencie
   assert.deepEqual(foldSpend(subs), { basis: 'subscription', amountUsd: 25.75, costedRuns: 2, uncostedRuns: 0 });
   assert.deepEqual(foldSpend([{ basis: 'dollars', usd: 0.5 }, null]), { basis: 'dollars', amountUsd: 0.5, costedRuns: 1, uncostedRuns: 1 });
   assert.deepEqual(foldSpend([]), { basis: null, amountUsd: null, costedRuns: 0, uncostedRuns: 0 });
-  // A notional quota figure and a billed figure are not the same currency; summing them would produce a
-  // number with no meaning, and "$360" being read as cash is the exact confusion this refuses.
-  assert.throws(() => foldSpend([{ basis: 'subscription', notionalUsd: 1 }, { basis: 'dollars', usd: 1 }]),
-    /more than one basis \(subscription, dollars\)/);
+  // A notional quota figure and a billed figure are not the same currency, so there is no single number —
+  // but that resolves to 'unpriced' as a VALUE, exactly as src/usage.js's sumCost resolves it. Throwing
+  // here used to discard a fully-decided verdict at record-assembly time over a secondary figure.
+  assert.deepEqual(foldSpend([{ basis: 'subscription', notionalUsd: 1 }, { basis: 'dollars', usd: 1 }]),
+    { basis: 'unpriced', amountUsd: null, costedRuns: 2, uncostedRuns: 0 });
+});
+
+// An 'unpriced' run carries no currency to conflict with — it is a run whose price is unrecoverable (a
+// schedule gap, an unreported figure), so it counts as uncosted and never blocks the runs that did price.
+test('foldSpend keeps the priced total when one run of the same engine could not be priced', () => {
+  assert.deepEqual(
+    foldSpend([{ basis: 'subscription', notionalUsd: 13.5 }, { basis: 'unpriced', reason: 'schedule-gap' }]),
+    { basis: 'subscription', amountUsd: 13.5, costedRuns: 1, uncostedRuns: 1 },
+  );
+  assert.deepEqual(
+    foldSpend([{ basis: 'dollars', usd: 2 }, { basis: 'unpriced', reason: 'no-price' }, { basis: 'dollars', usd: 3 }]),
+    { basis: 'dollars', amountUsd: 5, costedRuns: 2, uncostedRuns: 1 },
+  );
+  // Every run unpriced is not a basis conflict either — it is simply no figure at all.
+  assert.deepEqual(foldSpend([{ basis: 'unpriced', reason: 'not-reported' }]),
+    { basis: null, amountUsd: null, costedRuns: 0, uncostedRuns: 1 });
 });
 
 test('excessRuns names every case holding more runs than N — the population the gate cannot measure', () => {

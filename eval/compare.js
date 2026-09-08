@@ -47,6 +47,7 @@ const {
 const { matcherLabel, parseExpected, parseMeta, parseUsage, listRunDirs, requireLlmJudgeCredential } = require('./score');
 const { readSuiteTiming, formatDuration } = require('./freeze-suite');
 const { workingTree, treeIdentity } = require('./run-case');
+const { sumCost } = require('../src/usage');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite one wave at a time, score it, and print a DEGRADED / OK / IMPROVED / UNDECIDED verdict. Exit 1 on
@@ -357,12 +358,20 @@ function compareVerdict(baseline, candidate) {
   };
 }
 
-// [LAW:effects-at-boundaries] Pure: the cheapest rung this candidate's existing runs already stand on.
-// freeze-suite.js fills levels, so an interrupted or UNDECIDED root can sit UNEVEN (one case at 2, another
-// at 1); the ladder must resume at the level every case has reached, because a suite pooled over unequal
-// depth measures an unequal mixture. The MINIMUM is that level. [LAW:one-source-of-truth]
-function completedDepth(caseNames, prior) {
-  return Math.min(...caseNames.map(name => prior.filter(r => r.case === name).length));
+// [LAW:effects-at-boundaries] Pure: the rung the ladder resumes at — the DEEPEST any case has reached.
+// A suite pooled over unequal depth measures an unequal mixture, so an interrupted or UNDECIDED root that
+// sits UNEVEN (one case at 2, another at 1) has to be levelled before it can be judged. freeze-suite.js
+// fills levels UPWARD — planJobs adds a job only where `completed < level` — so the level that levels the
+// root is the one the leader already stands on, and resuming there tops up every case behind it.
+//
+// The MINIMUM cannot do that job, and used to be taken: `-n <min>` is a no-op for the leader as well as
+// for the laggard, so the root stayed uneven, score.js reported each case's own run count, and
+// buildBaseline refused the pair ("a baseline needs one common N") on every retry — an externally
+// interrupted root could never be resumed, which is the one thing resuming exists for. Levelling upward
+// also keeps the replays already paid for, where trimming to the minimum would discard them.
+// [LAW:one-source-of-truth]
+function resumeDepth(caseNames, prior) {
+  return Math.max(...caseNames.map(name => prior.filter(r => r.case === name).length));
 }
 
 // [LAW:effects-at-boundaries] Pure: can the remaining budget buy one more wave? Priced at the most
@@ -397,19 +406,29 @@ function jobTimeoutMinutes({ elapsedMs, budgetMs }) {
 // burned and bills nothing, and reporting that as dollars is how "$360" became a number the owner
 // reasonably refused to pay. [FRAMING:representation]
 //
-// Mixed bases are refused rather than summed: two currencies added together is a figure with no meaning,
-// and a suite whose cases ran on one pinned engine cannot legitimately produce them. [LAW:no-silent-failure]
+// Mixed bases are never summed — two currencies added together is a figure with no meaning — but that
+// rule is READ from src/usage.js's sumCost rather than restated here. [LAW:single-enforcer] It said so
+// itself ("SUMMING IS THE ONE PLACE the 'never add across bases' rule lives"), and the copy that used to
+// live here had already drifted to the opposite behaviour: it THREW where the canonical rule resolves to
+// 'unpriced'. That throw fired while assembling the verdict record, after the replays were paid for, so a
+// secondary figure could discard a primary answer that cost hours — reporting the spend as unknown is the
+// honest arm, and losing the verdict is not a stricter version of it. [LAW:no-silent-failure]
+//
+// An 'unpriced' run is not a rival currency but a run whose price is unrecoverable (a schedule gap, an
+// unreported figure), so it is withheld from the basis population and lands in `uncostedRuns` where it
+// belongs — which is what it always was.
+const AMOUNT_BY_BASIS = { dollars: c => c.usd, subscription: c => c.notionalUsd, unpriced: () => null };
+
 function foldSpend(costs) {
   const present = costs.filter(c => c !== null && c !== undefined);
-  const bases = [...new Set(present.map(c => c.basis))];
-  if (bases.length > 1) throw new Error(`The candidate's runs report spend in more than one basis (${bases.join(', ')}) — a suite runs on one pinned engine, so these cannot be added.`);
-  const amountFor = (c) => (c.basis === 'dollars' ? c.usd : c.notionalUsd);
-  const amounts = present.map(amountFor).filter(v => typeof v === 'number' && Number.isFinite(v));
+  const priced = present.filter(c => c.basis !== 'unpriced');
+  const folded = priced.length === 0 ? null : sumCost(priced);
+  const costedRuns = present.filter(c => Number.isFinite(AMOUNT_BY_BASIS[c.basis](c))).length;
   return {
-    basis: bases[0] ?? null,
-    amountUsd: amounts.length === 0 ? null : amounts.reduce((a, b) => a + b, 0),
-    costedRuns: amounts.length,
-    uncostedRuns: costs.length - amounts.length,
+    basis: folded === null ? null : folded.basis,
+    amountUsd: folded === null ? null : AMOUNT_BY_BASIS[folded.basis](folded),
+    costedRuns,
+    uncostedRuns: costs.length - costedRuns,
   };
 }
 
@@ -488,7 +507,7 @@ function renderVerdictMarkdown(record) {
     `${r.waves.length ? ` (${r.waves.map(w => formatDuration(w.elapsedMs)).join(', ')})` : ''}.`,
   );
   lines.push(
-    `**Spend:** ${r.spend.amountUsd === null ? 'not reported by the engine' : `${usd(r.spend.amountUsd)}`}` +
+    `**Spend:** ${r.spend.amountUsd !== null ? `${usd(r.spend.amountUsd)}` : r.spend.basis === 'unpriced' ? 'no single figure — runs reported on bases that cannot be added' : 'not reported by the engine'}` +
     `${r.spend.basis === 'subscription' ? ' **notional** — subscription quota at list-price equivalent, not billed' : r.spend.basis === 'dollars' ? ' billed' : ''}` +
     ` over ${r.spend.costedRuns} costed run(s)${r.spend.uncostedRuns ? `, ${r.spend.uncostedRuns} uncosted` : ''}.`,
   );
@@ -845,7 +864,7 @@ function main() {
     //    at a time and stops at the first that decides, so the figure that matters up front is what a wave
     //    costs and what the ceiling would cost if every rung were bought. [LAW:verifiable-goals]
     const perWaveUsd = estimateCandidateCostUsd(rawBaselineSuite, 1);
-    const startDepth = Math.max(1, completedDepth(caseNames, prior));
+    const startDepth = Math.max(1, resumeDepth(caseNames, prior));
     process.stderr.write(`\nWalking the ladder from wave ${startDepth} to at most ${repeats}: ${caseNames.length} replay(s) per wave against the WORKING TREE, scored and judged after each, stopping at the first wave that decides.\n`);
     process.stderr.write(`Budget ${opts.budgetMinutes} minute(s) for this invocation. Estimated cost ${perWaveUsd === null ? 'unknown (the baseline recorded no per-run cost — its engine bills quota, not dollars)' : `≈ $${perWaveUsd.toFixed(2)} per wave, ≤ $${(perWaveUsd * repeats).toFixed(2)} if every rung is bought`}.\n\n`);
 
@@ -945,5 +964,5 @@ module.exports = {
   parseArgs, replayArgs, jobTimeoutMinutes, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
   foreignRuns, readPriorRuns, excessRuns, driftedRuns, producedTree,
-  completedDepth, affordsAnotherWave, foldSpend,
+  resumeDepth, affordsAnotherWave, foldSpend,
 };
