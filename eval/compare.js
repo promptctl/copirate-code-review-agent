@@ -601,6 +601,22 @@ function main() {
         }
       }
     }
+
+    // 4d. Fail BEFORE spending on ARM drift, for the same reason 4c exists: compareVerdict's arm check
+    //     only fires after the entire suite has replayed and scored. This replay forwards no effort
+    //     flags, so run-case.js builds the checked-out tree's own default profile — read it from the one
+    //     module that owns it rather than restating the number here. [LAW:one-source-of-truth]
+    //     Refusing is deliberate, not a missing feature: a PR that moves DEFAULT_SWEEP_CAP could instead
+    //     be FORCED onto the baseline's arm, but the arm change is then the very change under test, and
+    //     the gate would report a confident OK on a PR whose recall effect it had just neutralized.
+    //     Re-freeze the baseline, or price the lever with an A/B. [LAW:no-silent-failure]
+    if (baseline.effort) {
+      const { defaultEffortProfile } = require('../src/effort');
+      const candidateEffort = defaultEffortProfile();
+      if (describeEffort(candidateEffort) !== describeEffort(baseline.effort)) {
+        throw new Error(`Incomparable: this tree replays at effort ${describeEffort(candidateEffort)} but the baseline was frozen at ${describeEffort(baseline.effort)} — the review effort drifted since the freeze. Re-freeze the baseline before gating, or measure the lever with an A/B (see eval/README's "Varying a lever").`);
+      }
+    }
   }
 
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);

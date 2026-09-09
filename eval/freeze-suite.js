@@ -34,6 +34,9 @@ const { spawn } = require('child_process');
 // from it rather than copied here or into run-case.js's spawn line. effort.js has an EMPTY require
 // graph, so this stays a pure-helper import under the load-purity rule above.
 const { DEFAULT_SWEEP_CAP } = require('../src/effort');
+// [LAW:one-source-of-truth] The CLI-integer rule's owner; run-case.js imports the same one. Empty
+// require graph, so this too stays a pure-helper import under the load-purity rule above.
+const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
 
 const USAGE = `Replay every golden case N times into one output root, resumably, across one or more credentials.
 
@@ -117,27 +120,6 @@ function parseArgs(argv) {
     );
   }
   return opts;
-}
-
-// [LAW:one-type-per-behavior] One integer parse; the FLOOR is the only difference between a count (≥1)
-// and a cap whose off position is 0, so it crosses as a value and the floor's English name is a lookup
-// rather than a branch — each error still promises its exact accept set. The idiomatic names cover the
-// two floors this file uses; every other floor names itself, so the naming is TOTAL over its input and
-// no exported caller can reach a `must be undefined`. [LAW:no-silent-failure]
-const FLOOR_NAME = { 0: 'a non-negative integer', 1: 'a positive integer' };
-
-function parseIntAtLeast(value, label, min) {
-  const floor = FLOOR_NAME[min] ?? `an integer >= ${min}`;
-  // [LAW:no-silent-failure] Number('') and Number(' ') are 0. The option loop refuses the exactly-empty
-  // value, but not an all-whitespace one, and a cap whose floor is 0 would take it as the sweeps-off arm.
-  if (typeof value !== 'number' && String(value).trim() === '') throw new Error(`${label} must be ${floor} (got ${JSON.stringify(value)}).`);
-  const n = typeof value === 'number' ? value : Number(String(value).trim());
-  if (!Number.isInteger(n) || n < min) throw new Error(`${label} must be ${floor} (got ${JSON.stringify(value)}).`);
-  return n;
-}
-
-function parsePositiveInt(value, label) {
-  return parseIntAtLeast(value, label, 1);
 }
 
 // [LAW:parse-dont-validate] A comma list of env var NAMES in, a lane list with its VALUES already read
@@ -736,4 +718,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, parseIntAtLeast, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

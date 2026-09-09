@@ -33,6 +33,9 @@ const { execFileSync } = require('child_process');
 // require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
 // cannot bind TRANSCRIPT_DIR before main() redirects RUNNER_TEMP.
 const { DEFAULT_SWEEP_CAP, defaultEffortProfile } = require('../src/effort');
+// [LAW:one-source-of-truth] The CLI-integer rule's owner; freeze-suite.js imports the same one. Empty
+// require graph, so this stays a pure-helper import under the load-purity rule above.
+const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
 artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
@@ -105,31 +108,6 @@ function parseArgs(argv) {
   // not a bad input — which is why it parses against 0 rather than through parsePositiveInt.
   opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
   return opts;
-}
-
-// [LAW:one-source-of-truth] How a CLI integer is parsed is one rule; the FLOOR is the only thing that
-// differs between a count (≥1) and a cap whose off position is 0, so the floor crosses as a value and
-// the two accept sets are one function, not two near-copies. [LAW:one-type-per-behavior]
-// The floor's English name is a lookup, not a branch, so each error still promises the exact accept set.
-const FLOOR_NAME = { 0: 'a non-negative integer', 1: 'a positive integer' };
-
-// [LAW:parse-dont-validate] Parse a CLI flag as an integer at or above `min` — the accept set is exactly
-// {min, min+1, …}. Number() + Number.isInteger rejects '2.5'/'3.7'/'abc' where parseInt would SILENTLY
-// TRUNCATE ('2.5' → 2), so the check finally matches what the error promises.
-// [LAW:no-silent-failure] The rejected value is echoed so a typo is located, not guessed.
-function parseIntAtLeast(raw, flag, min) {
-  // [LAW:no-silent-failure] Number('') and Number(' ') are 0, so a flag given no value would parse as
-  // zero — invisible for a count (0 is below its floor) and CATASTROPHIC for a cap whose floor IS 0:
-  // `--sweep-cap=` would silently select the sweeps-off arm. Blank is refused before the coercion.
-  if (String(raw).trim() === '') throw new Error(`${flag} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(raw)}).`);
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < min) throw new Error(`${flag} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(raw)}).`);
-  return n;
-}
-
-// The counts' floor, named once. [LAW:one-source-of-truth]
-function parsePositiveInt(raw, flag) {
-  return parseIntAtLeast(raw, flag, 1);
 }
 
 // [LAW:parse-dont-validate] Parse the raw case.json into a validated manifest — a value whose existence
