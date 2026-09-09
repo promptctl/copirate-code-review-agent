@@ -32,6 +32,12 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+// [LAW:one-source-of-truth] The one src require, and the only kind that keeps this module's pure load:
+// src/effort.js owns the effort TYPE, so it also owns which axis set each schema version had. The scorer
+// reads that rule rather than restating it — a second copy of "what did a pre-readSet run do" is exactly
+// the divergence this import exists to prevent. effort.js is stdlib-free, so importing it still performs
+// no IO. [LAW:effects-at-boundaries]
+const { completeEffort } = require('../src/effort');
 
 // The judge is the SCORER'S OWN measurement instrument, pinned independently of whatever engine a case
 // replayed on, so a score means the same thing across every case — and, critically, so a change to the
@@ -231,19 +237,23 @@ function parseMeta(raw, label) {
   if (json.case !== path.basename(json.case) || json.case === '.' || json.case === '..') {
     throw new Error(`${label} 'case' must be a plain directory component, got ${JSON.stringify(json.case)}.`);
   }
-  return { case: json.case, config: json.config ?? null, effort: parseEffort(json.effort, label), candidate: parseCandidate(json.candidate, label) };
+  return { case: json.case, config: json.config ?? null, effort: parseEffort(json, label), candidate: parseCandidate(json.candidate, label) };
 }
 
 // The review effort a run was produced under, as run-case.js recorded it: the whole EffortProfile, since
-// each axis is a lever some A/B varies. Absent on runs replayed before the arm was recorded — a typed
-// absence (null), which is a DIFFERENT value from "recorded at the default", not a synonym for it: what
-// an unrecorded run ran at is unknown, and guessing it is how two arms get averaged into one number.
-// [LAW:one-source-of-truth] The absence has ONE meaning and two spellings on the wire, and this parser
-// reads both: a missing key (a legacy meta.json) and an explicit null (what aggregateRuns itself writes
-// into scorecard-summary.json for such a run, since JSON has no `undefined`). A reader that took only
-// the first could not read back what its own writer emits.
+// each axis is a lever some A/B varies. It takes the RECORD, not the profile alone, because the profile's
+// meaning depends on the schema version written beside it — reading one without the other is how a record
+// loses the very fact that makes its omissions interpretable. [LAW:one-source-of-truth]
+// A wholly absent effort stays a typed absence (null): unlike a missing AXIS, which the schema's back-fill
+// resolves, a record with no profile at all names no version and fixes no value, so what it ran at is
+// genuinely unknown and guessing it is how two arms get averaged into one number.
+// [LAW:one-source-of-truth] That whole-effort absence has ONE meaning and two spellings on the wire, and
+// this parser reads both: a missing key (a legacy meta.json) and an explicit null (what aggregateRuns
+// itself writes into scorecard-summary.json for such a run, since JSON has no `undefined`). A reader that
+// took only the first could not read back what its own writer emits.
 // [LAW:parse-dont-validate] [LAW:no-silent-failure] anything else is a malformed record, refused.
-function parseEffort(raw, label) {
+function parseEffort(record, label) {
+  const raw = record.effort;
   if (raw === undefined || raw === null) return null;
   const ok = typeof raw === 'object' && !Array.isArray(raw)
     && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
@@ -261,12 +271,13 @@ function parseEffort(raw, label) {
       `readSet: <string|null>}, got ${JSON.stringify(raw)}.`,
     );
   }
-  // [LAW:one-source-of-truth] A per-AXIS absence, read the same two ways the whole-effort absence is: a
-  // missing key (a meta.json written before this axis existed — every 2mg.1 replay) and an explicit null
-  // (what this parser's own writer emits back into scorecard-summary.json). It is NOT a synonym for the
-  // default arm: what an unrecorded axis ran at is unknown, and guessing it is exactly how two arms get
-  // averaged into one number that names neither.
-  return { roundCap: raw.roundCap, sweepCap: raw.sweepCap, reasoningTier: raw.reasoningTier, readSet: raw.readSet ?? null };
+  // [LAW:parse-dont-validate] The profile leaves here COMPLETE — every axis of the current type carries a
+  // value — so nothing downstream meets a per-axis void or has to decide what one means. A missing axis is
+  // not guessed at: src/effort.js's back-fill answers it from the record's schema version, which is a fact
+  // about what the code could do when the record was written, not an assumption about what it chose.
+  // The record is handed over whole rather than picked apart field by field, so an axis added to the
+  // profile flows through this reader without a second list here learning its name. [LAW:one-source-of-truth]
+  return completeEffort({ effort: raw, effortSchema: record.effortSchema });
 }
 
 // [LAW:one-source-of-truth] ONE rendering of an effort, used both to COMPARE two runs' arms and to name
@@ -274,11 +285,9 @@ function parseEffort(raw, label) {
 function describeEffort(effort) {
   return effort === null
     ? 'unrecorded'
-    // [LAW:no-silent-failure] readSet renders its absence as 'unrecorded', NOT as reasoningTier's 'none'.
-    // The two nulls are different facts: a null tier is a produced value meaning "no raise", while a null
-    // arm only ever comes off the wire from a run predating the axis — so it must read as the same word
-    // the whole-effort absence uses, and must never collide with the name of a real arm.
-    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'} readSet=${effort.readSet ?? 'unrecorded'}`;
+    // Every axis renders a value because parseEffort hands over a complete profile; only reasoningTier
+    // spells its null, and it spells it as a REAL value ('none' = no raise proposed), never as an absence.
+    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'} readSet=${effort.readSet}`;
 }
 
 // [LAW:parse-dont-validate] A case-out dir's runs are one population or they are not scorable: the mean

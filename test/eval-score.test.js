@@ -10,6 +10,7 @@ const {
   requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
   parseEffort, describeEffort, agreedScope, misarmedRuns,
 } = require('../eval/score');
+const { EFFORT_SCHEMA } = require('../src/effort');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
 // must-find recall (primary), nice-to-find recall, and noise — deterministically, via an injected
@@ -562,17 +563,19 @@ test('callJudge posts to the pinned Anthropic messages endpoint with the model i
 // checkpoint that turns a pile of run dirs into a scorable population.
 describe('the arm a run was produced under', () => {
   const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' };
+  // A record as run-case.js writes one: the profile and the schema version naming its axis set, together.
+  const recorded = effort => ({ effort, effortSchema: EFFORT_SCHEMA });
 
   test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
-    assert.deepEqual(parseEffort(profile, 'meta.json'), profile);
-    assert.deepEqual(parseEffort({ roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' }, 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' });
+    assert.deepEqual(parseEffort(recorded(profile), 'meta.json'), profile);
+    assert.deepEqual(parseEffort(recorded({ roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' }), 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' });
   });
 
   test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
-    assert.equal(parseEffort(undefined, 'meta.json'), null);
+    assert.equal(parseEffort({}, 'meta.json'), null);
     // The same absence, spelled the way JSON spells it — what aggregateRuns writes for a legacy suite
     // and baseline.js reads straight back. One absence, one meaning, both spellings.
-    assert.equal(parseEffort(null, 'scorecard-summary.json'), null);
+    assert.equal(parseEffort({ effort: null }, 'scorecard-summary.json'), null);
     assert.equal(describeEffort(null), 'unrecorded');
     assert.notEqual(describeEffort(null), describeEffort(profile));
   });
@@ -595,12 +598,12 @@ describe('the arm a run was produced under', () => {
 
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
     for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: [] }]) {
-      assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
+      assert.throws(() => parseEffort(recorded(bad), 'meta.json'), /'effort' must be/, JSON.stringify(bad));
     }
   });
 
   test('parseMeta carries the arm through, and tolerates a run recorded before it existed', () => {
-    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', effort: profile }), 'm').effort, profile);
+    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', ...recorded(profile) }), 'm').effort, profile);
     assert.equal(parseMeta(JSON.stringify({ case: 'alpha' }), 'm').effort, null);
   });
 
@@ -612,19 +615,35 @@ describe('the arm a run was produced under', () => {
     assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none readSet=assigned' });
   });
 
-  // The read-set axis (copirate-measurement-2mg.2) is a second lever on the same profile, so the arm
-  // machinery must separate ITS arms too — a suite that pooled a split-read run with a whole-read one
-  // would report a recall number naming neither, which is the exact failure the arm record exists to stop.
-  test('an unrecorded read set is its own arm — a 2mg.1 run can never pool with either arm of this axis', () => {
-    // Every run replayed before this axis existed recorded three fields. Parsing that as the DEFAULT arm
-    // would silently enroll ~42 historical replays into the 'assigned' arm on nothing but a guess.
-    const legacy = parseEffort({ roundCap: 0, sweepCap: 2, reasoningTier: null }, 'meta.json');
-    assert.equal(legacy.readSet, null);
-    assert.match(describeEffort(legacy), /readSet=unrecorded/);
-    assert.notEqual(describeEffort(legacy), describeEffort(profile));
+  // [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): the 40 runs already on disk carry three axes
+  // and no schema version, and the read-set arm they ran under is a FACT about the code of that era
+  // (scope-bounded reads shipped in bfcd889, 2026-07-06, before every stored run) — not a guess. The
+  // back-fill is what turns that fact into a value the comparison sites can read.
+  test('a record written before the read-set axis resolves to the arm the code structurally had', () => {
+    const legacy = parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } }, 'meta.json');
+    assert.equal(legacy.readSet, 'assigned');
+    // ...which is the whole point: it now pools with runs of the same arm, and still refuses the other one.
+    assert.equal(describeEffort(legacy), describeEffort(profile));
     assert.notEqual(describeEffort(legacy), describeEffort({ ...profile, readSet: 'changed' }));
-    // ... and the absence reads back identically in both spellings, as the whole-effort absence does.
-    assert.deepEqual(parseEffort({ ...legacy, readSet: null }, 'x'), legacy);
+    // The same record re-read from a scorecard-summary, where absence is spelled as an explicit null,
+    // resolves identically — one fact, one value, whichever spelling it arrives in.
+    assert.deepEqual(parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: null } }, 'x'), legacy);
+  });
+
+  test('a record stamped with the CURRENT schema must carry every axis itself — a gap is a defect, not an era', () => {
+    // The recorder is derived from the type, so a current-schema record missing an axis means the writer
+    // fell behind. Filling it from a default would launder that into a plausible arm; it is refused by name.
+    assert.throws(
+      () => parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null }, effortSchema: EFFORT_SCHEMA }, 'meta.json'),
+      /missing readSet/,
+    );
+  });
+
+  test('a schema this tree has no row for is refused, never interpreted through another version\'s rules', () => {
+    assert.throws(
+      () => parseEffort({ ...recorded(profile), effortSchema: 'copirate-effort/v99' }, 'meta.json'),
+      /Unknown effort schema/,
+    );
   });
 
   test('the two read-set arms are distinct arms, and a dir holding both is refused by name', () => {

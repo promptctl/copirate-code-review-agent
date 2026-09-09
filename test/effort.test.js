@@ -2,7 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK, readSetProjection, READ_SETS, DEFAULT_READ_SET } = require('../src/effort');
+const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK, readSetProjection, READ_SETS, DEFAULT_READ_SET, EFFORT_SCHEMA, UNVERSIONED_EFFORT_SCHEMA, EFFORT_SCHEMA_BACKFILL, effortAxes, recordEffort, completeEffort } = require('../src/effort');
 const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
@@ -225,5 +225,69 @@ describe('resolveReasoningTier — against each adapter’s declared reasoning-e
   test('codex clamps claude-only tiers into its own range', () => {
     const range = registry.get('codex').capabilities.reasoningEfforts;
     assert.equal(resolveReasoningTier('max', range), 'xhigh');     // claude ceiling → codex ceiling
+  });
+});
+
+// [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): a run record must carry a COMPLETE, versioned
+// profile derived from the type — so that adding an axis to defaultEffortProfile and forgetting the
+// recorder is a loud failure rather than a fact silently destroyed at write time.
+describe('the recorded effort profile is complete and versioned', () => {
+  test('the demanded axis set is READ OFF the type, so a new axis is demanded the moment it exists', () => {
+    // Not a second list that a new axis would have to remember to join — the same keys, derived.
+    assert.deepEqual(effortAxes(), Object.keys(defaultEffortProfile()));
+  });
+
+  test('every axis of the type is required of a current-schema record — the loop grows with the type', () => {
+    // This is the "added an axis and forgot the recorder" failure, stated once against the type rather
+    // than once per axis: whatever axes exist, omitting any one of them is refused BY NAME. A future axis
+    // is covered by this test on the day it is added, with no edit here.
+    for (const axis of effortAxes()) {
+      const gapped = { ...defaultEffortProfile() };
+      delete gapped[axis];
+      assert.throws(
+        () => completeEffort({ effort: gapped, effortSchema: EFFORT_SCHEMA }),
+        new RegExp(`missing ${axis}`),
+        `omitting '${axis}' at the current schema must be refused, not filled`,
+      );
+    }
+  });
+
+  test('producer and reader agree over the type: a recorded default profile round-trips unchanged', () => {
+    const profile = defaultEffortProfile();
+    const record = recordEffort(profile);
+    assert.equal(record.effortSchema, EFFORT_SCHEMA);
+    assert.deepEqual(completeEffort(record), profile);
+  });
+
+  test('the unversioned era resolves to the arm the code structurally had, in either spelling of absence', () => {
+    // bfcd889 (2026-07-06) shipped scope-bounded reads before every stored run, so a record from before the
+    // axis existed did not choose 'assigned' — it could not have done anything else.
+    const era = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+    assert.equal(completeEffort({ effort: era }).readSet, 'assigned');
+    assert.equal(completeEffort({ effort: { ...era, readSet: null } }).readSet, 'assigned');
+    assert.equal(completeEffort({ effort: era, effortSchema: UNVERSIONED_EFFORT_SCHEMA }).readSet, 'assigned');
+  });
+
+  test('a back-filled axis never overwrites a value the record actually carries', () => {
+    const era = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'changed' };
+    assert.equal(completeEffort({ effort: era }).readSet, 'changed');
+    // ...and an axis no row names passes through untouched, which is what keeps reasoningTier's REAL null
+    // (meaning "propose no raise") from being read as an absence and filled.
+    assert.equal(completeEffort({ effort: era }).reasoningTier, null);
+  });
+
+  test('the back-fill is a historical fact, not a mirror of the current default', () => {
+    // If DEFAULT_READ_SET ever moves, what those 40 stored runs did does not move with it. The row is
+    // spelled out for exactly this reason, so the test states it rather than comparing to the default.
+    assert.equal(EFFORT_SCHEMA_BACKFILL[UNVERSIONED_EFFORT_SCHEMA].readSet, 'assigned');
+    // The current version supplies nothing: its records are complete by construction.
+    assert.deepEqual(EFFORT_SCHEMA_BACKFILL[EFFORT_SCHEMA], {});
+  });
+
+  test('a schema with no row is refused, never interpreted through some other version\'s rules', () => {
+    assert.throws(
+      () => completeEffort({ effort: defaultEffortProfile(), effortSchema: 'copirate-effort/v99' }),
+      /Unknown effort schema "copirate-effort\/v99"/,
+    );
   });
 });
