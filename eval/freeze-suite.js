@@ -121,15 +121,18 @@ function parseArgs(argv) {
 
 // [LAW:one-type-per-behavior] One integer parse; the FLOOR is the only difference between a count (≥1)
 // and a cap whose off position is 0, so it crosses as a value and the floor's English name is a lookup
-// rather than a branch — each error still promises its exact accept set.
+// rather than a branch — each error still promises its exact accept set. The idiomatic names cover the
+// two floors this file uses; every other floor names itself, so the naming is TOTAL over its input and
+// no exported caller can reach a `must be undefined`. [LAW:no-silent-failure]
 const FLOOR_NAME = { 0: 'a non-negative integer', 1: 'a positive integer' };
 
 function parseIntAtLeast(value, label, min) {
+  const floor = FLOOR_NAME[min] ?? `an integer >= ${min}`;
   // [LAW:no-silent-failure] Number('') and Number(' ') are 0. The option loop refuses the exactly-empty
   // value, but not an all-whitespace one, and a cap whose floor is 0 would take it as the sweeps-off arm.
-  if (typeof value !== 'number' && String(value).trim() === '') throw new Error(`${label} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(value)}).`);
+  if (typeof value !== 'number' && String(value).trim() === '') throw new Error(`${label} must be ${floor} (got ${JSON.stringify(value)}).`);
   const n = typeof value === 'number' ? value : Number(String(value).trim());
-  if (!Number.isInteger(n) || n < min) throw new Error(`${label} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(value)}).`);
+  if (!Number.isInteger(n) || n < min) throw new Error(`${label} must be ${floor} (got ${JSON.stringify(value)}).`);
   return n;
 }
 

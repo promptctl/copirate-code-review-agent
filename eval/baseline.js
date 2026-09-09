@@ -20,7 +20,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parseJsonObject } = require('./score');
+const { parseJsonObject, parseEffort, describeEffort } = require('./score');
 const { workingTree } = require('./run-case');
 
 // The schema id the freezer stamps and the loader demands — one name, written once, so a writer that
@@ -150,6 +150,9 @@ function parseCaseSummary(raw, label) {
     case: json.case,
     runs: json.runs,
     matcher: json.matcher,
+    // The A/B arm this case was scored under, parsed by score.js's own effort boundary so a summary can
+    // never mean one thing to the scorer and another to the freezer. [LAW:single-enforcer]
+    effort: parseEffort(json.effort, label),
     mustFindRecall: parseBand(json.mustFindRecall, `${label}.mustFindRecall`),
     inventoryMustFindRecall: parseBand(json.inventoryMustFindRecall, `${label}.inventoryMustFindRecall`),
     niceToFindRecall: parseBand(json.niceToFindRecall, `${label}.niceToFindRecall`),
@@ -235,10 +238,16 @@ function buildBaseline({ cases, provenance }) {
   const repeats = cases[0].summary.runs;
   const matcher = cases[0].summary.matcher;
   const engine = cases[0].engine;
+  // [LAW:one-source-of-truth] The arm is rendered through describeEffort, the same string score.js
+  // compares runs by — so a mixed suite is refused here by exactly the rule that refuses a mixed case-out
+  // dir. An UNRECORDED arm is its own value: a legacy suite (all null) freezes, but a legacy case mixed
+  // with a recorded one does not, because nothing proves they ran the same lever.
+  const effort = cases[0].summary.effort;
   for (const c of cases) {
     if (c.summary.runs !== repeats) throw new Error(`Case '${c.summary.case}' was scored over ${c.summary.runs} run(s) but '${cases[0].summary.case}' over ${repeats} — a baseline needs one common N. Re-run the odd case at N=${repeats}.`);
     if (c.summary.matcher !== matcher) throw new Error(`Case '${c.summary.case}' was scored with matcher '${c.summary.matcher}' but '${cases[0].summary.case}' with '${matcher}' — a baseline needs one matcher.`);
     if (!sameEngine(c.engine, engine)) throw new Error(`Case '${c.summary.case}' pins engine ${JSON.stringify(c.engine)} but '${cases[0].summary.case}' pins ${JSON.stringify(engine)} — a baseline needs one engine.`);
+    if (describeEffort(c.summary.effort) !== describeEffort(effort)) throw new Error(`Case '${c.summary.case}' was scored at effort ${describeEffort(c.summary.effort)} but '${cases[0].summary.case}' at ${describeEffort(effort)} — a baseline freezes one arm, not an average of two.`);
   }
 
   // One pass over every run of every case, summing the suite-level facts:
@@ -309,6 +318,10 @@ function buildBaseline({ cases, provenance }) {
     generatedAt: provenance.date,
     mainSha: provenance.sha,
     engine,
+    // The lever the frozen distribution was measured at. An A/B arm is a different measurement from the
+    // default arm, and a baseline that did not say which one it is invites a candidate to be gated
+    // against a floor it never ran under. [FRAMING:representation]
+    effort,
     matcher,
     repeats,
     degradationRule: DEGRADATION_RULE,
@@ -423,6 +436,7 @@ function renderBaselineMarkdown(baseline) {
     `This is the reference the compare gate (\`copirate-eval-harness-2fk.5\`) measures a candidate engine change against.`,
     '',
     `- **Engine (pinned):** \`${eng.provider}\` / \`${eng.model}\`${eng.reasoning ? ` / reasoning=${eng.reasoning}` : ''}`,
+    `- **Effort (arm):** ${describeEffort(baseline.effort)}`,
     `- **Matcher:** \`${baseline.matcher}\``,
     `- **Repeats (N):** ${baseline.repeats} per case`,
     `- **PRIMARY GATE — pooled inventory must-find recall:** ${pct(pooled.rate)} (${pooled.found}/${pooled.opportunities} across all ${baseline.repeats}×${baseline.suite.cases} runs, against each case's pooled multi-round inventory); gate floor **${pct(pooled.gateFloor)}** (~2σ lower bound). A candidate below the floor is degraded.`,

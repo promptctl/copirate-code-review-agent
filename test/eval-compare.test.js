@@ -27,6 +27,9 @@ function caseEntry(name, mustFindBand, perRun, engine) {
   return {
     summary: {
       case: name, runs: perRun.length, matcher: 'llm/deepseek-v4-flash',
+      // The arm, as parseCaseSummary always produces it. These fixtures predate the lever, so both sides
+      // are the typed absence — stated, not omitted, so the arm agreement is exercised rather than skipped.
+      effort: null,
       mustFindRecall: mustFindBand,
       inventoryMustFindRecall: mustFindBand,
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: perRun.length },

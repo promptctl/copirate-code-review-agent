@@ -285,6 +285,12 @@ as its own value — `unrecorded` matches only `unrecorded`, because nothing pro
 ran at. The arm also rides on each `scorecard.json` and `scorecard-summary.json`, so a
 number lifted out of an artifact carries the setting that produced it.
 
+`baseline.js` applies the same rule one level up: it records the arm in `baseline.json`
+and refuses to freeze a suite whose cases disagree on it, exactly as it refuses a suite
+whose cases pin different engines. An A/B arm is a measurement of a lever, not the
+suite's reference distribution — freezing one as the baseline would gate every future
+candidate against a floor it never ran under.
+
 ## Scoring a replay
 
 `eval/score.js` (`npm run review:score`) reduces a case's replay artifacts to the

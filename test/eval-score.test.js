@@ -557,12 +557,15 @@ describe('the arm a run was produced under', () => {
 
   test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
     assert.equal(parseEffort(undefined, 'meta.json'), null);
+    // The same absence, spelled the way JSON spells it — what aggregateRuns writes for a legacy suite
+    // and baseline.js reads straight back. One absence, one meaning, both spellings.
+    assert.equal(parseEffort(null, 'scorecard-summary.json'), null);
     assert.equal(describeEffort(null), 'unrecorded');
     assert.notEqual(describeEffort(null), describeEffort(profile));
   });
 
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
-    for (const bad of [null, 'high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
+    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
       assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
     }
   });

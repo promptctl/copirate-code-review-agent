@@ -238,10 +238,14 @@ function parseMeta(raw, label) {
 // each axis is a lever some A/B varies. Absent on runs replayed before the arm was recorded — a typed
 // absence (null), which is a DIFFERENT value from "recorded at the default", not a synonym for it: what
 // an unrecorded run ran at is unknown, and guessing it is how two arms get averaged into one number.
+// [LAW:one-source-of-truth] The absence has ONE meaning and two spellings on the wire, and this parser
+// reads both: a missing key (a legacy meta.json) and an explicit null (what aggregateRuns itself writes
+// into scorecard-summary.json for such a run, since JSON has no `undefined`). A reader that took only
+// the first could not read back what its own writer emits.
 // [LAW:parse-dont-validate] [LAW:no-silent-failure] anything else is a malformed record, refused.
 function parseEffort(raw, label) {
-  if (raw === undefined) return null;
-  const ok = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+  if (raw === undefined || raw === null) return null;
+  const ok = typeof raw === 'object' && !Array.isArray(raw)
     && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
     && Number.isInteger(raw.sweepCap) && raw.sweepCap >= 0
     && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string');
