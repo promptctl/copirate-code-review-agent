@@ -65,7 +65,7 @@ const DEFAULT_SWEEP_CAP = 2;
 //                changed set (split), not N× (duplicated): the shipped cost cut.
 //   'changed'  — the worker reads the whole changed set, the pre-split behavior. It projects to the
 //                EMPTY list because that is already prompt.js's value for "read every changed file in
-//                full" (buildReviewInput's scopeFiles) — this axis picks which value flows to a seam
+//                full" (buildReviewInput's readFiles) — this axis picks which value flows to a seam
 //                that was always value-driven, and adds no second prompt path. [LAW:composability]
 // The projection takes the scope's assigned files and returns the read set, so the two arms are one
 // signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
