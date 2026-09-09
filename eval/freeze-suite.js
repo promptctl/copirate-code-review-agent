@@ -326,28 +326,35 @@ function readSuiteTiming(outRoot) {
 // the scorer about how many runs a case has.
 function censusCases(caseDirs, outRoot) {
   const { parseCaseManifest } = require('./run-case');
-  const { listRunDirs, parseMeta } = require('./score');
+  const { listRunDirs } = require('./score');
   return caseDirs.map(dir => {
     const manifest = parseCaseManifest(fs.readFileSync(path.join(dir, 'case.json'), 'utf8'), dir);
-    // The census is the ONE read of what already sits under --out, so it reports the arm each prior run
-    // recorded alongside the count. A second pass over the same dirs to answer "which arm" would be a
-    // second census that could disagree with this one. [LAW:one-source-of-truth]
-    const runs = listRunDirs(path.join(outRoot, manifest.name)).map(runDir => {
-      const metaPath = path.join(runDir, 'meta.json');
-      // [LAW:no-silent-failure] run-case.js writes findings.json and meta.json together, so one without
-      // the other is a torn record — refused by name here rather than as a bare ENOENT from the read, or
-      // (worse) skipped, which would let a run whose arm cannot be proven pass as matching.
-      if (!fs.existsSync(metaPath)) throw new Error(`${runDir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
-      return { dir: runDir, effort: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).effort };
-    });
     return {
       name: manifest.name,
       dir,
       engine: manifest.engine,
-      runs,
-      completed: runs.length,
+      completed: listRunDirs(path.join(outRoot, manifest.name)).length,
     };
   });
+}
+
+// The arm every run already under --out was produced at. DELIBERATELY separate from censusCases, which
+// only counts: the census runs twice — once before the spend and once after every replay, to report what
+// the scorer will find — and a read that can fail on run CONTENT must never sit in the closing one, where
+// throwing would discard the report and the timing artifact of a suite that has already spent hours.
+// [LAW:decomposition] Two questions asked at two different moments, so two functions; this one is asked
+// once, before anything is spent, where refusing costs nothing.
+function priorRunArms(caseNames, outRoot) {
+  const { listRunDirs, parseMeta } = require('./score');
+  return caseNames.flatMap(name => listRunDirs(path.join(outRoot, name)).map(runDir => {
+    const metaPath = path.join(runDir, 'meta.json');
+    // [LAW:no-silent-failure] run-case.js writes meta.json first and findings.json last (atomically), so a
+    // killed replay leaves a dir listRunDirs never counts. A counted run WITHOUT meta.json therefore means
+    // the record was torn after the fact — refused by name, never skipped, since skipping would let a run
+    // whose arm cannot be proven pass the resume check as if it matched.
+    if (!fs.existsSync(metaPath)) throw new Error(`${runDir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
+    return { dir: runDir, effort: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).effort };
+  }));
 }
 
 function discoverCaseDirs(casesDir) {
@@ -648,7 +655,7 @@ async function main() {
   // the backstop, but it fires at scoring — after the whole remaining suite has replayed at full spend.
   // [LAW:no-silent-failure]
   const { misarmedRuns } = require('./score');
-  const misarmed = misarmedRuns(effort, cases.flatMap(c => c.runs));
+  const misarmed = misarmedRuns(effort, priorRunArms(cases.map(c => c.name), outRoot));
   if (misarmed.length > 0) {
     throw new Error(`--out ${outRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(m => `  ${m.dir} ${m.reason}`).join('\n')}\nA case-out dir holds one arm — resume with the arm these runs were produced at (--sweep-cap), or give this arm its own --out.`);
   }
@@ -743,4 +750,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, resolveLanes, priorRunArms, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

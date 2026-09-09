@@ -311,7 +311,10 @@ describe('runLane', () => {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { censusCases, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
+const { censusCases, priorRunArms, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
+// The arm an unflagged replay runs at, from the module that owns the number — a literal here would fail
+// these tests with an unrelated arm-mismatch the day that default moves. [LAW:one-source-of-truth]
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 const tmpTree = () => fs.mkdtempSync(path.join(os.tmpdir(), 'freeze-suite-test-'));
 const writeCase = (casesDir, dirName, manifestName) => {
@@ -325,7 +328,7 @@ const writeCase = (casesDir, dirName, manifestName) => {
 // A completed run as run-case.js leaves it: findings.json AND the meta.json recording what produced it,
 // written together. `effort` defaults to the arm an unflagged replay runs at, which is what a resume the
 // census must accept looks like.
-const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: 2, reasoningTier: null }) => {
+const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null }) => {
   const dir = path.join(outRoot, caseName, runName);
   fs.mkdirSync(dir, { recursive: true });
   if (findings) {
@@ -333,6 +336,44 @@ const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, 
     fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, effort }));
   }
 };
+
+describe('priorRunArms reads what arm each existing run was produced at', () => {
+  test('every counted run reports its recorded arm, and a pre-arm run reports none', () => {
+    const root = tmpTree();
+    writeCase(path.join(root, 'cases'), 'delta', 'delta');
+    const outRoot = path.join(root, 'out');
+    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+    writeRun(outRoot, 'delta', 'run-1', true, off);
+    writeRun(outRoot, 'delta', 'run-2', true, null);
+    assert.deepEqual(priorRunArms(['delta'], outRoot).map(r => r.effort), [off, null]);
+    // A case with nothing under --out contributes nothing, rather than a run with an unknown arm.
+    assert.deepEqual(priorRunArms(['never-replayed'], outRoot), []);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a counted run with no meta.json is a torn record, refused by name', () => {
+    const root = tmpTree();
+    const outRoot = path.join(root, 'out');
+    writeRun(outRoot, 'epsilon', 'run-1', true);
+    // run-case.js writes meta.json first and findings.json last, so this shape cannot come from a crash —
+    // and skipping it would let a run whose arm cannot be proven pass the resume check as if it matched.
+    fs.rmSync(path.join(outRoot, 'epsilon', 'run-1', 'meta.json'));
+    assert.throws(() => priorRunArms(['epsilon'], outRoot), /torn run record/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // The census stays content-blind on purpose: it runs again after every replay, and a read that could
+  // throw on run content would discard the report and timing of a suite that has already spent.
+  test('the census counts a torn record rather than throwing on it — it must survive the closing pass', () => {
+    const root = tmpTree();
+    const dir = writeCase(path.join(root, 'cases'), 'zeta', 'zeta');
+    const outRoot = path.join(root, 'out');
+    writeRun(outRoot, 'zeta', 'run-1', true);
+    fs.rmSync(path.join(outRoot, 'zeta', 'run-1', 'meta.json'));
+    assert.deepEqual(censusCases([dir], outRoot).map(c => c.completed), [1]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
 
 describe('censusCases counts what the scorer will actually find', () => {
   // A case has one identity, its directory's name; a manifest that says otherwise is refused at the census
@@ -353,31 +394,6 @@ describe('censusCases counts what the scorer will actually find', () => {
     const dir = writeCase(path.join(root, 'cases'), 'beta', 'beta');
     // No out subdir at all — the first-ever run of a new case, which must plan a full deficit.
     assert.deepEqual(censusCases([dir], path.join(root, 'out')).map(c => c.completed), [0]);
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  test('the census reports the arm each prior run recorded, so a resume can be held to one', () => {
-    const root = tmpTree();
-    const dir = writeCase(path.join(root, 'cases'), 'delta', 'delta');
-    const outRoot = path.join(root, 'out');
-    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
-    writeRun(outRoot, 'delta', 'run-1', true, off);
-    writeRun(outRoot, 'delta', 'run-2', true, null);
-    const [c] = censusCases([dir], outRoot);
-    assert.equal(c.completed, 2);
-    assert.deepEqual(c.runs.map(r => r.effort), [off, null]);
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  test('a run with findings.json but no meta.json is a torn record, refused by name', () => {
-    const root = tmpTree();
-    const dir = writeCase(path.join(root, 'cases'), 'epsilon', 'epsilon');
-    const outRoot = path.join(root, 'out');
-    writeRun(outRoot, 'epsilon', 'run-1', true);
-    // run-case.js writes both together. Skipping the read instead would let a run whose arm cannot be
-    // proven pass the resume check as if it matched.
-    fs.rmSync(path.join(outRoot, 'epsilon', 'run-1', 'meta.json'));
-    assert.throws(() => censusCases([dir], outRoot), /torn run record/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
