@@ -48,9 +48,6 @@ describe('defaultEffortProfile', () => {
   });
 });
 
-// maxTier is the per-config FLOOR reconciliation: difficulty proposes a raise, the config carries a
-// baseline, and the effective tier is the higher of the two. These assert the value semantics that make
-// difficulty a monotonic floor (it lifts an under-specified config, never lowers an explicit one).
 describe('readSetProjection — the read-set arm, resolved to what a worker opens', () => {
   // The axis's CONTRACT: which files a worker opens in full, given its scope's assignment. Asserted
   // through the resolved projection — the only way a caller can reach the meaning — never by reading
@@ -82,6 +79,9 @@ describe('readSetProjection — the read-set arm, resolved to what a worker open
   });
 });
 
+// maxTier is the per-config FLOOR reconciliation: difficulty proposes a raise, the config carries a
+// baseline, and the effective tier is the higher of the two. These assert the value semantics that make
+// difficulty a monotonic floor (it lifts an under-specified config, never lowers an explicit one).
 describe('maxTier — the higher reasoning tier, difficulty as a monotonic floor', () => {
   test('both null → null (the byte-identical no-raise case)', () => {
     assert.equal(maxTier(null, null), null);
