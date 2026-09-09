@@ -116,8 +116,8 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   // A summary written before the arm was recorded carries a typed absence, never an invented default.
   assert.equal(s.effort, null);
   assert.deepEqual(
-    parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null } }), 'x').effort,
-    { roundCap: 3, sweepCap: 0, reasoningTier: null },
+    parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' } }), 'x').effort,
+    { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' },
   );
   assert.throws(() => parseCaseSummary(summaryFixture({ effort: { roundCap: 3 } }), 'x'), /'effort' must be/);
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary.

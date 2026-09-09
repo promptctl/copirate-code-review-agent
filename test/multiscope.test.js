@@ -18,7 +18,7 @@ const {
   buildPrMaterial,
   buildRepoMaterial,
 } = require('../src/multiscope');
-const { defaultEffortProfile } = require('../src/effort');
+const { defaultEffortProfile, DEFAULT_READ_SET } = require('../src/effort');
 const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
@@ -387,6 +387,7 @@ describe('runScopeChain', () => {
   const bug = (body) => ({ path: 'a.js', line: 1, body, severity: 3 });
   const chainArgs = (spawn, extra = {}) => ({
     scope, context: '', material, spawn, log: () => {}, ledger: findingsLedger(), sweepCap: 3,
+    readFilesFor: (files) => files,
     deadline: null, now: Date.now, runningTotal: () => 'elapsed unclocked (no budget)', ...extra,
   });
   // A fake spawn seam: findingsFor(pass, prompt) answers this scope's pass-th spawn.
@@ -490,7 +491,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const passArgs = (registry) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {},
   });
 
   // A fake engine adapter: the scout returns SCOPES; each worker returns one finding tagged with its
@@ -765,7 +766,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     runMultiScopePass({
       config,
       material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
-      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log, sleepFn: async () => {},
+      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log, sleepFn: async () => {},
     });
 
   test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
@@ -821,7 +822,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const args = (registry, sweepCap, log = () => {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap, log, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap, readSet: DEFAULT_READ_SET, log, sleepFn: async () => {},
   });
 
   // A fake adapter: the scout plans SCOPES; each worker spawn returns findingsFor(scopeName, pass),
@@ -1466,7 +1467,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     usage: null,
   });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   test("a deadline-killed pass-0 worker yields a PARTIAL review: siblings' findings delivered, the gap carried as data, no in-place retry", async () => {
@@ -1597,7 +1598,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
   const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   // A fake engine with known per-spawn durations: the scout runs minutes 0–2; worker for scope s in
@@ -1864,7 +1865,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   const run = async (extra = {}, registry = makeRegistry()) => {
     const logs = [];
     await runMultiScopePass({
-      config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0,
+      config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, readSet: DEFAULT_READ_SET,
       log: (m) => logs.push(m), sleepFn: async () => {}, ...extra,
     });
     return logs;

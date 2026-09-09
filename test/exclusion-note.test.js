@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 
 const { filterFiles, NO_EXCLUSIONS, excludedPathList } = require('../src/diff');
 const { buildPrMaterial, buildRepoMaterial, planScopes, runMultiScopePass } = require('../src/multiscope');
+const { DEFAULT_READ_SET } = require('../src/effort');
 
 // EXCLUDE_PATTERNS removes changed files from the reviewed diff, and the reviewer used to be told
 // nothing about it — so a file it EXPECTED to change was absent, and absence-by-configuration was
@@ -228,6 +229,7 @@ describe('the strip is wired end to end — material → plan boundary → worke
       instructionsPath: 'x',
       laneCeiling: 4,
       sweepCap: 0,
+      readSet: DEFAULT_READ_SET,
       log: m => logs.push(m),
       sleepFn: async () => {},
     });

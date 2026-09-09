@@ -262,10 +262,16 @@ eval/out/<case-name>/<timestamp>-run<i>/
 
 The engine is **pinned by the case** and cannot be overridden — a replay on a different
 model would corrupt every comparison. Review *effort* is the opposite: it is the thing an
-A/B is for. `--sweep-cap <N>` sets how many convergence sweeps each scope may run after its
-first pass, and both `run-case.js` and `freeze-suite.js` take it. `0` is the
-pre-convergence single-pass behavior; unset is the engine's own `DEFAULT_SWEEP_CAP`
-(`src/effort.js` owns that number — nothing here copies it).
+A/B is for. Both `run-case.js` and `freeze-suite.js` take one flag per effort axis, and each
+flag's default is read from `src/effort.js`, which owns the value — nothing here copies it:
+
+| Flag | Axis | Arms |
+| --- | --- | --- |
+| `--sweep-cap <N>` | convergence sweeps allowed per scope after its first pass | `0` is the pre-convergence single-pass behavior; unset is `DEFAULT_SWEEP_CAP` |
+| `--read-set <arm>` | which changed files each scope worker opens **in full** | `assigned` (shipped: the read is split across the plan) or `changed` (pre-split: every worker reads the whole changed set); unset is `DEFAULT_READ_SET` |
+
+An axis is only ever varied **one at a time**: two arms that differ on two axes produce a delta
+attributable to neither.
 
 Give each arm its own `--out` root:
 
@@ -278,11 +284,20 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-swe
 for c in eval/out/ab-sweep2/*/ eval/out/ab-sweep0/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 ```
 
+The read-set arms run the same way — the flag is the only thing that changes:
+
+```bash
+# arm A — split reads, the shipped cost cut
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-assigned --read-set assigned
+# arm B — every worker reads the whole changed set, the behavior the cut replaced
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-changed --read-set changed
+```
+
 Every run records the effort profile it actually ran under in its `meta.json`, and both ends
 **refuse** a mix: `freeze-suite.js` reads the arm of every run already under `--out` and aborts
 before resolving a credential, and `score.js` refuses a case-out dir whose runs disagree. Both name
 both arms. That is what makes the resume story safe: re-running a suite into an existing `--out`
-under a different `--sweep-cap` — forgetting the flag while topping up an arm is the easy slip —
+under a different `--sweep-cap` or `--read-set` — forgetting the flag while topping up an arm is the easy slip —
 would otherwise look exactly like a completed suite, queue only the deficit at the new arm, and
 produce a band that blends two arms and describes neither. A run replayed before the arm was recorded counts
 as its own value — `unrecorded` matches only `unrecorded`, because nothing proves what it

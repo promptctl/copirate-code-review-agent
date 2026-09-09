@@ -248,14 +248,25 @@ function parseEffort(raw, label) {
   const ok = typeof raw === 'object' && !Array.isArray(raw)
     && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
     && Number.isInteger(raw.sweepCap) && raw.sweepCap >= 0
-    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string');
+    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string')
+    // The read-set arm is accepted as any string, exactly as reasoningTier is, rather than against
+    // src/effort.js's vocabulary: this parser reads RECORDS, and a record naming an arm this tree no
+    // longer declares is a real historical run, not a malformed one. An unknown arm still cannot be
+    // averaged into anything — it forms its own arm and refuses by mismatch below. [LAW:one-way-deps]
+    // the eval reader stays independent of the engine's current vocabulary.
+    && (raw.readSet === undefined || raw.readSet === null || typeof raw.readSet === 'string');
   if (!ok) {
     throw new Error(
-      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>}, ` +
-      `got ${JSON.stringify(raw)}.`,
+      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>, ` +
+      `readSet: <string|null>}, got ${JSON.stringify(raw)}.`,
     );
   }
-  return { roundCap: raw.roundCap, sweepCap: raw.sweepCap, reasoningTier: raw.reasoningTier };
+  // [LAW:one-source-of-truth] A per-AXIS absence, read the same two ways the whole-effort absence is: a
+  // missing key (a meta.json written before this axis existed — every 2mg.1 replay) and an explicit null
+  // (what this parser's own writer emits back into scorecard-summary.json). It is NOT a synonym for the
+  // default arm: what an unrecorded axis ran at is unknown, and guessing it is exactly how two arms get
+  // averaged into one number that names neither.
+  return { roundCap: raw.roundCap, sweepCap: raw.sweepCap, reasoningTier: raw.reasoningTier, readSet: raw.readSet ?? null };
 }
 
 // [LAW:one-source-of-truth] ONE rendering of an effort, used both to COMPARE two runs' arms and to name
@@ -263,7 +274,11 @@ function parseEffort(raw, label) {
 function describeEffort(effort) {
   return effort === null
     ? 'unrecorded'
-    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'}`;
+    // [LAW:no-silent-failure] readSet renders its absence as 'unrecorded', NOT as reasoningTier's 'none'.
+    // The two nulls are different facts: a null tier is a produced value meaning "no raise", while a null
+    // arm only ever comes off the wire from a run predating the axis — so it must read as the same word
+    // the whole-effort absence uses, and must never collide with the name of a real arm.
+    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'} readSet=${effort.readSet ?? 'unrecorded'}`;
 }
 
 // [LAW:parse-dont-validate] A case-out dir's runs are one population or they are not scorable: the mean
