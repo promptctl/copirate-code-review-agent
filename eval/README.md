@@ -208,7 +208,8 @@ is attributable to the code change under test, never to a replay that drifted.
 ```bash
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
-#          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share)
+#          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
+#          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
@@ -254,6 +255,35 @@ eval/out/<case-name>/<timestamp>-run<i>/
 
 `eval/out/` is git-ignored — run artifacts are never committed. Like everything under
 `eval/`, `run-case.js` is dev-only tooling and does **not** bump the version.
+
+## Varying a lever: A/B arms
+
+The engine is **pinned by the case** and cannot be overridden — a replay on a different
+model would corrupt every comparison. Review *effort* is the opposite: it is the thing an
+A/B is for. `--sweep-cap <N>` sets how many convergence sweeps each scope may run after its
+first pass, and both `run-case.js` and `freeze-suite.js` take it. `0` is the
+pre-convergence single-pass behavior; unset is the engine's own `DEFAULT_SWEEP_CAP`
+(`src/effort.js` owns that number — nothing here copies it).
+
+Give each arm its own `--out` root:
+
+```bash
+# arm A — sweeps on, the shipped behavior
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep2 --sweep-cap 2
+# arm B — sweeps off, the faster review being priced
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep0 --sweep-cap 0
+# score each arm as usual, then read the recall / noise / cost bands off the two summaries
+for c in eval/out/ab-sweep2/*/ eval/out/ab-sweep0/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
+```
+
+Every run records the effort profile it actually ran under in its `meta.json`, and
+`score.js` **refuses** a case-out dir whose runs disagree, naming both arms. That is what
+makes the resume story safe: re-running a suite into an existing `--out` under a different
+`--sweep-cap` would otherwise look exactly like a completed suite, and its band would be a
+blend of two arms that describes neither. A run replayed before the arm was recorded counts
+as its own value — `unrecorded` matches only `unrecorded`, because nothing proves what it
+ran at. The arm also rides on each `scorecard.json` and `scorecard-summary.json`, so a
+number lifted out of an artifact carries the setting that produced it.
 
 ## Scoring a replay
 
@@ -329,6 +359,7 @@ Full-suite workflow (run → score → freeze):
 #    Per-replay logs land in the SIBLING eval/out/freeze-<sha>-logs/, so every child of the out
 #    root below is a case run dir and the glob in step 2 needs no exclusions.
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
+#    (a baseline is frozen at the DEFAULT arm; --sweep-cap belongs to A/B roots, not to this one)
 # 2. Score each case (writes scorecard-summary.json per case).
 for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 # 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).

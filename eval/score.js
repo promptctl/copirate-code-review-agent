@@ -231,7 +231,62 @@ function parseMeta(raw, label) {
   if (json.case !== path.basename(json.case) || json.case === '.' || json.case === '..') {
     throw new Error(`${label} 'case' must be a plain directory component, got ${JSON.stringify(json.case)}.`);
   }
-  return { case: json.case, config: json.config ?? null, candidate: parseCandidate(json.candidate, label) };
+  return { case: json.case, config: json.config ?? null, effort: parseEffort(json.effort, label), candidate: parseCandidate(json.candidate, label) };
+}
+
+// The review effort a run was produced under, as run-case.js recorded it: the whole EffortProfile, since
+// each axis is a lever some A/B varies. Absent on runs replayed before the arm was recorded — a typed
+// absence (null), which is a DIFFERENT value from "recorded at the default", not a synonym for it: what
+// an unrecorded run ran at is unknown, and guessing it is how two arms get averaged into one number.
+// [LAW:parse-dont-validate] [LAW:no-silent-failure] anything else is a malformed record, refused.
+function parseEffort(raw, label) {
+  if (raw === undefined) return null;
+  const ok = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+    && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
+    && Number.isInteger(raw.sweepCap) && raw.sweepCap >= 0
+    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string');
+  if (!ok) {
+    throw new Error(
+      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>}, ` +
+      `got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return { roundCap: raw.roundCap, sweepCap: raw.sweepCap, reasoningTier: raw.reasoningTier };
+}
+
+// [LAW:one-source-of-truth] ONE rendering of an effort, used both to COMPARE two runs' arms and to name
+// them in the refusal — so the message can never describe a difference the comparison did not make.
+function describeEffort(effort) {
+  return effort === null
+    ? 'unrecorded'
+    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'}`;
+}
+
+// [LAW:parse-dont-validate] A case-out dir's runs are one population or they are not scorable: the mean
+// of two cases, or of two review efforts, is a number that names neither. This is the checkpoint that
+// turns a pile of run dirs into a POPULATION — its output is the scope every scorecard in the dir shares,
+// so the reduction downstream can read the arm off run 0 and be right.
+// [LAW:effects-at-boundaries] Pure: metas in, scope out; the caller does the reading.
+// [LAW:no-silent-failure] The refusal names the offending dir and both sides, because "these disagree" a
+// hundred runs deep is a message that sends the reader searching.
+function agreedScope(runs) {
+  const [first, ...rest] = runs;
+  const scope = { case: first.meta.case, effort: describeEffort(first.meta.effort) };
+  for (const { dir, meta } of rest) {
+    if (meta.case !== scope.case) {
+      throw new Error(`Run ${dir} is case '${meta.case}' but earlier runs are '${scope.case}'. A case-out dir holds one case.`);
+    }
+    // The rule an A/B leans on: a suite resumed under a different --sweep-cap looks exactly like a
+    // completed suite, and its band would blend two arms. An UNRECORDED arm is its own value — it does
+    // not match a recorded one, because nothing proves what it ran at.
+    if (describeEffort(meta.effort) !== scope.effort) {
+      throw new Error(
+        `Run ${dir} ran at effort ${describeEffort(meta.effort)} but earlier runs ran at ${scope.effort}. ` +
+        `A case-out dir holds one arm — give each A/B arm its own --out.`,
+      );
+    }
+  }
+  return scope;
 }
 
 // The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
@@ -356,6 +411,7 @@ async function scoreRun({ expected, produced, usage, meta, judge, matcherLabel }
   return {
     case: meta.case,
     config: meta.config,
+    effort: meta.effort,
     matcher: matcherLabel,
     findingCount: produced.length,
     candidatePairs: candidatePairs.length,
@@ -393,6 +449,9 @@ function aggregateRuns(caseName, scorecards) {
     case: caseName,
     runs: scorecards.length,
     matcher: scorecards.length ? scorecards[0].matcher : null,
+    // Safe to read off run 0: main refuses a case-out dir whose runs disagree on their arm, so by the
+    // time a summary is reduced there is only one effort in it. [LAW:single-enforcer]
+    effort: scorecards.length ? scorecards[0].effort : null,
     mustFindRecall: band(scorecards.map(s => s.mustFind.recall)),
     inventoryMustFindRecall: band(scorecards.map(s => s.inventoryMustFind.recall)),
     niceToFindRecall: band(scorecards.map(s => s.niceToFind.recall)),
@@ -727,15 +786,13 @@ async function main() {
     });
   }
 
-  const scorecards = [];
-  let caseName = null;
-  for (const runDir of runDirs) {
-    const meta = parseMeta(fs.readFileSync(path.join(runDir, 'meta.json'), 'utf8'), path.join(runDir, 'meta.json'));
-    if (caseName === null) caseName = meta.case;
-    // [LAW:no-silent-failure] Every run under one case-out dir must be the same case — a mismatch means the
-    // dir was assembled wrong, and averaging across cases would be a silently meaningless number.
-    if (meta.case !== caseName) throw new Error(`Run ${runDir} is case '${meta.case}' but earlier runs are '${caseName}'. A case-out dir holds one case.`);
+  // Every run's provenance is read and RECONCILED before the first judge call: a dir that could never
+  // yield a quotable number is refused while it is still free to refuse. [LAW:parse-dont-validate]
+  const runs = runDirs.map(dir => ({ dir, meta: parseMeta(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'), path.join(dir, 'meta.json')) }));
+  const { case: caseName } = agreedScope(runs);
 
+  const scorecards = [];
+  for (const { dir: runDir, meta } of runs) {
     const expectedPath = path.join(path.resolve(opts.casesDir), meta.case, 'expected.json');
     if (!fs.existsSync(expectedPath)) throw new Error(`No expected.json for case '${meta.case}' at ${expectedPath} (set --cases-dir?).`);
     const expected = parseExpected(fs.readFileSync(expectedPath, 'utf8'), expectedPath);
@@ -764,7 +821,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,

@@ -8,6 +8,7 @@ const {
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
   requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
+  parseEffort, describeEffort, agreedScope,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -540,4 +541,75 @@ test('callJudge posts to the pinned Anthropic messages endpoint with the model i
   // engine's credential — routing it anywhere else is the failure this line pins.
   assert.equal(seen[0].auth, 'Bearer k');
   require('fs').rmSync(tmp, { force: true });
+});
+
+
+// [LAW:verifiable-goals] AC (copirate-measurement-2mg.1): an A/B is only readable if each run says which
+// arm produced it and a dir cannot hold two. These cover the arm's parse, its one rendering, and the
+// checkpoint that turns a pile of run dirs into a scorable population.
+describe('the arm a run was produced under', () => {
+  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+
+  test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
+    assert.deepEqual(parseEffort(profile, 'meta.json'), profile);
+    assert.deepEqual(parseEffort({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }, 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high' });
+  });
+
+  test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
+    assert.equal(parseEffort(undefined, 'meta.json'), null);
+    assert.equal(describeEffort(null), 'unrecorded');
+    assert.notEqual(describeEffort(null), describeEffort(profile));
+  });
+
+  test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
+    for (const bad of [null, 'high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
+      assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
+    }
+  });
+
+  test('parseMeta carries the arm through, and tolerates a run recorded before it existed', () => {
+    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', effort: profile }), 'm').effort, profile);
+    assert.equal(parseMeta(JSON.stringify({ case: 'alpha' }), 'm').effort, null);
+  });
+
+  test('agreedScope returns the scope a whole case-out dir shares', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile } } },
+    ];
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none' });
+  });
+
+  test('a dir resumed under a different --sweep-cap is refused, not averaged into a band naming neither arm', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile, sweepCap: 0 } } },
+    ];
+    assert.throws(() => agreedScope(runs), /r2 ran at effort roundCap=0 sweepCap=0 .* earlier runs ran at roundCap=0 sweepCap=2/);
+    assert.throws(() => agreedScope(runs), /give each A\/B arm its own --out/);
+  });
+
+  test('an unrecorded run mixed with a recorded one is refused too — unknown is not a match', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: profile } },
+    ];
+    assert.throws(() => agreedScope(runs), /ran at effort roundCap=0 sweepCap=2 .* earlier runs ran at unrecorded/);
+  });
+
+  test('a dir of only pre-provenance runs still scores — legacy suites are one population', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: null } },
+    ];
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'unrecorded' });
+  });
+
+  test('the case rule is unchanged: a foreign case in the dir is still refused', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'beta', effort: null } },
+    ];
+    assert.throws(() => agreedScope(runs), /A case-out dir holds one case/);
+  });
 });

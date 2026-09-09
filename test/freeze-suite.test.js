@@ -37,6 +37,12 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['-n', '0']), /positive integer/);
   assert.throws(() => parseArgs(['-n', '2.5']), /positive integer/);
   assert.throws(() => parseArgs(['--job-timeout', '0']), /positive integer/);
+  // The arm every replay runs at: unset is the engine's own bound, and 0 — the sweeps-off arm — is a
+  // setting, not a rejected value. A blank one is refused rather than coerced to that arm by Number('').
+  assert.equal(parseArgs([]).sweepCap, require('../src/effort').DEFAULT_SWEEP_CAP);
+  assert.equal(parseArgs(['--sweep-cap', '0']).sweepCap, 0);
+  assert.throws(() => parseArgs(['--sweep-cap', '-1']), /--sweep-cap must be a non-negative integer/);
+  assert.throws(() => parseArgs(['--sweep-cap=  ']), /--sweep-cap must be a non-negative integer/);
 });
 
 describe('planJobs', () => {
@@ -513,11 +519,14 @@ describe('laneReplay hands the injected replay its share of the host', () => {
     const replay = laneReplay({
       lanes: [{ name: 'A', value: 'a' }, { name: 'B', value: 'b' }],
       totalMemBytes: 8 * 2 ** 30,
+      sweepCap: 0,
       replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
     });
     const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
     assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
-    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30 }]);
+    // The suite's own facts — the memory share and the arm every replay runs — are folded in here, so
+    // the lane loop never carries either.
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0 }]);
   });
 });
 
@@ -528,6 +537,7 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     outRoot: '/out/freeze-abc',
     memoryBudget: 8 * 2 ** 30,
+    sweepCap: 0,
   });
 
   test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
@@ -535,7 +545,9 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     assert.equal(s.command, process.execPath);
     // The share arrives as bytes on the child's own flag: L children each defaulting to the whole host
     // would multiply the per-lane memory guardrail by L.
-    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30)]);
+    // The arm is on the child's argv too, always — never implicit at the default — so which arm a replay
+    // ran is readable from the spawn, not inferred from the suite's flags.
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30), '--sweep-cap', '0']);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });

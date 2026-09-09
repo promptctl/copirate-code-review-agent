@@ -23,13 +23,17 @@
 // It is also the gate's replay step: eval/compare.js spawns this command over the baseline's case set
 // (--cases) so a gate run and a freeze are one scheduler, not a serial loop beside a parallel one.
 //
-// [LAW:effects-at-boundaries] Module load is PURE: only stdlib. Every world-effect (fs, spawn, env reads)
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + pure helpers. Every world-effect (fs, spawn, env reads)
 // lives inside main() or a helper it calls, so importing this file for the planner tests touches nothing.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+// [LAW:one-source-of-truth] The sweep bound's owner is src/effort.js, so --sweep-cap's default is read
+// from it rather than copied here or into run-case.js's spawn line. effort.js has an EMPTY require
+// graph, so this stays a pure-helper import under the load-purity rule above.
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 const USAGE = `Replay every golden case N times into one output root, resumably, across one or more credentials.
 
@@ -46,6 +50,11 @@ Usage: node eval/freeze-suite.js [options]
   --credentials <A,B,…>    Names of env vars holding one credential each. One LANE per name, run
                            concurrently; each lane replays jobs sequentially. Default: a single lane
                            reading the suite provider's own credential input.
+  --sweep-cap <N>          Convergence sweeps allowed per scope, forwarded to every replay (default: the
+                           engine's own DEFAULT_SWEEP_CAP). 0 is the sweeps-off arm of an A/B. Give each
+                           arm its OWN --out: the cap is recorded per run and the scorer refuses a
+                           case-out dir whose runs disagree, so a resume under the wrong cap is caught,
+                           not averaged.
   --help                   Show this help.
 
 Every case must pin the same engine — the rule eval/baseline.js enforces on the resulting suite, applied
@@ -66,8 +75,8 @@ const MAX_TIMER_MS = 2147483647;
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO. Mirrors
 // run-case.js's parser, including its `--flag looks-like-another-flag` refusal. [LAW:one-source-of-truth]
 function parseArgs(argv) {
-  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120 };
-  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout' };
+  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120, sweepCap: DEFAULT_SWEEP_CAP };
+  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout', 'sweep-cap': 'sweepCap' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -93,6 +102,10 @@ function parseArgs(argv) {
   }
   opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
   opts.jobTimeout = parsePositiveInt(opts.jobTimeout, '--job-timeout');
+  // Parsed HERE, before any lane resolves or any dollar is spent, rather than left for the first child
+  // to reject three minutes in — the same reason --cases is checked against the golden set up front.
+  // Floor 0: sweeps-off is a legal arm, not a bad input. [LAW:parse-dont-validate]
+  opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
   // A delay past Node's 32-bit ceiling does not wait longer — setTimeout fires it on the next tick. So
   // `--job-timeout 100000`, reaching for "no meaningful limit", would kill every replay within ~1ms and
   // report each one TIMED OUT: the operator's intent inverted, in a report that blames the replays.
@@ -106,10 +119,22 @@ function parseArgs(argv) {
   return opts;
 }
 
-function parsePositiveInt(value, label) {
+// [LAW:one-type-per-behavior] One integer parse; the FLOOR is the only difference between a count (≥1)
+// and a cap whose off position is 0, so it crosses as a value and the floor's English name is a lookup
+// rather than a branch — each error still promises its exact accept set.
+const FLOOR_NAME = { 0: 'a non-negative integer', 1: 'a positive integer' };
+
+function parseIntAtLeast(value, label, min) {
+  // [LAW:no-silent-failure] Number('') and Number(' ') are 0. The option loop refuses the exactly-empty
+  // value, but not an all-whitespace one, and a cap whose floor is 0 would take it as the sweeps-off arm.
+  if (typeof value !== 'number' && String(value).trim() === '') throw new Error(`${label} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(value)}).`);
   const n = typeof value === 'number' ? value : Number(String(value).trim());
-  if (!Number.isInteger(n) || n < 1) throw new Error(`${label} must be a positive integer (got ${JSON.stringify(value)}).`);
+  if (!Number.isInteger(n) || n < min) throw new Error(`${label} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(value)}).`);
   return n;
+}
+
+function parsePositiveInt(value, label) {
+  return parseIntAtLeast(value, label, 1);
 }
 
 // [LAW:parse-dont-validate] A comma list of env var NAMES in, a lane list with its VALUES already read
@@ -476,10 +501,14 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
 // provider reads is the security-relevant half of this file, and it inherited process.env — so a wrong
 // key does not fail, it silently replays on whatever credential the parent happened to be holding. A
 // mapping only a real spawn can observe is a mapping nothing asserts.
-function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }) {
+function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap }) {
   return {
     command: process.execPath,
-    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget)],
+    // --sweep-cap is passed on EVERY replay, never only when it differs from the default: an arm that is
+    // implicit in one spawn and explicit in another is an arm nothing can read back off the argv.
+    // [LAW:dataflow-not-control-flow] A value that is not an integer here needs no guard — run-case.js's
+    // own parser is the single enforcer and refuses it by name. [LAW:single-enforcer]
+    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget), '--sweep-cap', String(sweepCap)],
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, [credentialInput]: lane.value },
   };
@@ -500,14 +529,14 @@ function laneMemoryShare(totalMemBytes, laneCount) {
 // host folded in. The share is the suite's fact — it knows how many lanes share the machine — so it is
 // bound here, once, and the lane loop never learns it. Derived when a replay runs, not when the closure
 // is built: a suite with nothing to run resolves no lanes, and there is no share of nothing.
-function laneReplay({ lanes, totalMemBytes, replay }) {
-  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length) });
+function laneReplay({ lanes, totalMemBytes, sweepCap, replay }) {
+  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length), sweepCap });
 }
 
 // [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
 // it — the deadline, the process group, the log — belongs to superviseSpawn above.
-function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, logPath, timeoutMinutes }) {
-  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }), logPath, timeoutMinutes });
+function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, logPath, timeoutMinutes }) {
+  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap }), logPath, timeoutMinutes });
 }
 
 // A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
@@ -662,7 +691,7 @@ async function main() {
   const done = [];
   const started = Date.now();
   // Each replay plans its lanes against its share of the host, bound in laneReplay.
-  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), replay: runReplay });
+  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), sweepCap: opts.sweepCap, replay: runReplay });
   await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
@@ -704,4 +733,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, parsePositiveInt, parseIntAtLeast, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

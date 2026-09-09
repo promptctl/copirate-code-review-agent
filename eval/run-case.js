@@ -28,6 +28,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+// [LAW:one-source-of-truth] The sweep bound's owner is src/effort.js, so --sweep-cap's default is read
+// from it rather than copied here. This is the one src require at module load: effort.js has an EMPTY
+// require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
+// cannot bind TRANSCRIPT_DIR before main() redirects RUNNER_TEMP.
+const { DEFAULT_SWEEP_CAP, defaultEffortProfile } = require('../src/effort');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
 artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
@@ -41,17 +46,23 @@ Usage: node eval/run-case.js <case-dir> [options]
                       Host memory this replay plans its lanes against (default: the whole machine).
                       freeze-suite passes each concurrent replay its share, so L replays keep the
                       per-lane memory guardrail instead of each assuming the host is theirs.
+  --sweep-cap <N>     Convergence sweeps allowed per scope after its first pass (default: the engine's
+                      own DEFAULT_SWEEP_CAP). 0 replays the pre-convergence single-pass behavior — the
+                      lever an A/B prices. The value used is recorded in every run's meta.json, and the
+                      scorer refuses a case-out dir whose runs disagree, so an arm cannot be mixed.
   --help              Show this help.
 
 The engine (provider/model/reasoning) is PINNED by case.json and cannot be overridden here — a replay
-on a different model would corrupt any baseline comparison, so a mismatch is refused loudly.
+on a different model would corrupt any baseline comparison, so a mismatch is refused loudly. Review
+EFFORT is not pinned by the case: it is the lever an A/B varies over one frozen case, which is why
+--sweep-cap is offered where --model is refused.
 `;
 
 // [LAW:effects-at-boundaries] Pure arg parse: flags + one required positional map to a plain options
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
-  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null };
-  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget' };
+  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -88,17 +99,37 @@ function parseArgs(argv) {
   // null is the recorded absence — "plan against the whole host" — resolved where the host is read, not
   // here: this parser does no IO. [LAW:effects-at-boundaries]
   if (opts.memoryBudget !== null) opts.memoryBudget = parsePositiveInt(opts.memoryBudget, '--memory-budget');
+  // The cap leaves the parser as an integer with NO absent case: unset means DEFAULT_SWEEP_CAP, already
+  // in the slot, so main builds one effort profile unconditionally instead of branching on "was it
+  // given?". [LAW:dataflow-not-control-flow] Its floor is 0 — the sweeps-off arm is a legal setting,
+  // not a bad input — which is why it parses against 0 rather than through parsePositiveInt.
+  opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
   return opts;
 }
 
-// [LAW:parse-dont-validate] Parse a CLI flag as a positive integer — the accept set is exactly
-// {1,2,3,…}. Number() + Number.isInteger rejects '2.5'/'3.7'/'abc' where parseInt would SILENTLY
-// TRUNCATE ('2.5' → 2), so the check finally matches the "positive integer" the error promises.
+// [LAW:one-source-of-truth] How a CLI integer is parsed is one rule; the FLOOR is the only thing that
+// differs between a count (≥1) and a cap whose off position is 0, so the floor crosses as a value and
+// the two accept sets are one function, not two near-copies. [LAW:one-type-per-behavior]
+// The floor's English name is a lookup, not a branch, so each error still promises the exact accept set.
+const FLOOR_NAME = { 0: 'a non-negative integer', 1: 'a positive integer' };
+
+// [LAW:parse-dont-validate] Parse a CLI flag as an integer at or above `min` — the accept set is exactly
+// {min, min+1, …}. Number() + Number.isInteger rejects '2.5'/'3.7'/'abc' where parseInt would SILENTLY
+// TRUNCATE ('2.5' → 2), so the check finally matches what the error promises.
 // [LAW:no-silent-failure] The rejected value is echoed so a typo is located, not guessed.
-function parsePositiveInt(raw, flag) {
+function parseIntAtLeast(raw, flag, min) {
+  // [LAW:no-silent-failure] Number('') and Number(' ') are 0, so a flag given no value would parse as
+  // zero — invisible for a count (0 is below its floor) and CATASTROPHIC for a cap whose floor IS 0:
+  // `--sweep-cap=` would silently select the sweeps-off arm. Blank is refused before the coercion.
+  if (String(raw).trim() === '') throw new Error(`${flag} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(raw)}).`);
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} must be a positive integer (got ${JSON.stringify(raw)}).`);
+  if (!Number.isInteger(n) || n < min) throw new Error(`${flag} must be ${FLOOR_NAME[min]} (got ${JSON.stringify(raw)}).`);
   return n;
+}
+
+// The counts' floor, named once. [LAW:one-source-of-truth]
+function parsePositiveInt(raw, flag) {
+  return parseIntAtLeast(raw, flag, 1);
 }
 
 // [LAW:parse-dont-validate] Parse the raw case.json into a validated manifest — a value whose existence
@@ -410,6 +441,12 @@ async function main() {
       `Replaying case '${manifest.name}' ${opts.repeats}× on ${config.name} (${config.model}) over ${files.length} file(s)…\n`,
     );
 
+    // [LAW:one-source-of-truth] ONE profile for the whole invocation, built before the loop: every repeat
+    // of a case is the same arm by construction, and this is the exact value meta.json records — the
+    // scorer reads the arm off the run instead of re-deriving it from a directory name or the operator's
+    // memory of which flag they typed.
+    const effort = defaultEffortProfile({ sweepCap: opts.sweepCap });
+
     const runDirs = [];
     for (let i = 1; i <= opts.repeats; i++) {
       const runDir = path.join(caseOutRoot, runDirName(timestamp, i));
@@ -423,7 +460,7 @@ async function main() {
       // freeze-suite, L replays share one machine, and each one sizing itself to os.totalmem() multiplies
       // the per-lane guardrail by L. [LAW:one-source-of-truth]
       const { review } = await runMultiScope({
-        chain: [config], material, registry, instructionsPath,
+        chain: [config], material, registry, instructionsPath, effort,
         laneCeiling: laneCeilingFromMemory(opts.memoryBudget ?? os.totalmem()),
         log: msg => process.stderr.write(`[run ${i}] ${msg}\n`),
       });
@@ -437,6 +474,11 @@ async function main() {
         meta: {
           case: manifest.name, timestamp, run: i, repeats: opts.repeats,
           config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
+          // The effort ACTUALLY passed to the engine, not the flags typed at it — provenance of the arm
+          // this run belongs to, the same way `config` is provenance of the engine it ran on. A run whose
+          // arm is unrecorded (produced before this field existed) is a different value from one recorded
+          // at the default, and the scorer treats it as such. [FRAMING:representation]
+          effort,
           candidate,
           findingCount: review.findings.length,
         },
