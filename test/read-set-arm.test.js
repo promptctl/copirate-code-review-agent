@@ -39,14 +39,13 @@ const SCOPES = [
 
 // One pass over the material at one arm, returning what the engine actually saw: every worker prompt,
 // plus the plan the pass reviewed. The adapter's first spawn is the scout; the rest are workers.
-async function passAtArm(readSet) {
-  const material = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
+async function passAtArm(readSet, { material = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }), scopes = SCOPES } = {}) {
   const workerPrompts = [];
   let spawn = 0;
   const adapter = {
     async produceReview({ buildPromptFor }) {
       const prompt = buildPromptFor(TOOL_NAMES);
-      if (spawn++ === 0) return { summary: 'ctx', findings: [], assessments: [], scopes: SCOPES, usage: null };
+      if (spawn++ === 0) return { summary: 'ctx', findings: [], assessments: [], scopes, usage: null };
       workerPrompts.push(prompt);
       return { summary: 'sum', findings: [], assessments: [], usage: null };
     },
@@ -123,6 +122,35 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
     const { scopes, withheldAssignments } = planScopes(SCOPES, ['src/auth.js', 'src/io.js'], []);
     assert.deepEqual(scopes.map(s => s.files), [['src/auth.js'], ['src/io.js']]);
     assert.deepEqual(withheldAssignments, []);
+  });
+
+  // The bug this guards: `scopeFiles` once carried BOTH what a worker opens and what it was assigned, and
+  // the two coincided until this axis existed. Projected to [] under 'changed', the ownership test would
+  // find no go.mod on ANY worker and a bumped dependency would produce ZERO assessments — a silent quality
+  // difference between the arms that has nothing to do with the read set, contaminating the very A/B this
+  // file exists to make trustworthy. Ownership is an identical-everywhere-else fact. [LAW:one-source-of-truth]
+  test('exactly one worker owns the go.mod bump under BOTH arms — the arm never moves ownership', async () => {
+    const depFiles = [
+      { filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' },
+      ...FILES,
+    ];
+    const depScopes = [
+      { name: 'deps', focus: 'the go.mod bump', files: ['go.mod'] },
+      ...SCOPES,
+    ];
+    const dependencySummaries = [{
+      modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true, owner: 'a', repoName: 'b',
+      compareUrl: 'https://github.com/a/b/compare/v1.0.0...v1.1.0', totalCommits: 1,
+      commits: [{ sha: 'x'.repeat(12), message: 'm' }], totalFiles: 0, files: [],
+    }];
+    for (const arm of ['assigned', 'changed']) {
+      const material = buildPrMaterial({ files: depFiles, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, dependencySummaries });
+      const { workerPrompts } = await passAtArm(arm, { material, scopes: depScopes });
+      const owners = workerPrompts.filter(p => p.includes("You own this PR's go.mod bump"));
+      assert.equal(owners.length, 1, `${arm}: expected exactly one go.mod owner, got ${owners.length}`);
+      assert.equal(owners[0], promptFor(workerPrompts, 'deps'), `${arm}: the wrong worker owns the bump`);
+      assert.match(owners[0], /VERBATIM: github\.com\/a\/b/);
+    }
   });
 
   test('the default profile replays the shipped arm — an omitted arm cannot silently become the other one', async () => {

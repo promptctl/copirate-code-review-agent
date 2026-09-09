@@ -138,7 +138,7 @@ multiscope.runMultiScope = async ({ material, chain }) => {
 const { runPrReview } = require('../src/run');
 
 const review = () => runPrReview('Review Agent', [], defaultEffortProfile({ roundCap: 0 }), null);
-const workerPrompt = (material) => material.buildWorkerPrompt('the whole change', TOOL_NAMES, material.changedPaths, []);
+const workerPrompt = (material) => material.buildWorkerPrompt('the whole change', TOOL_NAMES, { assigned: material.changedPaths, read: material.changedPaths }, []);
 
 describe('a pull request whose every changed file arrives without a patch', () => {
   // GitHub omits `patch` for a file whose diff is large (roughly >400 changed lines) or binary, so
