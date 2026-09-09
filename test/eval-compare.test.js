@@ -227,6 +227,26 @@ test('compareVerdict refuses incomparable N / engine / matcher / case set', () =
   ])), /Incomparable case sets.*missing \[case-b\].*extra \[case-c\]/s);
 });
 
+test('compareVerdict refuses a candidate replayed at a different arm than the baseline was frozen at', () => {
+  const armed = (name, effort) => {
+    const c = caseEntry(name, { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 }, [[1, 3], [2, 3]]);
+    c.summary.effort = effort;
+    return c;
+  };
+  const SWEEPS_ON = { roundCap: 3, sweepCap: 2, reasoningTier: null };
+  const SWEEPS_OFF = { roundCap: 3, sweepCap: 0, reasoningTier: null };
+  const baseline = frozenBaseline([armed('case-a', SWEEPS_ON), armed('case-b', SWEEPS_ON)]);
+  // The case the gate most needs to refuse: a PR that moves DEFAULT_SWEEP_CAP replays the candidate at its
+  // own new default, and the recall delta reported against the old floor would be an arm delta wearing a
+  // regression's clothes.
+  assert.throws(() => compareVerdict(baseline, candidateSuite([armed('case-a', SWEEPS_OFF), armed('case-b', SWEEPS_OFF)])),
+    /Incomparable: candidate ran at effort roundCap=3 sweepCap=0 .* but the baseline was frozen at roundCap=3 sweepCap=2/);
+  assert.equal(compareVerdict(baseline, candidateSuite([armed('case-a', SWEEPS_ON), armed('case-b', SWEEPS_ON)])).status, 'OK');
+  // A pre-arm baseline cannot prove what it ran at, so it gates a recorded candidate exactly as before —
+  // the two committed baselines are that case, and this check must not retire them.
+  assert.equal(compareVerdict(frozenBaseline(CASES_A()), candidateSuite([armed('case-a', SWEEPS_OFF), armed('case-b', SWEEPS_OFF)])).status, 'OK');
+});
+
 test('compareVerdict refuses a candidate whose pooled inventory opportunities differ from the baseline', () => {
   // expected.json is a living document (curated independent of re-freezing); if a case's inventory changed
   // opportunity count since the baseline was frozen, the candidate's pooled denominator no longer matches

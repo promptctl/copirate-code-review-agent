@@ -248,8 +248,10 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     names its scope and pass, a 'scout' carries neither. A per-replay duration is the
                     envelope of those spans, derivable from the artifact with no CI log to scrape.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
-                    and candidate ({sha, dirty}: the tree that produced the run; null on runs from
-                    before it was recorded).
+                    effort ({roundCap, sweepCap, reasoningTier}: the arm the run ACTUALLY ran at; null
+                    on runs from before it was recorded, which matches only other nulls), and candidate
+                    ({sha, dirty}: the tree that produced the run; null on runs from before it was
+                    recorded).
   transcripts/    — the full per-spawn session transcripts (scout + one per scope).
 ```
 
@@ -336,9 +338,11 @@ can never silently reuse a stale ruling.
 ```
 eval/out/<case-name>/
   <ts>-run<i>/scorecard.json   — per run: must-find/nice-to-find recall (found, total, foundIds,
-                                 missedIds), noise items, cost, and the per-pair match detail.
-  scorecard-summary.json       — across the case's runs: mean/min/max recall band, the shape 2fk.4
-                                 (baseline/variance) reduces.
+                                 missedIds), noise items, cost, the run's effort (the arm, copied from
+                                 meta.json), and the per-pair match detail.
+  scorecard-summary.json       — across the case's runs: mean/min/max recall band and the one effort
+                                 every run in the dir shares, the shape 2fk.4 (baseline/variance)
+                                 reduces.
 ```
 
 The judge is a **measurement instrument** and is validated once: hand-match the
@@ -433,7 +437,8 @@ eval/baseline/<date>-<short-sha>/
   baseline.json   — the frozen distribution (schema v2): the suite's pooled INVENTORY must-find gate floor
                     (the one gate number), the frozen-round pooled rate (continuity diagnostic), each case's
                     inventory + frozen-round recall bands (mean/min/max) + diagnostic floor, the suite cost,
-                    the pinned engine, and the degradation rule. parseBaseline (exported) is the loader the
+                    the pinned engine, the effort the suite was frozen at (null on a pre-arm freeze, which
+                    the gate reads as "cannot prove its arm"), and the degradation rule. parseBaseline (exported) is the loader the
                     compare gate (2fk.5) reuses, and evaluateGate is the one predicate that applies the rule.
   baseline.md     — the same, human-readable: the per-case band table, suite cost, and the rule.
 ```

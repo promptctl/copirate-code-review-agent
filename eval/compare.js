@@ -31,7 +31,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort } = require('./score');
 const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
@@ -230,6 +230,12 @@ function compareVerdict(baseline, candidate) {
   if (baseline.engine && !sameEngine(candidate.engine, baseline.engine)) {
     throw new Error(`Incomparable: candidate ran on engine ${JSON.stringify(candidate.engine)} but the baseline pins ${JSON.stringify(baseline.engine)}.`);
   }
+  // The arm is the same kind of pin: a candidate replayed at a different sweep bound is measuring the
+  // lever, not the change under test. A pre-arm baseline cannot prove what it ran at, so — as with the
+  // engine — the check applies only once the baseline names one.
+  if (baseline.effort && describeEffort(candidate.effort) !== describeEffort(baseline.effort)) {
+    throw new Error(`Incomparable: candidate ran at effort ${describeEffort(candidate.effort)} but the baseline was frozen at ${describeEffort(baseline.effort)}. Recall from two arms isn't comparable.`);
+  }
   if (baseline.matcher && candidate.matcher !== baseline.matcher) {
     throw new Error(`Incomparable: candidate was scored with matcher '${candidate.matcher}' but the baseline used '${baseline.matcher}'. Recall from two matchers isn't comparable.`);
   }
@@ -291,6 +297,7 @@ function compareVerdict(baseline, candidate) {
     degraded,
     repeats: baseline.repeats,
     engine: baseline.engine,
+    effort: baseline.effort,
     matcher: baseline.matcher,
     pooled: {
       candidate: candidatePooled,
@@ -330,7 +337,8 @@ function renderVerdictMarkdown(verdict, meta = {}) {
     `Candidate${meta.candidate === undefined ? '' : ` (${describeTree(meta.candidate)})`} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
-      ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
+      ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}` +
+      `${verdict.effort ? ` · effort ${describeEffort(verdict.effort)}` : ''}.`,
     '',
     `**PRIMARY GATE — pooled inventory must-find recall:** candidate **${pct(p.candidate.rate)}** ` +
       `(${p.candidate.found}/${p.candidate.opportunities}) vs gate floor **${pct(p.gateFloor)}** ` +

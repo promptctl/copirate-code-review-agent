@@ -389,6 +389,9 @@ function parseBaseline(raw, label) {
   return {
     schema: json.schema, mainSha: json.mainSha, generatedAt: json.generatedAt ?? null,
     engine: json.engine ?? null, matcher: json.matcher ?? null, repeats: json.repeats,
+    // The arm the gate compares a candidate against — parsed, not defaulted, so a committed baseline
+    // carrying a malformed profile is refused here rather than gating as 'unrecorded'.
+    effort: parseEffort(json.effort, label),
     degradationRule: json.degradationRule ?? null,
     pooledInventoryMustFind: { found: pooled.found, opportunities: pooled.opportunities, rate: pooled.rate ?? null, gateFloor: pooled.gateFloor },
     cases,
