@@ -41,6 +41,10 @@ function caseEntry(name, mustFindBand, opts = {}) {
   return {
     summary: {
       case: name, runs: opts.runs ?? 2, matcher: opts.matcher ?? 'llm/deepseek-v4-flash',
+      // The arm, as parseCaseSummary always produces it: an EffortProfile, or null for a run replayed
+      // before the arm was recorded. Stated rather than omitted, so a fixture can never pass by being
+      // undefined on both sides of a comparison it was meant to exercise.
+      effort: opts.effort ?? null,
       mustFindRecall: mustFindBand,
       inventoryMustFindRecall: opts.inventoryBand ?? mustFindBand,
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: 2 },
@@ -109,6 +113,13 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   // mustFind / inventoryMustFind are parsed to typed {found,total} at the boundary, not kept as raw strings.
   assert.deepEqual(s.perRun[0].mustFind, { found: 1, total: 3 });
   assert.deepEqual(s.perRun[0].inventoryMustFind, { found: 1, total: 3 });
+  // A summary written before the arm was recorded carries a typed absence, never an invented default.
+  assert.equal(s.effort, null);
+  assert.deepEqual(
+    parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null } }), 'x').effort,
+    { roundCap: 3, sweepCap: 0, reasoningTier: null },
+  );
+  assert.throws(() => parseCaseSummary(summaryFixture({ effort: { roundCap: 3 } }), 'x'), /'effort' must be/);
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary.
   assert.throws(() => parseCaseSummary('123', 'x'), /not a JSON object/);
   assert.throws(() => parseCaseSummary(summaryFixture({ case: '' }), 'x'), /no 'case' name/);
@@ -243,6 +254,25 @@ test('buildBaseline computes per-full-run cost only when every run is costed', (
   assert.equal(b.suite.costPerFullRunUsd, 0.2); // 0.4 / 2 repeats
 });
 
+test('buildBaseline records the arm the suite was measured at, and the markdown names it', () => {
+  const arm = { roundCap: 3, sweepCap: 0, reasoningTier: null };
+  const cases = [
+    caseEntry('case-a', { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 }, { effort: arm }),
+    caseEntry('case-b', { mean: 1, min: 1, max: 1, n: 2 }, { effort: arm }),
+  ];
+  const b = buildBaseline({ cases, provenance: { sha: 'deadbeef', date: '2026-09-08' } });
+  assert.deepEqual(b.effort, arm);
+  assert.match(renderBaselineMarkdown(b), /sweepCap=0/);
+  // A suite of runs replayed before the arm was recorded still freezes — the two committed baselines are
+  // exactly that — and says out loud that it cannot name its lever.
+  const legacy = buildBaseline({
+    cases: [caseEntry('case-a', { mean: 1, min: 1, max: 1, n: 2 })],
+    provenance: { sha: 'deadbeef', date: '2026-09-08' },
+  });
+  assert.equal(legacy.effort, null);
+  assert.match(renderBaselineMarkdown(legacy), /unrecorded/);
+});
+
 test('buildBaseline refuses an inconsistent or empty suite loudly', () => {
   assert.throws(() => buildBaseline({ cases: [], provenance: { sha: 'a', date: 'd' } }), /no scored cases/);
   // Mixed N.
@@ -260,6 +290,23 @@ test('buildBaseline refuses an inconsistent or empty suite loudly', () => {
     cases: [caseEntry('a', { mean: 1, min: 1, max: 1, n: 2 }), caseEntry('b', { mean: 1, min: 1, max: 1, n: 2 }, { engine: { provider: 'zai', model: 'glm', reasoning: null } })],
     provenance: { sha: 'a', date: 'd' },
   }), /one engine/);
+  // Mixed arm — the A/B trap. A sweeps-off suite and a sweeps-on suite average into a number that
+  // describes neither lever, and nothing else in the freeze would have noticed.
+  assert.throws(() => buildBaseline({
+    cases: [
+      caseEntry('a', { mean: 1, min: 1, max: 1, n: 2 }, { effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }),
+      caseEntry('b', { mean: 1, min: 1, max: 1, n: 2 }, { effort: { roundCap: 3, sweepCap: 0, reasoningTier: null } }),
+    ],
+    provenance: { sha: 'a', date: 'd' },
+  }), /freezes one arm/);
+  // An UNRECORDED arm is its own value, not a wildcard that matches whatever it is paired with.
+  assert.throws(() => buildBaseline({
+    cases: [
+      caseEntry('a', { mean: 1, min: 1, max: 1, n: 2 }, { effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }),
+      caseEntry('b', { mean: 1, min: 1, max: 1, n: 2 }),
+    ],
+    provenance: { sha: 'a', date: 'd' },
+  }), /freezes one arm/);
   // Zero inventory must-find opportunities (every perRun is 0/0) — not a gradeable baseline. Refusing at the
   // producer keeps its output loadable by parseBaseline (which requires opportunities>=1 + a finite gate floor).
   assert.throws(() => buildBaseline({

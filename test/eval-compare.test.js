@@ -27,6 +27,9 @@ function caseEntry(name, mustFindBand, perRun, engine) {
   return {
     summary: {
       case: name, runs: perRun.length, matcher: 'llm/deepseek-v4-flash',
+      // The arm, as parseCaseSummary always produces it. These fixtures predate the lever, so both sides
+      // are the typed absence — stated, not omitted, so the arm agreement is exercised rather than skipped.
+      effort: null,
       mustFindRecall: mustFindBand,
       inventoryMustFindRecall: mustFindBand,
       niceToFindRecall: { mean: 0, min: 0, max: 0, n: perRun.length },
@@ -224,6 +227,26 @@ test('compareVerdict refuses incomparable N / engine / matcher / case set', () =
   ])), /Incomparable case sets.*missing \[case-b\].*extra \[case-c\]/s);
 });
 
+test('compareVerdict refuses a candidate replayed at a different arm than the baseline was frozen at', () => {
+  const armed = (name, effort) => {
+    const c = caseEntry(name, { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 }, [[1, 3], [2, 3]]);
+    c.summary.effort = effort;
+    return c;
+  };
+  const SWEEPS_ON = { roundCap: 3, sweepCap: 2, reasoningTier: null };
+  const SWEEPS_OFF = { roundCap: 3, sweepCap: 0, reasoningTier: null };
+  const baseline = frozenBaseline([armed('case-a', SWEEPS_ON), armed('case-b', SWEEPS_ON)]);
+  // The case the gate most needs to refuse: a PR that moves DEFAULT_SWEEP_CAP replays the candidate at its
+  // own new default, and the recall delta reported against the old floor would be an arm delta wearing a
+  // regression's clothes.
+  assert.throws(() => compareVerdict(baseline, candidateSuite([armed('case-a', SWEEPS_OFF), armed('case-b', SWEEPS_OFF)])),
+    /Incomparable: candidate ran at effort roundCap=3 sweepCap=0 .* but the baseline was frozen at roundCap=3 sweepCap=2/);
+  assert.equal(compareVerdict(baseline, candidateSuite([armed('case-a', SWEEPS_ON), armed('case-b', SWEEPS_ON)])).status, 'OK');
+  // A pre-arm baseline cannot prove what it ran at, so it gates a recorded candidate exactly as before —
+  // the two committed baselines are that case, and this check must not retire them.
+  assert.equal(compareVerdict(frozenBaseline(CASES_A()), candidateSuite([armed('case-a', SWEEPS_OFF), armed('case-b', SWEEPS_OFF)])).status, 'OK');
+});
+
 test('compareVerdict refuses a candidate whose pooled inventory opportunities differ from the baseline', () => {
   // expected.json is a living document (curated independent of re-freezing); if a case's inventory changed
   // opportunity count since the baseline was frozen, the candidate's pooled denominator no longer matches
@@ -415,6 +438,7 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
 const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
 
+
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };
   const runs = [
@@ -490,7 +514,7 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
       fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
       return dir;
     };
-    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false } });
+    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } });
     const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
     mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
     mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
@@ -502,8 +526,10 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
     assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
     fs.rmSync(misplaced, { recursive: true, force: true });
     assert.deepEqual(prior, [
-      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false } },
-      { case: 'case-a', dir: a2, candidate: null },
+      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } },
+      // The arm rides through beside the tree, and a run recorded before either existed reads as null for
+      // both — the census the arm check below consumes.
+      { case: 'case-a', dir: a2, candidate: null, effort: null },
     ]);
     assert.deepEqual(readPriorRuns(path.join(root, 'absent'), ['case-a']), []);
   } finally {

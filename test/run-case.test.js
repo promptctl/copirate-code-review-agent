@@ -3,6 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial } = require('../eval/run-case');
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 test('parseArgs takes the required positional and applies defaults', () => {
   const o = parseArgs(['eval/cases/foo']);
@@ -11,6 +12,30 @@ test('parseArgs takes the required positional and applies defaults', () => {
   assert.equal(o.out, 'eval/out');
   // No budget given: the recorded absence, resolved to the whole host where the host is read.
   assert.equal(o.memoryBudget, null);
+  // The arm has no absent case: unset IS the engine's own bound, read from the axis's owner rather than
+  // copied, so main builds one effort profile with no branch on "was it given?".
+  assert.equal(o.sweepCap, DEFAULT_SWEEP_CAP);
+});
+
+// [LAW:verifiable-goals] AC (copirate-measurement-2mg.1): the sweeps-off arm is expressible at the CLI,
+// and only integers at or above 0 are — the cap bounds the chain, so a negative or fractional one is a
+// typo, never a setting.
+describe('parseArgs takes --sweep-cap as a non-negative integer, in both flag forms', () => {
+  test('0 is a legal SETTING — the sweeps-off arm — not a rejected value', () => {
+    assert.equal(parseArgs(['foo', '--sweep-cap', '0']).sweepCap, 0);
+    assert.equal(parseArgs(['foo', '--sweep-cap=0']).sweepCap, 0);
+    assert.equal(parseArgs(['foo', '--sweep-cap', '4']).sweepCap, 4);
+  });
+
+  test('a value outside {0,1,2,…} is refused, naming the flag and echoing what was typed', () => {
+    for (const bad of ['-1', '1.5', 'lots', '']) {
+      assert.throws(() => parseArgs(['foo', `--sweep-cap=${bad}`]), /--sweep-cap must be a non-negative integer/, `--sweep-cap=${bad}`);
+    }
+  });
+
+  test('the counts keep their own floor: --repeats still refuses 0', () => {
+    assert.throws(() => parseArgs(['foo', '-n', '0']), /must be a positive integer/);
+  });
 });
 
 test('parseArgs takes --memory-budget as a positive integer of bytes, in both flag forms', () => {

@@ -8,6 +8,7 @@ const {
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
   requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
+  parseEffort, describeEffort, agreedScope, misarmedRuns,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -235,7 +236,7 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
     { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },
     { path: 'q.ts', line: 1, body: 'novel unrelated thing', severity: 'advisory' },
   ]), 'f');
-  const args = { expected: EXPECTED_V, produced, usage: { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 2 }, span: null, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
+  const args = { expected: EXPECTED_V, produced, usage: { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 2 }, span: null, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } }, judge: keywordJudge, matcherLabel: 'fake' };
   const a = await scoreRun(args);
   const b = await scoreRun(args);
   assert.deepEqual(a, b); // deterministic given the same judge
@@ -245,12 +246,19 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
   assert.equal(a.inventoryMustFind.recall, 1);
   assert.equal(a.noise.count, 1);
   assert.equal(a.usage.cost.usd, 0.5);
+  // The arm reaches the artifact unchanged. This assignment is the only link between a run's real
+  // provenance and every arm check the freezer and the gate make downstream — dropped or misspelled, it
+  // would leave `effort` undefined, which JSON omits entirely, and no other test would notice.
+  assert.deepEqual(a.effort, { roundCap: 0, sweepCap: 2, reasoningTier: null });
 });
 
 test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   // Each fixture run found `found` of the 7 frozen-round must-finds and invFound of the 9 inventory-wide ones.
   const mk = (found, total, invFound, invTotal, noise, usd) => ({
     matcher: 'fake',
+    // scoreRun always sets this — to a profile, or to null for a run recorded before the arm existed.
+    // Stated here so the band's arm is read from a scorecard shaped like a real one.
+    effort: null,
     mustFind: { found, total, recall: total ? found / total : null },
     inventoryMustFind: { found: invFound, total: invTotal, recall: invTotal ? invFound / invTotal : null },
     niceToFind: { found: 0, total: 0, recall: null },
@@ -260,6 +268,12 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   });
   const s = aggregateRuns('demo', [mk(7, 7, 8, 9, 2, 0.01), mk(5, 7, 5, 9, 4, 0.02), mk(6, 7, 6, 9, 3, 0.03)]);
   assert.equal(s.runs, 3);
+  // The summary carries the one arm its runs share — read off run 0, which main's agreedScope refusal is
+  // what makes safe. This is the field baseline.js and compare.js gate on. A summary of runs recorded
+  // before the arm existed says so, rather than naming a default nobody proved.
+  assert.equal(s.effort, null);
+  const armed = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+  assert.deepEqual(aggregateRuns('demo', [{ ...mk(7, 7, 8, 9, 2, 0.01), effort: armed }]).effort, armed);
   assert.equal(s.mustFindRecall.max, 1);
   assert.equal(s.mustFindRecall.min, 5 / 7);
   assert.ok(Math.abs(s.mustFindRecall.mean - (1 + 5 / 7 + 6 / 7) / 3) < 1e-9);
@@ -540,4 +554,94 @@ test('callJudge posts to the pinned Anthropic messages endpoint with the model i
   // engine's credential — routing it anywhere else is the failure this line pins.
   assert.equal(seen[0].auth, 'Bearer k');
   require('fs').rmSync(tmp, { force: true });
+});
+
+
+// [LAW:verifiable-goals] AC (copirate-measurement-2mg.1): an A/B is only readable if each run says which
+// arm produced it and a dir cannot hold two. These cover the arm's parse, its one rendering, and the
+// checkpoint that turns a pile of run dirs into a scorable population.
+describe('the arm a run was produced under', () => {
+  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+
+  test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
+    assert.deepEqual(parseEffort(profile, 'meta.json'), profile);
+    assert.deepEqual(parseEffort({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }, 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high' });
+  });
+
+  test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
+    assert.equal(parseEffort(undefined, 'meta.json'), null);
+    // The same absence, spelled the way JSON spells it — what aggregateRuns writes for a legacy suite
+    // and baseline.js reads straight back. One absence, one meaning, both spellings.
+    assert.equal(parseEffort(null, 'scorecard-summary.json'), null);
+    assert.equal(describeEffort(null), 'unrecorded');
+    assert.notEqual(describeEffort(null), describeEffort(profile));
+  });
+
+  test('misarmedRuns names every run the invocation cannot pool with, which identity alone would pass', () => {
+    const on = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+    const runs = [
+      { dir: 'r1', effort: on },    // the arm this invocation replays at
+      { dir: 'r2', effort: off },   // left by a --sweep-cap 0 invocation against the same root
+      { dir: 'r3', effort: null },  // replayed before the arm was recorded — nothing proves what it ran at
+    ];
+    const misarmed = misarmedRuns(on, runs);
+    assert.deepEqual(misarmed.map(m => m.dir), ['r2', 'r3']);
+    // Both arms in one phrase: the operator has to know which side to fix.
+    assert.match(misarmed[0].reason, /was replayed at effort roundCap=0 sweepCap=0 .*this invocation replays at roundCap=0 sweepCap=2/);
+    assert.match(misarmed[1].reason, /was replayed at effort unrecorded/);
+    assert.deepEqual(misarmedRuns(on, []), []);
+  });
+
+  test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
+    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
+      assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
+    }
+  });
+
+  test('parseMeta carries the arm through, and tolerates a run recorded before it existed', () => {
+    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', effort: profile }), 'm').effort, profile);
+    assert.equal(parseMeta(JSON.stringify({ case: 'alpha' }), 'm').effort, null);
+  });
+
+  test('agreedScope returns the scope a whole case-out dir shares', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile } } },
+    ];
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none' });
+  });
+
+  test('a dir resumed under a different --sweep-cap is refused, not averaged into a band naming neither arm', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile, sweepCap: 0 } } },
+    ];
+    assert.throws(() => agreedScope(runs), /r2 ran at effort roundCap=0 sweepCap=0 .* earlier runs ran at roundCap=0 sweepCap=2/);
+    assert.throws(() => agreedScope(runs), /give each A\/B arm its own --out/);
+  });
+
+  test('an unrecorded run mixed with a recorded one is refused too — unknown is not a match', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: profile } },
+    ];
+    assert.throws(() => agreedScope(runs), /ran at effort roundCap=0 sweepCap=2 .* earlier runs ran at unrecorded/);
+  });
+
+  test('a dir of only pre-provenance runs still scores — legacy suites are one population', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: null } },
+    ];
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'unrecorded' });
+  });
+
+  test('the case rule is unchanged: a foreign case in the dir is still refused', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: null } },
+      { dir: '/out/alpha/r2', meta: { case: 'beta', effort: null } },
+    ];
+    assert.throws(() => agreedScope(runs), /A case-out dir holds one case/);
+  });
 });

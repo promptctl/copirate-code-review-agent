@@ -17,8 +17,12 @@
 //      was built with (so producer and comparator can NEVER drift — [LAW:one-source-of-truth]), and
 //   4. applies the frozen pooled degradation rule via baseline.js's evaluateGate: candidate pooled
 //      inventory must-find recall < the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
-// N and the engine are DERIVED FROM the baseline and asserted, because a candidate run at a different N or
-// engine is not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
+// N comes FROM the baseline and is imposed on the replay. The engine and the review-effort ARM are the
+// checked-out tree's own — the case's pin and src/effort.js's default — and are ASSERTED against the
+// baseline's, because a candidate run at a different N, engine, or arm is not comparable: its pooled rate
+// measures a different thing. Asserted, never forced: this CLI has no --sweep-cap, so a tree whose
+// DEFAULT_SWEEP_CAP moved is refused rather than quietly replayed at the baseline's arm, which would gate
+// a PR while neutralizing the very change under test. [LAW:no-silent-failure]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib and functions imported from baseline.js (the
 // pure reducers), score.js (parsers, the run census) and run-case.js (the tree identity) — nothing runs at
@@ -31,7 +35,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort, misarmedRuns } = require('./score');
 const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
@@ -43,8 +47,13 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          committed baseline under eval/baseline/, by commit-graph order — NOT directory-name
                          order, and an uncommitted baseline.json always outranks a committed one. Refused
                          (exit 2) if the newest can't be determined unambiguously (e.g. a shallow git clone
-                         with more than one candidate); pass --baseline explicitly in that case. N, engine,
-                         and matcher come FROM whichever baseline is resolved.
+                         with more than one candidate); pass --baseline explicitly in that case. N comes FROM
+                         whichever baseline is resolved and is imposed on the replay; the engine, matcher,
+                         and review-effort arm are the checked-out tree's own (or this CLI's flag) and are
+                         ASSERTED against the baseline's — a mismatch refuses rather than adapts. A tree
+                         whose default arm (src/effort.js DEFAULT_SWEEP_CAP) differs from the baseline's is
+                         REFUSED before any spend, not replayed at the baseline's arm: re-freeze, or price
+                         the lever with an A/B (see eval/README, "Varying a lever").
   --matcher <kind>       Semantic matcher for scoring the candidate: 'llm' (default) or 'lexical'. MUST
                          match the baseline's matcher, or the recall numbers aren't comparable — refused
                          up front, before any spend. IGNORED under --reuse-candidate (no scoring runs in
@@ -230,6 +239,12 @@ function compareVerdict(baseline, candidate) {
   if (baseline.engine && !sameEngine(candidate.engine, baseline.engine)) {
     throw new Error(`Incomparable: candidate ran on engine ${JSON.stringify(candidate.engine)} but the baseline pins ${JSON.stringify(baseline.engine)}.`);
   }
+  // The arm is the same kind of pin: a candidate replayed at a different sweep bound is measuring the
+  // lever, not the change under test. A pre-arm baseline cannot prove what it ran at, so — as with the
+  // engine — the check applies only once the baseline names one.
+  if (baseline.effort && describeEffort(candidate.effort) !== describeEffort(baseline.effort)) {
+    throw new Error(`Incomparable: candidate ran at effort ${describeEffort(candidate.effort)} but the baseline was frozen at ${describeEffort(baseline.effort)}. Recall from two arms isn't comparable.`);
+  }
   if (baseline.matcher && candidate.matcher !== baseline.matcher) {
     throw new Error(`Incomparable: candidate was scored with matcher '${candidate.matcher}' but the baseline used '${baseline.matcher}'. Recall from two matchers isn't comparable.`);
   }
@@ -291,6 +306,7 @@ function compareVerdict(baseline, candidate) {
     degraded,
     repeats: baseline.repeats,
     engine: baseline.engine,
+    effort: baseline.effort,
     matcher: baseline.matcher,
     pooled: {
       candidate: candidatePooled,
@@ -330,7 +346,8 @@ function renderVerdictMarkdown(verdict, meta = {}) {
     `Candidate${meta.candidate === undefined ? '' : ` (${describeTree(meta.candidate)})`} vs baseline` +
       `${meta.baselineSha ? ` \`${meta.baselineSha.slice(0, 7)}\`` : ''}` +
       `${eng ? ` · engine \`${eng.provider}\`/\`${eng.model}\`${eng.reasoning ? `/reasoning=${eng.reasoning}` : ''}` : ''}` +
-      ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}.`,
+      ` · N=${verdict.repeats}${verdict.matcher ? ` · matcher \`${verdict.matcher}\`` : ''}` +
+      `${verdict.effort ? ` · effort ${describeEffort(verdict.effort)}` : ''}.`,
     '',
     `**PRIMARY GATE — pooled inventory must-find recall:** candidate **${pct(p.candidate.rate)}** ` +
       `(${p.candidate.found}/${p.candidate.opportunities}) vs gate floor **${pct(p.gateFloor)}** ` +
@@ -500,7 +517,7 @@ function readPriorRuns(candidateRoot, caseNames) {
     const metaPath = path.join(dir, 'meta.json');
     const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
     if (meta.case !== name) throw new Error(`${metaPath} names case '${meta.case}' but lives under '${name}' — a misplaced run; move or remove it.`);
-    return { case: name, dir, candidate: meta.candidate };
+    return { case: name, dir, candidate: meta.candidate, effort: meta.effort };
   }));
 }
 
@@ -520,6 +537,12 @@ function main() {
   const baseline = parseBaseline(rawBaselineText, baselineJsonPath);
   const rawBaselineSuite = JSON.parse(rawBaselineText).suite;
   const repeats = baseline.repeats;
+
+  // The arm THIS invocation will replay at, resolved once: replayArgs forwards no effort flags, so
+  // run-case.js builds the checked-out tree's own default profile. Guard 4d holds it against the
+  // baseline's arm; step 5 holds every prior run under --out against it. One derivation, two uses.
+  // [LAW:one-source-of-truth]
+  const candidateEffort = require('../src/effort').defaultEffortProfile();
 
   const casesDir = path.resolve(opts.casesDir);
   const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
@@ -593,6 +616,20 @@ function main() {
         }
       }
     }
+
+    // 4d. Fail BEFORE spending on ARM drift, for the same reason 4c exists: compareVerdict's arm check
+    //     only fires after the entire suite has replayed and scored. This replay forwards no effort
+    //     flags, so run-case.js builds the checked-out tree's own default profile — read it from the one
+    //     module that owns it rather than restating the number here. [LAW:one-source-of-truth]
+    //     Refusing is deliberate, not a missing feature: a PR that moves DEFAULT_SWEEP_CAP could instead
+    //     be FORCED onto the baseline's arm, but the arm change is then the very change under test, and
+    //     the gate would report a confident OK on a PR whose recall effect it had just neutralized.
+    //     Re-freeze the baseline, or price the lever with an A/B. [LAW:no-silent-failure]
+    if (baseline.effort) {
+      if (describeEffort(candidateEffort) !== describeEffort(baseline.effort)) {
+        throw new Error(`Incomparable: this tree replays at effort ${describeEffort(candidateEffort)} but the baseline was frozen at ${describeEffort(baseline.effort)} — the review effort drifted since the freeze. Re-freeze the baseline before gating, or measure the lever with an A/B (see eval/README's "Varying a lever").`);
+      }
+    }
   }
 
   process.stderr.write(`\nBaseline: ${baselineJsonPath}\n`);
@@ -621,6 +658,13 @@ function main() {
     const foreign = foreignRuns(candidate, prior);
     if (foreign.length > 0) {
       throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
+    }
+    // The arm is not provable from identity the way the engine is, so a run left here at another
+    // --sweep-cap passes every check above and would only surface in score.js's agreedScope at 7b —
+    // after the rest of the suite has replayed at full spend. [LAW:no-silent-failure]
+    const misarmed = misarmedRuns(candidateEffort, prior);
+    if (misarmed.length > 0) {
+      throw new Error(`--out ${candidateRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nA suite pooled across two arms measures neither. Pick a fresh --out, or remove them first.`);
     }
     const excess = excessRuns(caseNames, prior, repeats);
     if (excess.length > 0) {

@@ -37,6 +37,12 @@ test('parseArgs rejects bad input loudly', () => {
   assert.throws(() => parseArgs(['-n', '0']), /positive integer/);
   assert.throws(() => parseArgs(['-n', '2.5']), /positive integer/);
   assert.throws(() => parseArgs(['--job-timeout', '0']), /positive integer/);
+  // The arm every replay runs at: unset is the engine's own bound, and 0 — the sweeps-off arm — is a
+  // setting, not a rejected value. A blank one is refused rather than coerced to that arm by Number('').
+  assert.equal(parseArgs([]).sweepCap, require('../src/effort').DEFAULT_SWEEP_CAP);
+  assert.equal(parseArgs(['--sweep-cap', '0']).sweepCap, 0);
+  assert.throws(() => parseArgs(['--sweep-cap', '-1']), /--sweep-cap must be a non-negative integer/);
+  assert.throws(() => parseArgs(['--sweep-cap=  ']), /--sweep-cap must be a non-negative integer/);
 });
 
 describe('planJobs', () => {
@@ -305,7 +311,10 @@ describe('runLane', () => {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { censusCases, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
+const { censusCases, priorRunArms, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
+// The arm an unflagged replay runs at, from the module that owns the number — a literal here would fail
+// these tests with an unrelated arm-mismatch the day that default moves. [LAW:one-source-of-truth]
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 const tmpTree = () => fs.mkdtempSync(path.join(os.tmpdir(), 'freeze-suite-test-'));
 const writeCase = (casesDir, dirName, manifestName) => {
@@ -316,11 +325,55 @@ const writeCase = (casesDir, dirName, manifestName) => {
   }));
   return dir;
 };
-const writeRun = (outRoot, caseName, runName, findings) => {
+// A completed run as run-case.js leaves it: findings.json AND the meta.json recording what produced it,
+// written together. `effort` defaults to the arm an unflagged replay runs at, which is what a resume the
+// census must accept looks like.
+const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null }) => {
   const dir = path.join(outRoot, caseName, runName);
   fs.mkdirSync(dir, { recursive: true });
-  if (findings) fs.writeFileSync(path.join(dir, 'findings.json'), '[]');
+  if (findings) {
+    fs.writeFileSync(path.join(dir, 'findings.json'), '[]');
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, effort }));
+  }
 };
+
+describe('priorRunArms reads what arm each existing run was produced at', () => {
+  test('every counted run reports its recorded arm, and a pre-arm run reports none', () => {
+    const root = tmpTree();
+    writeCase(path.join(root, 'cases'), 'delta', 'delta');
+    const outRoot = path.join(root, 'out');
+    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+    writeRun(outRoot, 'delta', 'run-1', true, off);
+    writeRun(outRoot, 'delta', 'run-2', true, null);
+    assert.deepEqual(priorRunArms(['delta'], outRoot).map(r => r.effort), [off, null]);
+    // A case with nothing under --out contributes nothing, rather than a run with an unknown arm.
+    assert.deepEqual(priorRunArms(['never-replayed'], outRoot), []);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a counted run with no meta.json is a torn record, refused by name', () => {
+    const root = tmpTree();
+    const outRoot = path.join(root, 'out');
+    writeRun(outRoot, 'epsilon', 'run-1', true);
+    // run-case.js writes meta.json first and findings.json last, so this shape cannot come from a crash —
+    // and skipping it would let a run whose arm cannot be proven pass the resume check as if it matched.
+    fs.rmSync(path.join(outRoot, 'epsilon', 'run-1', 'meta.json'));
+    assert.throws(() => priorRunArms(['epsilon'], outRoot), /torn run record/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // The census stays content-blind on purpose: it runs again after every replay, and a read that could
+  // throw on run content would discard the report and timing of a suite that has already spent.
+  test('the census counts a torn record rather than throwing on it — it must survive the closing pass', () => {
+    const root = tmpTree();
+    const dir = writeCase(path.join(root, 'cases'), 'zeta', 'zeta');
+    const outRoot = path.join(root, 'out');
+    writeRun(outRoot, 'zeta', 'run-1', true);
+    fs.rmSync(path.join(outRoot, 'zeta', 'run-1', 'meta.json'));
+    assert.deepEqual(censusCases([dir], outRoot).map(c => c.completed), [1]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
 
 describe('censusCases counts what the scorer will actually find', () => {
   // A case has one identity, its directory's name; a manifest that says otherwise is refused at the census
@@ -513,11 +566,14 @@ describe('laneReplay hands the injected replay its share of the host', () => {
     const replay = laneReplay({
       lanes: [{ name: 'A', value: 'a' }, { name: 'B', value: 'b' }],
       totalMemBytes: 8 * 2 ** 30,
+      sweepCap: 0,
       replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
     });
     const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
     assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
-    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30 }]);
+    // The suite's own facts — the memory share and the arm every replay runs — are folded in here, so
+    // the lane loop never carries either.
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0 }]);
   });
 });
 
@@ -528,6 +584,7 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     outRoot: '/out/freeze-abc',
     memoryBudget: 8 * 2 ** 30,
+    sweepCap: 0,
   });
 
   test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
@@ -535,7 +592,9 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     assert.equal(s.command, process.execPath);
     // The share arrives as bytes on the child's own flag: L children each defaulting to the whole host
     // would multiply the per-lane memory guardrail by L.
-    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30)]);
+    // The arm is on the child's argv too, always — never implicit at the default — so which arm a replay
+    // ran is readable from the spawn, not inferred from the suite's flags.
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30), '--sweep-cap', '0']);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });
@@ -627,6 +686,44 @@ describe('the CLI selects case directories before any manifest is parsed', () =>
     const r = run(['--cases-dir', casesDir, '-n', '1', '--out', outRoot]);
     assert.notEqual(r.status, 0);
     assert.match(r.out, /wip.*not valid JSON/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s pre-spend arm guard, through the real CLI. The refusal has no unit seam: it sits in main()
+// ABOVE credentialInputFor, and that POSITION is the whole claim — a resume that forgot --sweep-cap 0 is
+// refused before the credential is even looked for, so no lane resolves and no replay spends. Running the
+// CLI with the pinned provider's credential absent is what pins the ordering; supplying one would leave a
+// guard that had slid below lane resolution passing this test.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI refuses a mixed-arm resume before it needs a credential', () => {
+  const { spawnSync } = require('node:child_process');
+  const { providerSpec } = require('../src/provider');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+
+  test('a run planted at the sweeps-off arm refuses a default-arm invocation, naming both arms', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true, { roundCap: 0, sweepCap: 0, reasoningTier: null });
+
+    // N=2 against one completed run leaves a real deficit, so without the guard this invocation would plan
+    // a replay and go looking for a lane — and the pinned provider's credential is stripped from the
+    // child's env, so reaching that point would fail with a credential error instead of this one.
+    const env = { ...process.env };
+    delete env[providerSpec('deepseek').credentialInput];
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '2', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const out = `${r.stdout}${r.stderr}`;
+
+    assert.notEqual(r.status, 0, out);
+    assert.match(out, /run\(s\) produced at a different review effort/);
+    assert.match(out, /was replayed at effort roundCap=0 sweepCap=0 /);
+    assert.match(out, new RegExp(`this invocation replays at roundCap=0 sweepCap=${DEFAULT_SWEEP_CAP} `));
+    // Nothing was scheduled: the suite/deficit banner main() prints once lanes resolve never appears.
+    assert.doesNotMatch(out, /replay\(s\) to run/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

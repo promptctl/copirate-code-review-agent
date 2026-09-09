@@ -23,13 +23,20 @@
 // It is also the gate's replay step: eval/compare.js spawns this command over the baseline's case set
 // (--cases) so a gate run and a freeze are one scheduler, not a serial loop beside a parallel one.
 //
-// [LAW:effects-at-boundaries] Module load is PURE: only stdlib. Every world-effect (fs, spawn, env reads)
+// [LAW:effects-at-boundaries] Module load is PURE: only stdlib + pure helpers. Every world-effect (fs, spawn, env reads)
 // lives inside main() or a helper it calls, so importing this file for the planner tests touches nothing.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+// [LAW:one-source-of-truth] The sweep bound's owner is src/effort.js, so --sweep-cap's default is read
+// from it rather than copied here or into run-case.js's spawn line. effort.js has an EMPTY require
+// graph, so this stays a pure-helper import under the load-purity rule above.
+const { DEFAULT_SWEEP_CAP, defaultEffortProfile } = require('../src/effort');
+// [LAW:one-source-of-truth] The CLI-integer rule's owner; run-case.js imports the same one. Empty
+// require graph, so this too stays a pure-helper import under the load-purity rule above.
+const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
 
 const USAGE = `Replay every golden case N times into one output root, resumably, across one or more credentials.
 
@@ -46,6 +53,11 @@ Usage: node eval/freeze-suite.js [options]
   --credentials <A,B,…>    Names of env vars holding one credential each. One LANE per name, run
                            concurrently; each lane replays jobs sequentially. Default: a single lane
                            reading the suite provider's own credential input.
+  --sweep-cap <N>          Convergence sweeps allowed per scope, forwarded to every replay (default: the
+                           engine's own DEFAULT_SWEEP_CAP). 0 is the sweeps-off arm of an A/B. Give each
+                           arm its OWN --out: the cap is recorded per run and the scorer refuses a
+                           case-out dir whose runs disagree, so a resume under the wrong cap is caught,
+                           not averaged.
   --help                   Show this help.
 
 Every case must pin the same engine — the rule eval/baseline.js enforces on the resulting suite, applied
@@ -66,8 +78,8 @@ const MAX_TIMER_MS = 2147483647;
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO. Mirrors
 // run-case.js's parser, including its `--flag looks-like-another-flag` refusal. [LAW:one-source-of-truth]
 function parseArgs(argv) {
-  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120 };
-  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout' };
+  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120, sweepCap: DEFAULT_SWEEP_CAP };
+  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout', 'sweep-cap': 'sweepCap' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -93,6 +105,10 @@ function parseArgs(argv) {
   }
   opts.repeats = parsePositiveInt(opts.repeats, '-n/--repeats');
   opts.jobTimeout = parsePositiveInt(opts.jobTimeout, '--job-timeout');
+  // Parsed HERE, before any lane resolves or any dollar is spent, rather than left for the first child
+  // to reject three minutes in — the same reason --cases is checked against the golden set up front.
+  // Floor 0: sweeps-off is a legal arm, not a bad input. [LAW:parse-dont-validate]
+  opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
   // A delay past Node's 32-bit ceiling does not wait longer — setTimeout fires it on the next tick. So
   // `--job-timeout 100000`, reaching for "no meaningful limit", would kill every replay within ~1ms and
   // report each one TIMED OUT: the operator's intent inverted, in a report that blames the replays.
@@ -104,12 +120,6 @@ function parseArgs(argv) {
     );
   }
   return opts;
-}
-
-function parsePositiveInt(value, label) {
-  const n = typeof value === 'number' ? value : Number(String(value).trim());
-  if (!Number.isInteger(n) || n < 1) throw new Error(`${label} must be a positive integer (got ${JSON.stringify(value)}).`);
-  return n;
 }
 
 // [LAW:parse-dont-validate] A comma list of env var NAMES in, a lane list with its VALUES already read
@@ -328,6 +338,25 @@ function censusCases(caseDirs, outRoot) {
   });
 }
 
+// The arm every run already under --out was produced at. DELIBERATELY separate from censusCases, which
+// only counts: the census runs twice — once before the spend and once after every replay, to report what
+// the scorer will find — and a read that can fail on run CONTENT must never sit in the closing one, where
+// throwing would discard the report and the timing artifact of a suite that has already spent hours.
+// [LAW:decomposition] Two questions asked at two different moments, so two functions; this one is asked
+// once, before anything is spent, where refusing costs nothing.
+function priorRunArms(caseNames, outRoot) {
+  const { listRunDirs, parseMeta } = require('./score');
+  return caseNames.flatMap(name => listRunDirs(path.join(outRoot, name)).map(runDir => {
+    const metaPath = path.join(runDir, 'meta.json');
+    // [LAW:no-silent-failure] run-case.js writes meta.json first and findings.json last (atomically), so a
+    // killed replay leaves a dir listRunDirs never counts. A counted run WITHOUT meta.json therefore means
+    // the record was torn after the fact — refused by name, never skipped, since skipping would let a run
+    // whose arm cannot be proven pass the resume check as if it matched.
+    if (!fs.existsSync(metaPath)) throw new Error(`${runDir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
+    return { dir: runDir, effort: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).effort };
+  }));
+}
+
 function discoverCaseDirs(casesDir) {
   if (!fs.existsSync(casesDir)) throw new Error(`Cases dir not found: ${casesDir}.`);
   const dirs = fs.readdirSync(casesDir, { withFileTypes: true })
@@ -476,10 +505,14 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
 // provider reads is the security-relevant half of this file, and it inherited process.env — so a wrong
 // key does not fail, it silently replays on whatever credential the parent happened to be holding. A
 // mapping only a real spawn can observe is a mapping nothing asserts.
-function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }) {
+function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap }) {
   return {
     command: process.execPath,
-    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget)],
+    // --sweep-cap is passed on EVERY replay, never only when it differs from the default: an arm that is
+    // implicit in one spawn and explicit in another is an arm nothing can read back off the argv.
+    // [LAW:dataflow-not-control-flow] A value that is not an integer here needs no guard — run-case.js's
+    // own parser is the single enforcer and refuses it by name. [LAW:single-enforcer]
+    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget), '--sweep-cap', String(sweepCap)],
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, [credentialInput]: lane.value },
   };
@@ -500,14 +533,14 @@ function laneMemoryShare(totalMemBytes, laneCount) {
 // host folded in. The share is the suite's fact — it knows how many lanes share the machine — so it is
 // bound here, once, and the lane loop never learns it. Derived when a replay runs, not when the closure
 // is built: a suite with nothing to run resolves no lanes, and there is no share of nothing.
-function laneReplay({ lanes, totalMemBytes, replay }) {
-  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length) });
+function laneReplay({ lanes, totalMemBytes, sweepCap, replay }) {
+  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length), sweepCap });
 }
 
 // [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
 // it — the deadline, the process group, the log — belongs to superviseSpawn above.
-function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, logPath, timeoutMinutes }) {
-  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget }), logPath, timeoutMinutes });
+function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, logPath, timeoutMinutes }) {
+  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap }), logPath, timeoutMinutes });
 }
 
 // A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
@@ -613,6 +646,19 @@ async function main() {
   // --cases absent means the whole golden set; that is the option's own enum, so the one branch is on it.
   const cases = censusCases(opts.cases === null ? golden : selectCaseDirs(golden, opts.cases.split(',')), outRoot);
   const pin = suitePin(cases);
+  // The arm THIS invocation replays at: run-case.js builds exactly this from the --sweep-cap forwarded to
+  // it, so the profile is read from its owner rather than restated. [LAW:one-source-of-truth]
+  const effort = defaultEffortProfile({ sweepCap: opts.sweepCap });
+  // Resuming an --out under a different --sweep-cap is the likeliest operator slip on the A/B path this
+  // command documents (forget the flag while topping up the sweeps-off arm), and the census would happily
+  // queue only the deficit at the new arm and mix two arms in one case-out dir. score.js's agreedScope is
+  // the backstop, but it fires at scoring — after the whole remaining suite has replayed at full spend.
+  // [LAW:no-silent-failure]
+  const { misarmedRuns } = require('./score');
+  const misarmed = misarmedRuns(effort, priorRunArms(cases.map(c => c.name), outRoot));
+  if (misarmed.length > 0) {
+    throw new Error(`--out ${outRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(m => `  ${m.dir} ${m.reason}`).join('\n')}\nA case-out dir holds one arm — resume with the arm these runs were produced at (--sweep-cap), or give this arm its own --out.`);
+  }
   const credentialInput = credentialInputFor(pin.provider);
 
   const jobs = planJobs({ cases, repeats: opts.repeats });
@@ -662,7 +708,7 @@ async function main() {
   const done = [];
   const started = Date.now();
   // Each replay plans its lanes against its share of the host, bound in laneReplay.
-  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), replay: runReplay });
+  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), sweepCap: opts.sweepCap, replay: runReplay });
   await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
@@ -704,4 +750,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parsePositiveInt, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, resolveLanes, priorRunArms, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
