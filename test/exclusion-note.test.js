@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 
 const { filterFiles, NO_EXCLUSIONS, excludedPathList } = require('../src/diff');
 const { buildPrMaterial, buildRepoMaterial, planScopes, runMultiScopePass } = require('../src/multiscope');
+const { DEFAULT_READ_SET } = require('../src/effort');
 
 // EXCLUDE_PATTERNS removes changed files from the reviewed diff, and the reviewer used to be told
 // nothing about it — so a file it EXPECTED to change was absent, and absence-by-configuration was
@@ -55,7 +56,7 @@ describe('the reviewer is told what was removed from its view', () => {
   // never shown asks it to infer from an absence, and that measurably lost — delivered verbatim to all
   // 15 spawns of a real run, the patterns-only note still drew the finding it forbade.
   test('the worker prompt names the withheld paths as changed, plus the patterns and the count', () => {
-    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js']);
+    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
     assert.match(prompt, /These 2 file\(s\) are part of this change and were modified by it/);
     assert.match(prompt, /EXCLUDE_PATTERNS \(build\/\*\*, \*\.lock\) removed them from your view/);
@@ -65,7 +66,7 @@ describe('the reviewer is told what was removed from its view', () => {
   // change, and a note that only forbade the conclusion lost to it. The claim is not that the files are
   // fine — it is that compliance is unobservable from this material, in either direction.
   test('the worker prompt forecloses a repo rule about the withheld files, and is not a route back to reading them', () => {
-    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js']);
+    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.match(prompt, /holds equally for a repository rule you have read requiring that they change/);
     assert.match(prompt, /cannot check compliance in either direction/);
     assert.match(prompt, /Do not read these paths, and record no finding that rests on one of them/);
@@ -78,7 +79,7 @@ describe('the reviewer is told what was removed from its view', () => {
     const many = Array.from({ length: 25 }, (_, i) => ({ filename: `build/f${i}.js`, status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x' }));
     const { reviewed, excluded } = filterFiles([...FILES, ...many], ['build/**']);
     const prompt = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded })
-      .buildWorkerPrompt('code', TOOL_NAMES, ['src/a.js']);
+      .buildWorkerPrompt('code', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.match(prompt, /\(and 6 more\)/);          // 1 build/out.js + 25 = 26 withheld, 20 named
     assert.match(prompt, /These 26 file\(s\) are part of this change/);
     assert.ok(!prompt.includes('build/f24.js'), 'the cap did not bound the list');
@@ -88,7 +89,7 @@ describe('the reviewer is told what was removed from its view', () => {
   // otherwise the false finding simply reappears one pass later.
   test('a convergence sweep prompt carries it too', () => {
     const priorFindings = [{ path: 'src/a.js', line: 1, body: 'something', severity: 3 }];
-    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, ['src/a.js'], priorFindings);
+    const prompt = material.buildWorkerPrompt('code — src/a.js', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] }, priorFindings);
     assert.match(prompt, /THIS IS A CONVERGENCE SWEEP/);
     assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
   });
@@ -228,6 +229,7 @@ describe('the strip is wired end to end — material → plan boundary → worke
       instructionsPath: 'x',
       laneCeiling: 4,
       sweepCap: 0,
+      readSet: DEFAULT_READ_SET,
       log: m => logs.push(m),
       sleepFn: async () => {},
     });

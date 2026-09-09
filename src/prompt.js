@@ -100,9 +100,13 @@ function reviewCharter(toolNames) {
 // multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
 // (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
 // never a branch. The whole annotated diff is shown either way so every anchor stays valid.
-// scopeFiles is this worker's assigned changed files: it reads THOSE in full, not the whole changed
-// set, so N workers cost ~1× the read of the changed set (split), not N× (duplicated). Empty scopeFiles
-// is the whole-set read (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
+// [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
+// value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
+// owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
+// arm, src/effort.js, applied to that assignment). They coincide under the shipped 'assigned' arm, which
+// is why one list once passed for both — and diverge under 'changed', where readFiles is empty and every
+// worker reads the whole set while exactly one still owns the bump. Empty readFiles is the whole-set read
+// (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
 // appends the fetched upstream-change context after the diff, same placement as the unshowable-
@@ -134,7 +138,7 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
 // excluded is filterFiles' record of what EXCLUDE_PATTERNS removed from this diff ({patterns, paths}).
 // NO_EXCLUSIONS (nothing removed) renders nothing, so an unfiltered review is byte-identical.
 // [LAW:dataflow-not-control-flow]
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
+function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], readFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
   const includedFiles = [];
@@ -271,11 +275,11 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     presentation — findings drive the merge decision.\n`
     : '';
 
-  // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty scopeFiles
+  // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty readFiles
   // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
-  // is split, not duplicated N times); an empty scopeFiles reads the whole changed set (single-scope PR
-  // or repo mode). Either way the whole diff is shown, so cross-file context and report-anywhere are
-  // unchanged — only the expensive full-file reads are partitioned.
+  // is split, not duplicated N times); an empty readFiles reads the whole changed set (single-scope PR,
+  // repo mode, or the 'changed' read-set arm). Either way the whole diff is shown, so cross-file context
+  // and report-anywhere are unchanged — only the expensive full-file reads are partitioned.
   // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
   // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
   // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
@@ -285,12 +289,12 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // before recording, dropping one the context refutes and recording an inconclusive one with its
   // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
   // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
-  const readTargets = scopeFiles.length > 0
+  const readTargets = readFiles.length > 0
     // No flatten: these are paths the worker must OPEN. Collapsing a separator here would name a file
     // that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
     // such a path at the boundary instead, so every path reaching this line is byte-exact and
     // single-line. [LAW:no-silent-failure]
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${scopeFiles.join(', ')}. `
+    ? `Read the complete content of THESE files — this scope's assigned changed files: ${readFiles.join(', ')}. `
       + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
       + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `

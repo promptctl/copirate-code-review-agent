@@ -514,7 +514,7 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
       fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
       return dir;
     };
-    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } });
+    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } });
     const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
     mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
     mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
@@ -526,7 +526,7 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
     assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
     fs.rmSync(misplaced, { recursive: true, force: true });
     assert.deepEqual(prior, [
-      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } },
+      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } },
       // The arm rides through beside the tree, and a run recorded before either existed reads as null for
       // both — the census the arm check below consumes.
       { case: 'case-a', dir: a2, candidate: null, effort: null },

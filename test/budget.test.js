@@ -9,10 +9,11 @@ const {
   estimatedCostUsd,
   sweepFactor,
   reasoningFactor,
+  readSetFactor,
   perReviewCapUsd,
   chooseProfile,
 } = require('../src/budget');
-const { defaultEffortProfile, TIER_RANK } = require('../src/effort');
+const { defaultEffortProfile, TIER_RANK, READ_SETS, DEFAULT_READ_SET } = require('../src/effort');
 
 // Candidates are real EffortProfile values built through the actual constructor — proving the policy
 // composes with the shipped type, not a hand-rolled stand-in. A ladder of roundCaps is the shape the
@@ -116,6 +117,47 @@ describe('sweepFactor — the convergence-sweep cost multiplicand', () => {
   test('a malformed sweepCap throws loudly — never a NaN estimate that silently skips the candidate', () => {
     for (const bad of [undefined, null, -1, 1.5, 'two']) {
       assert.throws(() => sweepFactor(bad), /Invalid sweepCap/);
+    }
+  });
+});
+
+// The read-partitioning multiplicand (copirate-measurement-2mg.2): under the shipped 'assigned' arm each
+// worker opens only its own scope, so a round reads the changed set about once; under 'changed' every
+// worker opens all of it, so the read is duplicated once per scope. What must hold is the RANK — the
+// duplicated-read arm is always costlier — not the constant, which is an unmeasured estimate.
+describe('readSetFactor — the read-partitioning cost multiplicand', () => {
+  test('the shipped arm is the neutral 1×, and the duplicated-read arm is strictly costlier', () => {
+    assert.equal(readSetFactor(DEFAULT_READ_SET), 1.0);
+    assert.equal(readSetFactor('assigned'), 1.0);
+    assert.ok(readSetFactor('changed') > readSetFactor('assigned'));
+  });
+
+  test('every arm the axis declares has a price — no arm can index past the table into NaN', () => {
+    // A NaN estimate never satisfies `<= cap`, so an unpriced arm would not fail: the candidate would be
+    // silently skipped. The module asserts this correspondence at load; this is the test that would fail
+    // if that assertion were ever removed alongside a new arm.
+    for (const arm of READ_SETS) assert.ok(Number.isFinite(readSetFactor(arm)), arm);
+  });
+
+  test('estimatedCostUsd is monotonic in readSet at a fixed diff, roundCap and sweepCap', () => {
+    const at = (readSet) => estimatedCostUsd(defaultEffortProfile({ roundCap: 2, readSet }), 100);
+    assert.ok(at('assigned') < at('changed'), `expected the duplicated read to rank costlier, got ${at('assigned')}, ${at('changed')}`);
+  });
+
+  test('a default profile prices exactly as it did before the axis existed (the neutral 1×)', () => {
+    // [LAW:carrying-cost] Adding an axis must not re-rank the candidates every existing review is chosen
+    // from — the shipped arm multiplies by 1, so every default-profile estimate is unchanged.
+    const withAxis = estimatedCostUsd(defaultEffortProfile({ roundCap: 3 }), 250);
+    const withoutAxis = estimatedCostUsd({ roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' }, 250);
+    assert.equal(withAxis, withoutAxis);
+  });
+
+  test('an unpriceable arm throws loudly — including the wire-only null, which no producer can emit', () => {
+    // reasoningFactor prices null at 1.0 because a null tier is a real produced value ("no raise"). A null
+    // readSet only ever comes off DISK, from a run recorded before the axis existed, so pricing it would
+    // put a value the pricer cannot vouch for into a budget decision.
+    for (const bad of [undefined, null, '', 'all', 'ASSIGNED', 0]) {
+      assert.throws(() => readSetFactor(bad), /Unknown read set/, JSON.stringify(bad));
     }
   });
 });

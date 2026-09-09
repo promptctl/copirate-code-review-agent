@@ -2,12 +2,12 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK } = require('../src/effort');
+const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK, readSetProjection, READ_SETS, DEFAULT_READ_SET } = require('../src/effort');
 const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
   test('carries only the axes it governs — no lane count; that is machine capacity, derived in the pool', () => {
-    assert.deepEqual(defaultEffortProfile(), { roundCap: 0, sweepCap: 2, reasoningTier: null });
+    assert.deepEqual(defaultEffortProfile(), { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' });
   });
 
   test('defaults sweepCap to the convergence-sweep bound (2) and folds a supplied one', () => {
@@ -25,6 +25,12 @@ describe('defaultEffortProfile', () => {
     assert.equal(defaultEffortProfile({ reasoningTier: 'high' }).reasoningTier, 'high');
   });
 
+  test('defaults readSet to the shipped split-read arm and folds a supplied one', () => {
+    assert.equal(defaultEffortProfile().readSet, 'assigned');
+    assert.equal(defaultEffortProfile().readSet, DEFAULT_READ_SET);
+    assert.equal(defaultEffortProfile({ readSet: 'changed' }).readSet, 'changed');
+  });
+
   test('returns a fresh object each call (no shared mutable default)', () => {
     const a = defaultEffortProfile();
     a.sweepCap = 99;
@@ -39,6 +45,37 @@ describe('defaultEffortProfile', () => {
   test('defaults roundCap to the neutral 0 (unlimited) sentinel when unsupplied', () => {
     assert.equal(defaultEffortProfile().roundCap, 0);
     assert.equal(defaultEffortProfile({}).roundCap, 0);
+  });
+});
+
+describe('readSetProjection — the read-set arm, resolved to what a worker opens', () => {
+  // The axis's CONTRACT: which files a worker opens in full, given its scope's assignment. Asserted
+  // through the resolved projection — the only way a caller can reach the meaning — never by reading
+  // the table directly, so a different table shape with the same behavior still passes.
+  test("'assigned' reads exactly the scope's own files — the shipped split-read arm", () => {
+    const files = ['a.js', 'b.js'];
+    assert.deepEqual(readSetProjection('assigned')(files), files);
+  });
+
+  test("'changed' reads the whole changed set, spelled as prompt.js's empty-list value for it", () => {
+    assert.deepEqual(readSetProjection('changed')(['a.js', 'b.js']), []);
+  });
+
+  test('the two arms disagree on the same scope — the A/B is expressible at all', () => {
+    const files = ['a.js'];
+    assert.notDeepEqual(readSetProjection('assigned')(files), readSetProjection('changed')(files));
+  });
+
+  test('every declared arm resolves to a projection — no name without a meaning', () => {
+    for (const arm of READ_SETS) assert.equal(typeof readSetProjection(arm), 'function');
+  });
+
+  test('an arm outside the vocabulary throws, naming the known arms — never coalesced to the default', () => {
+    // The measurement-integrity case: a silent fall back to 'assigned' would report the SHIPPED
+    // behavior under the other arm's name, so the A/B would read as "no difference" and be believed.
+    for (const bad of [undefined, null, '', 'all', 'ASSIGNED', 0]) {
+      assert.throws(() => readSetProjection(bad), /Unknown read set/);
+    }
   });
 });
 

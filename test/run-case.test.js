@@ -3,7 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial } = require('../eval/run-case');
-const { DEFAULT_SWEEP_CAP } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS } = require('../src/effort');
 
 test('parseArgs takes the required positional and applies defaults', () => {
   const o = parseArgs(['eval/cases/foo']);
@@ -45,6 +45,31 @@ test('parseArgs takes --memory-budget as a positive integer of bytes, in both fl
   assert.throws(() => parseArgs(['foo', '--memory-budget', '1.5']), /--memory-budget must be a positive integer/);
   assert.throws(() => parseArgs(['foo', '--memory-budget', 'lots']), /--memory-budget must be a positive integer/);
   assert.throws(() => parseArgs(['foo', '--memory-budget']), /--memory-budget requires a value/);
+});
+
+// [LAW:verifiable-goals] AC (copirate-measurement-2mg.2): the whole-changed-set read arm is expressible
+// at the CLI, and ONLY the declared arms are — a misspelled arm must never resolve to the shipped one,
+// because the arm's whole job is to name which behavior produced the recall number.
+describe('parseArgs takes --read-set as one of the declared arms, in both flag forms', () => {
+  test('the unshipped arm is a legal SETTING, and the vocabulary is the axis owner\'s, not a copy', () => {
+    assert.equal(parseArgs(['foo', '--read-set', 'changed']).readSet, 'changed');
+    assert.equal(parseArgs(['foo', '--read-set=changed']).readSet, 'changed');
+    assert.equal(parseArgs(['foo', '--read-set=assigned']).readSet, 'assigned');
+    for (const arm of READ_SETS) assert.equal(parseArgs(['foo', `--read-set=${arm}`]).readSet, arm);
+  });
+
+  test('unset is the engine\'s own default arm, with no absent case to branch on', () => {
+    assert.equal(parseArgs(['foo']).readSet, DEFAULT_READ_SET);
+  });
+
+  test('a value outside the vocabulary is refused, naming the arms and echoing what was typed', () => {
+    // '' is the `--read-set=` form: refused by membership, with no coercion step that could invent an
+    // arm out of it — the enum counterpart of --sweep-cap='s Number('') === 0 trap.
+    for (const bad of ['', 'all', 'Assigned', 'asigned', 'none', '0']) {
+      assert.throws(() => parseArgs(['foo', `--read-set=${bad}`]), /--read-set must be one of assigned, changed/, `--read-set=${bad}`);
+    }
+    assert.throws(() => parseArgs(['foo', '--read-set']), /--read-set requires a value/);
+  });
 });
 
 test('parseArgs supports -n alias, --flag=value, and --help', () => {
@@ -260,7 +285,7 @@ test("buildCaseMaterial threads the exclusion record into the material, so a rep
   const { material } = buildCaseMaterial({
     allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
   });
-  const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, ['src/a.js']);
+  const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
   assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
   assert.match(material.buildScoutPrompt(CASE_TOOL_NAMES), /Withheld from the list above — changed in this pull request:\*\* dist\/index\.js/);
 });

@@ -32,10 +32,11 @@ const { execFileSync } = require('child_process');
 // from it rather than copied here. This is the one src require at module load: effort.js has an EMPTY
 // require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
 // cannot bind TRANSCRIPT_DIR before main() redirects RUNNER_TEMP.
-const { DEFAULT_SWEEP_CAP, defaultEffortProfile } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS, defaultEffortProfile } = require('../src/effort');
 // [LAW:one-source-of-truth] The CLI-integer rule's owner; freeze-suite.js imports the same one. Empty
 // require graph, so this stays a pure-helper import under the load-purity rule above.
 const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
+const { parseOneOf } = require('./cli-enum');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
 artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
@@ -53,19 +54,24 @@ Usage: node eval/run-case.js <case-dir> [options]
                       own DEFAULT_SWEEP_CAP). 0 replays the pre-convergence single-pass behavior — the
                       lever an A/B prices. The value used is recorded in every run's meta.json, and the
                       scorer refuses a case-out dir whose runs disagree, so an arm cannot be mixed.
+  --read-set <arm>    Which changed files each scope worker opens IN FULL (default: the engine's own
+                      DEFAULT_READ_SET). 'assigned' is the shipped behavior — a worker reads only its own
+                      scope, so the read is split across the plan. 'changed' is the pre-split behavior —
+                      every worker reads the whole changed set. Recorded and mix-refused exactly as
+                      --sweep-cap is.
   --help              Show this help.
 
 The engine (provider/model/reasoning) is PINNED by case.json and cannot be overridden here — a replay
 on a different model would corrupt any baseline comparison, so a mismatch is refused loudly. Review
 EFFORT is not pinned by the case: it is the lever an A/B varies over one frozen case, which is why
---sweep-cap is offered where --model is refused.
+--sweep-cap and --read-set are offered where --model is refused.
 `;
 
 // [LAW:effects-at-boundaries] Pure arg parse: flags + one required positional map to a plain options
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
-  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP };
-  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap' };
+  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap', 'read-set': 'readSet' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -107,6 +113,11 @@ function parseArgs(argv) {
   // given?". [LAW:dataflow-not-control-flow] Its floor is 0 — the sweeps-off arm is a legal setting,
   // not a bad input — which is why it parses against 0 rather than through parsePositiveInt.
   opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
+  // The read-set arm leaves the parser as a member of the vocabulary, with no absent case for the same
+  // reason the cap has none: unset means DEFAULT_READ_SET, already in the slot. It is a NAMED arm rather
+  // than a number because the axis has no off position — 'changed' is not "less" reading, it is a
+  // different partitioning of the same reading. [LAW:dataflow-not-control-flow]
+  opts.readSet = parseOneOf(opts.readSet, '--read-set', READ_SETS);
   return opts;
 }
 
@@ -423,7 +434,7 @@ async function main() {
     // of a case is the same arm by construction, and this is the exact value meta.json records — the
     // scorer reads the arm off the run instead of re-deriving it from a directory name or the operator's
     // memory of which flag they typed.
-    const effort = defaultEffortProfile({ sweepCap: opts.sweepCap });
+    const effort = defaultEffortProfile({ sweepCap: opts.sweepCap, readSet: opts.readSet });
 
     const runDirs = [];
     for (let i = 1; i <= opts.repeats; i++) {

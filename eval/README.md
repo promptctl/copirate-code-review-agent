@@ -209,7 +209,8 @@ is attributable to the code change under test, never to a replay that drifted.
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
-#          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP)
+#          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
+#          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
@@ -248,7 +249,7 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     names its scope and pass, a 'scout' carries neither. A per-replay duration is the
                     envelope of those spans, derivable from the artifact with no CI log to scrape.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
-                    effort ({roundCap, sweepCap, reasoningTier}: the arm the run ACTUALLY ran at; null
+                    effort ({roundCap, sweepCap, reasoningTier, readSet}: the arm the run ACTUALLY ran at; null
                     on runs from before it was recorded, which matches only other nulls), and candidate
                     ({sha, dirty}: the tree that produced the run; null on runs from before it was
                     recorded).
@@ -262,10 +263,16 @@ eval/out/<case-name>/<timestamp>-run<i>/
 
 The engine is **pinned by the case** and cannot be overridden — a replay on a different
 model would corrupt every comparison. Review *effort* is the opposite: it is the thing an
-A/B is for. `--sweep-cap <N>` sets how many convergence sweeps each scope may run after its
-first pass, and both `run-case.js` and `freeze-suite.js` take it. `0` is the
-pre-convergence single-pass behavior; unset is the engine's own `DEFAULT_SWEEP_CAP`
-(`src/effort.js` owns that number — nothing here copies it).
+A/B is for. Both `run-case.js` and `freeze-suite.js` take one flag per effort axis, and each
+flag's default is read from `src/effort.js`, which owns the value — nothing here copies it:
+
+| Flag | Axis | Arms |
+| --- | --- | --- |
+| `--sweep-cap <N>` | convergence sweeps allowed per scope after its first pass | `0` is the pre-convergence single-pass behavior; unset is `DEFAULT_SWEEP_CAP` |
+| `--read-set <arm>` | which changed files each scope worker opens **in full** | `assigned` (shipped: the read is split across the plan) or `changed` (pre-split: every worker reads the whole changed set); unset is `DEFAULT_READ_SET` |
+
+An axis is only ever varied **one at a time**: two arms that differ on two axes produce a delta
+attributable to neither.
 
 Give each arm its own `--out` root:
 
@@ -278,11 +285,20 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-swe
 for c in eval/out/ab-sweep2/*/ eval/out/ab-sweep0/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 ```
 
+The read-set arms run the same way — the flag is the only thing that changes:
+
+```bash
+# arm A — split reads, the shipped cost cut
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-assigned --read-set assigned
+# arm B — every worker reads the whole changed set, the behavior the cut replaced
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-changed --read-set changed
+```
+
 Every run records the effort profile it actually ran under in its `meta.json`, and both ends
 **refuse** a mix: `freeze-suite.js` reads the arm of every run already under `--out` and aborts
 before resolving a credential, and `score.js` refuses a case-out dir whose runs disagree. Both name
 both arms. That is what makes the resume story safe: re-running a suite into an existing `--out`
-under a different `--sweep-cap` — forgetting the flag while topping up an arm is the easy slip —
+under a different `--sweep-cap` or `--read-set` — forgetting the flag while topping up an arm is the easy slip —
 would otherwise look exactly like a completed suite, queue only the deficit at the new arm, and
 produce a band that blends two arms and describes neither. A run replayed before the arm was recorded counts
 as its own value — `unrecorded` matches only `unrecorded`, because nothing proves what it
@@ -296,11 +312,13 @@ suite's reference distribution — freezing one as the baseline would gate every
 candidate against a floor it never ran under.
 
 `compare.js` closes the last layer, and it is the one a live PR meets: it holds a candidate to the
-baseline's arm the way it already holds it to the pinned engine. A tree whose `DEFAULT_SWEEP_CAP`
-differs from the baseline's arm is **refused before any spend**, as are prior runs left under a
-resumed `--out` at another `--sweep-cap` (which carry the candidate's own tree identity, so nothing
-else would catch them until scoring, after the suite had replayed). It refuses rather than replaying
-the candidate at the baseline's arm on purpose: for a PR that moves `DEFAULT_SWEEP_CAP` the arm change
+baseline's arm the way it already holds it to the pinned engine. A tree whose default effort profile
+(`src/effort.js`: `DEFAULT_SWEEP_CAP`, `DEFAULT_READ_SET`, …) differs from the baseline's **on any axis**
+is **refused before any spend**, as are prior runs left under a resumed `--out` at another arm (which
+carry the candidate's own tree identity, so nothing else would catch them until scoring, after the suite
+had replayed). It compares whole profiles instead of named axes and carries no arm flag of its own, so an
+axis added to `src/effort.js` is gated the day it lands with no edit here. It refuses rather than replaying
+the candidate at the baseline's arm on purpose: for a PR that moves one of those defaults the arm change
 *is* the change under test, and pinning it away would report a confident OK on a PR whose recall
 effect the gate had just neutralized. Re-freeze the baseline, or price the lever with an A/B.
 
@@ -380,7 +398,8 @@ Full-suite workflow (run → score → freeze):
 #    Per-replay logs land in the SIBLING eval/out/freeze-<sha>-logs/, so every child of the out
 #    root below is a case run dir and the glob in step 2 needs no exclusions.
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
-#    (a baseline is frozen at the DEFAULT arm; --sweep-cap belongs to A/B roots, not to this one)
+#    (a baseline is frozen at the DEFAULT effort profile; --sweep-cap and --read-set belong to
+#     A/B roots, not to this one)
 # 2. Score each case (writes scorecard-summary.json per case).
 for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 # 3. Freeze the scored suite into a committed baseline (baseline.json + baseline.md).

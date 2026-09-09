@@ -18,7 +18,7 @@ const {
   buildPrMaterial,
   buildRepoMaterial,
 } = require('../src/multiscope');
-const { defaultEffortProfile } = require('../src/effort');
+const { defaultEffortProfile, DEFAULT_READ_SET } = require('../src/effort');
 const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
@@ -387,6 +387,7 @@ describe('runScopeChain', () => {
   const bug = (body) => ({ path: 'a.js', line: 1, body, severity: 3 });
   const chainArgs = (spawn, extra = {}) => ({
     scope, context: '', material, spawn, log: () => {}, ledger: findingsLedger(), sweepCap: 3,
+    readFilesFor: (files) => files,
     deadline: null, now: Date.now, runningTotal: () => 'elapsed unclocked (no budget)', ...extra,
   });
   // A fake spawn seam: findingsFor(pass, prompt) answers this scope's pass-th spawn.
@@ -490,7 +491,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const passArgs = (registry) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {},
   });
 
   // A fake engine adapter: the scout returns SCOPES; each worker returns one finding tagged with its
@@ -765,7 +766,7 @@ describe('runMultiScopePass — scout coverage sweep', () => {
     runMultiScopePass({
       config,
       material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
-      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log, sleepFn: async () => {},
+      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log, sleepFn: async () => {},
     });
 
   test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
@@ -821,7 +822,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   };
   const config = { engine: 'fake', name: 'c1' };
   const args = (registry, sweepCap, log = () => {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap, log, sleepFn: async () => {},
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap, readSet: DEFAULT_READ_SET, log, sleepFn: async () => {},
   });
 
   // A fake adapter: the scout plans SCOPES; each worker spawn returns findingsFor(scopeName, pass),
@@ -971,7 +972,7 @@ describe('buildPrMaterial', () => {
   });
 
   test('with assigned scopeFiles, the worker is told to read ONLY those in full (not the whole set)', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js', 'src/report.js']);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: ['src/usage.js', 'src/report.js'], read: ['src/usage.js', 'src/report.js'] });
     assert.match(prompt, /Read the complete content of THESE files/);
     assert.match(prompt, /src\/usage\.js, src\/report\.js/);
     assert.match(prompt, /Another scope's worker reads the other changed files/);
@@ -986,7 +987,7 @@ describe('buildPrMaterial', () => {
   });
 
   test('with no assigned files (single-scope PR), the worker reads every changed file in full', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: [], read: [] });
     assert.match(prompt, /Read the complete content of every changed file/);
     assert.doesNotMatch(prompt, /Read the complete content of THESE files/);
   });
@@ -998,7 +999,7 @@ describe('buildPrMaterial', () => {
   // ticket's guiding intent: depth, not a completeness quota).
   test('the review prompt directs following a changed symbol to its call sites, fenced against a whole-tree sweep', () => {
     for (const scopeFiles of [[], ['src/usage.js']]) {
-      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, scopeFiles);
+      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: scopeFiles, read: scopeFiles });
       assert.match(prompt, /surfaces at the call sites/);
       assert.match(prompt, /Grep the repository for that symbol's other uses/);
       // the anti-sweep guard: depth is targeted, not a completeness pass over the tree
@@ -1014,7 +1015,7 @@ describe('buildPrMaterial', () => {
   // — so it is present whether or not the scope carries assigned files, right alongside the .2 assertions above.
   test('the review prompt directs verifying a suspicion against fuller context before recording, refuted findings dropped and inconclusive ones recorded with stated uncertainty', () => {
     for (const scopeFiles of [[], ['src/usage.js']]) {
-      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, scopeFiles);
+      const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: scopeFiles, read: scopeFiles });
       // the same call-site reading runs both directions (recall + precision), not a new context-read
       assert.match(prompt, /That same reading cuts both ways/);
       // verify-before-record against the fuller context, not the hunk alone
@@ -1029,7 +1030,7 @@ describe('buildPrMaterial', () => {
   // The comment/code-mismatch hunt + the 1-5 severity scale are charter content, shared by both
   // materials. Stronger-contract-wins is the owner's explicit rule.
   test('the charter directs comment/code mismatch review — stronger contract wins, one finding per divergence', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: [], read: [] });
     assert.match(prompt, /review every comment against the code it describes/);
     assert.match(prompt, /STRONGER of the two contracts wins/);
     assert.match(prompt, /aligning the weaker side to the stronger one/);
@@ -1042,7 +1043,7 @@ describe('buildPrMaterial', () => {
   // already-drifted copy: it demanded five findings where the general rule demanded one, and with every
   // finding required work, the two readings differ by four required changes on the same review.
   test('the charter states the batching rule ONCE — the mismatch category never contradicts it', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: [], read: [] });
     assert.match(prompt, /One comment per distinct issue/);
     assert.match(prompt, /five comments repeating one stale claim are one\s+finding naming the pattern/);
     assert.doesNotMatch(prompt, /never batch/);
@@ -1050,7 +1051,7 @@ describe('buildPrMaterial', () => {
   });
 
   test('the charter defines severity as a 1-5 priority label that never decides the review outcome', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: [], read: [] });
     assert.match(prompt, /integer 1-5 priority label for the author/);
     assert.match(prompt, /never\s+decides what happens to the review/);
     // 1 is the LOWEST-STAKES thing that must still change — never a licence to record something the
@@ -1077,7 +1078,7 @@ describe('buildPrMaterial', () => {
       { modulePath: 'gitlab.example/c/d', from: 'v2.0.0', to: 'v2.1.0', resolved: false, reason: 'no GitHub repo' },
     ];
     const depMaterial = buildPrMaterial({ files: goModFiles, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, dependencySummaries: summaries });
-    const prompt = depMaterial.buildWorkerPrompt('dep — go.mod', TOOL_NAMES, ['go.mod']);
+    const prompt = depMaterial.buildWorkerPrompt('dep — go.mod', TOOL_NAMES, { assigned: ['go.mod'], read: ['go.mod'] });
     // The fetched-upstream note is injected (both resolved and unresolved modules appear as CONTEXT).
     assert.match(prompt, /Dependency version bump/);
     assert.match(prompt, /github\.com\/a\/b/);
@@ -1097,7 +1098,7 @@ describe('buildPrMaterial', () => {
       files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT,
       priorPushbacks: [{ path: 'src/a.js', line: 3, finding: 'Bug: off-by-one', replies: ['Intentional — exclusive range.'] }],
     });
-    const prompt = pbMaterial.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    const prompt = pbMaterial.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.match(prompt, /PRIOR-ROUND PUSHBACKS/);
     assert.match(prompt, /\[src\/a\.js:3\] your earlier finding: Bug: off-by-one/);
     assert.match(prompt, /the author replied: Intentional — exclusive range\./);
@@ -1105,7 +1106,7 @@ describe('buildPrMaterial', () => {
 
   // The default is the empty value: no priorPushbacks arg ⇒ no block ⇒ a byte-identical cold worker prompt.
   test('with no priorPushbacks, the worker prompt carries no pushback block', () => {
-    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/a.js']);
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.doesNotMatch(prompt, /PRIOR-ROUND PUSHBACKS/);
   });
 });
@@ -1466,7 +1467,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     usage: null,
   });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   test("a deadline-killed pass-0 worker yields a PARTIAL review: siblings' findings delivered, the gap carried as data, no in-place retry", async () => {
@@ -1597,7 +1598,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   const at = (min) => `2026-08-22T03:${String(min).padStart(2, '0')}:00.000Z`;
   const span = (fromMin, toMin) => ({ from: at(fromMin), to: at(toMin) });
   const passArgs = (registry, extra = {}) => ({
-    config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, log: () => {}, sleepFn: async () => {}, ...extra,
+    config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {}, ...extra,
   });
 
   // A fake engine with known per-spawn durations: the scout runs minutes 0–2; worker for scope s in
@@ -1864,7 +1865,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   const run = async (extra = {}, registry = makeRegistry()) => {
     const logs = [];
     await runMultiScopePass({
-      config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0,
+      config, material, registry, instructionsPath: 'x', laneCeiling: 2, sweepCap: 0, readSet: DEFAULT_READ_SET,
       log: (m) => logs.push(m), sleepFn: async () => {}, ...extra,
     });
     return logs;

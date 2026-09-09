@@ -2,7 +2,7 @@
 const os = require('os');
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = require('./failover');
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
-const { defaultEffortProfile, maxTier } = require('./effort');
+const { defaultEffortProfile, maxTier, readSetProjection } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = require('./schedule');
@@ -260,7 +260,7 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // took this pass", and what that means is decided by the pass index the fact lands on — a value, not
 // a branch. Every other error propagates. [LAW:dataflow-not-control-flow] The killed spawn's burned
 // time is not this chain's concern: the spawn seam recorded it (err.span) before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
@@ -270,7 +270,7 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   const attemptPass = async (pass) => {
     if (remainingMs(deadline, now()) <= 0) return null;
     try {
-      return await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
+      return await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings: seedFor(pass), pass });
     } catch (e) {
       if (e instanceof DeadlineExceededError) return null;
       throw e;
@@ -310,11 +310,18 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 // [LAW:one-source-of-truth] `pass` is the index as DATA (0 = the review of record, 1..N = sweeps);
 // the human-facing 'sweep N ' label derives from it via sweepLabelPrefix, and the schedule record
 // carries the number — one value, both representations derived.
-async function runScopeWorker({ scope, context, material, spawn, log, priorFindings = [], pass = 0 }) {
+async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
-  // [LAW:decomposition] The worker reads its scope's assigned files in full, not the whole changed set;
-  // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
-  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files, priorFindings);
+  // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
+  // scope's assignment (readFilesFor, resolved once at the pass boundary): under the shipped 'assigned' arm
+  // that IS scope.files, so N workers split the read; under 'changed' it is the empty list, which is the
+  // material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
+  // [LAW:one-source-of-truth] The pair keeps the two facts apart: `read` is that projection; `assigned` is
+  // `scope.files` unprojected — the COVERAGE record planScopes' set membership and the exclusion strip own,
+  // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
+  // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
+  const buildPromptFor = (toolNames) =>
+    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor(scope.files) }, priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -485,7 +492,12 @@ function uniquelyNamed(scopes) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+  // [LAW:parse-dont-validate] The read-set arm is resolved to its projection ONCE, here, before the scout
+  // spawns: every worker below is handed the resolved projection, so an arm outside the vocabulary is
+  // refused at zero spend rather than at the first worker's prompt. Same position and reason as the two
+  // gates below — the difference is that this one hands back the proven value it checked.
+  const readFilesFor = readSetProjection(readSet);
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -617,7 +629,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
   // A scope whose pass 0 the budget took is a COVERAGE gap, carried as data to the summary and the
@@ -679,9 +691,10 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound AND the
-// reasoning raise, and this is the ONE seam where the chain and the profile meet — so both projections
-// happen here: sweepCap onto the pass's plain number, and reasoningTier folded onto each config's own
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound, read-set arm
+// AND reasoning raise, and this is the ONE seam where the chain and the profile meet — so all three
+// projections happen here: sweepCap onto the pass's plain number, readSet onto the pass's arm (which the
+// pass resolves to a projection before spawning anything), and reasoningTier folded onto each config's own
 // reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier down to each
 // adapter — means the effective config flows through produceReview unchanged, so the engine clamps it
 // per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer) automatically
@@ -693,11 +706,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
 function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
+  const readSet = effort.readSet;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -752,7 +766,9 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded }).prompt,
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
-    buildWorkerPrompt: (focusText, toolNames, scopeFiles, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
+    // [LAW:dataflow-not-control-flow] The assignment and the read set arrive as one pair and land on the two
+    // parameters that own them; both default to the empty list — the broad single-scope call, a value not a mode.
+    buildWorkerPrompt: (focusText, toolNames, { assigned = [], read = [] } = {}, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles: assigned, readFiles: read, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
   };
 }
 
@@ -769,9 +785,9 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
     withheldPaths: [],
     buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
     // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
-    // tree; the scopeFiles arg the PR worker uses is deliberately ignored here, while the convergence
+    // tree; the assigned/read pair the PR worker uses is deliberately ignored here, while the convergence
     // sweep's priorFindings flows through exactly as in PR material. [LAW:dataflow-not-control-flow]
-    buildWorkerPrompt: (focusText, toolNames, _scopeFiles, priorFindings) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot, priorFindings }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, _assignedRead, priorFindings) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot, priorFindings }).prompt,
   };
 }
 

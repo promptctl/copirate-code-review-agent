@@ -561,11 +561,11 @@ test('callJudge posts to the pinned Anthropic messages endpoint with the model i
 // arm produced it and a dir cannot hold two. These cover the arm's parse, its one rendering, and the
 // checkpoint that turns a pile of run dirs into a scorable population.
 describe('the arm a run was produced under', () => {
-  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' };
 
   test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
     assert.deepEqual(parseEffort(profile, 'meta.json'), profile);
-    assert.deepEqual(parseEffort({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }, 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high' });
+    assert.deepEqual(parseEffort({ roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' }, 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' });
   });
 
   test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
@@ -594,7 +594,7 @@ describe('the arm a run was produced under', () => {
   });
 
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
-    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
+    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: [] }]) {
       assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
     }
   });
@@ -609,7 +609,31 @@ describe('the arm a run was produced under', () => {
       { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
       { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile } } },
     ];
-    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none' });
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none readSet=assigned' });
+  });
+
+  // The read-set axis (copirate-measurement-2mg.2) is a second lever on the same profile, so the arm
+  // machinery must separate ITS arms too — a suite that pooled a split-read run with a whole-read one
+  // would report a recall number naming neither, which is the exact failure the arm record exists to stop.
+  test('an unrecorded read set is its own arm — a 2mg.1 run can never pool with either arm of this axis', () => {
+    // Every run replayed before this axis existed recorded three fields. Parsing that as the DEFAULT arm
+    // would silently enroll ~42 historical replays into the 'assigned' arm on nothing but a guess.
+    const legacy = parseEffort({ roundCap: 0, sweepCap: 2, reasoningTier: null }, 'meta.json');
+    assert.equal(legacy.readSet, null);
+    assert.match(describeEffort(legacy), /readSet=unrecorded/);
+    assert.notEqual(describeEffort(legacy), describeEffort(profile));
+    assert.notEqual(describeEffort(legacy), describeEffort({ ...profile, readSet: 'changed' }));
+    // ... and the absence reads back identically in both spellings, as the whole-effort absence does.
+    assert.deepEqual(parseEffort({ ...legacy, readSet: null }, 'x'), legacy);
+  });
+
+  test('the two read-set arms are distinct arms, and a dir holding both is refused by name', () => {
+    const runs = [
+      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
+      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile, readSet: 'changed' } } },
+    ];
+    assert.throws(() => agreedScope(runs), /r2 ran at effort .*readSet=changed.* earlier runs ran at .*readSet=assigned/s);
+    assert.deepEqual(misarmedRuns(profile, [{ dir: 'r1', effort: { ...profile, readSet: 'changed' } }]).map(m => m.dir), ['r1']);
   });
 
   test('a dir resumed under a different --sweep-cap is refused, not averaged into a band naming neither arm', () => {

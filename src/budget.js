@@ -1,6 +1,6 @@
 'use strict';
 
-const { TIER_RANK } = require('./effort');
+const { TIER_RANK, READ_SETS } = require('./effort');
 
 // The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
 // budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
@@ -137,17 +137,59 @@ function reasoningFactor(tier) {
   return REASONING_COST_MULTIPLIER[TIER_RANK[tier]];
 }
 
+// [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
+// 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
+// the changed set about ONCE however many scopes the plan has. 'changed' is the pre-split behavior, where
+// every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
+// scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
+// fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative
+// constant standing for a typical plan's scope count rather than a fabricated per-plan number — what MUST
+// hold is that the duplicated-read arm always ranks costlier, and 1.0 < 1.6 holds that for every plan.
+// Like REASONING_COST_MULTIPLIER this is hand-tuned with NO machine source.
+// Source / last estimated: copirate-measurement-2mg.2, 2026-09-09 (UNMEASURED — the A/B this axis exists
+// to run reports per-review MINUTES, not dollars; recalibrate if full-read cost is ever metered).
+const READ_SET_COST_MULTIPLIER = { assigned: 1.0, changed: 1.6 };
+
+// [LAW:single-enforcer] [LAW:one-source-of-truth] Same exact-correspondence assertion the tier tables get,
+// for the same reason: an arm added to effort.js with no multiplier here would price as undefined → NaN,
+// and a NaN estimate never satisfies `<= cap`, so the candidate would be silently skipped rather than
+// priced. Checked ONCE at module load, in both directions — a missing entry is the NaN above, a surplus
+// one is a dead price for an arm that does not exist. [LAW:no-silent-failure]
+const PRICED_READ_SETS = Object.keys(READ_SET_COST_MULTIPLIER);
+if (PRICED_READ_SETS.length !== READ_SETS.length || !READ_SETS.every(a => Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, a))) {
+  throw new Error(
+    `READ_SET_COST_MULTIPLIER prices ${PRICED_READ_SETS.join(', ')} but effort.js declares read sets `
+    + `${READ_SETS.join(', ')}; keep the two tables in exact correspondence (one price per arm).`,
+  );
+}
+
+// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a read-set arm.
+// [LAW:no-silent-failure] Unlike reasoningFactor, there is NO null arm to price: `null` readSet is a
+// wire-only artifact (a run recorded before the axis existed, parsed as a typed absence by eval/score.js)
+// and can never legitimately reach a producer's profile, so pricing it at 1.0 would hide a bug rather
+// than serve a value. Every arm outside the vocabulary throws, naming the known arms.
+function readSetFactor(readSet) {
+  if (!Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, readSet)) {
+    throw new Error(
+      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
+    );
+  }
+  return READ_SET_COST_MULTIPLIER[readSet];
+}
+
 // [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
 // [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] EffortProfile now carries THREE cost-bearing axes, all priced HERE as
+// [LAW:types-are-the-program] EffortProfile now carries FOUR cost-bearing axes, all priced HERE as
 // independent monotonic multiplicands on the per-round base: roundCap (how many rounds), sweepCap
 // (how many convergence passes each round runs — landed in zai-recall-upr.2 with its consumer, the
-// sweep loop in runMultiScopePass), and reasoningTier (how hard each pass reasons — landed in
-// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam). modelTier
-// becomes a fourth when its consumer migrates; reading an axis before the type carries it would be
+// sweep loop in runMultiScopePass), reasoningTier (how hard each pass reasons — landed in
+// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam), and readSet
+// (whether each worker's full reads are split across the plan or duplicated per worker — landed in
+// copirate-measurement-2mg.2 with its consumer, the read-set projection at runScopeWorker). modelTier
+// becomes a fifth when its consumer migrates; reading an axis before the type carries it would be
 // the false theorem effort.js refuses.
 // [LAW:dataflow-not-control-flow] the product is total — every profile prices, a null reasoningTier
 // multiplies by 1.0 and a sweepCap of 0 by 1, so a roundCap-only profile is unchanged.
@@ -155,7 +197,8 @@ function estimatedCostUsd(profile, diffSize) {
   return perRoundBaseUsd(diffSize)
     * effectiveRounds(profile.roundCap)
     * sweepFactor(profile.sweepCap)
-    * reasoningFactor(profile.reasoningTier);
+    * reasoningFactor(profile.reasoningTier)
+    * readSetFactor(profile.readSet);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -252,6 +295,8 @@ module.exports = {
   effectiveRounds,
   sweepFactor,
   reasoningFactor,
+  readSetFactor,
+  READ_SET_COST_MULTIPLIER,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
