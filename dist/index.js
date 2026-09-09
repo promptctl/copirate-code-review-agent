@@ -29928,7 +29928,7 @@ function wrappy (fn, cb) {
 "use strict";
 
 
-const { TIER_RANK } = __nccwpck_require__(4652);
+const { TIER_RANK, READ_SETS } = __nccwpck_require__(4652);
 
 // The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
 // budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
@@ -30065,17 +30065,59 @@ function reasoningFactor(tier) {
   return REASONING_COST_MULTIPLIER[TIER_RANK[tier]];
 }
 
+// [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
+// 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
+// the changed set about ONCE however many scopes the plan has. 'changed' is the pre-split behavior, where
+// every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
+// scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
+// fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative
+// constant standing for a typical plan's scope count rather than a fabricated per-plan number — what MUST
+// hold is that the duplicated-read arm always ranks costlier, and 1.0 < 1.6 holds that for every plan.
+// Like REASONING_COST_MULTIPLIER this is hand-tuned with NO machine source.
+// Source / last estimated: copirate-measurement-2mg.2, 2026-09-09 (UNMEASURED — the A/B this axis exists
+// to run reports per-review MINUTES, not dollars; recalibrate if full-read cost is ever metered).
+const READ_SET_COST_MULTIPLIER = { assigned: 1.0, changed: 1.6 };
+
+// [LAW:single-enforcer] [LAW:one-source-of-truth] Same exact-correspondence assertion the tier tables get,
+// for the same reason: an arm added to effort.js with no multiplier here would price as undefined → NaN,
+// and a NaN estimate never satisfies `<= cap`, so the candidate would be silently skipped rather than
+// priced. Checked ONCE at module load, in both directions — a missing entry is the NaN above, a surplus
+// one is a dead price for an arm that does not exist. [LAW:no-silent-failure]
+const PRICED_READ_SETS = Object.keys(READ_SET_COST_MULTIPLIER);
+if (PRICED_READ_SETS.length !== READ_SETS.length || !READ_SETS.every(a => Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, a))) {
+  throw new Error(
+    `READ_SET_COST_MULTIPLIER prices ${PRICED_READ_SETS.join(', ')} but effort.js declares read sets `
+    + `${READ_SETS.join(', ')}; keep the two tables in exact correspondence (one price per arm).`,
+  );
+}
+
+// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a read-set arm.
+// [LAW:no-silent-failure] Unlike reasoningFactor, there is NO null arm to price: `null` readSet is a
+// wire-only artifact (a run recorded before the axis existed, parsed as a typed absence by eval/score.js)
+// and can never legitimately reach a producer's profile, so pricing it at 1.0 would hide a bug rather
+// than serve a value. Every arm outside the vocabulary throws, naming the known arms.
+function readSetFactor(readSet) {
+  if (!Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, readSet)) {
+    throw new Error(
+      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
+    );
+  }
+  return READ_SET_COST_MULTIPLIER[readSet];
+}
+
 // [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
 // [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] EffortProfile now carries THREE cost-bearing axes, all priced HERE as
+// [LAW:types-are-the-program] EffortProfile now carries FOUR cost-bearing axes, all priced HERE as
 // independent monotonic multiplicands on the per-round base: roundCap (how many rounds), sweepCap
 // (how many convergence passes each round runs — landed in zai-recall-upr.2 with its consumer, the
-// sweep loop in runMultiScopePass), and reasoningTier (how hard each pass reasons — landed in
-// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam). modelTier
-// becomes a fourth when its consumer migrates; reading an axis before the type carries it would be
+// sweep loop in runMultiScopePass), reasoningTier (how hard each pass reasons — landed in
+// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam), and readSet
+// (whether each worker's full reads are split across the plan or duplicated per worker — landed in
+// copirate-measurement-2mg.2 with its consumer, the read-set projection at runScopeWorker). modelTier
+// becomes a fifth when its consumer migrates; reading an axis before the type carries it would be
 // the false theorem effort.js refuses.
 // [LAW:dataflow-not-control-flow] the product is total — every profile prices, a null reasoningTier
 // multiplies by 1.0 and a sweepCap of 0 by 1, so a roundCap-only profile is unchanged.
@@ -30083,7 +30125,8 @@ function estimatedCostUsd(profile, diffSize) {
   return perRoundBaseUsd(diffSize)
     * effectiveRounds(profile.roundCap)
     * sweepFactor(profile.sweepCap)
-    * reasoningFactor(profile.reasoningTier);
+    * reasoningFactor(profile.reasoningTier)
+    * readSetFactor(profile.readSet);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -30180,6 +30223,8 @@ module.exports = {
   effectiveRounds,
   sweepFactor,
   reasoningFactor,
+  readSetFactor,
+  READ_SET_COST_MULTIPLIER,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
@@ -32049,14 +32094,22 @@ module.exports = {
 // nothing derives from would be a false theorem — a knob the profile claims to own while its real
 // source is still an input or a per-config value elsewhere. So the profile owns `roundCap` (its
 // consumer, the pre-spawn round gate in run.js, reads it here), `sweepCap` (its consumer, the
-// convergence chain in runMultiScopePass, reads it here), and `reasoningTier` (its consumer is the reasoning fold at the
+// convergence chain in runMultiScopePass, reads it here), `reasoningTier` (its consumer is the reasoning fold at the
 // runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
 // profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
-// to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
-// current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today per-config on the chain).
+// to the engine's range), and `readSet` (its consumer is the read-set projection at runScopeWorker,
+// which decides WHICH files each worker opens in full). It GROWS a field as each remaining knob's
+// consumer is migrated off its current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today
+// per-config on the chain).
 // Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its consumer
 // exists is a lie — so `reasoningTier` lands together with its fold consumer (multiscope.js) and its
 // price (budget.js estimatedCostUsd), never as an ungoverned placeholder.
+//
+// [LAW:one-source-of-truth] `readSet` and the still-unlanded `readBudget` are DIFFERENT axes and the
+// names invite conflating them. `readBudget` (MAX_DIFF_CHARS) bounds how much DIFF is rendered into the
+// prompt — the same text for every worker. `readSet` decides which changed files a worker OPENS in full
+// once it has that diff, which is per-WORKER and is the axis a multi-scope plan can split. Both are read
+// cost; only one is partitionable, which is why splitting was a lever at all.
 //
 // [LAW:one-source-of-truth] `reasoningTier` on the profile is the difficulty-PROPOSED RAISE, NOT a
 // review's absolute reasoning tier. The absolute per-config baseline stays `config.reasoning` (each
@@ -32087,6 +32140,38 @@ module.exports = {
 // is always finite. [LAW:types-are-the-program]
 const DEFAULT_SWEEP_CAP = 2;
 
+// [LAW:dataflow-not-control-flow] The read-set axis, as a table from each arm's NAME to the projection
+// that produces the files a worker opens in full. The vocabulary is the table's KEYS (READ_SETS below),
+// so a name can never exist without the meaning it selects — the pair that would drift if the two were
+// written separately. [LAW:one-source-of-truth]
+//   'assigned' — the worker reads only the scope it was assigned. N workers cost ~1× the read of the
+//                changed set (split), not N× (duplicated): the shipped cost cut.
+//   'changed'  — the worker reads the whole changed set, the pre-split behavior. It projects to the
+//                EMPTY list because that is already prompt.js's value for "read every changed file in
+//                full" (buildReviewInput's scopeFiles) — this axis picks which value flows to a seam
+//                that was always value-driven, and adds no second prompt path. [LAW:composability]
+// The projection takes the scope's assigned files and returns the read set, so the two arms are one
+// signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
+// `scope.files` remains the coverage record either way (planScopes' set-membership check, and the
+// exclusion strip in withoutWithheldFiles), so an arm changes what a worker READS and nothing about
+// what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
+const READ_SET_PROJECTION = {
+  assigned: (scopeFiles) => scopeFiles,
+  changed: () => [],
+};
+
+// [LAW:one-source-of-truth] The arm vocabulary, derived from the projection table rather than listed a
+// second time: the CLIs validate against this and the error messages name it, so a new arm is one entry
+// in one table. [LAW:types-are-the-program]
+const READ_SETS = Object.keys(READ_SET_PROJECTION);
+
+// [LAW:one-source-of-truth] The default read set: the behavior the engine ships (each worker reads its
+// own scope). Unlike a cap there is no numeric "off" — the axis is a closed two-value vocabulary, so the
+// non-default arm is named, not spelled as a magic number. [LAW:no-mode-explosion] this is an A/B AXIS,
+// not a user knob: no action input sets it, and its non-default arm exists to be MEASURED
+// (copirate-measurement-2mg.2) — the shipped lever was priced on cost evidence with no recall verdict.
+const DEFAULT_READ_SET = 'assigned';
+
 // [LAW:dataflow-not-control-flow] The abstract reasoning-tier ladder, low→high, keyed to an ordinal
 // RANK. It is the union of every engine's declared reasoning-effort vocabulary: claude-code exposes
 // low..max, codex minimal..xhigh, opencode none. `xhigh` (codex's ceiling) and `max` (claude-code's
@@ -32096,7 +32181,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
+// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null), readSet: string }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE the engine's default
 // behavior (which, since zai-recall-upr.2, includes convergence sweeps: sweepCap > 0). An OPTIONS
@@ -32117,8 +32202,30 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // estimatedCostUsd — both land together with the axis, per this module's header. It is OWNED here
 // (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, not a
 // consumer knob. [LAW:no-mode-explosion]
-function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null } = {}) {
-  return { roundCap, sweepCap, reasoningTier };
+// `readSet` is the profile's read-partitioning axis (copirate-measurement-2mg.2): its consumer is the
+// projection at runScopeWorker, its price the read multiplicand in budget.js's estimatedCostUsd — both
+// land with the axis, per this module's header. It is OWNED here (DEFAULT_READ_SET), not sourced from an
+// action input: how a plan splits its reads is engine policy, not a consumer knob. [LAW:no-mode-explosion]
+function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null, readSet = DEFAULT_READ_SET } = {}) {
+  return { roundCap, sweepCap, reasoningTier, readSet };
+}
+
+// [LAW:parse-dont-validate] Resolve the arm NAME to the projection it selects — the axis's one checkpoint,
+// and the only place its vocabulary is checked. It returns something that could not exist before the check
+// (the projection itself), so a caller holding one holds a proven arm: there is nothing left inland to
+// re-check, and no way to reach a worker with a name the table has no meaning for. [LAW:single-enforcer]
+// Callers resolve ONCE at a pass boundary rather than per worker, which is what puts the refusal BEFORE the
+// scout spawn instead of after it — a malformed arm costs nothing rather than a round of spend.
+// [LAW:no-silent-failure] an unknown arm is a caller bug, not something to coalesce to the default:
+// silently reading the shipped arm would make an A/B report the DEFAULT behavior under the other arm's
+// name — a measurement that lies rather than fails. Throw, naming the known arms.
+function readSetProjection(readSet) {
+  if (!Object.prototype.hasOwnProperty.call(READ_SET_PROJECTION, readSet)) {
+    throw new Error(
+      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
+    );
+  }
+  return READ_SET_PROJECTION[readSet];
 }
 
 // [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
@@ -32197,10 +32304,13 @@ function resolveReasoningTier(tier, engineEfforts) {
 
 module.exports = {
   DEFAULT_SWEEP_CAP,
+  DEFAULT_READ_SET,
+  READ_SETS,
   TIER_RANK,
   defaultEffortProfile,
   resolveReasoningTier,
   maxTier,
+  readSetProjection,
 };
 
 
@@ -34341,7 +34451,7 @@ module.exports = {
 const os = __nccwpck_require__(857);
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
-const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
+const { defaultEffortProfile, maxTier, readSetProjection } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = __nccwpck_require__(7932);
@@ -34599,7 +34709,7 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // took this pass", and what that means is decided by the pass index the fact lands on — a value, not
 // a branch. Every other error propagates. [LAW:dataflow-not-control-flow] The killed spawn's burned
 // time is not this chain's concern: the spawn seam recorded it (err.span) before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
@@ -34609,7 +34719,7 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   const attemptPass = async (pass) => {
     if (remainingMs(deadline, now()) <= 0) return null;
     try {
-      return await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
+      return await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings: seedFor(pass), pass });
     } catch (e) {
       if (e instanceof DeadlineExceededError) return null;
       throw e;
@@ -34649,11 +34759,16 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 // [LAW:one-source-of-truth] `pass` is the index as DATA (0 = the review of record, 1..N = sweeps);
 // the human-facing 'sweep N ' label derives from it via sweepLabelPrefix, and the schedule record
 // carries the number — one value, both representations derived.
-async function runScopeWorker({ scope, context, material, spawn, log, priorFindings = [], pass = 0 }) {
+async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
-  // [LAW:decomposition] The worker reads its scope's assigned files in full, not the whole changed set;
-  // the material threads scope.files into the read instruction. Repo material ignores it (no diff).
-  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files, priorFindings);
+  // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
+  // scope's assignment (readFilesFor, resolved once at the pass boundary): under the shipped 'assigned' arm
+  // that IS scope.files, so N workers split the read; under 'changed' it is the empty list, which is the
+  // material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
+  // [LAW:one-source-of-truth] `scope.files` stays the COVERAGE record in both arms — planScopes' set
+  // membership and the exclusion strip read it, never this projection — so an arm changes what a worker
+  // READS and nothing about what the plan claims to cover. Repo material ignores the argument (no diff).
+  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, readFilesFor(scope.files), priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -34824,7 +34939,12 @@ function uniquelyNamed(scopes) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+  // [LAW:parse-dont-validate] The read-set arm is resolved to its projection ONCE, here, before the scout
+  // spawns: every worker below is handed the resolved projection, so an arm outside the vocabulary is
+  // refused at zero spend rather than at the first worker's prompt. Same position and reason as the two
+  // gates below — the difference is that this one hands back the proven value it checked.
+  const readFilesFor = readSetProjection(readSet);
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -34956,7 +35076,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
   // A scope whose pass 0 the budget took is a COVERAGE gap, carried as data to the summary and the
@@ -35018,9 +35138,10 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound AND the
-// reasoning raise, and this is the ONE seam where the chain and the profile meet — so both projections
-// happen here: sweepCap onto the pass's plain number, and reasoningTier folded onto each config's own
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound, read-set arm
+// AND reasoning raise, and this is the ONE seam where the chain and the profile meet — so all three
+// projections happen here: sweepCap onto the pass's plain number, readSet onto the pass's arm (which the
+// pass resolves to a projection before spawning anything), and reasoningTier folded onto each config's own
 // reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier down to each
 // adapter — means the effective config flows through produceReview unchanged, so the engine clamps it
 // per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer) automatically
@@ -35032,11 +35153,12 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
 function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
+  const readSet = effort.readSet;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
