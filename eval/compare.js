@@ -17,8 +17,11 @@
 //      was built with (so producer and comparator can NEVER drift — [LAW:one-source-of-truth]), and
 //   4. applies the frozen pooled degradation rule via baseline.js's evaluateGate: candidate pooled
 //      inventory must-find recall < the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
-// N and the engine are DERIVED FROM the baseline and asserted, because a candidate run at a different N or
-// engine is not comparable — its pooled rate measures a different thing. [LAW:no-silent-failure]
+// N, the engine, and the review-effort ARM are DERIVED FROM the baseline and asserted, because a candidate
+// run at a different N, engine, or arm is not comparable — its pooled rate measures a different thing.
+// The arm is asserted rather than forced: this CLI has no --sweep-cap, so a tree whose DEFAULT_SWEEP_CAP
+// moved is refused, never quietly replayed at the baseline's arm — that would gate a PR while neutralizing
+// the very change under test. [LAW:no-silent-failure]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib and functions imported from baseline.js (the
 // pure reducers), score.js (parsers, the run census) and run-case.js (the tree identity) — nothing runs at
@@ -44,7 +47,10 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          order, and an uncommitted baseline.json always outranks a committed one. Refused
                          (exit 2) if the newest can't be determined unambiguously (e.g. a shallow git clone
                          with more than one candidate); pass --baseline explicitly in that case. N, engine,
-                         and matcher come FROM whichever baseline is resolved.
+                         matcher, and review-effort arm come FROM whichever baseline is resolved. A tree
+                         whose default arm (src/effort.js DEFAULT_SWEEP_CAP) differs from the baseline's is
+                         REFUSED before any spend, not replayed at the baseline's arm: re-freeze, or price
+                         the lever with an A/B (see eval/README, "Varying a lever").
   --matcher <kind>       Semantic matcher for scoring the candidate: 'llm' (default) or 'lexical'. MUST
                          match the baseline's matcher, or the recall numbers aren't comparable — refused
                          up front, before any spend. IGNORED under --reuse-candidate (no scoring runs in
@@ -498,6 +504,17 @@ function foreignRuns(current, runs) {
     .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; the tree under gate is ${describeTree(current)}` }));
 }
 
+// [LAW:effects-at-boundaries] Pure: which prior runs under --out were produced at a different arm than
+// this invocation will replay at. foreignRuns cannot cover this. An engine is baked into the pinned
+// case.json, so a prior run on the same clean commit is provably the same engine — but the arm is a free
+// CLI knob (--sweep-cap on run-case.js / freeze-suite.js) tied to nothing in the tree, so a run left here
+// at another arm carries this candidate's exact identity and is still unpoolable with the new ones.
+function misarmedRuns(effort, runs) {
+  return runs
+    .filter(r => describeEffort(r.effort) !== describeEffort(effort))
+    .map(({ dir, effort: was }) => ({ dir, reason: `was replayed at effort ${describeEffort(was)}; this invocation replays at ${describeEffort(effort)}` }));
+}
+
 // Every completed run already under the candidate root for the gated cases, with the tree that produced
 // it. "Completed" is score.js's own predicate (listRunDirs) — the same census freeze-suite.js will take,
 // so what this accepts is exactly what the replay will count. A run whose record names a different case
@@ -508,7 +525,7 @@ function readPriorRuns(candidateRoot, caseNames) {
     const metaPath = path.join(dir, 'meta.json');
     const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
     if (meta.case !== name) throw new Error(`${metaPath} names case '${meta.case}' but lives under '${name}' — a misplaced run; move or remove it.`);
-    return { case: name, dir, candidate: meta.candidate };
+    return { case: name, dir, candidate: meta.candidate, effort: meta.effort };
   }));
 }
 
@@ -528,6 +545,12 @@ function main() {
   const baseline = parseBaseline(rawBaselineText, baselineJsonPath);
   const rawBaselineSuite = JSON.parse(rawBaselineText).suite;
   const repeats = baseline.repeats;
+
+  // The arm THIS invocation will replay at, resolved once: replayArgs forwards no effort flags, so
+  // run-case.js builds the checked-out tree's own default profile. Guard 4d holds it against the
+  // baseline's arm; step 5 holds every prior run under --out against it. One derivation, two uses.
+  // [LAW:one-source-of-truth]
+  const candidateEffort = require('../src/effort').defaultEffortProfile();
 
   const casesDir = path.resolve(opts.casesDir);
   const freezeSuiteScript = path.join(__dirname, 'freeze-suite.js');
@@ -611,8 +634,6 @@ function main() {
     //     the gate would report a confident OK on a PR whose recall effect it had just neutralized.
     //     Re-freeze the baseline, or price the lever with an A/B. [LAW:no-silent-failure]
     if (baseline.effort) {
-      const { defaultEffortProfile } = require('../src/effort');
-      const candidateEffort = defaultEffortProfile();
       if (describeEffort(candidateEffort) !== describeEffort(baseline.effort)) {
         throw new Error(`Incomparable: this tree replays at effort ${describeEffort(candidateEffort)} but the baseline was frozen at ${describeEffort(baseline.effort)} — the review effort drifted since the freeze. Re-freeze the baseline before gating, or measure the lever with an A/B (see eval/README's "Varying a lever").`);
       }
@@ -645,6 +666,13 @@ function main() {
     const foreign = foreignRuns(candidate, prior);
     if (foreign.length > 0) {
       throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
+    }
+    // The arm is not provable from identity the way the engine is, so a run left here at another
+    // --sweep-cap passes every check above and would only surface in score.js's agreedScope at 7b —
+    // after the rest of the suite has replayed at full spend. [LAW:no-silent-failure]
+    const misarmed = misarmedRuns(candidateEffort, prior);
+    if (misarmed.length > 0) {
+      throw new Error(`--out ${candidateRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nA suite pooled across two arms measures neither. Pick a fresh --out, or remove them first.`);
     }
     const excess = excessRuns(caseNames, prior, repeats);
     if (excess.length > 0) {
@@ -739,5 +767,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
+  foreignRuns, misarmedRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
 };

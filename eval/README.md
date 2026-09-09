@@ -293,6 +293,15 @@ whose cases pin different engines. An A/B arm is a measurement of a lever, not t
 suite's reference distribution — freezing one as the baseline would gate every future
 candidate against a floor it never ran under.
 
+`compare.js` closes the last layer, and it is the one a live PR meets: it holds a candidate to the
+baseline's arm the way it already holds it to the pinned engine. A tree whose `DEFAULT_SWEEP_CAP`
+differs from the baseline's arm is **refused before any spend**, as are prior runs left under a
+resumed `--out` at another `--sweep-cap` (which carry the candidate's own tree identity, so nothing
+else would catch them until scoring, after the suite had replayed). It refuses rather than replaying
+the candidate at the baseline's arm on purpose: for a PR that moves `DEFAULT_SWEEP_CAP` the arm change
+*is* the change under test, and pinning it away would report a confident OK on a PR whose recall
+effect the gate had just neutralized. Re-freeze the baseline, or price the lever with an A/B.
+
 ## Scoring a replay
 
 `eval/score.js` (`npm run review:score`) reduces a case's replay artifacts to the
@@ -591,8 +600,9 @@ would be a ruler that moves with what it measures.
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:
 
-1. replays every baseline case **N times** (N and the engine come *from the baseline*, and are
-   asserted — a candidate run at a different N or engine measures something else) by spawning
+1. replays every baseline case **N times** (N, the engine, and the effort arm come *from the
+   baseline*, and are asserted — a candidate run at a different N, engine, or arm measures something
+   else) by spawning
    `freeze-suite.js` over the baseline's case set — the freeze's own scheduler, driving
    `run-case.js` once per replay across the `--credentials` lanes — then scores each case with
    `score.js`, into an isolated candidate root;

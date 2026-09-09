@@ -436,7 +436,23 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
+const { foreignRuns, misarmedRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
+
+test('misarmedRuns names every prior run the replay cannot pool with, which identity alone would pass', () => {
+  const on = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+  const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+  const runs = [
+    { dir: 'r1', effort: on },    // the arm this invocation replays at
+    { dir: 'r2', effort: off },   // left behind by a direct freeze-suite.js --sweep-cap 0 on the same commit
+    { dir: 'r3', effort: null },  // replayed before the arm was recorded — nothing proves what it ran at
+  ];
+  const misarmed = misarmedRuns(on, runs);
+  assert.deepEqual(misarmed.map(m => m.dir), ['r2', 'r3']);
+  // Both arms in one phrase: the operator has to know which side to fix.
+  assert.match(misarmed[0].reason, /was replayed at effort roundCap=0 sweepCap=0 .*this invocation replays at roundCap=0 sweepCap=2/);
+  assert.match(misarmed[1].reason, /was replayed at effort unrecorded/);
+  assert.deepEqual(misarmedRuns(on, []), []);
+});
 
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };
@@ -513,7 +529,7 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
       fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
       return dir;
     };
-    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false } });
+    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } });
     const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
     mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
     mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
@@ -525,8 +541,10 @@ test('readPriorRuns reads the census the replay will take — completed runs onl
     assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
     fs.rmSync(misplaced, { recursive: true, force: true });
     assert.deepEqual(prior, [
-      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false } },
-      { case: 'case-a', dir: a2, candidate: null },
+      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } },
+      // The arm rides through beside the tree, and a run recorded before either existed reads as null for
+      // both — the census the arm check below consumes.
+      { case: 'case-a', dir: a2, candidate: null, effort: null },
     ]);
     assert.deepEqual(readPriorRuns(path.join(root, 'absent'), ['case-a']), []);
   } finally {
