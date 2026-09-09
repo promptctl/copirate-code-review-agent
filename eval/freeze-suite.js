@@ -33,7 +33,7 @@ const { spawn } = require('child_process');
 // [LAW:one-source-of-truth] The sweep bound's owner is src/effort.js, so --sweep-cap's default is read
 // from it rather than copied here or into run-case.js's spawn line. effort.js has an EMPTY require
 // graph, so this stays a pure-helper import under the load-purity rule above.
-const { DEFAULT_SWEEP_CAP } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP, defaultEffortProfile } = require('../src/effort');
 // [LAW:one-source-of-truth] The CLI-integer rule's owner; run-case.js imports the same one. Empty
 // require graph, so this too stays a pure-helper import under the load-purity rule above.
 const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
@@ -326,14 +326,26 @@ function readSuiteTiming(outRoot) {
 // the scorer about how many runs a case has.
 function censusCases(caseDirs, outRoot) {
   const { parseCaseManifest } = require('./run-case');
-  const { listRunDirs } = require('./score');
+  const { listRunDirs, parseMeta } = require('./score');
   return caseDirs.map(dir => {
     const manifest = parseCaseManifest(fs.readFileSync(path.join(dir, 'case.json'), 'utf8'), dir);
+    // The census is the ONE read of what already sits under --out, so it reports the arm each prior run
+    // recorded alongside the count. A second pass over the same dirs to answer "which arm" would be a
+    // second census that could disagree with this one. [LAW:one-source-of-truth]
+    const runs = listRunDirs(path.join(outRoot, manifest.name)).map(runDir => {
+      const metaPath = path.join(runDir, 'meta.json');
+      // [LAW:no-silent-failure] run-case.js writes findings.json and meta.json together, so one without
+      // the other is a torn record — refused by name here rather than as a bare ENOENT from the read, or
+      // (worse) skipped, which would let a run whose arm cannot be proven pass as matching.
+      if (!fs.existsSync(metaPath)) throw new Error(`${runDir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
+      return { dir: runDir, effort: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).effort };
+    });
     return {
       name: manifest.name,
       dir,
       engine: manifest.engine,
-      completed: listRunDirs(path.join(outRoot, manifest.name)).length,
+      runs,
+      completed: runs.length,
     };
   });
 }
@@ -627,6 +639,19 @@ async function main() {
   // --cases absent means the whole golden set; that is the option's own enum, so the one branch is on it.
   const cases = censusCases(opts.cases === null ? golden : selectCaseDirs(golden, opts.cases.split(',')), outRoot);
   const pin = suitePin(cases);
+  // The arm THIS invocation replays at: run-case.js builds exactly this from the --sweep-cap forwarded to
+  // it, so the profile is read from its owner rather than restated. [LAW:one-source-of-truth]
+  const effort = defaultEffortProfile({ sweepCap: opts.sweepCap });
+  // Resuming an --out under a different --sweep-cap is the likeliest operator slip on the A/B path this
+  // command documents (forget the flag while topping up the sweeps-off arm), and the census would happily
+  // queue only the deficit at the new arm and mix two arms in one case-out dir. score.js's agreedScope is
+  // the backstop, but it fires at scoring — after the whole remaining suite has replayed at full spend.
+  // [LAW:no-silent-failure]
+  const { misarmedRuns } = require('./score');
+  const misarmed = misarmedRuns(effort, cases.flatMap(c => c.runs));
+  if (misarmed.length > 0) {
+    throw new Error(`--out ${outRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(m => `  ${m.dir} ${m.reason}`).join('\n')}\nA case-out dir holds one arm — resume with the arm these runs were produced at (--sweep-cap), or give this arm its own --out.`);
+  }
   const credentialInput = credentialInputFor(pin.provider);
 
   const jobs = planJobs({ cases, repeats: opts.repeats });

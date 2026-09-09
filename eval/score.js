@@ -293,6 +293,20 @@ function agreedScope(runs) {
   return scope;
 }
 
+// [LAW:effects-at-boundaries] Pure: which of these runs were produced at a different arm than the one
+// given. Runs are {dir, effort} — whatever read them off disk. This lives beside describeEffort rather
+// than in either CLI because both need it and the rule is one: freeze-suite.js refuses a resume that
+// would mix arms in a case-out dir, compare.js refuses prior runs under a candidate root. Identity does
+// not cover it — an engine is baked into a pinned case.json, but the arm is a free CLI knob tied to
+// nothing in the tree, so a mixed run can carry the right commit and still be unpoolable.
+// [LAW:one-source-of-truth] [LAW:no-silent-failure] Every offender is named with BOTH arms; agreedScope
+// would otherwise be the first to notice, after the spend.
+function misarmedRuns(effort, runs) {
+  return runs
+    .filter(r => describeEffort(r.effort) !== describeEffort(effort))
+    .map(({ dir, effort: was }) => ({ dir, reason: `was replayed at effort ${describeEffort(was)}; this invocation replays at ${describeEffort(effort)}` }));
+}
+
 // The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
 // <boolean>}`. Absent on runs replayed before provenance was kept — a typed absence (null), which
 // compare.js reads as "cannot be proven anyone's". Anything else is a malformed record, refused.
@@ -825,7 +839,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, misarmedRuns,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,

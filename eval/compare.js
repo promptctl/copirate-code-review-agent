@@ -17,11 +17,12 @@
 //      was built with (so producer and comparator can NEVER drift — [LAW:one-source-of-truth]), and
 //   4. applies the frozen pooled degradation rule via baseline.js's evaluateGate: candidate pooled
 //      inventory must-find recall < the baseline's pooled gate floor  ⇒  DEGRADED (non-zero exit).
-// N, the engine, and the review-effort ARM are DERIVED FROM the baseline and asserted, because a candidate
-// run at a different N, engine, or arm is not comparable — its pooled rate measures a different thing.
-// The arm is asserted rather than forced: this CLI has no --sweep-cap, so a tree whose DEFAULT_SWEEP_CAP
-// moved is refused, never quietly replayed at the baseline's arm — that would gate a PR while neutralizing
-// the very change under test. [LAW:no-silent-failure]
+// N comes FROM the baseline and is imposed on the replay. The engine and the review-effort ARM are the
+// checked-out tree's own — the case's pin and src/effort.js's default — and are ASSERTED against the
+// baseline's, because a candidate run at a different N, engine, or arm is not comparable: its pooled rate
+// measures a different thing. Asserted, never forced: this CLI has no --sweep-cap, so a tree whose
+// DEFAULT_SWEEP_CAP moved is refused rather than quietly replayed at the baseline's arm, which would gate
+// a PR while neutralizing the very change under test. [LAW:no-silent-failure]
 //
 // [LAW:effects-at-boundaries] Module load is PURE: only stdlib and functions imported from baseline.js (the
 // pure reducers), score.js (parsers, the run census) and run-case.js (the tree identity) — nothing runs at
@@ -34,7 +35,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort, misarmedRuns } = require('./score');
 const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
@@ -504,17 +505,6 @@ function foreignRuns(current, runs) {
     .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; the tree under gate is ${describeTree(current)}` }));
 }
 
-// [LAW:effects-at-boundaries] Pure: which prior runs under --out were produced at a different arm than
-// this invocation will replay at. foreignRuns cannot cover this. An engine is baked into the pinned
-// case.json, so a prior run on the same clean commit is provably the same engine — but the arm is a free
-// CLI knob (--sweep-cap on run-case.js / freeze-suite.js) tied to nothing in the tree, so a run left here
-// at another arm carries this candidate's exact identity and is still unpoolable with the new ones.
-function misarmedRuns(effort, runs) {
-  return runs
-    .filter(r => describeEffort(r.effort) !== describeEffort(effort))
-    .map(({ dir, effort: was }) => ({ dir, reason: `was replayed at effort ${describeEffort(was)}; this invocation replays at ${describeEffort(effort)}` }));
-}
-
 // Every completed run already under the candidate root for the gated cases, with the tree that produced
 // it. "Completed" is score.js's own predicate (listRunDirs) — the same census freeze-suite.js will take,
 // so what this accepts is exactly what the replay will count. A run whose record names a different case
@@ -767,5 +757,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, misarmedRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
+  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
 };

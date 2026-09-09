@@ -278,11 +278,13 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-swe
 for c in eval/out/ab-sweep2/*/ eval/out/ab-sweep0/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 ```
 
-Every run records the effort profile it actually ran under in its `meta.json`, and
-`score.js` **refuses** a case-out dir whose runs disagree, naming both arms. That is what
-makes the resume story safe: re-running a suite into an existing `--out` under a different
-`--sweep-cap` would otherwise look exactly like a completed suite, and its band would be a
-blend of two arms that describes neither. A run replayed before the arm was recorded counts
+Every run records the effort profile it actually ran under in its `meta.json`, and both ends
+**refuse** a mix: `freeze-suite.js` reads the arm of every run already under `--out` and aborts
+before resolving a credential, and `score.js` refuses a case-out dir whose runs disagree. Both name
+both arms. That is what makes the resume story safe: re-running a suite into an existing `--out`
+under a different `--sweep-cap` — forgetting the flag while topping up an arm is the easy slip —
+would otherwise look exactly like a completed suite, queue only the deficit at the new arm, and
+produce a band that blends two arms and describes neither. A run replayed before the arm was recorded counts
 as its own value — `unrecorded` matches only `unrecorded`, because nothing proves what it
 ran at. The arm also rides on each `scorecard.json` and `scorecard-summary.json`, so a
 number lifted out of an artifact carries the setting that produced it.
@@ -600,9 +602,10 @@ would be a ruler that moves with what it measures.
 **A candidate is just another suite.** `compare.js` reimplements no pooling, no scoring, and no
 gate predicate — it:
 
-1. replays every baseline case **N times** (N, the engine, and the effort arm come *from the
-   baseline*, and are asserted — a candidate run at a different N, engine, or arm measures something
-   else) by spawning
+1. replays every baseline case **N times** — N comes *from the baseline* and is imposed on the
+   replay; the engine and the effort arm are the checked-out tree's own and are *asserted against*
+   the baseline's, a mismatch refusing rather than adapting (see [Varying a lever](#varying-a-lever-ab-arms)
+   for why forcing the arm would be worse) — by spawning
    `freeze-suite.js` over the baseline's case set — the freeze's own scheduler, driving
    `run-case.js` once per replay across the `--credentials` lanes — then scores each case with
    `score.js`, into an isolated candidate root;
@@ -624,8 +627,8 @@ child, so every child of `<out>` stays a case run dir the scorer can pool).
 
 **Exit codes are a trichotomy** so a CI gate (`copirate-eval-harness-2fk.6`) can tell the three
 outcomes apart: `0` = ran and OK/IMPROVED, `1` = ran and **DEGRADED** (the gate tripped), `2` =
-could not run (bad args, missing baseline, a matcher/N/engine that isn't comparable — refused
-*before* any spend where possible).
+could not run (bad args, missing baseline, a matcher/N/engine/effort-arm that isn't comparable —
+refused *before* any spend where possible).
 
 ### When to run it
 

@@ -436,23 +436,8 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, misarmedRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
+const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
 
-test('misarmedRuns names every prior run the replay cannot pool with, which identity alone would pass', () => {
-  const on = { roundCap: 0, sweepCap: 2, reasoningTier: null };
-  const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
-  const runs = [
-    { dir: 'r1', effort: on },    // the arm this invocation replays at
-    { dir: 'r2', effort: off },   // left behind by a direct freeze-suite.js --sweep-cap 0 on the same commit
-    { dir: 'r3', effort: null },  // replayed before the arm was recorded — nothing proves what it ran at
-  ];
-  const misarmed = misarmedRuns(on, runs);
-  assert.deepEqual(misarmed.map(m => m.dir), ['r2', 'r3']);
-  // Both arms in one phrase: the operator has to know which side to fix.
-  assert.match(misarmed[0].reason, /was replayed at effort roundCap=0 sweepCap=0 .*this invocation replays at roundCap=0 sweepCap=2/);
-  assert.match(misarmed[1].reason, /was replayed at effort unrecorded/);
-  assert.deepEqual(misarmedRuns(on, []), []);
-});
 
 test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
   const here = { sha: 'aaaaaaa1', dirty: false };

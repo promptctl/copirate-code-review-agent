@@ -8,7 +8,7 @@ const {
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
   requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
-  parseEffort, describeEffort, agreedScope,
+  parseEffort, describeEffort, agreedScope, misarmedRuns,
 } = require('../eval/score');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -236,7 +236,7 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
     { path: 'a.ts', line: 10, body: 'null pointer at close()', severity: 'blocking' },
     { path: 'q.ts', line: 1, body: 'novel unrelated thing', severity: 'advisory' },
   ]), 'f');
-  const args = { expected: EXPECTED_V, produced, usage: { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 2 }, span: null, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' } }, judge: keywordJudge, matcherLabel: 'fake' };
+  const args = { expected: EXPECTED_V, produced, usage: { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 2 }, span: null, cost: { basis: 'dollars', usd: 0.5 } }, meta: { case: 'demo', config: { model: 'm' }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } }, judge: keywordJudge, matcherLabel: 'fake' };
   const a = await scoreRun(args);
   const b = await scoreRun(args);
   assert.deepEqual(a, b); // deterministic given the same judge
@@ -246,12 +246,19 @@ test('scoreRun produces a timestamp-free, re-runnable scorecard', async () => {
   assert.equal(a.inventoryMustFind.recall, 1);
   assert.equal(a.noise.count, 1);
   assert.equal(a.usage.cost.usd, 0.5);
+  // The arm reaches the artifact unchanged. This assignment is the only link between a run's real
+  // provenance and every arm check the freezer and the gate make downstream — dropped or misspelled, it
+  // would leave `effort` undefined, which JSON omits entirely, and no other test would notice.
+  assert.deepEqual(a.effort, { roundCap: 0, sweepCap: 2, reasoningTier: null });
 });
 
 test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   // Each fixture run found `found` of the 7 frozen-round must-finds and invFound of the 9 inventory-wide ones.
   const mk = (found, total, invFound, invTotal, noise, usd) => ({
     matcher: 'fake',
+    // scoreRun always sets this — to a profile, or to null for a run recorded before the arm existed.
+    // Stated here so the band's arm is read from a scorecard shaped like a real one.
+    effort: null,
     mustFind: { found, total, recall: total ? found / total : null },
     inventoryMustFind: { found: invFound, total: invTotal, recall: invTotal ? invFound / invTotal : null },
     niceToFind: { found: 0, total: 0, recall: null },
@@ -261,6 +268,12 @@ test('aggregateRuns forms a mean/min/max band and skips null recalls', () => {
   });
   const s = aggregateRuns('demo', [mk(7, 7, 8, 9, 2, 0.01), mk(5, 7, 5, 9, 4, 0.02), mk(6, 7, 6, 9, 3, 0.03)]);
   assert.equal(s.runs, 3);
+  // The summary carries the one arm its runs share — read off run 0, which main's agreedScope refusal is
+  // what makes safe. This is the field baseline.js and compare.js gate on. A summary of runs recorded
+  // before the arm existed says so, rather than naming a default nobody proved.
+  assert.equal(s.effort, null);
+  const armed = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+  assert.deepEqual(aggregateRuns('demo', [{ ...mk(7, 7, 8, 9, 2, 0.01), effort: armed }]).effort, armed);
   assert.equal(s.mustFindRecall.max, 1);
   assert.equal(s.mustFindRecall.min, 5 / 7);
   assert.ok(Math.abs(s.mustFindRecall.mean - (1 + 5 / 7 + 6 / 7) / 3) < 1e-9);
@@ -562,6 +575,22 @@ describe('the arm a run was produced under', () => {
     assert.equal(parseEffort(null, 'scorecard-summary.json'), null);
     assert.equal(describeEffort(null), 'unrecorded');
     assert.notEqual(describeEffort(null), describeEffort(profile));
+  });
+
+  test('misarmedRuns names every run the invocation cannot pool with, which identity alone would pass', () => {
+    const on = { roundCap: 0, sweepCap: 2, reasoningTier: null };
+    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null };
+    const runs = [
+      { dir: 'r1', effort: on },    // the arm this invocation replays at
+      { dir: 'r2', effort: off },   // left by a --sweep-cap 0 invocation against the same root
+      { dir: 'r3', effort: null },  // replayed before the arm was recorded — nothing proves what it ran at
+    ];
+    const misarmed = misarmedRuns(on, runs);
+    assert.deepEqual(misarmed.map(m => m.dir), ['r2', 'r3']);
+    // Both arms in one phrase: the operator has to know which side to fix.
+    assert.match(misarmed[0].reason, /was replayed at effort roundCap=0 sweepCap=0 .*this invocation replays at roundCap=0 sweepCap=2/);
+    assert.match(misarmed[1].reason, /was replayed at effort unrecorded/);
+    assert.deepEqual(misarmedRuns(on, []), []);
   });
 
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
