@@ -64,7 +64,7 @@ Usage: node eval/freeze-suite.js [options]
   --read-set <arm>         Which changed files each scope worker opens in full, forwarded to every replay
                            (default: the engine's own DEFAULT_READ_SET). 'assigned' is the shipped
                            split read; 'changed' is the pre-split arm where every worker reads the whole
-                           changed set. Same one-arm-per---out rule as --sweep-cap.
+                           changed set. Same rule as --sweep-cap: give each arm its OWN --out.
   --help                   Show this help.
 
 Every case must pin the same engine — the rule eval/baseline.js enforces on the resulting suite, applied

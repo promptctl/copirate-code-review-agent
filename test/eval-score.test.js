@@ -594,7 +594,7 @@ describe('the arm a run was produced under', () => {
   });
 
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
-    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
+    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: [] }]) {
       assert.throws(() => parseEffort(bad, 'meta.json'), /'effort' must be/, JSON.stringify(bad));
     }
   });
