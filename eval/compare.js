@@ -47,8 +47,10 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          committed baseline under eval/baseline/, by commit-graph order — NOT directory-name
                          order, and an uncommitted baseline.json always outranks a committed one. Refused
                          (exit 2) if the newest can't be determined unambiguously (e.g. a shallow git clone
-                         with more than one candidate); pass --baseline explicitly in that case. N, engine,
-                         matcher, and review-effort arm come FROM whichever baseline is resolved. A tree
+                         with more than one candidate); pass --baseline explicitly in that case. N comes FROM
+                         whichever baseline is resolved and is imposed on the replay; the engine, matcher,
+                         and review-effort arm are the checked-out tree's own (or this CLI's flag) and are
+                         ASSERTED against the baseline's — a mismatch refuses rather than adapts. A tree
                          whose default arm (src/effort.js DEFAULT_SWEEP_CAP) differs from the baseline's is
                          REFUSED before any spend, not replayed at the baseline's arm: re-freeze, or price
                          the lever with an A/B (see eval/README, "Varying a lever").

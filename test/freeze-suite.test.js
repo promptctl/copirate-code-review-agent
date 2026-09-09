@@ -690,6 +690,44 @@ describe('the CLI selects case directories before any manifest is parsed', () =>
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s pre-spend arm guard, through the real CLI. The refusal has no unit seam: it sits in main()
+// ABOVE credentialInputFor, and that POSITION is the whole claim — a resume that forgot --sweep-cap 0 is
+// refused before the credential is even looked for, so no lane resolves and no replay spends. Running the
+// CLI with the pinned provider's credential absent is what pins the ordering; supplying one would leave a
+// guard that had slid below lane resolution passing this test.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI refuses a mixed-arm resume before it needs a credential', () => {
+  const { spawnSync } = require('node:child_process');
+  const { providerSpec } = require('../src/provider');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+
+  test('a run planted at the sweeps-off arm refuses a default-arm invocation, naming both arms', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true, { roundCap: 0, sweepCap: 0, reasoningTier: null });
+
+    // N=2 against one completed run leaves a real deficit, so without the guard this invocation would plan
+    // a replay and go looking for a lane — and the pinned provider's credential is stripped from the
+    // child's env, so reaching that point would fail with a credential error instead of this one.
+    const env = { ...process.env };
+    delete env[providerSpec('deepseek').credentialInput];
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '2', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const out = `${r.stdout}${r.stderr}`;
+
+    assert.notEqual(r.status, 0, out);
+    assert.match(out, /run\(s\) produced at a different review effort/);
+    assert.match(out, /was replayed at effort roundCap=0 sweepCap=0 /);
+    assert.match(out, new RegExp(`this invocation replays at roundCap=0 sweepCap=${DEFAULT_SWEEP_CAP} `));
+    // Nothing was scheduled: the suite/deficit banner main() prints once lanes resolve never appears.
+    assert.doesNotMatch(out, /replay\(s\) to run/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
 describe('suiteTiming', () => {
   const jobs = [
     { name: 'alpha', level: 1, lane: 'TOKEN_A', ok: true, outcome: 'ok', durationMs: 65000, log: 'out/logs/alpha.log' },
