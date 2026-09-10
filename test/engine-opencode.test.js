@@ -311,6 +311,10 @@ describe('opencodeAdapter interface declarations', () => {
     assert.equal(opencodeAdapter.name, 'opencode');
   });
 
+  test('contextWindow is null — undeclared, so nothing is withheld and every read is full', () => {
+    assert.equal(opencodeAdapter.contextWindow, null);
+  });
+
   test('OPENCODE_TIMEOUT_MS is 3000000', () => {
     assert.equal(OPENCODE_TIMEOUT_MS, 3_000_000);
   });

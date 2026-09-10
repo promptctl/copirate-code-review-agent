@@ -86,10 +86,14 @@ const TOOL_NAMES = {
   assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
-const FILES = [
+// Changed files carry the content measurement the material requires (measureChangedFiles); the reader
+// is injected as empty content, since these tests exercise the prompt's shape, not the window fit.
+const { measureChangedFiles } = require('../src/window');
+const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
+const FILES = stamp([
   { filename: 'src/auth.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' },
   { filename: 'src/io.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const b = 2;' },
-];
+]);
 
 // One pass whose material CAPTURES what each worker was handed. The capture sits at material.buildWorkerPrompt
 // — the exact seam runScopeWorker hands the assignment to — rather than regexing the rendered prompt, so what
@@ -112,7 +116,7 @@ async function passRecording({ pinnedPlan = null } = {}) {
     },
   };
   const adapter = {
-    async produceReview({ buildPromptFor }) {
+    contextWindow: null, async produceReview({ buildPromptFor }) {
       buildPromptFor(TOOL_NAMES);
       return { summary: 'sum', findings: [], assessments: [], usage: null };
     },
@@ -309,7 +313,7 @@ describe('a plan that does not describe this change is refused at zero spend', (
 
   test('the refusal costs nothing: no engine spawn is made at all', async () => {
     let spawned = 0;
-    const adapter = { async produceReview() { spawned++; throw new Error('the pass spawned an engine on a plan it should have refused'); } };
+    const adapter = { contextWindow: null, async produceReview() { spawned++; throw new Error('the pass spawned an engine on a plan it should have refused'); } };
     await assert.rejects(() => runMultiScopePass({
       config: { engine: 'fake', name: 'c1' },
       material: buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }),

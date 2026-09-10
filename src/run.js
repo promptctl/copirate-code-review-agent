@@ -6,10 +6,11 @@ const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
-const { buildReviewInput } = require('./prompt');
+const { showableFiles } = require('./prompt');
+const { measureChangedFiles } = require('./window');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
-const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause } = require('./multiscope');
 const { defaultEffortProfile } = require('./effort');
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = require('./budget');
 const { assessDifficulty } = require('./difficulty');
@@ -17,7 +18,7 @@ const { difficultyCandidates, parseDifficultyScaling } = require('./difficulty-p
 const { readSpentToday, appendCost } = require('./ledger');
 const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = require('./dependency-diff');
 const { renderCostLine, costWarning, costMarker, renderPrTime } = require('./usage');
-const { renderTimingBreakdown } = require('./schedule');
+const { renderTimingBreakdown, passLabel } = require('./schedule');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
@@ -201,10 +202,32 @@ function warnBudgetExhausted(review) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
-  const state = review.unreviewedScopes.length > 0
-    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
-    : 'every scope was reviewed, but convergence sweeps were cut short';
+  // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
+  // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
+  const { budget } = unreviewedByCause(review);
+  const state = budget.length > 0
+    ? `${budget.length} scope(s) went unreviewed (${budget.join(', ')})`
+    : review.unreviewedScopes.length === 0
+      ? 'every scope was reviewed, but convergence sweeps were cut short'
+      : 'convergence sweeps were cut short';
   core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
+}
+
+// [LAW:one-source-of-truth] The sibling warning for the other way coverage falls short: a scope worker
+// that died terminally (a context-window overflow, a crashed CLI). Rendered from the pass's scopeFailures
+// record — every failed pass with its message — exactly as the summary's line is, so the annotation and
+// the posted review name the same scopes and causes. [LAW:no-silent-failure] a delivered partial review
+// is operator news: the failure must be visible in the run's annotations, not only in the review body.
+function warnScopeFailures(review) {
+  if (review.scopeFailures.length === 0) return;
+  // The same two facts the summary's failure line states: a death at the review of record is a coverage
+  // gap and names the scope; a death in a sweep leaves pass 0's judgment standing.
+  const failed = review.scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ');
+  const { failure } = unreviewedByCause(review);
+  const coverage = failure.length > 0
+    ? `NOT reviewed: ${failure.join(', ')}. The other scopes' findings were still delivered.`
+    : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.';
+  core.warning(`${review.scopeFailures.length} scope worker(s) failed — ${failed}. ${coverage}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -702,12 +725,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
-  // toolNames; the material rebuilds the worker prompt per attempt so each engine gets its own tool
-  // identifiers. [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] runMultiScope (via
-  // produceReview) owns retry timing; the whole plan→workers pass is one attempt per config.
-  const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
-  const anchors = buildReviewAnchors(anchorInput.files);
+  // [LAW:effects-at-boundaries] The one read of the changed files' sizes, at the run boundary: every
+  // changed file is measured in the reviewed checkout (the tree the workers' Read tool opens), and the
+  // measured set is what the anchors and the material are built from — the window fit sizes each
+  // worker's reads by it. [LAW:parse-dont-validate] the stamp travels with the files; buildPrMaterial
+  // requires it.
+  const measured = measureChangedFiles(filteredFiles, REVIEWED_REPO_ROOT);
+  // Anchors are engine-agnostic (purely diff-line based): the files whose diff is on the LINE grid under
+  // MAX_DIFF_CHARS (showableFiles — the same derivation the worker prompt renders from). The material
+  // rebuilds the worker prompt per attempt so each engine gets its own tool identifiers.
+  // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
+  // retry timing; the whole plan→workers pass is one attempt per config.
+  const anchors = buildReviewAnchors(showableFiles(measured, maxDiffChars));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
@@ -732,7 +761,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }
   }
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
+  const material = buildPrMaterial({ files: measured, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -740,6 +769,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
+  warnScopeFailures(review);
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -814,6 +844,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
+  warnScopeFailures(review);
 
   const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
   const report = renderRepoReport({ reviewerName, scope, review, footer });
@@ -890,4 +921,4 @@ async function run() {
   }
 }
 
-module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, warnScopeFailures, MAX_DEPENDENCY_BUMPS_FETCHED };

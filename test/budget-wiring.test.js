@@ -227,18 +227,50 @@ describe('warnBudgetExhausted', () => {
     return warnings;
   }
   test('a coverage gap names the unreviewed scopes', () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: ['store', 'docs'] });
+    const w = captured({ budgetExhausted: true, unreviewedScopes: ['store', 'docs'], scopeFailures: [] });
     assert.equal(w.length, 1);
     assert.match(w[0], /2 scope\(s\) went unreviewed \(store, docs\)/);
     assert.match(w[0], /TIME_BUDGET_MINUTES/);
   });
   test('curtailed-only says every scope was reviewed — never a contradictory zero-unreviewed line', () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: [] });
+    const w = captured({ budgetExhausted: true, unreviewedScopes: [], scopeFailures: [] });
     assert.equal(w.length, 1);
     assert.match(w[0], /every scope was reviewed, but convergence sweeps were cut short/);
     assert.doesNotMatch(w[0], /0 scope\(s\)/);
   });
+  test("a scope unreviewed because its worker died is not the budget's to name, and coverage is not claimed", () => {
+    const w = captured({ budgetExhausted: true, unreviewedScopes: ['store'], scopeFailures: [{ scope: 'store', pass: 0, message: 'boom' }] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /Review time budget exhausted: convergence sweeps were cut short\./);
+    assert.doesNotMatch(w[0], /every scope was reviewed|store/);
+  });
   test('a budget that never bit warns nothing', () => {
-    assert.deepEqual(captured({ budgetExhausted: false, unreviewedScopes: [] }), []);
+    assert.deepEqual(captured({ budgetExhausted: false, unreviewedScopes: [], scopeFailures: [] }), []);
+  });
+});
+
+describe('warnScopeFailures', () => {
+  const { warnScopeFailures } = require('../src/run');
+  const core = require('@actions/core');
+  function captured(review) {
+    const original = core.warning;
+    const warnings = [];
+    core.warning = m => warnings.push(m);
+    try { warnScopeFailures(review); } finally { core.warning = original; }
+    return warnings;
+  }
+  test('a death at the review of record is a coverage gap that names the scope', () => {
+    const w = captured({ unreviewedScopes: ['store'], scopeFailures: [{ scope: 'store', pass: 0, message: 'Prompt is too long' }] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /1 scope worker\(s\) failed — 'store' at review: Prompt is too long\. NOT reviewed: store\. The other scopes' findings were still delivered\./);
+  });
+  test("a death in a sweep leaves pass 0's judgment standing and says so", () => {
+    const w = captured({ unreviewedScopes: [], scopeFailures: [{ scope: 'store', pass: 1, message: 'crashed' }] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /'store' at sweep 1: crashed\. Every scope was reviewed; the failed sweep may have left late-round findings missing\./);
+    assert.doesNotMatch(w[0], /NOT reviewed/);
+  });
+  test('no failures warns nothing', () => {
+    assert.deepEqual(captured({ unreviewedScopes: [], scopeFailures: [] }), []);
   });
 });

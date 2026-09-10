@@ -24,23 +24,27 @@ const TOOL_NAMES = {
   assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
+// Changed files carry the content measurement the material requires (measureChangedFiles); the reader
+// is injected as empty content, since these tests exercise the prompt's shape, not the window fit.
+const { measureChangedFiles } = require('../src/window');
+const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
 
 // Two directories of two files each, so the partition yields two scopes ('src/auth' and 'src/io') and
 // 'assigned' and 'changed' genuinely disagree: with one scope owning everything the arms would coincide,
 // and a test that cannot fail on the wrong arm proves nothing.
-const FILES = [
+const FILES = stamp([
   { filename: 'src/auth/login.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' },
   { filename: 'src/auth/token.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const t = 1;' },
   { filename: 'src/io/read.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const b = 2;' },
   { filename: 'src/io/write.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const w = 2;' },
-];
+]);
 
 // One pass over the material at one arm, returning what the engine actually saw: every worker prompt,
 // plus the plan the pass reviewed. A PR pass computes its plan, so every spawn is a worker.
 async function passAtArm(readSet, { material = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }) } = {}) {
   const workerPrompts = [];
   const adapter = {
-    async produceReview({ buildPromptFor }) {
+    contextWindow: null, async produceReview({ buildPromptFor }) {
       workerPrompts.push(buildPromptFor(TOOL_NAMES));
       return { summary: 'sum', findings: [], assessments: [], usage: null };
     },
@@ -129,10 +133,10 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
   // file exists to make trustworthy. Ownership is an identical-everywhere-else fact. [LAW:one-source-of-truth]
   test('exactly one worker owns the go.mod bump under BOTH arms — the arm never moves ownership', async () => {
     // go.mod sits at the repository root, which the partition never merges: it is its own 'top-level' scope.
-    const depFiles = [
+    const depFiles = stamp([
       { filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' },
       ...FILES,
-    ];
+    ]);
     const dependencySummaries = [{
       modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true, owner: 'a', repoName: 'b',
       compareUrl: 'https://github.com/a/b/compare/v1.0.0...v1.1.0', totalCommits: 1,
@@ -155,7 +159,7 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
 
   test('an arm outside the vocabulary is refused BEFORE any spawn — a bad arm costs nothing', async () => {
     let spawns = 0;
-    const adapter = { async produceReview() { spawns++; return { summary: '', findings: [], assessments: [], usage: null }; } };
+    const adapter = { contextWindow: null, async produceReview() { spawns++; return { summary: '', findings: [], assessments: [], usage: null }; } };
     await assert.rejects(runMultiScopePass({
       config: { engine: 'fake', name: 'c1' },
       material: buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }),

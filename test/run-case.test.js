@@ -292,7 +292,7 @@ const CASE_TOOL_NAMES = {
 
 test("buildCaseMaterial filters the case through production's seam and returns the split", () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   assert.deepEqual(files.map(f => f.filename), ['src/a.js']);
   assert.deepEqual(excluded, { patterns: ['dist/**'], paths: ['dist/index.js'] });
@@ -303,7 +303,7 @@ test("buildCaseMaterial filters the case through production's seam and returns t
 // buildPrMaterial call would leave a replay scoring the reviewer against a prompt production never sends.
 test("buildCaseMaterial threads the exclusion record into the material, so a replay renders production's prompts", () => {
   const { material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
   assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
@@ -311,16 +311,34 @@ test("buildCaseMaterial threads the exclusion record into the material, so a rep
 
 test('buildCaseMaterial with no exclusions reviews every file and says nothing about exclusion', () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   assert.equal(files.length, 2);
   assert.deepEqual(excluded.paths, []);
   assert.ok(!material.buildWorkerPrompt('scope', CASE_TOOL_NAMES).includes('EXCLUDE_PATTERNS'));
 });
 
+// The default reader is the production wiring: main() never passes readContent, so a replay measures
+// the extracted tree exactly as run.js measures the checkout. A stub in every other test here would let
+// a shadowed default (say, () => '') pass the suite while every real replay measured its files empty.
+test('buildCaseMaterial without readContent measures the file as it stands on disk', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-case-material-'));
+  try {
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const x = 1;\nconst y = 2;\n');
+    const { files } = buildCaseMaterial({ allFiles: [CASE_FILES[0]], excludePatterns: [], reviewedRepoRoot: root });
+    assert.equal(files[0].content.lines, 2);
+    assert.ok(files[0].content.tokens > 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('buildCaseMaterial refuses a case whose patterns exclude everything, rather than replaying it empty', () => {
   assert.throws(
-    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree' }),
+    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '' }),
     /All 2 changed file\(s\) were excluded/,
   );
 });

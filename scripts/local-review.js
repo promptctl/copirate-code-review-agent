@@ -43,7 +43,9 @@ Usage: node scripts/local-review.js [options]
                       values live in the file.
   --use <name>        Config name to select from --config (default: the file's 'default').
   --range <expr>      git diff range for the material (default: "HEAD~1 HEAD"). Ignored in repo mode.
-  --diff <file>       Use a unified .diff file instead of computing one from --range.
+  --diff <file>       Use a unified .diff file instead of computing one from --range. The checkout at
+                      --repo must be at that diff's head: the changed files are measured and read from
+                      it, exactly as production reads the PR's checkout.
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
   --mode <pr|repo>    Review mode (default: pr). repo = whole-repo exploration, no diff.
   --scope <text>      Optional free-text scope, repo mode only.
@@ -265,6 +267,7 @@ async function main() {
   process.env.RUNNER_TEMP = runTemp;
   const { TRANSCRIPT_DIR } = require('../src/debug');
   const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('../src/multiscope');
+  const { measureChangedFiles } = require('../src/window');
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
@@ -280,7 +283,7 @@ async function main() {
   // exactly as run.js does — then drive the identical production engine. The local harness IS the
   // production path minus the GitHub sink.
   const material = opts.mode === 'pr'
-    ? buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: repo })
+    ? buildPrMaterial({ files: measureChangedFiles(files, repo), maxDiffChars: 0, reviewedRepoRoot: repo })
     : buildRepoMaterial({ scope: opts.scope, excludePatterns: [], reviewedRepoRoot: repo });
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);

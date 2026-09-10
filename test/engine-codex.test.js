@@ -467,6 +467,10 @@ describe('codexAdapter interface declarations', () => {
     assert.equal(codexAdapter.name, 'codex');
   });
 
+  test('contextWindow is null — undeclared, so nothing is withheld and every read is full', () => {
+    assert.equal(codexAdapter.contextWindow, null);
+  });
+
   test('CODEX_TIMEOUT_MS is 3000000', () => {
     assert.equal(CODEX_TIMEOUT_MS, 3_000_000);
   });

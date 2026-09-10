@@ -11,6 +11,8 @@ const {
   laneCeilingFromMemory,
   findingsLedger,
   sweepsByDepth,
+  coverageOf,
+  CURTAILMENT_CAUSES,
   runScopeWorkers,
   runScopeChain,
   runMultiScopePass,
@@ -33,6 +35,10 @@ const TOOL_NAMES = {
   assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
+// Changed files carry the content measurement the material requires (measureChangedFiles); the reader
+// is injected as empty content, since these tests exercise the prompt's shape, not the window fit.
+const { measureChangedFiles } = require('../src/window');
+const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
 
 // ── parseScopeValue — typed scope records from the add_scope tool (mirrors parseFindingValue) ─────
 // The plan is no longer parsed from prose; the scout records each scope through the collector, so the
@@ -371,9 +377,9 @@ describe('sweepsByDepth', () => {
     const chains = [
       [{ added: 2, curtailed: false }, { added: 0, curtailed: false }], // converged at sweep 2
       [{ added: 0, curtailed: false }],                                  // converged at sweep 1
-      [{ added: 1, curtailed: false }, { added: 0, curtailed: true }],   // the budget took its sweep 2
+      [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'budget' } }],   // the budget took its sweep 2
     ];
-    assert.deepEqual(sweepsByDepth(chains), [{ added: 3, curtailed: false }, { added: 0, curtailed: true }]);
+    assert.deepEqual(sweepsByDepth(chains), [{ added: 3, curtailed: [] }, { added: 0, curtailed: ['budget'] }]);
   });
   test('no sweeps anywhere folds to [] — the value the summary renders as nothing', () => {
     assert.deepEqual(sweepsByDepth([[], []]), []);
@@ -437,21 +443,21 @@ describe('runScopeChain', () => {
     let spawned = 0;
     const spawn = async () => { spawned++; };
     const out = await runScopeChain(chainArgs(spawn, { deadline: 100, now: () => 200 }));
-    assert.deepEqual(out.passes, [{ added: 0, curtailed: true }]);
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'budget' } }]);
     assert.equal(spawned, 0);
   });
 
   test('a deadline kill at pass 0 settles the same way as a refusal', async () => {
     const spawn = async () => { throw new DeadlineExceededError('killed'); };
     const out = await runScopeChain(chainArgs(spawn, { deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(out.passes, [{ added: 0, curtailed: true }]);
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'budget' } }]);
   });
 
   test("the budget taking a SWEEP curtails the chain; pass 0's judgment stands", async () => {
     const spawn = spawnOf((pass) => { if (pass > 0) throw new DeadlineExceededError('killed in the sweep'); return [bug('one')]; });
     const ledger = findingsLedger();
     const out = await runScopeChain(chainArgs(spawn, { ledger, deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 0, curtailed: true }]);
+    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'budget' } }]);
     assert.deepEqual(ledger.findings.map(f => f.body), ['one']);
   });
 
@@ -462,9 +468,32 @@ describe('runScopeChain', () => {
     assert.ok(out.passes.every(p => p.added === 1 && !p.curtailed));
   });
 
-  test('any other error propagates unchanged — a failed scope is never a quiet empty one', async () => {
+  test('a TransientError propagates unchanged — failover owns it, the chain never absorbs it', async () => {
     const spawn = async () => { throw new TransientError('rate-limited'); };
     await assert.rejects(runScopeChain(chainArgs(spawn)), TransientError);
+  });
+
+  // zai-engine-ydc: a worker that dies on an error no retry fixes (a context-window overflow, a crashed
+  // CLI) settles as this scope's failure — absorbed as a value, exactly as the budget is — so sibling
+  // chains' earned findings are never discarded by a fail-loud rethrow.
+  test('any other error at pass 0 settles as a failure carrying the error: the scope is a coverage gap, nothing rethrown', async () => {
+    const boom = new Error('Claude Code review failed: Prompt is too long');
+    const spawn = async () => { throw boom; };
+    const logs = [];
+    const out = await runScopeChain(chainArgs(spawn, { log: (m) => logs.push(m) }));
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'failure', error: boom } }]);
+    assert.ok(logs.some(m => m === "scope 'a' not reviewed — worker failed: Claude Code review failed: Prompt is too long"), JSON.stringify(logs));
+    assert.ok(logs.some(m => /^scope 'a' chain: review failed — /.test(m)), JSON.stringify(logs));
+  });
+
+  test("a failure in a SWEEP ends the chain; pass 0's judgment stands", async () => {
+    const spawn = spawnOf((pass) => { if (pass > 0) throw new Error('crashed in the sweep'); return [bug('one')]; });
+    const ledger = findingsLedger();
+    const out = await runScopeChain(chainArgs(spawn, { ledger }));
+    assert.equal(out.passes.length, 2);
+    assert.deepEqual(out.passes[0], { added: 1, curtailed: false });
+    assert.equal(out.passes[1].curtailed.cause, 'failure');
+    assert.deepEqual(ledger.findings.map(f => f.body), ['one']);
   });
 
   test('assessments from every completed pass reach the outcome', async () => {
@@ -502,7 +531,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
   function makeRegistry({ flaky } = {}) {
     const calls = { scout: 0, workers: {} };
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') {
           calls.scout++;
@@ -541,7 +570,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
     // assessments the adapter returned — every bump then rendered "unassessed". This asserts the CONTRACT
     // (a worker's assessments survive aggregation), independent of how runScopeWorker forwards them.
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
         const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
@@ -559,7 +588,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
 
   test('a transient error that persists past spawn retries propagates loudly — no scope is silently dropped', async () => {
     const alwaysFlaky = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
         throw new TransientError('API Error: terminated');
       },
@@ -588,7 +617,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
   // A fake adapter that records the `reasoning` of every config it is spawned with.
   function recordingRegistry(seen) {
     const adapter = {
-      async produceReview({ config, buildPromptFor }) {
+      contextWindow: null, async produceReview({ config, buildPromptFor }) {
         seen.push(config.reasoning);
         if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
         return { summary: 'sum', findings: [], assessments: [], usage: null };
@@ -635,9 +664,9 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
     // (after the first throws a persistent transient) also spawns at the folded tier, and configUsed is it.
     const seen = [];
     const adapters = {
-      c1: { async produceReview() { throw new TransientError('API Error: terminated'); } },
+      c1: { contextWindow: null, async produceReview() { throw new TransientError('API Error: terminated'); } },
       c2: {
-        async produceReview({ config, buildPromptFor }) {
+        contextWindow: null, async produceReview({ config, buildPromptFor }) {
           seen.push(config.reasoning);
           if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, usage: null };
           return { summary: 'sum', findings: [], assessments: [], usage: null };
@@ -687,7 +716,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
     const seenPrompts = [];
     const perScopeCalls = {};
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: usagePerSpawn };
         seenPrompts.push(prompt);
@@ -731,7 +760,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
     let releaseA;
     const aHeld = new Promise(r => { releaseA = r; });
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
         seenPrompts.push(prompt);
@@ -806,21 +835,27 @@ describe('runMultiScopePass — convergence sweeps', () => {
 });
 
 describe('buildPrMaterial', () => {
-  const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+  // The read set a worker is handed is a projection of its assignment, which the partition draws from
+  // the changed set — so every file named below is a changed file, as in production.
+  const files = stamp([
+    { filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' },
+    { filename: 'src/usage.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const u = 1;' },
+    { filename: 'src/report.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const r = 1;' },
+  ]);
   const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
 
   test("exposes the changed-file list — the partition's input and the pinned producer's proof set", () => {
-    assert.deepEqual(material.changedPaths, ['src/a.js']);
+    assert.deepEqual(material.changedPaths, ['src/a.js', 'src/usage.js', 'src/report.js']);
   });
 
   // [LAW:one-source-of-truth] The proposal IS partitionByDirectory over the filenames: no spawn is made
   // (the producer takes none), and the value is the same one test/partition.test.js pins per case.
   test('the proposal is the partition of the changed filenames, bought from no spawn', () => {
-    const files = [
+    const files = stamp([
       { filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+1' },
       { filename: 'src/b.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+2' },
       { filename: 'README.md', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+3' },
-    ];
+    ]);
     const proposal = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }).proposal({ log: () => {} });
     const expected = partitionByDirectory(['src/a.js', 'src/b.js', 'README.md']);
     assert.deepEqual(proposal, { provenance: 'partition', scopes: expected.scopes, context: expected.context, scoutUsage: null });
@@ -932,7 +967,7 @@ describe('buildPrMaterial', () => {
   // dependencySummaries is the ONE source buildPrMaterial derives both the prompt note (renderDependencyDiffNote)
   // and the resolved-only assess bumps from. [LAW:verifiable-goals]
   test('dependencySummaries drives the worker prompt: the note is injected and the assess directive lists only RESOLVED modules', () => {
-    const goModFiles = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' }];
+    const goModFiles = stamp([{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+\tgithub.com/a/b v1.1.0' }]);
     const summaries = [
       { modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true, owner: 'a', repoName: 'b',
         compareUrl: 'https://github.com/a/b/compare/v1.0.0...v1.1.0', totalCommits: 1, commits: [{ sha: 'x'.repeat(12), message: 'm' }], totalFiles: 0, files: [] },
@@ -1041,7 +1076,7 @@ describe('the repo scout prompt carries no size threshold', () => {
 // ── buildReviewInput focus value (the single-scope vs narrowed distinction) ───────────────────────
 
 describe('buildReviewInput focus', () => {
-  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+  const FILES = stamp([{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }]);
 
   test('empty focus renders no CONCENTRATE block (the broad whole-diff review)', () => {
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
@@ -1070,7 +1105,7 @@ describe('buildReviewInput focus', () => {
 // identical); a non-empty list renders finding↔reply pairs plus the weigh-with-judgment steer.
 
 describe('buildReviewInput prior pushbacks', () => {
-  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+  const FILES = stamp([{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }]);
 
   test('empty priorPushbacks renders no pushback block (byte-identical cold review)', () => {
     const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
@@ -1111,7 +1146,7 @@ describe('buildReviewInput prior pushbacks', () => {
 // renders each finding plus the hunt-what-is-missing steer and the explicit permission to come back
 // empty — the guard that keeps a sweep from manufacturing findings (precision) to fill the silence.
 describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findings', () => {
-  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+  const FILES = stamp([{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }]);
   const PRIOR = [
     { path: 'src/a.js', line: 3, body: 'Bug: leaks the handle', severity: 4 },
     { path: 'src/b.js', line: 8, body: 'Edge case: empty list crashes', severity: 3 },
@@ -1170,7 +1205,7 @@ describe('buildReviewInput / buildRepoReviewInput convergence-sweep prior findin
 // single author records each module's judgment. Every other worker — and every non-dependency PR —
 // renders nothing.
 describe('buildReviewInput dependency assess directive', () => {
-  const FILES = [{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+require github.com/a/b v1.1.0' }];
+  const FILES = stamp([{ filename: 'go.mod', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+require github.com/a/b v1.1.0' }]);
   const BUMPS = [{ modulePath: 'github.com/a/b', from: 'v1.0.0', to: 'v1.1.0', resolved: true }];
 
   test('the go.mod-owning worker is told to call assess_dependency, naming the exact module', () => {
@@ -1212,7 +1247,7 @@ describe('buildReviewInput dependency assess directive', () => {
 // verdict cannot count. [LAW:no-silent-failure]
 describe('buildReviewInput surfaces unshowable files', () => {
   test('a patchless file appears in the block with a read-in-full instruction and no diff fence', () => {
-    const files = [{ filename: 'src/big.js', status: 'modified' }]; // no `patch` — GitHub omitted it
+    const files = stamp([{ filename: 'src/big.js', status: 'modified' }]); // no `patch` — GitHub omitted it
     const { prompt } = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /could not be shown \(too large or binary/);
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/big\\.js`));
@@ -1226,10 +1261,10 @@ describe('buildReviewInput surfaces unshowable files', () => {
 
   test('a budget-skipped file lands in the SAME block as a patchless file', () => {
     const big = '@@ -1,1 +1,400 @@\n' + Array.from({ length: 400 }, (_, i) => `+line ${i}`).join('\n');
-    const files = [
+    const files = stamp([
       { filename: 'src/patchless.js', status: 'modified' },
       { filename: 'src/overbudget.js', status: 'modified', patch: big },
-    ];
+    ]);
     // A tiny budget forces the patchable file to be skipped too.
     const { prompt } = buildReviewInput({ files, maxDiffChars: 50, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, new RegExp(`${REPO_ROOT}/src/patchless\\.js`));
@@ -1237,7 +1272,7 @@ describe('buildReviewInput surfaces unshowable files', () => {
   });
 
   test('a fully-shown diff renders no unshowable block', () => {
-    const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
+    const files = stamp([{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }]);
     const { prompt } = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.doesNotMatch(prompt, /could not be shown/);
   });
@@ -1253,7 +1288,7 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
   // Inputs deliberately carry NONE of the hunted tokens, so any src/|scripts/|dist/ match below can only
   // be baked-in template text — never echoed input. (This is the 598.3 discipline: test the template by
   // feeding it inputs free of what you are hunting.)
-  const NEUTRAL_FILES = [{ filename: 'lib/thing.go', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x := 1' }];
+  const NEUTRAL_FILES = stamp([{ filename: 'lib/thing.go', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x := 1' }]);
   const review = buildReviewInput({ files: NEUTRAL_FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
   const repoScout = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
 
@@ -1299,7 +1334,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   function makeRegistry({ workerBehavior }) {
     const calls = { scout: 0, workers: {}, deadlines: [] };
     const adapter = {
-      async produceReview({ buildPromptFor, deadline }) {
+      contextWindow: null, async produceReview({ buildPromptFor, deadline }) {
         calls.deadlines.push(deadline);
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') {
@@ -1460,7 +1495,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   function makeRegistry({ workerBehavior } = {}) {
     const workerSpan = (scope, sweep) => span(sweep ? 20 : 10, (sweep ? 20 : 10) + 1 + SCOPES.findIndex(s => s.name === scope.name));
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') {
           return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: { span: span(0, 2) } };
@@ -1593,7 +1628,7 @@ describe('the pass stamps unique scope names', () => {
   const scoped = (name, focus) => ({ name, focus, files: [] });
   async function planFor(scoutScopes) {
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], assessments: [], scopes: scoutScopes, usage: null };
         return { summary: 'sum', findings: [], assessments: [], usage: null };
       },
@@ -1622,8 +1657,7 @@ describe('the pass stamps unique scope names', () => {
     const summary = composeSummary(
       'Splits the sync path in two.',
       [{ name: 'sync', focus: 'f1', files: [] }, { name: 'sync (2)', focus: 'f2', files: [] }],
-      [],
-      { exhausted: true, unreviewedScopes: ['sync (2)'] },
+      { unreviewed: [{ name: 'sync (2)', cause: 'budget' }], scopeFailures: [], sweeps: [], budgetExhausted: true },
     );
     assert.match(summary, /Reviewed 1 scope\(s\): sync\./);
     assert.match(summary, /1 of 2 scope\(s\) were reviewed; NOT reviewed: sync \(2\)/);
@@ -1645,7 +1679,7 @@ describe('runMultiScope — failover budget bounded by the deadline', () => {
       buildWorkerPrompt: (t) => t,
     };
     const adapter = {
-      async produceReview() {
+      contextWindow: null, async produceReview() {
         spawns++;
         clock += 600; // each attempt burns fake time toward the 1s deadline
         throw new TransientError('rate-limited', 999_999); // uncapped server Retry-After
@@ -1696,7 +1730,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   // nothing (so sweepCap:1 converges after one sweep). `usageFor` lets a test null a scope's usage.
   function makeRegistry({ usageFor } = {}) {
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') {
           return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: { span: span(0, 2) } };
@@ -1756,5 +1790,238 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   test('a caller without a start mint or budget logs the typed absences, not a second clock', async () => {
     const logs = await run();
     assert.ok(logs.includes('all scopes done — elapsed unclocked (no budget)'), JSON.stringify(logs));
+  });
+});
+
+// ── zai-engine-ydc: a scope worker that dies terminally leaves its scope unreviewed, the rest delivered
+// The precedent is the deadline: a scope the budget took is absorbed as data, never as a fail-loud
+// rethrow that discards sibling findings. A worker whose spawn fails on an error no retry fixes — a
+// context-window overflow ("Prompt is too long"), a crashed CLI — now settles the same way, with its
+// cause and message carried as data (scopeFailures) beside the budget's (budgetExhausted).
+describe('runMultiScopePass — a terminally failed scope worker', () => {
+  const SCOPES = [
+    { name: 'a', focus: 'fa', files: [] },
+    { name: 'b', focus: 'fb', files: [] },
+    { name: 'c', focus: 'fc', files: [] },
+  ];
+  const material = {
+    changedPaths: [],
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
+    buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
+  };
+  const config = { engine: 'fake', name: 'c1' };
+  function makeRegistry(workerBehavior) {
+    const calls = { workers: {} };
+    const adapter = {
+      contextWindow: null,
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        const sweep = prompt.startsWith('SWEEP ');
+        const scope = SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`));
+        calls.workers[scope.name] = (calls.workers[scope.name] ?? 0) + 1;
+        return workerBehavior({ scope, sweep });
+      },
+    };
+    return { registry: { get: () => adapter }, calls };
+  }
+  const okResult = (scope) => ({ summary: `sum-${scope.name}`, findings: [{ path: `${scope.name}.js`, line: 1, body: `bug in ${scope.name}`, severity: 3 }], assessments: [], usage: null });
+  const passArgs = (registry, extra = {}) => ({
+    config, material, registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {}, ...extra,
+  });
+  const overflow = () => new Error('Claude Code review failed: Prompt is too long — the worker material (diff + instructions) plus its file reads exceeded the model context window');
+
+  test("THE acceptance test: one worker's spawn throws a plain Error; the other scopes' findings are delivered, the failed scope is named unreviewed with its message", async () => {
+    const { registry, calls } = makeRegistry(({ scope }) => { if (scope.name === 'b') throw overflow(); return okResult(scope); });
+    const logs = [];
+    const review = await runMultiScopePass(passArgs(registry, { log: m => logs.push(m) }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
+    assert.deepEqual(review.unreviewedScopes, ['b']);
+    assert.equal(review.budgetExhausted, false); // nothing here is the budget's doing
+    assert.deepEqual(review.scopeFailures, [{ scope: 'b', pass: 0, message: overflow().message }]);
+    assert.equal(calls.workers.b, 1); // a terminal failure is not retried in place
+    assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
+    assert.doesNotMatch(review.summary, /Time budget exhausted/);
+    assert.match(review.summary, /⚠️ \*\*Scope worker failed\*\* — 'b' at review: Claude Code review failed: Prompt is too long/);
+    assert.match(review.summary, /NOT reviewed: b\. The findings above cover only the reviewed scopes\./);
+    assert.ok(logs.includes(`scope 'b' not reviewed — worker failed: ${overflow().message}`), JSON.stringify(logs));
+    assert.ok(logs.some(m => /^scope 'b' chain: review failed — /.test(m)), JSON.stringify(logs));
+  });
+
+  test('every worker failing rethrows the first failure itself — never a budget error the run did not spend', async () => {
+    const { registry } = makeRegistry(() => { throw overflow(); });
+    await assert.rejects(runMultiScopePass(passArgs(registry)), (e) => !(e instanceof DeadlineExceededError) && /Prompt is too long/.test(e.message));
+  });
+
+  test('a TransientError still propagates out of the pass — failover owns it', async () => {
+    const { registry } = makeRegistry(({ scope }) => { if (scope.name === 'b') throw new TransientError('API Error: 529 overloaded'); return okResult(scope); });
+    await assert.rejects(runMultiScopePass(passArgs(registry)), TransientError);
+  });
+
+  test("a failure in a sweep leaves pass 0's judgment standing and is reported at that pass", async () => {
+    const { registry } = makeRegistry(({ scope, sweep }) => { if (sweep && scope.name === 'a') throw new Error('crashed mid-sweep'); return sweep ? { ...okResult(scope), findings: [] } : okResult(scope); });
+    const review = await runMultiScopePass(passArgs(registry, { sweepCap: 1 }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
+    assert.deepEqual(review.unreviewedScopes, []);
+    assert.deepEqual(review.scopeFailures, [{ scope: 'a', pass: 1, message: 'crashed mid-sweep' }]);
+    assert.match(review.summary, /\*\*convergence sweep 1\*\* — cut short by a worker failure after 0 new finding\(s\)\./);
+    assert.match(review.summary, /Scope worker failed.*'a' at sweep 1: crashed mid-sweep\. Every scope was reviewed/);
+  });
+
+  test('a budget-taken scope and a failed scope are both unreviewed, each under its own cause', async () => {
+    const { registry } = makeRegistry(({ scope }) => {
+      if (scope.name === 'b') throw new DeadlineExceededError('killed');
+      if (scope.name === 'c') throw overflow();
+      return okResult(scope);
+    });
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    assert.deepEqual(review.unreviewedScopes, ['b', 'c']);
+    assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.scopeFailures.map(f => f.scope), ['c']);
+    assert.match(review.summary, /Reviewed 1 scope\(s\): a\./);
+    assert.match(review.summary, /Time budget exhausted\*\* — 1 of 3 scope\(s\) were reviewed; NOT reviewed: b\./);
+    assert.match(review.summary, /Scope worker failed\*\* — 'c' at review: .*NOT reviewed: c\./);
+  });
+
+  test("an adapter that never declared contextWindow is refused before anything spawns", async () => {
+    const adapter = { async produceReview() { throw new Error('must not spawn'); } };
+    await assert.rejects(runMultiScopePass(passArgs({ get: () => adapter })), /declare contextWindow as null or a positive integer .*got undefined from 'fake'/);
+  });
+});
+
+describe('coverageOf — the one fold of the chains\' outcomes into the pass\'s coverage record', () => {
+  const scopes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+  const boom = new Error('line one\nline two of a long stdout tail');
+  test('unreviewed names pass-0 curtailments with their cause; scopeFailures every failed pass, single-line; sweeps by depth; the budget bit', () => {
+    const outcomes = [
+      { passes: [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'failure', error: boom } }] },
+      { passes: [{ added: 0, curtailed: { cause: 'budget' } }] },
+      { passes: [{ added: 2, curtailed: false }, { added: 1, curtailed: false }] },
+    ];
+    assert.deepEqual(coverageOf(scopes, outcomes), {
+      unreviewed: [{ name: 'b', cause: 'budget' }],
+      scopeFailures: [{ scope: 'a', pass: 1, message: 'line one' }],
+      sweeps: [{ added: 1, curtailed: ['failure'] }],
+      budgetExhausted: true,
+    });
+  });
+  test('nothing curtailed folds to the empty coverage record', () => {
+    assert.deepEqual(coverageOf(scopes, scopes.map(() => ({ passes: [{ added: 0, curtailed: false }] }))), { unreviewed: [], scopeFailures: [], sweeps: [], budgetExhausted: false });
+  });
+  test('CURTAILMENT_CAUSES is the closed vocabulary, in fold order', () => {
+    assert.deepEqual(CURTAILMENT_CAUSES, ['budget', 'failure']);
+  });
+});
+
+// ── buildReviewInput — the window fit decides what a worker is shown and told to read ─────────────
+describe('composeSummary with a failed scope and a budget-cut sweep', () => {
+  test('the budget line does not claim every scope was reviewed while the failure line names one that was not', () => {
+    const scopes = [{ name: 'a' }, { name: 'b' }];
+    const summary = composeSummary('ctx', scopes, {
+      unreviewed: [{ name: 'a', cause: 'failure' }],
+      scopeFailures: [{ scope: 'a', pass: 0, message: 'boom' }],
+      sweeps: [{ added: 0, curtailed: ['budget'] }],
+      budgetExhausted: true,
+    });
+    assert.match(summary, /⏳ \*\*Time budget exhausted\*\* — convergence sweeps were cut short; late-round findings may be missing\./);
+    assert.doesNotMatch(summary, /every scope was reviewed/);
+    assert.match(summary, /⚠️ \*\*Scope worker failed\*\* — 'a' at review: boom\. NOT reviewed: a\./);
+  });
+});
+
+describe('buildReviewInput window fit', () => {
+  const hashes = Array.from({ length: 1500 }, (_, i) => `+mod/${i} v1.0.0 h1:A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6a7b8=`).join('\n');
+  const FILES = stamp([
+    { filename: 'go.sum', status: 'added', patch: `@@ -0,0 +1,1500 @@\n${hashes}` },
+    { filename: 'src/new.js', status: 'added', patch: '@@ -0,0 +1,2 @@\n+const n = 1;\n+module.exports = n;' },
+    { filename: 'src/old.js', status: 'modified', patch: '@@ -10,2 +10,3 @@\n const a = 1;\n+const b = 2;\n@@ -40 +41 @@\n+const c = 3;' },
+  ]);
+  const build = (extra) => buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, ...extra }).prompt;
+
+  test('with no window every hunk is shown, and an added+shown file is reviewed from the diff — never Read again', () => {
+    const prompt = build({ readFiles: ['go.sum', 'src/new.js', 'src/old.js'] });
+    assert.match(prompt, /### go\.sum \(added\)/);
+    assert.match(prompt, /this scope's assigned changed files: src\/old\.js\. Skip any among them/);
+    assert.match(prompt, /NEW in this change and their diff below is their complete content — do NOT Read them again, review them from the diff: go\.sum, src\/new\.js\./);
+    assert.doesNotMatch(prompt, /could not be shown/);
+  });
+
+  test('under a finite window the largest hunk is withheld, listed with a per-file read instruction, and its file stays anchorable', () => {
+    const { files, prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['go.sum', 'src/new.js', 'src/old.js'], window: 100_000 });
+    assert.doesNotMatch(prompt, /### go\.sum \(added\)/);
+    assert.match(prompt, /### src\/new\.js \(added\)/);
+    assert.match(prompt, /could not be shown \(too large or binary, or the diff exceeded `MAX_DIFF_CHARS`, or withheld so the rest of the diff fits your context window\)/);
+    assert.match(prompt, new RegExp(`> - ${REPO_ROOT}/go\\.sum — read it in full`)); // its content stamp is '' here, so it fits whole
+    assert.match(prompt, /assigned changed files: go\.sum, src\/old\.js\. Skip any among them/);
+    assert.match(prompt, /do NOT Read them again, review them from the diff: src\/new\.js\./);
+    assert.deepEqual(files.map(f => f.filename), ['go.sum', 'src/new.js', 'src/old.js']); // anchorable set unchanged by the fit
+  });
+
+  test('a file too large to read whole is a targeted read, naming its changed lines and line count, in both passages', () => {
+    const big = stamp([{ filename: 'src/old.js', status: 'modified', patch: '@@ -10,2 +10,3 @@\n const a = 1;\n+const b = 2;\n@@ -40 +41 @@\n+const c = 3;' }])
+      .map(f => ({ ...f, content: { tokens: 150_000, lines: 9000 } }));
+    const prompt = buildReviewInput({ files: big, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/old.js'], window: 200_000 }).prompt;
+    assert.match(prompt, /do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: src\/old\.js \(lines 10-12, 41 of 9000\)\./);
+    assert.doesNotMatch(prompt, /assigned changed files:/);
+    assert.match(prompt, /Another scope's worker reads the other changed files/);
+  });
+
+  test('the rendered prompt never exceeds window − headroom, however many files the note and read lists must name', () => {
+    const { WORKER_HEADROOM_TOKENS, estimateTokens } = require('../src/window');
+    const many = stamp(Array.from({ length: 400 }, (_, i) => ({
+      filename: `pkg/module-${i}/handler.js`, status: 'modified',
+      patch: `@@ -1,2 +1,16 @@\n const a = ${i};\n${Array.from({ length: 15 }, (_, j) => `+const b${j} = a * ${j}; // ${'x'.repeat(60)}`).join('\n')}`,
+    }))).map(f => ({ ...f, content: { tokens: 400, lines: 40 } }));
+    const window = 200_000;
+    const prompt = buildReviewInput({ files: many, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: many.map(f => f.filename), window }).prompt;
+    assert.match(prompt, /could not be shown/); // the fit had to withhold, so the note is at its longest
+    assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
+  });
+
+  test('the same bound holds when every file lands in the full and in-diff lists instead of targeted', () => {
+    const { WORKER_HEADROOM_TOKENS, estimateTokens } = require('../src/window');
+    const many = stamp(Array.from({ length: 400 }, (_, i) => ({
+      filename: `locales/region-${i}/strings.json`, status: i % 2 === 0 ? 'added' : 'modified', patch: `@@ -1 +1 @@\n+{"k": ${i}}`,
+    }))).map(f => ({ ...f, content: { tokens: 20, lines: 1 } }));
+    const window = 200_000;
+    const prompt = buildReviewInput({ files: many, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: many.map(f => f.filename), window }).prompt;
+    assert.doesNotMatch(prompt, /could not be shown|do not fit whole/); // nothing withheld, nothing targeted
+    assert.match(prompt, /assigned changed files: locales\/region-1\/strings\.json/);
+    assert.match(prompt, /review them from the diff: locales\/region-0\/strings\.json/);
+    assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
+  });
+
+  test('a pure deletion at the top of a file is read from line 1, never a line 0 no file has', () => {
+    const { hunkRanges } = require('../src/diff');
+    assert.deepEqual(hunkRanges('@@ -1,3 +0,0 @@\n-a\n-b\n-c'), [{ from: 1, to: 1 }]);
+    const big = stamp([{ filename: 'src/top.js', status: 'modified', patch: '@@ -1,3 +0,0 @@\n-a\n-b\n-c' }])
+      .map(f => ({ ...f, content: { tokens: 150_000, lines: 9000 } }));
+    const prompt = buildReviewInput({ files: big, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/top.js'], window: 200_000 }).prompt;
+    assert.match(prompt, /src\/top\.js \(lines 1 of 9000\)/);
+  });
+
+  test("a withheld file outside this worker's read set is another scope's: consult only when a finding needs it; a removed one has nothing to read", () => {
+    const files = stamp([
+      { filename: 'go.sum', status: 'added', patch: `@@ -0,0 +1,1500 @@\n${hashes}` },
+      { filename: 'src/gone.js', status: 'removed', patch: '@@ -1,2 +0,0 @@\n-a\n-b' },
+      { filename: 'src/mine.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' },
+    ]);
+    const prompt = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/mine.js'], window: 100_000 }).prompt;
+    assert.match(prompt, new RegExp(`> - ${REPO_ROOT}/go\\.sum — another scope's worker owns it — consult it only when a finding of yours needs it`));
+    assert.doesNotMatch(prompt, new RegExp(`> - ${REPO_ROOT}/src/gone\\.js`)); // its hunk (deletions only) is shown, so it is on the grid
+  });
+
+  test("the 'changed' arm (empty readFiles) keeps its wording and still exempts added+shown files from a re-read", () => {
+    const prompt = build({ readFiles: [] });
+    assert.match(prompt, /Read the complete content of every changed file that contains code/);
+    assert.match(prompt, /do NOT Read them again, review them from the diff: go\.sum, src\/new\.js\./);
+    assert.doesNotMatch(prompt, /Another scope's worker/);
+  });
+
+  test('an unmeasured changed set is refused at the material boundary, before any worker prompt', () => {
+    assert.throws(
+      () => buildPrMaterial({ files: [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' }], maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }),
+      /changed file 'src\/a\.js' carries no content measurement; the changed set must pass through measureChangedFiles/,
+    );
   });
 });

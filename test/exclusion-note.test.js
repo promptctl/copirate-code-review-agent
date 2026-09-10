@@ -20,12 +20,16 @@ const TOOL_NAMES = {
   assessDependency: 'mcp__review_collector__assess_dependency',
 };
 const REPO_ROOT = '/home/runner/work/acme/acme';
+// Changed files carry the content measurement the material requires (measureChangedFiles); the reader
+// is injected as empty content, since these tests exercise the prompt's shape, not the window fit.
+const { measureChangedFiles } = require('../src/window');
+const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
 
-const FILES = [
+const FILES = stamp([
   { filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' },
   { filename: 'build/out.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+bundled' },
   { filename: 'deps.lock', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+pinned' },
-];
+]);
 
 describe('filterFiles — the cut and the record of the cut are one value', () => {
   test('records the paths it removed, paired with the patterns that removed them', () => {
@@ -78,7 +82,7 @@ describe('the reviewer is told what was removed from its view', () => {
   test('a large withheld set is capped, and says how many it did not name', () => {
     const many = Array.from({ length: 25 }, (_, i) => ({ filename: `build/f${i}.js`, status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x' }));
     const { reviewed, excluded } = filterFiles([...FILES, ...many], ['build/**']);
-    const prompt = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded })
+    const prompt = buildPrMaterial({ files: stamp(reviewed), maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded })
       .buildWorkerPrompt('code', TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
     assert.match(prompt, /\(and 6 more\)/);          // 1 build/out.js + 25 = 26 withheld, 20 named
     assert.match(prompt, /These 26 file\(s\) are part of this change/);
@@ -106,7 +110,7 @@ describe('a withheld path is never a read target — the partition is over what 
     const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
     const workerPrompts = [];
     const adapter = {
-      async produceReview({ buildPromptFor }) {
+      contextWindow: null, async produceReview({ buildPromptFor }) {
         workerPrompts.push(buildPromptFor({}));
         return { summary: 'sum', findings: [], assessments: [], usage: null };
       },

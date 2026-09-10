@@ -362,9 +362,12 @@ function loadDiffFiles(diffPath) {
 // reviewer against a prompt production never sends — the instrument measuring the wrong thing.
 // [LAW:effects-at-boundaries] Pure: it computes and throws. The caller owns the stderr line, composed
 // from the `excluded` returned here.
-function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot }) {
+// readContent is the injected file reader measureChangedFiles takes (fs by default): the replay measures
+// the case's extracted tree exactly as run.js measures the checkout. [LAW:effects-at-boundaries]
+function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot, readContent }) {
   const { filterFiles } = require('../src/diff');
   const { buildPrMaterial } = require('../src/multiscope');
+  const { measureChangedFiles } = require('../src/window');
   const { reviewed: files, excluded } = filterFiles(allFiles, excludePatterns);
   // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
   // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
@@ -373,7 +376,10 @@ function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot }) {
   }
   // maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the frozen diff is the whole
   // material the workers see, anchored against the same (filtered) files.
-  return { files, excluded, material: buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot, excluded }) };
+  // [LAW:one-source-of-truth] The same measurement production stamps (run.js), from the same seam, so
+  // a replay's workers are fit to the window exactly as a live review's are.
+  const measured = measureChangedFiles(files, reviewedRepoRoot, readContent);
+  return { files: measured, excluded, material: buildPrMaterial({ files: measured, maxDiffChars: 0, reviewedRepoRoot, excluded }) };
 }
 
 // [LAW:no-ambient-temporal-coupling] Drain the engine's frozen TRANSCRIPT_DIR into this run's dir, then

@@ -31522,11 +31522,14 @@ function excludedPathList(paths) {
 // changed line; both GitHub (line+side) and Gitea (new_position) speak it natively.
 // Each hunk header resets the new-side counter; only added/context lines advance it
 // and are anchorable (deletions have no new-side line).
+// [LAW:one-source-of-truth] The one reading of a hunk header: new-side start and length.
+const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+
 function* patchLines(patch) {
   let newLine = 0;
   let inHunk = false;
   for (const text of patch.split('\n')) {
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+    const hunk = HUNK_HEADER.exec(text);
     if (hunk) {
       newLine = Number(hunk[1]);
       inHunk = true;
@@ -31547,6 +31550,24 @@ function* patchLines(patch) {
     }
     yield { kind: 'meta', text };
   }
+}
+
+// [LAW:effects-at-boundaries] Pure: the new-side line ranges this patch touches, one per hunk, in
+// patch order — what a worker told to read a file "around its changed lines" opens with Read
+// offset/limit instead of the whole file. A header without a length (`+12 @@`) is one line. A pure
+// deletion at the top of the file (`+0,0`) has no new-side line of its own; the read starts at line 1,
+// the nearest line that exists, never at a line 0 no file has.
+function hunkRanges(patch) {
+  const ranges = [];
+  for (const text of patch.split('\n')) {
+    const hunk = HUNK_HEADER.exec(text);
+    if (hunk) {
+      const from = Math.max(Number(hunk[1]), 1);
+      const length = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      ranges.push({ from, to: from + Math.max(length, 1) - 1 });
+    }
+  }
+  return ranges;
 }
 
 function buildFileAnchors(file) {
@@ -31768,6 +31789,7 @@ function reconcileChangedSet(listed, parsed) {
 }
 
 module.exports = {
+  hunkRanges,
   matchesPattern,
   parseReviewableFiles,
   reconcileChangedSet,
@@ -32590,6 +32612,14 @@ function buildCommand({ config, collector, home }) {
     ANTHROPIC_MODEL: config.model,
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    // [LAW:no-silent-failure] A worker whose material overruns the window must FAIL, not review a
+    // summary: with auto-compaction on, the CLI silently condensed a 232k-token first request to
+    // 22k and the worker "succeeded" having judged a compaction summary of the diff, not the diff
+    // (links-317-dolt-telemetry, session d54a1478). With it off the same overflow surfaces as the
+    // "Prompt is too long" error assertSucceeded names, and the chain reports the scope unreviewed.
+    // The fit (src/window.js) is what keeps the material inside the window; this is the alarm that
+    // says so when it did not. Present in the pinned CLI (2.1.0) and current releases (2.1.267).
+    DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
 
@@ -32634,7 +32664,13 @@ function assertSucceeded(stdout) {
     throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
   }
   if (parsed.is_error || parsed.subtype === 'error') {
-    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
+    // The overflow is named as what it is — the worker's material plus its reads exceeded the model's
+    // context window — because the raw "Prompt is too long" reads like a prompt-authoring bug and sent
+    // two investigations toward the instructions before the transcripts showed a 232k first request.
+    const overflow = /prompt is too long/i.test(String(parsed.result ?? ''))
+      ? ' — the worker material (diff + instructions) plus its file reads exceeded the model context window; see contextWindow and the window fit in src/window.js'
+      : '';
+    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}${overflow}`);
   }
 }
 
@@ -32717,6 +32753,18 @@ const classifyClaudeError = classifyError;
 const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
+  // [LAW:one-source-of-truth] The FLOOR across every model this engine fronts, measured on the case
+  // that overflowed it (a 232k first request failing "Prompt is too long" against Claude's 200k).
+  // The engine is not Claude-only — src/provider.js routes zai and deepseek through it — but no
+  // model routed here has a smaller window (GLM-5.x and DeepSeek V4 both declare 200k or more), and
+  // a model with a larger one gets material fit to 200k, which withholds early rather than late: the
+  // safe direction. Unlike codex/opencode, whose fronted models' windows are unknown to this repo,
+  // this floor is a known fact for the models in the provider table. An operator who overrides the
+  // model or base URL to something outside it is not validated against a window list (this repo keeps
+  // none, and a second table of model facts would drift); a smaller window there overflows LOUDLY —
+  // "Prompt is too long", the scope reported unreviewed — never as a silent compaction.
+  // Moves with a measurement, never a wish.
+  contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
@@ -32821,6 +32869,12 @@ function makeCliAdapter(spec) {
     name: spec.name,
     toolNames: spec.toolNames,
     capabilities: spec.capabilities,
+    // The model context window this engine reviews inside, in tokens, or null when the engine does
+    // not declare one. The multi-scope pass hands it to the material so each worker's prompt is FIT
+    // to it (src/window.js) — the diff it is shown and the files it is told to read are sized so the
+    // first request cannot overflow. Forwarded as declared; runMultiScopePass (src/multiscope.js) is
+    // the one checkpoint of its vocabulary (null | positive integer). [LAW:one-source-of-truth]
+    contextWindow: spec.contextWindow,
 
     // buildPromptFor(toolNames) is applied with THIS engine's tool identifiers, so a failover chain
     // gives each engine its own MCP tool names in the prompt. [LAW:types-are-the-program]
@@ -33194,6 +33248,9 @@ function classifyError(err, text) {
 const codexAdapter = makeCliAdapter({
   name: 'codex',
   timeoutMs: CODEX_TIMEOUT_MS,
+  // Undeclared: codex fronts models of differing windows and compacts on its own; nothing is withheld
+  // from its workers and every read is full — the pre-fit behavior, as a value. [LAW:dataflow-not-control-flow]
+  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
@@ -33580,6 +33637,8 @@ function classifyError(err, text) {
 const opencodeAdapter = makeCliAdapter({
   name: 'opencode',
   timeoutMs: OPENCODE_TIMEOUT_MS,
+  // Undeclared: opencode fronts any provider's models; nothing is withheld and every read is full.
+  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth for config
     // validation in src/config.js. An EMPTY reasoningEfforts set is a deliberate, accurate theorem:
@@ -34550,10 +34609,10 @@ module.exports = {
 "use strict";
 
 const os = __nccwpck_require__(857);
-const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS } = __nccwpck_require__(2887);
+const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, TransientError } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
 const { defaultEffortProfile, maxTier, readSetProjection } = __nccwpck_require__(4652);
-const { dedupeFindings, dedupeAssessments, parseScopeValue } = __nccwpck_require__(1565);
+const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = __nccwpck_require__(7932);
 const { planRecord } = __nccwpck_require__(8194);
@@ -34678,15 +34737,21 @@ function sumSpan(spans) {
 // findings; its summary is not output.
 // Each convergence sweep contributes one line stating what it added; sweeps is a value: [] (sweepCap 0,
 // or the shape predating sweeps) renders nothing. [LAW:dataflow-not-control-flow]
-// budget is the time-budget outcome: the default (not exhausted, nothing unreviewed) renders nothing,
-// so a run without a deadline — and a run that fit its deadline — is byte-identical to before.
-// [LAW:no-silent-failure] When the budget DID bite, the coverage line names only the scopes actually
-// reviewed, the unreviewed ones are listed by name, and a curtailed convergence is called out — a
-// partial review must never read like a clean bill. The scout summary standing above it describes the
-// CHANGE and never the review, so it cannot soften that report into one.
-function composeSummary(scoutSummary, scopes, sweeps = [], budget = { exhausted: false, unreviewedScopes: [] }) {
-  const unreviewed = new Set(budget.unreviewedScopes);
-  const reviewed = scopes.filter(s => !unreviewed.has(s.name));
+// coverage is the pass's COVERAGE record (coverageOf): which scopes went unreviewed and why, which
+// workers failed, the per-depth sweep fold, and whether the time budget bit. FULL_COVERAGE — the
+// default, nothing unreviewed, nothing failed, no sweeps — renders nothing, so a run without a
+// deadline that fit its lanes is byte-identical to before. [LAW:no-silent-failure] When coverage
+// DID fall short, the coverage line names only the scopes actually reviewed, the unreviewed ones are
+// listed by name under the cause that took them (the budget, or a worker that failed terminally —
+// each with its message), and a curtailed convergence is called out — a partial review must never
+// read like a clean bill. The scout summary standing above it describes the CHANGE and never the
+// review, so it cannot soften that report into one.
+function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
+  const { unreviewed, scopeFailures, sweeps, budgetExhausted } = coverage;
+  const unreviewedNames = new Set(unreviewed.map(u => u.name));
+  const reviewed = scopes.filter(s => !unreviewedNames.has(s.name));
+  const budgetUnreviewed = unreviewed.filter(u => u.cause === 'budget').map(u => u.name);
+  const failedUnreviewed = unreviewed.filter(u => u.cause === 'failure').map(u => u.name);
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
   // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
   // there is no absent-summary state for this sink to represent. Neither can break this line-structured
@@ -34696,19 +34761,41 @@ function composeSummary(scoutSummary, scopes, sweeps = [], budget = { exhausted:
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
     // because it was killed" and "searched and found nothing" are different facts.
-    lines.push(`**convergence sweep ${i + 1}** — ${s.curtailed
-      ? `cut short by the time budget after ${s.added} new finding(s).`
+    lines.push(`**convergence sweep ${i + 1}** — ${s.curtailed.length > 0
+      ? `cut short by ${s.curtailed.map(c => CURTAILMENT_BY[c]).join(' and ')} after ${s.added} new finding(s).`
       : s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
   }
-  if (budget.exhausted) {
-    lines.push(budget.unreviewedScopes.length > 0
+  if (budgetExhausted) {
+    lines.push(budgetUnreviewed.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${budget.unreviewedScopes.join(', ')}. The findings above cover only the reviewed scopes.`
-      : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
+        + `NOT reviewed: ${budgetUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
+      // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
+      // not the budget's share of it: a scope whose worker died is named on the failure line below, and
+      // this line must not contradict it.
+      : `⏳ **Time budget exhausted** — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
         + 'late-round findings may be missing.');
+  }
+  // [LAW:no-silent-failure] A worker that died terminally is named with what killed it, at the pass it
+  // died on: at the review of record the scope is a coverage gap; at a sweep, pass 0's judgment stands
+  // and only late-round findings may be missing — two facts, both stated, never folded into "partial".
+  if (scopeFailures.length > 0) {
+    lines.push(`⚠️ **Scope worker failed** — ${scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ')}. `
+      + (failedUnreviewed.length > 0
+        ? `NOT reviewed: ${failedUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
+        : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.'));
   }
   return lines.join('\n');
 }
+
+// [LAW:types-are-the-program] Why a pass did not run to completion — the vocabulary `curtailed` speaks
+// at every depth. 'budget': the wall-clock budget refused or killed it (planned degradation, owned by
+// the deadline). 'failure': the worker died on an error no retry fixes — a context-window overflow, a
+// crashed CLI — and the error rides along so the caller can rethrow it when NOTHING was reviewed.
+// A TransientError is neither: failover owns it, and the chain lets it propagate.
+const CURTAILMENT_CAUSES = ['budget', 'failure'];
+// The one prose rendering of each cause, shared by the sweep line and the pass log.
+const CURTAILMENT_BY = { budget: 'the time budget', failure: 'a worker failure' };
+const FULL_COVERAGE = Object.freeze({ unreviewed: [], scopeFailures: [], sweeps: [], budgetExhausted: false });
 
 // [LAW:one-source-of-truth] The memory one engine lane reserves. Every lane is a full engine CLI
 // process (claude-code, codex, opencode) holding its own context — observed in the low hundreds of MB
@@ -34754,16 +34841,48 @@ function findingsLedger() {
 
 // [LAW:effects-at-boundaries] Pure: fold every chain's sweep records into one record per DEPTH — the
 // per-sweep lines the summary prints and the budget verdict reads. Index i is sweep i+1. A chain that
-// stopped earlier contributes nothing at deeper indexes; a depth is curtailed when ANY chain's sweep at
-// that depth was, and its `added` is what the chains that ran it added between them. The result is as
-// deep as the deepest chain, so a review with no sweeps folds to [] — the value composeSummary renders
-// as nothing. [LAW:dataflow-not-control-flow]
+// stopped earlier contributes nothing at deeper indexes; a depth's `curtailed` is the DISTINCT list of
+// causes (CURTAILMENT_CAUSES order) that cut any chain's sweep at that depth — [] when none was — and
+// its `added` is what the chains that ran it added between them. The result is as deep as the deepest
+// chain, so a review with no sweeps folds to [] — the value composeSummary renders as nothing.
+// [LAW:dataflow-not-control-flow]
 function sweepsByDepth(chains) {
   const depth = Math.max(0, ...chains.map(c => c.length));
   return Array.from({ length: depth }, (_, i) => {
     const at = chains.filter(c => i < c.length).map(c => c[i]);
-    return { added: at.reduce((sum, s) => sum + s.added, 0), curtailed: at.some(s => s.curtailed) };
+    const causes = new Set(at.filter(s => s.curtailed).map(s => s.curtailed.cause));
+    return { added: at.reduce((sum, s) => sum + s.added, 0), curtailed: CURTAILMENT_CAUSES.filter(c => causes.has(c)) };
   });
+}
+
+// [LAW:effects-at-boundaries] Pure: the pass's COVERAGE record, folded ONCE from the chains' outcomes
+// — the one derivation the summary renders from and the return value carries, so the posted prose and
+// the sink's data cannot disagree about which scope went unreviewed or why. [LAW:one-source-of-truth]
+//   unreviewed    — [{ name, cause }] for every scope whose pass 0 did not complete (the coverage gap);
+//   scopeFailures — [{ scope, pass, message }] for every pass at any depth a worker died on, the
+//                   message stamped single-line here (firstLine) so the line-structured summary and
+//                   the operator warning can carry it as-is;
+//   sweeps        — sweepsByDepth over the chains' sweep passes;
+//   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
+// [LAW:one-source-of-truth] The review record carries the unreviewed set as names (unreviewedScopes —
+// the verdict's input) and the failures as a record (scopeFailures); the split of the names by cause is
+// derived here, ONCE, for every sink that must attribute a gap correctly: a scope unreviewed because its
+// worker died at the review of record is the failure's, and only the rest are the budget's.
+function unreviewedByCause({ unreviewedScopes, scopeFailures }) {
+  const failure = scopeFailures.filter(f => f.pass === 0).map(f => f.scope);
+  return { failure, budget: unreviewedScopes.filter(name => !failure.includes(name)) };
+}
+
+function coverageOf(scopes, outcomes) {
+  const unreviewed = scopes.flatMap((s, i) => {
+    const c = outcomes[i].passes[0].curtailed;
+    return c ? [{ name: s.name, cause: c.cause }] : [];
+  });
+  const scopeFailures = scopes.flatMap((s, i) => outcomes[i].passes.flatMap((p, pass) =>
+    (p.curtailed && p.curtailed.cause === 'failure' ? [{ scope: s.name, pass, message: firstLine(p.curtailed.error.message) }] : [])));
+  const sweeps = sweepsByDepth(outcomes.map(o => o.passes.slice(1)));
+  const budgetExhausted = unreviewed.some(u => u.cause === 'budget') || sweeps.some(s => s.curtailed.includes('budget'));
+  return { unreviewed, scopeFailures, sweeps, budgetExhausted };
 }
 
 // [LAW:dataflow-not-control-flow] A fixed-width pool of lanes that is FAIL-LOUD: the first error
@@ -34798,44 +34917,53 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // recorded so far — its own and its siblings' — stopping the moment a sweep adds nothing.
 // [LAW:composability] It returns one OUTCOME per scope:
 //   { passes: [{ added, curtailed }], assessments }
-// where passes[0] is the review of record and passes[k] is sweep k. `curtailed` is the time budget's
-// planned degradation, one fact at every depth: at pass 0 it is the coverage gap the summary and the
+// where passes[0] is the review of record and passes[k] is sweep k. `curtailed` is false for a pass
+// that ran, or the cause that stopped it — { cause: 'budget' } or { cause: 'failure', error } (see
+// CURTAILMENT_CAUSES) — one fact at every depth: at pass 0 it is the coverage gap the summary and the
 // verdict carry (the scope was not reviewed); at a sweep it merely ends the chain (pass 0's judgment
 // stands). The list is exactly the passes that RAN plus at most one curtailed entry, so a caller reads
 // the chain's depth off its length. [LAW:types-are-the-program]
 //
-// [LAW:single-enforcer] The budget meets a scope in exactly ONE place — attemptPass — identically
-// before every pass: a pass is refused before spawning when nothing remains, and a spawn the deadline
-// kills mid-flight settles the same way (DeadlineExceededError, absorbed here so sibling chains'
-// earned results are never discarded by a fail-loud rethrow). Both are the same fact, "the budget
-// took this pass", and what that means is decided by the pass index the fact lands on — a value, not
-// a branch. Every other error propagates. [LAW:dataflow-not-control-flow] The killed spawn's burned
-// time is not this chain's concern: the spawn seam recorded it (err.span) before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }) {
+// [LAW:single-enforcer] A pass's fate is decided in exactly ONE place — attemptPass — identically
+// before and around every pass: the budget refuses a pass before spawning when nothing remains, and a
+// spawn the deadline kills mid-flight settles the same way (DeadlineExceededError); a worker that
+// dies on any error failover does not own (a context-window overflow, a crashed CLI — anything but a
+// TransientError) settles as a failure. Both are absorbed HERE so sibling chains' earned results are
+// never discarded by a fail-loud rethrow (zai-engine-ydc: one overflowing worker used to void every
+// other scope's findings), and what a curtailment means is decided by the pass index it lands on —
+// a value, not a branch. A TransientError alone propagates: the retry seam already spent its in-place
+// attempts on it, and config-level failover is the owner of what happens next. [LAW:dataflow-not-control-flow]
+// The killed spawn's burned time is not this chain's concern: the spawn seam recorded it (err.span)
+// before the error got here.
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, contextWindow, deadline, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
   // the ledger as it stands the instant it starts. The pass index is the domain's own discriminator
   // (review of record vs sweep), so this is the one branch the chain has. [LAW:dataflow-not-control-flow]
   const seedFor = (pass) => (pass === 0 ? [] : ledger.findings);
+  // attemptPass settles to one of two shapes: { result } (the worker's records) or { curtailed }
+  // (why it did not run to completion). [LAW:types-are-the-program]
   const attemptPass = async (pass) => {
-    if (remainingMs(deadline, now()) <= 0) return null;
+    if (remainingMs(deadline, now()) <= 0) return { curtailed: { cause: 'budget' } };
     try {
-      return await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings: seedFor(pass), pass });
+      return { result: await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings: seedFor(pass), pass }) };
     } catch (e) {
-      if (e instanceof DeadlineExceededError) return null;
-      throw e;
+      if (e instanceof DeadlineExceededError) return { curtailed: { cause: 'budget' } };
+      if (e instanceof TransientError) throw e;
+      return { curtailed: { cause: 'failure', error: e } };
     }
   };
   const passes = [];
   const assessments = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
-    const result = await attemptPass(pass);
-    if (result === null) {
-      log(`${sweepLabelPrefix(pass)}scope '${scope.name}' not reviewed — time budget exhausted`);
-      passes.push({ added: 0, curtailed: true });
+    const attempt = await attemptPass(pass);
+    if (attempt.curtailed) {
+      log(`${sweepLabelPrefix(pass)}scope '${scope.name}' not reviewed — ${curtailmentLogText(attempt.curtailed)}`);
+      passes.push({ added: 0, curtailed: attempt.curtailed });
       break;
     }
+    const { result } = attempt;
     assessments.push(...result.assessments);
     const added = ledger.merge(result.findings);
     passes.push({ added, curtailed: false });
@@ -34846,9 +34974,16 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   // a scope the budget refused before it was ever reviewed — read straight off the passes value, so
   // the log never says a never-reviewed scope "finished after 0 pass(es)" a line after saying it was
   // not reviewed. [LAW:dataflow-not-control-flow]
-  const chain = passes.map((p, i) => `${passLabel(i)}${p.curtailed ? ' curtailed' : ''}`).join(', ');
+  const chain = passes.map((p, i) => `${passLabel(i)}${p.curtailed ? CHAIN_LABEL_BY[p.curtailed.cause] : ''}`).join(', ');
   log(`scope '${scope.name}' chain: ${chain} — ${runningTotal()}`);
   return { passes, assessments };
+}
+
+// [LAW:one-source-of-truth] The two log renderings of a curtailment, keyed by cause: the pass line's
+// reason and the chain line's suffix ('review curtailed' is the budget's established wording).
+const CHAIN_LABEL_BY = { budget: ' curtailed', failure: ' failed' };
+function curtailmentLogText(curtailed) {
+  return curtailed.cause === 'budget' ? 'time budget exhausted' : `worker failed: ${firstLine(curtailed.error.message)}`;
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -34861,7 +34996,10 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 // [LAW:one-source-of-truth] `pass` is the index as DATA (0 = the review of record, 1..N = sweeps);
 // the human-facing 'sweep N ' label derives from it via sweepLabelPrefix, and the schedule record
 // carries the number — one value, both representations derived.
-async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, priorFindings = [], pass = 0 }) {
+// contextWindow is the engine's declared window (adapter.contextWindow: tokens, or null), handed to the
+// material so the worker's prompt is FIT to it (buildReviewInput → fitWorkerMaterial) — a value from the
+// adapter, threaded, never re-read from the registry here. [LAW:one-source-of-truth]
+async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
   // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
   // scope's assignment (readFilesFor, resolved once at the pass boundary): under the shipped 'assigned' arm
@@ -34872,7 +35010,7 @@ async function runScopeWorker({ scope, context, material, spawn, log, readFilesF
   // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
   // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) =>
-    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor(scope.files) }, priorFindings);
+    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor(scope.files), window: contextWindow }, priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -35047,6 +35185,15 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     throw new Error(`runMultiScopePass requires a positive integer laneCeiling (got ${JSON.stringify(laneCeiling)}); it comes from the machine's capacity (laneCeilingFromMemory).`);
   }
   const adapter = registry.get(config.engine);
+  // [LAW:parse-dont-validate] The engine's context window crosses from the adapter into the engine HERE,
+  // and this is its one checkpoint: null (undeclared) or a positive integer. An adapter that never
+  // declared the field hands over `undefined`, which the material's default would launder into
+  // "undeclared" and the fit into a NaN budget — either way a silent answer to a question nobody asked.
+  // Refused at zero spend with the field named, like the two gates above. [LAW:no-silent-failure]
+  const contextWindow = adapter.contextWindow;
+  if (contextWindow !== null && !(Number.isInteger(contextWindow) && contextWindow > 0)) {
+    throw new Error(`runMultiScopePass requires the engine adapter to declare contextWindow as null or a positive integer token count (got ${JSON.stringify(contextWindow)} from '${config.engine}').`);
+  }
 
   // [LAW:decomposition] Every engine spawn in this pass goes through one transient-retry seam, so a
   // single flaky request (a dropped socket, a 5xx) is absorbed in place — the scout and each worker
@@ -35149,29 +35296,31 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, contextWindow, deadline, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
-  // A scope whose pass 0 the budget took is a COVERAGE gap, carried as data to the summary and the
+  // A scope whose pass 0 did not complete is a COVERAGE gap, carried as data to the summary and the
   // verdict; a curtailed sweep merely bounds convergence — pass 0's judgments of record stand.
-  const unreviewedScopes = scopes.filter((s, i) => outcomes[i].passes[0].curtailed).map(s => s.name);
-  // [LAW:no-silent-failure] The budget expired before ANY scope completed: there is no review to
-  // deliver, and "delivering" an empty one would approve a change nobody looked at. Fail fast with
-  // the knob named — the diagnosable error the empty-handed workflow cancel never was.
-  if (unreviewedScopes.length === scopes.length) {
+  const coverage = coverageOf(scopes, outcomes);
+  // [LAW:no-silent-failure] NO scope completed: there is no review to deliver, and "delivering" an
+  // empty one would approve a change nobody looked at. Fail fast with the real cause — the first
+  // worker's own error when one died, so an overflow or a crash is diagnosed as itself and never as
+  // a budget the run did not spend; otherwise the budget, with the knob named.
+  if (coverage.unreviewed.length === scopes.length) {
+    const failed = scopes.map((s, i) => outcomes[i].passes[0].curtailed).find(c => c.cause === 'failure');
+    if (failed) throw failed.error;
     throw new DeadlineExceededError(
       `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
     );
   }
-  const sweeps = sweepsByDepth(outcomes.map(o => o.passes.slice(1)));
+  const { sweeps, unreviewed, scopeFailures, budgetExhausted } = coverage;
   for (const [i, s] of sweeps.entries()) {
     const pass = i + 1;
-    log(`convergence sweep ${pass}: ${s.added} new finding(s)${s.curtailed ? ' — cut short (time budget)' : s.added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
+    log(`convergence sweep ${pass}: ${s.added} new finding(s)${s.curtailed.length > 0 ? ` — cut short (${s.curtailed.map(c => SWEEP_LOG_BY[c]).join(', ')})` : s.added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
   }
-  const budgetExhausted = unreviewedScopes.length > 0 || sweeps.some(s => s.curtailed);
 
   return {
-    summary: composeSummary(context, scopes, sweeps, { exhausted: budgetExhausted, unreviewedScopes }),
+    summary: composeSummary(context, scopes, coverage),
     findings: ledger.findings,
     // [LAW:dataflow-not-control-flow] Dependency assessments aggregate exactly like findings — a flatMap
     // over the chains plus one dedup — and with the SAME shape: no `|| []` fallback, because every chain
@@ -35216,13 +35365,20 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       scoutUsage: proposal.scoutUsage,
     }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
-    // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
-    // the budget bit at all. The summary text above derives from these same values, never the
-    // other way around. Both are their defaults ([]/false) on every run the budget didn't touch.
-    unreviewedScopes,
+    // approval when unreviewedScopes is non-empty (transport.submitReview) — the NAMES, whatever took
+    // them, since a scope a worker died on is exactly as unreviewed as one the budget refused — and
+    // run.js warns when the budget bit (budgetExhausted) and when a worker failed (scopeFailures,
+    // every failed pass at any depth with its message). The summary text above derives from these
+    // same values, never the other way around. All three are their defaults ([]/false/[]) on every
+    // run nothing went wrong in.
+    unreviewedScopes: unreviewed.map(u => u.name),
     budgetExhausted,
+    scopeFailures,
   };
 }
+
+// The sweep log's cause wording, keyed like CURTAILMENT_BY. [LAW:one-source-of-truth]
+const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
 
 // The engine seam both modes call. Wraps the multi-scope pass in failover.produceReview so the whole
 // pass retries/advances per config. produceReview supplies (config, buildPromptFor, anchors); the
@@ -35291,7 +35447,15 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // handed only what survived the filter. It reaches BOTH prompts because both reason about completeness:
 // the scout plans coverage of the changed set, a worker judges it. NO_EXCLUSIONS (an unfiltered run,
 // e.g. scripts/local-review.js) renders nothing in either. [LAW:dataflow-not-control-flow]
+// [LAW:parse-dont-validate] `files` must carry the content measurement measureChangedFiles (src/window.js)
+// stamps — the worker prompt's window fit sizes every full read by it — and THIS is the checkpoint: the
+// material boundary, before any lane spawns, so an unmeasured changed set is refused at zero spend with
+// the seam named, never discovered inside a worker as a TypeError absorbed into "scope failed".
 function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
+  const unmeasured = files.find(f => !f.content || !Number.isInteger(f.content.tokens) || !Number.isInteger(f.content.lines));
+  if (unmeasured) {
+    throw new Error(`buildPrMaterial: changed file '${unmeasured.filename}' carries no content measurement; the changed set must pass through measureChangedFiles (src/window.js) before it becomes review material.`);
+  }
   const changedPaths = files.map(f => f.filename);
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
@@ -35307,9 +35471,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     proposal: ({ log }) => partitionProposal({ changedPaths, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
-    // [LAW:dataflow-not-control-flow] The assignment and the read set arrive as one pair and land on the two
-    // parameters that own them; both default to the empty list — the broad single-scope call, a value not a mode.
-    buildWorkerPrompt: (focusText, toolNames, { assigned = [], read = [] } = {}, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles: assigned, readFiles: read, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
+    // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and
+    // land on the parameters that own them; the lists default to empty and the window to null (undeclared:
+    // nothing withheld, every read full) — the broad single-scope call, values not modes.
+    buildWorkerPrompt: (focusText, toolNames, { assigned = [], read = [], window = null } = {}, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles: assigned, readFiles: read, window, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
   };
 }
 
@@ -35335,6 +35500,7 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 }
 
 module.exports = {
+  unreviewedByCause,
   workerFocusText,
   sumUsage,
   composeSummary,
@@ -35342,6 +35508,8 @@ module.exports = {
   laneCeilingFromMemory,
   findingsLedger,
   sweepsByDepth,
+  coverageOf,
+  CURTAILMENT_CAUSES,
   scoutProposal,
   partitionProposal,
   runScopeWorkers,
@@ -35809,8 +35977,9 @@ module.exports = { preflight, probeConfig, classifyProbe, PROBE_TIMEOUT_MS };
 
 "use strict";
 
-const { annotatePatchWithLines, NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
+const { annotatePatchWithLines, hunkRanges, NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const { findingLineText } = __nccwpck_require__(1565);
+const { estimateTokens, fitWorkerMaterial } = __nccwpck_require__(8705);
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -35948,42 +36117,82 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
 // excluded is filterFiles' record of what EXCLUDE_PATTERNS removed from this diff ({patterns, paths}).
 // NO_EXCLUSIONS (nothing removed) renders nothing, so an unfiltered review is byte-identical.
 // [LAW:dataflow-not-control-flow]
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], readFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
-  const patchableFiles = files.filter(f => f.patch);
-  const includedDiffs = [];
-  const includedFiles = [];
-  // [LAW:one-type-per-behavior] A file GitHub returns without a patch (too large — roughly >400 changed
-  // lines — or binary) and a file whose diff overran the MAX_DIFF_CHARS budget are the SAME behavior: a
-  // changed file whose diff cannot be shown inline. They are two instances of one type, not two modes, so
-  // they merge into ONE list and one rendered block. Patchless files were previously filtered out at
-  // `f.patch` and vanished silently while the scout still assigned them to a scope (buildPrMaterial hands
-  // the scout every filename), so workers hunted for diff lines that did not exist. [LAW:no-silent-failure]
-  const unshowableFiles = files.filter(f => !f.patch).map(f => f.filename);
+// [LAW:one-type-per-behavior] A file GitHub returns without a patch (too large — roughly >400 changed
+// lines — or binary) and a file whose diff overran the MAX_DIFF_CHARS budget are the SAME behavior: a
+// changed file whose diff cannot be shown inline. They are two instances of one type, not two modes, so
+// they merge into ONE value: the inline entry a file gets, or null when it gets none. Patchless files
+// were previously filtered out at `f.patch` and vanished silently while the scout still assigned them to
+// a scope, so workers hunted for diff lines that did not exist. [LAW:no-silent-failure]
+// [LAW:one-source-of-truth] This is the ONE derivation of "which files are on the LINE grid before the
+// window is consulted": the worker prompt renders from it, and run.js derives the review's anchors from
+// it (showableFiles), so a worker can never be shown a grid the sink cannot anchor.
+function inlineEntries(files, maxDiffChars) {
+  const entries = new Map();
   let totalChars = 0;
-
-  for (const f of patchableFiles) {
+  for (const f of files) {
+    if (!f.patch) { entries.set(f.filename, null); continue; }
     // No flatten: parseReviewableFiles refused any path that could break this heading, and flattening
     // one here would hand the model a filename that does not match the file it must read.
     const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
     if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
-      unshowableFiles.push(f.filename);
+      entries.set(f.filename, null);
     } else {
-      includedDiffs.push(entry);
-      includedFiles.push(f);
+      entries.set(f.filename, entry);
       totalChars += entry.length;
     }
   }
+  return entries;
+}
 
-  let diffs = includedDiffs.join('\n\n');
+// The files whose diff can be shown inline under MAX_DIFF_CHARS — the anchorable set. A hunk the
+// window later withholds from one worker stays anchorable: a finding that worker records at the
+// file's real line lands on the same new-side numbering the grid carries. [LAW:one-source-of-truth]
+function showableFiles(files, maxDiffChars) {
+  return showable(files, inlineEntries(files, maxDiffChars));
+}
+const showable = (files, entries) => files.filter(f => entries.get(f.filename) !== null);
 
-  // [LAW:dataflow-not-control-flow] The unshowable set is a VALUE: an empty list renders nothing, so this
-  // is one path, not a "patchless mode". The recovery route is the one the pipeline already owns: a
-  // recorded finding whose line is off the diff grid becomes an UNANCHORED finding (partitionFindings),
-  // which counts toward the verdict and renders in the review body — so the riskiest (biggest) changed
-  // files stay reviewable, and an issue in them can never bypass the merge gate via summary prose.
-  if (unshowableFiles.length > 0) {
-    diffs += `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`). Read each in full at its absolute path and review its changes. Record any issue with ${toolNames.requestChange} using the file's real line number from the full file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${unshowableFiles.map(f => `> - ${reviewedRepoRoot}/${f}`).join('\n')}`;
+// [LAW:one-source-of-truth] How a worker is told to open ONE file whose diff is not on its grid,
+// read straight off the fit's per-file plan (src/window.js READ_KINDS) and the file's own status.
+// Every kind the plan can assign to a withheld file has a sentence; a kind that cannot reach here
+// ('in-diff' requires a shown hunk) fails loudly rather than rendering "undefined" into a prompt.
+function withheldReadInstruction(file, read) {
+  if (read === 'full') return 'read it in full';
+  if (read === 'targeted') return targetedReadText(file);
+  if (read === 'none') {
+    return file.status === 'removed'
+      ? 'deleted by this change — there is no file to read'
+      : "another scope's worker owns it — consult it only when a finding of yours needs it";
   }
+  throw new Error(`withheldReadInstruction: a withheld hunk cannot carry read kind '${read}' (${file.filename})`);
+}
+
+// [LAW:one-source-of-truth] The one instruction for a file the fit could not afford whole, used by the
+// withheld note and the read-target passage alike. It never says "read around the hunks" of a file
+// whose hunks ARE the file (an added file, a lockfile): the bound is what a finding needs, the changed
+// lines are where to start, and a generated artifact is skipped outright — the one class that both
+// dominates this case's material (a 1,527-line go.sum of hashes) and carries nothing to review.
+function targetedReadText(file) {
+  return `does not fit whole alongside this diff — open only the parts a finding needs, with Read offset and limit, starting from its changed lines (${changedLinesText(file)}); never the whole file, and skip it entirely when it is a lockfile or other generated artifact`;
+}
+
+// The changed-line ranges a targeted read opens, as prose: from the patch's hunk headers when the
+// host supplied a patch, and an honest "not known here" when it did not (GitHub omits the patch of
+// a file over ~400 changed lines or binary) — the worker then finds the touched region itself.
+// `patch` is genuinely optional in the domain; this is the one place its absence is rendered.
+function changedLinesText(file) {
+  const ranges = file.patch ? hunkRanges(file.patch) : [];
+  return ranges.length > 0
+    ? `lines ${ranges.map(r => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`)).join(', ')} of ${file.content.lines}`
+    : `${file.content.lines} lines; the host supplied no patch, so Grep for what this change touches and read around that`;
+}
+
+// `window` is the engine's context window in tokens (null = undeclared → nothing is withheld and every
+// read is full). Every file carries `content` — the measurement measureChangedFiles (src/window.js)
+// stamps and buildPrMaterial (the material boundary) requires — because the fit sizes full reads by it.
+// [LAW:parse-dont-validate] the stamp is checked once, there; this builder is inland and reads it.
+function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], readFiles = [], window = null, dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
+  const entries = inlineEntries(files, maxDiffChars);
 
   // [LAW:no-silent-failure] The reviewer is TOLD what was taken out of its view. Absence of a changed
   // file is otherwise indistinguishable from nobody having changed it, and a model reasoning about "the
@@ -36004,14 +36213,12 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // the diff, opposite instruction — two types, not one with a flag.
   // [LAW:dataflow-not-control-flow] A value: no paths removed ⇒ no block. Patterns that matched nothing
   // hid nothing, so silence is the truth there, not an omission.
-  if (excluded.paths.length > 0) {
-    diffs += `\n\n**Withheld from this diff — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
-      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence below is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`;
-  }
+  const excludedNote = excluded.paths.length > 0
+    ? `\n\n**Withheld from this diff — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
+      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence below is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`
+    : '';
 
-  if (dependencyDiffNote) {
-    diffs += `\n\n${dependencyDiffNote}`;
-  }
+  const dependencyNote = dependencyDiffNote ? `\n\n${dependencyDiffNote}` : '';
 
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
   // concentration instruction. The worker sees the whole diff (anchors stay valid) and concentrates
@@ -36085,37 +36292,13 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     presentation — findings drive the merge decision.\n`
     : '';
 
-  // [LAW:dataflow-not-control-flow] The set of files to read in full is a VALUE: a non-empty readFiles
-  // narrows the full read to this worker's assigned files (another worker reads the rest — the read cost
-  // is split, not duplicated N times); an empty readFiles reads the whole changed set (single-scope PR,
-  // repo mode, or the 'changed' read-set arm). Either way the whole diff is shown, so cross-file context
-  // and report-anywhere are unchanged — only the expensive full-file reads are partitioned.
-  // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
-  // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
-  // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
-  // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
-  // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
-  // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
-  // before recording, dropping one the context refutes and recording an inconclusive one with its
-  // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
-  // consequence lives in the buildReviewInput passage below, not a second "read more context" instruction.
-  const readTargets = readFiles.length > 0
-    // No flatten: these are paths the worker must OPEN. Collapsing a separator here would name a file
-    // that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
-    // such a path at the boundary instead, so every path reaching this line is byte-exact and
-    // single-line. [LAW:no-silent-failure]
-    ? `Read the complete content of THESE files — this scope's assigned changed files: ${readFiles.join(', ')}. `
-      + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
-      + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
-      + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
-      + `over Reading the whole file, and read another file in full only when a finding truly requires it. Do not pre-read the tree.`
-    : `Read the complete content of every changed file that contains code — skip only generated or vendored `
-      + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them.`;
-
-  return {
-    // [LAW:one-source-of-truth] The same included files define Claude's visible diff and valid review anchors.
-    files: includedFiles,
-    prompt: `
+  // [LAW:one-source-of-truth] ONE rendering of the worker prompt, with two holes — the read targets
+  // and the diff — that the window fit fills. The fit needs the size of everything ELSE first, so the
+  // template is rendered once with the holes empty to measure the fixed prose (the two notes below
+  // are fixed too: they do not move with the fit), then once more with the plan's material.
+  // [LAW:effects-at-boundaries] both renders are pure; the measurement is the same estimateTokens the
+  // fit uses for hunks and reads, so "fits" means one thing.
+  const render = (readTargets, diffs) => `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
@@ -36163,7 +36346,94 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     dropping it.
 
     ${reviewCharter(toolNames)}
-    \n\n${diffs}`,
+    \n\n${diffs}`;
+  // [LAW:effects-at-boundaries] Pure over its lists: the withheld-files note. An empty list renders
+  // nothing, so this is one path, not a "patchless mode". [LAW:one-type-per-behavior] A hunk GitHub
+  // never supplied, one over MAX_DIFF_CHARS, and one the window fit withheld are ONE behavior — a changed
+  // file whose diff is not on this worker's grid — so they are one list and one note; what differs per
+  // file is HOW MUCH of it to read, which the fit decided and the line states. The recovery route is the
+  // one the pipeline already owns: a recorded finding whose line is off the diff grid becomes an
+  // UNANCHORED finding (partitionFindings), which counts toward the verdict and renders in the review
+  // body — so the riskiest (biggest) changed files stay reviewable, and an issue in them can never
+  // bypass the merge gate via summary prose.
+  const withheldNoteText = (entries) => entries.length > 0
+    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — a line the diff below carries is anchored inline as usual, and one it does not carry is posted by the host in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
+    : '';
+
+  // [LAW:effects-at-boundaries] Pure over its lists: what the worker opens, as three lists that each
+  // render nothing when empty — files read in full, files whose diff below IS their whole content (new in
+  // this change — reading them again would spend the window twice on one file, the exact duplication that
+  // overflowed links-317's workers), and files too large to open whole. A non-empty readFiles narrows the
+  // full read to this worker's assigned files (another worker reads the rest — the read cost is split, not
+  // duplicated N times); an empty readFiles reads the whole changed set (single-scope PR, repo mode, or
+  // the 'changed' read-set arm). Either way the whole shown diff is the same for every worker, so
+  // cross-file context and report-anywhere are unchanged.
+  // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
+  // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
+  // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
+  // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
+  // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
+  // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
+  // before recording, dropping one the context refutes and recording an inconclusive one with its
+  // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
+  // consequence lives in the rendered passage below, not a second "read more context" instruction.
+  // No flatten anywhere here: these are paths the worker must OPEN. Collapsing a separator would name a
+  // file that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
+  // such a path at the boundary instead, so every path reaching this line is byte-exact and single-line.
+  // [LAW:no-silent-failure]
+  const readTargetsText = ({ full, inDiff, targeted }) => {
+    const inDiffSentence = inDiff.length > 0
+      ? `These changed files are NEW in this change and their diff below is their complete content — do NOT Read them again, review them from the diff: ${inDiff.join(', ')}. `
+      : '';
+    const targetedSentence = targeted.length > 0
+      ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
+      : '';
+    const fullSentence = full.length > 0
+      ? `Read the complete content of THESE files — this scope's assigned changed files: ${full.join(', ')}. `
+        + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
+      : '';
+    return (readFiles.length > 0
+      ? fullSentence + inDiffSentence + targetedSentence
+        + `Another scope's worker reads the other changed files, so do NOT read them in full — that duplicates their work and their cost. `
+        + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
+        + `over Reading the whole file, and read another file in full only when a finding truly requires it. Do not pre-read the tree.`
+      : `Read the complete content of every changed file that contains code — skip only generated or vendored `
+        + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them. `
+        + inDiffSentence + targetedSentence).trim();
+  };
+
+  // [LAW:one-source-of-truth] The prose that depends on the plan — the withheld-files note and the three
+  // read lists — is rendered by the same two functions that render the final prompt, so the fit measures
+  // exactly what will be sent. It is measured at its CEILING: every file withheld with the longest
+  // instruction (targeted), and every file named in all three read lists at once. A real plan places
+  // each file in at most one line of the note and exactly one read list, so it is a sub-selection of
+  // this rendering and never longer — the budget the hunks and reads are sized against already holds
+  // the prose. The over-count is a few tokens per file, paid once, for a bound that needs no argument.
+  const names = files.map(f => f.filename);
+  const plan = fitWorkerMaterial({
+    window,
+    fixedTokens: estimateTokens(render(readTargetsText({ full: names, inDiff: names, targeted: files }), withheldNoteText(files.map(f => ({ file: f, read: 'targeted' }))) + excludedNote + dependencyNote)),
+    files: files.map(f => ({ filename: f.filename, status: f.status, hunk: entries.get(f.filename), content: f.content })),
+    // [LAW:dataflow-not-control-flow] The read-set arm as the fit's value: this scope's assigned
+    // files, or null for "every changed file" (single-scope PR, repo mode, the 'changed' arm).
+    readSet: readFiles.length > 0 ? new Set(readFiles) : null,
+  });
+  const planOf = new Map(plan.map(p => [p.filename, p]));
+  const shown = files.filter(f => planOf.get(f.filename).hunk === 'shown');
+  const withheld = files.filter(f => planOf.get(f.filename).hunk === 'withheld');
+  const readAs = (kind) => files.filter(f => planOf.get(f.filename).read === kind);
+
+  const withheldNote = withheldNoteText(withheld.map(f => ({ file: f, read: planOf.get(f.filename).read })));
+  const diffs = shown.map(f => entries.get(f.filename)).join('\n\n') + withheldNote + excludedNote + dependencyNote;
+
+  const readTargets = readTargetsText({ full: readAs('full').map(f => f.filename), inDiff: readAs('in-diff').map(f => f.filename), targeted: readAs('targeted') });
+
+  return {
+    // [LAW:one-source-of-truth] The anchorable set: the files whose diff is on the LINE grid under
+    // MAX_DIFF_CHARS (showableFiles) — a hunk the window withheld from THIS worker stays anchorable,
+    // because a finding it records at the file's real line lands on the same new-side numbering.
+    files: showable(files, entries),
+    prompt: render(readTargets, diffs),
   };
 }
 
@@ -36289,7 +36559,7 @@ Plan the review of this repository. There is no diff. The repository under revie
   };
 }
 
-module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput };
+module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput, showableFiles };
 
 
 /***/ }),
@@ -37184,10 +37454,11 @@ const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
-const { buildReviewInput } = __nccwpck_require__(3479);
+const { showableFiles } = __nccwpck_require__(3479);
+const { measureChangedFiles } = __nccwpck_require__(8705);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
-const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause } = __nccwpck_require__(3746);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = __nccwpck_require__(5120);
 const { assessDifficulty } = __nccwpck_require__(4260);
@@ -37195,7 +37466,7 @@ const { difficultyCandidates, parseDifficultyScaling } = __nccwpck_require__(993
 const { readSpentToday, appendCost } = __nccwpck_require__(8192);
 const { parseDependencyDiffFlag, parseGoModBumps, fetchUpstreamChangeSummary, unresolvedSummary, renderDependencyReviewSection } = __nccwpck_require__(9838);
 const { renderCostLine, costWarning, costMarker, renderPrTime } = __nccwpck_require__(9614);
-const { renderTimingBreakdown } = __nccwpck_require__(7932);
+const { renderTimingBreakdown, passLabel } = __nccwpck_require__(7932);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
@@ -37379,10 +37650,32 @@ function warnBudgetExhausted(review) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
-  const state = review.unreviewedScopes.length > 0
-    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
-    : 'every scope was reviewed, but convergence sweeps were cut short';
+  // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
+  // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
+  const { budget } = unreviewedByCause(review);
+  const state = budget.length > 0
+    ? `${budget.length} scope(s) went unreviewed (${budget.join(', ')})`
+    : review.unreviewedScopes.length === 0
+      ? 'every scope was reviewed, but convergence sweeps were cut short'
+      : 'convergence sweeps were cut short';
   core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
+}
+
+// [LAW:one-source-of-truth] The sibling warning for the other way coverage falls short: a scope worker
+// that died terminally (a context-window overflow, a crashed CLI). Rendered from the pass's scopeFailures
+// record — every failed pass with its message — exactly as the summary's line is, so the annotation and
+// the posted review name the same scopes and causes. [LAW:no-silent-failure] a delivered partial review
+// is operator news: the failure must be visible in the run's annotations, not only in the review body.
+function warnScopeFailures(review) {
+  if (review.scopeFailures.length === 0) return;
+  // The same two facts the summary's failure line states: a death at the review of record is a coverage
+  // gap and names the scope; a death in a sweep leaves pass 0's judgment standing.
+  const failed = review.scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ');
+  const { failure } = unreviewedByCause(review);
+  const coverage = failure.length > 0
+    ? `NOT reviewed: ${failure.join(', ')}. The other scopes' findings were still delivered.`
+    : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.';
+  core.warning(`${review.scopeFailures.length} scope worker(s) failed — ${failed}. ${coverage}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the
@@ -37880,12 +38173,18 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
-  // toolNames; the material rebuilds the worker prompt per attempt so each engine gets its own tool
-  // identifiers. [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] runMultiScope (via
-  // produceReview) owns retry timing; the whole plan→workers pass is one attempt per config.
-  const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
-  const anchors = buildReviewAnchors(anchorInput.files);
+  // [LAW:effects-at-boundaries] The one read of the changed files' sizes, at the run boundary: every
+  // changed file is measured in the reviewed checkout (the tree the workers' Read tool opens), and the
+  // measured set is what the anchors and the material are built from — the window fit sizes each
+  // worker's reads by it. [LAW:parse-dont-validate] the stamp travels with the files; buildPrMaterial
+  // requires it.
+  const measured = measureChangedFiles(filteredFiles, REVIEWED_REPO_ROOT);
+  // Anchors are engine-agnostic (purely diff-line based): the files whose diff is on the LINE grid under
+  // MAX_DIFF_CHARS (showableFiles — the same derivation the worker prompt renders from). The material
+  // rebuilds the worker prompt per attempt so each engine gets its own tool identifiers.
+  // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
+  // retry timing; the whole plan→workers pass is one attempt per config.
+  const anchors = buildReviewAnchors(showableFiles(measured, maxDiffChars));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
@@ -37910,7 +38209,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }
   }
-  const material = buildPrMaterial({ files: filteredFiles, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
+  const material = buildPrMaterial({ files: measured, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -37918,6 +38217,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
+  warnScopeFailures(review);
 
   // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
   // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
@@ -37992,6 +38292,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
   });
   warnBudgetExhausted(review);
+  warnScopeFailures(review);
 
   const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
   const report = renderRepoReport({ reviewerName, scope, review, footer });
@@ -38068,7 +38369,7 @@ async function run() {
   }
 }
 
-module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, MAX_DEPENDENCY_BUMPS_FETCHED };
+module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resolveBudgetedEffort, resolveDifficultyEffort, bindingLevers, resolveDependencySummaries, warnBudgetExhausted, warnScopeFailures, MAX_DEPENDENCY_BUMPS_FETCHED };
 
 
 /***/ }),
@@ -41384,6 +41685,172 @@ module.exports = {
   isAnthropicEndpoint,
   isSubscription,
 };
+
+
+/***/ }),
+
+/***/ 8705:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
+
+// [FRAMING:representation] The model's context window is a hard wall, and until this module nothing
+// in the engine represented it: a worker's material was "the whole diff plus every assigned file read
+// in full", and whether that fit the window was decided by the model's reading choices, not by the
+// engine. On links-317-dolt-telemetry every worker's FIRST request was ~232k tokens against a 200k
+// window (eval/out/ab-sweep0-logs, sessions ef6bfa54/29ed8a63/fefe3d0e) — the prompt alone overflowed
+// before a single Read, and the workers that "succeeded" did so only because the CLI auto-compacted
+// the diff into a summary and reviewed that. This module makes the window a VALUE and the fit a pure
+// function of it and the material: what is shown inline, what is withheld, what is read in full, what
+// is read only around its hunks. [LAW:types-are-the-program] the fit is a per-file discriminated plan;
+// the prompt renders it and adds no judgment of its own. [LAW:no-mode-explosion] nothing here is an
+// operator input — the window is the engine's declared fact, the sizes are the material's.
+
+// [LAW:one-source-of-truth] Tokens are estimated ONCE, here, by one rule every consumer shares. The rule
+// is deliberately two-class rather than chars/4, because the material that overflowed is exactly the
+// material chars/4 misjudges by 3x: a go.sum hunk of base64 hashes and dotted module paths tokenizes at
+// roughly one token PER CHARACTER (measured 0.9 on that case's 1,527-line hunk — 195 KB of hash-dense
+// lines accounting for ~175k of the 232k), while ordinary prose and code run ~3.5 chars per token. A
+// line is hash-dense when it carries an opaque run: 24+ unbroken base64/hex-alphabet characters with at
+// least three digits, which no identifier and no sentence produces. The estimate errs HIGH by design
+// (1.0 over the measured 0.9; 3.5 over the ~4 code typically gets): the bound this feeds must never say
+// "fits" of something that does not, and a slightly early withholding costs one hunk's inline anchors,
+// not a review. Calibrated against that transcript: this rule estimates ~223k for the worker prompt
+// the API counted at ~220k (232k less the CLI's own ~12k system prompt and tool schemas) — the two
+// classes' errors partly cancel there, which is why neither rate is trimmed toward its measurement.
+const OPAQUE_RUN = /[A-Za-z0-9+/=]{24,}/g;
+const OPAQUE_MIN_DIGITS = 3;
+const OPAQUE_TOKENS_PER_CHAR = 1.0;
+const PROSE_CHARS_PER_TOKEN = 3.5;
+
+function isHashDense(line) {
+  for (const run of line.match(OPAQUE_RUN) ?? []) {
+    if ((run.match(/\d/g) ?? []).length >= OPAQUE_MIN_DIGITS) return true;
+  }
+  return false;
+}
+
+// [LAW:effects-at-boundaries] Pure: a conservative token count for a text. The newline is counted with
+// its line — it is a character the model pays for like any other.
+function estimateTokens(text) {
+  let tokens = 0;
+  for (const line of text.split('\n')) {
+    const chars = line.length + 1;
+    tokens += isHashDense(line) ? chars * OPAQUE_TOKENS_PER_CHAR : chars / PROSE_CHARS_PER_TOKEN;
+  }
+  return Math.ceil(tokens);
+}
+
+// [LAW:one-source-of-truth] The share of the window a worker needs BEYOND its material and its planned
+// reads, declared once with its basis. Two parts, both measured on the transcripts named above:
+//   - the engine's own fixed cost — system prompt, tool schemas, the reviewer instructions — ~12k
+//     (the scout's first request on that case: 12,168 tokens carrying a ~2k-token prompt);
+//   - a turn's working growth — thinking, tool-call arguments, Grep results, the targeted reads this
+//     module allows, the recorded findings — up to ~57k over a 23-turn session (that scout, 12k → 69k).
+// 70k is the sum rounded up. This is a capacity guardrail exactly like LANE_MEMORY_BYTES (multiscope.js):
+// it is not effort, it is not tunable per review, and it moves only with a new measurement of what a
+// worker's turn actually costs. A window of null (an engine that has not declared one) makes the
+// budget Infinity — nothing is withheld and every read is full, the same path with a different value.
+// [LAW:dataflow-not-control-flow]
+const WORKER_HEADROOM_TOKENS = 70_000;
+
+// [LAW:types-are-the-program] The read plan's vocabulary. A file's `read` is exactly one of:
+//   'full'     — open the whole file (it fits alongside the diff);
+//   'targeted' — too large to fit whole: read only around its hunks, by offset and limit;
+//   'in-diff'  — the file is new in this change and its hunk is shown, so the diff IS its full content;
+//   'none'     — not this worker's to open (another scope's file, or a deleted file with no head content).
+// A file's `hunk` is 'shown' (inline, on the LINE grid) or 'withheld' (no inline diff — findings on it
+// are recorded at real line numbers and posted unanchored).
+const READ_KINDS = ['full', 'targeted', 'in-diff', 'none'];
+
+// [LAW:effects-at-boundaries] Pure: the fit of one worker's material into the window.
+//   window      — the engine's declared context window in tokens, or null (unknown → unbounded).
+//   fixedTokens — the prompt's fit-independent prose (instructions, charter, focus, prior context).
+//   files       — [{ filename, status, hunk: string|null, content: { tokens, lines } }] in diff order;
+//                 hunk is the rendered inline entry, or null when it cannot be shown at all (no patch,
+//                 or over MAX_DIFF_CHARS) — those are withheld before the window is consulted.
+//   readSet     — Set of filenames this worker opens in full (the read-set arm's projection), or null
+//                 for "every changed file" (the single-scope PR and the 'changed' arm).
+// Returns [{ filename, hunk, read }] in the same order.
+//
+// The algebra: budget = window − headroom − fixed. Hunks are placed first, because the LINE grid is
+// the review's anchoring and the whole diff is what every worker shares; when they do not all fit,
+// the LARGEST is withheld first, then the next, until they do — one withheld hunk costs that file its
+// inline anchors and nothing else, whereas withholding many small ones would blind the worker to most
+// of the change to keep one lockfile's hashes on screen. Reads take what remains, smallest first, so
+// the count of files read whole is maximal; the rest are targeted. Deterministic: ties break on name.
+// [LAW:no-silent-failure] A finite window the fixed prose alone overruns is refused loudly — it means
+// the instructions, not the material, are the problem, and no allocation can fix that.
+function fitWorkerMaterial({ window, fixedTokens, files, readSet }) {
+  const budget = window === null ? Infinity : window - WORKER_HEADROOM_TOKENS - fixedTokens;
+  if (budget <= 0) {
+    throw new Error(`fitWorkerMaterial: the worker's fixed prompt (${fixedTokens} tokens) plus its ${WORKER_HEADROOM_TOKENS}-token headroom already exceeds the ${window}-token context window; no material can be placed.`);
+  }
+  const hunkTokens = new Map(files.filter(f => f.hunk !== null).map(f => [f.filename, estimateTokens(f.hunk)]));
+  const shown = new Set(hunkTokens.keys());
+  let placed = [...hunkTokens.values()].reduce((a, b) => a + b, 0);
+  const byHunkSizeDesc = [...hunkTokens.entries()].sort(([an, at], [bn, bt]) => bt - at || an.localeCompare(bn));
+  for (const [name, tokens] of byHunkSizeDesc) {
+    if (placed <= budget) break;
+    shown.delete(name);
+    placed -= tokens;
+  }
+
+  const opens = (f) => (readSet === null || readSet.has(f.filename)) && f.status !== 'removed';
+  const read = new Map(files.map(f => [f.filename, 'none']));
+  const candidates = [];
+  for (const f of files.filter(opens)) {
+    if (f.status === 'added' && shown.has(f.filename)) read.set(f.filename, 'in-diff');
+    else candidates.push(f);
+  }
+  candidates.sort((a, b) => a.content.tokens - b.content.tokens || a.filename.localeCompare(b.filename));
+  let remaining = budget - placed;
+  for (const f of candidates) {
+    if (f.content.tokens <= remaining) {
+      read.set(f.filename, 'full');
+      remaining -= f.content.tokens;
+    } else {
+      read.set(f.filename, 'targeted');
+    }
+  }
+  return files.map(f => ({ filename: f.filename, hunk: shown.has(f.filename) ? 'shown' : 'withheld', read: read.get(f.filename) }));
+}
+
+// [LAW:effects-at-boundaries] The ONE effect this module owns: measure each changed file's content as
+// it stands in the reviewed checkout — the tree the worker's Read tool will open — and stamp the
+// measurement onto the record. [LAW:parse-dont-validate] `content` is the stamp: buildPrMaterial and
+// buildReviewInput require it on every file, so an unmeasured changed set cannot reach a worker prompt.
+// A removed file has no head content (nothing to read); every other status is read from the checkout.
+// [LAW:no-silent-failure] A listed file missing from the checkout is refused with the path and root
+// named: the worker would fail to open it too, and a review that silently sized it at zero would plan
+// a full read of a file that is not there. `readContent` is the injected reader (fs by default) so the
+// measurement is a value a test can supply. Changed files under review are UTF-8 text in practice; a
+// binary file measured as text errs high, the safe direction.
+// The line count a Read tool sees: a file's trailing newline ends its last line, it does not start
+// another, so "a\nb\n" is two lines and an empty file is none.
+function lineCount(text) {
+  if (text.length === 0) return 0;
+  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+}
+
+function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) => fs.readFileSync(absPath, 'utf8')) {
+  return files.map(f => {
+    if (f.status === 'removed') return { ...f, content: { tokens: 0, lines: 0 } };
+    const absPath = path.join(reviewedRepoRoot, f.filename);
+    let text;
+    try {
+      text = readContent(absPath);
+    } catch (e) {
+      throw new Error(`The reviewed checkout at ${reviewedRepoRoot} has no readable ${f.filename} (listed as ${f.status} in this change): ${e.message}. The review reads changed files from that checkout, so it must be at the change's head.`);
+    }
+    return { ...f, content: { tokens: estimateTokens(text), lines: lineCount(text) } };
+  });
+}
+
+module.exports = { estimateTokens, fitWorkerMaterial, measureChangedFiles, WORKER_HEADROOM_TOKENS, READ_KINDS };
 
 
 /***/ }),
@@ -51924,7 +52391,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.63.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.64.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

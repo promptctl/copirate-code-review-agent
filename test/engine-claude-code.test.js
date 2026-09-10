@@ -228,7 +228,7 @@ describe('buildCommand — env is an explicit allowlist', () => {
     const allowedKeys = new Set([
       'PATH', 'TMPDIR', 'npm_config_cache', 'HOME',
       'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN',
-      'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'NO_COLOR',
+      'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'DISABLE_AUTO_COMPACT', 'NO_COLOR',
       'CLAUDE_CODE_EFFORT_LEVEL',
     ]);
     for (const key of Object.keys(env)) {
@@ -268,6 +268,7 @@ describe('buildCommand — the auth variant decides the credential channel, byte
   const CONSTANTS = {
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
 
@@ -354,6 +355,10 @@ describe('claudeCodeAdapter interface declarations', () => {
 
   test('CLAUDE_TIMEOUT_MS is 3000000 (50 minutes)', () => {
     assert.equal(CLAUDE_TIMEOUT_MS, 3_000_000);
+  });
+
+  test('contextWindow is 200,000 — the floor across the models this engine fronts', () => {
+    assert.equal(claudeCodeAdapter.contextWindow, 200_000);
   });
 
   test('apiTypes contains only "anthropic-messages"', () => {
@@ -499,6 +504,12 @@ describe('parseResultEnvelope — robust to json and stream-json', () => {
     );
     assert.equal(totalInputTokens(usage.tokens), 100);
     assert.equal(usage.tokens.output, 10);
+  });
+
+  test('an overflow names the window as the cause, not the prompt authoring', () => {
+    const envelope = JSON.stringify({ type: 'result', is_error: true, result: 'Prompt is too long' });
+    assert.throws(() => assertSucceeded(envelope), (e) =>
+      e.message.startsWith('Claude Code review failed: Prompt is too long — the worker material (diff + instructions) plus its file reads exceeded the model context window'));
   });
 
   test('a multi-line stream with no terminal result is a failure (assertSucceeded throws)', () => {

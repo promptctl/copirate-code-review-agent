@@ -298,6 +298,9 @@ function classifyError(err, text) {
 const codexAdapter = makeCliAdapter({
   name: 'codex',
   timeoutMs: CODEX_TIMEOUT_MS,
+  // Undeclared: codex fronts models of differing windows and compacts on its own; nothing is withheld
+  // from its workers and every read is full — the pre-fit behavior, as a value. [LAW:dataflow-not-control-flow]
+  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
