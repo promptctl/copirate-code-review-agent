@@ -389,6 +389,70 @@ after the fact is each run's own `plan.json`: a pinned replay records `provenanc
 a file that says `"scout"` still records `"pinned"`, and the price field it carries is dropped, because
 no scout spawn happened to bill for.
 
+### Reading it as a paired A/B: `eval/paired.js`
+
+Pinning the plan is only half the win — the other half is *spending* it in the statistic. `eval/paired.js`
+(`npm run review:paired`) takes the two arm roots and reduces them as a **paired** comparison instead of a
+difference of two pooled rates:
+
+```bash
+node eval/paired.js eval/out/ab-sweep2 eval/out/ab-sweep0 [--out <dir>]
+```
+
+It is an **instrument, not a third scorer**: it never runs the engine, never re-matches findings, and needs
+no credential. It reads the per-run `scorecard.json` `score.js` already wrote (the inventory must-find
+bucket — the gate metric, and only that one: a paired report over four buckets would be four experiments
+wearing one p-value) and the per-run `plan.json` the pass already recorded, and reduces them to
+
+* **discordant pairs** — how many findings arm A found and arm B missed (`b`), and the reverse (`c`),
+* an **exact McNemar p-value** — the two-sided binomial sign test on `b` and `c`, exact rather than the
+  chi-square approximation because the discordant counts here are a handful out of a hundred,
+* the **two pooled rates over the same paired set**, their difference, and the paired SE, and
+* the comparison's own **approximate 95 % resolution** (`1.96 × SE`), printed whether the result is null or
+  not — "no significant difference" is uninterpretable without the size of the difference the instrument
+  could have seen. It is a design figure and it is optimistic below about ten discordant pairs; the exact
+  p above it is the ruling.
+
+The pairing unit is **(case, plan, finding)**, and a pair whose two halves ran different structures is
+**refused, never formed**: for every case, the multiset of plans in arm A must equal the multiset in arm B —
+same plans, same number of replicates each. A plan's identity is its `scopes` and `context`, *not* its
+`provenance`: two runs can both say `"pinned"` and carry different partitions, and that is exactly the
+mistake the refusal exists to catch. Because of that, no separate pinned-vs-scouted check is needed —
+a scouted arm re-rolls its plans, so its keys will not match a pinned arm's and the comparison refuses on
+its own. The other refusals, each naming the offending dir: a run with no `plan.json` (it predates the
+plan record, so what structure it ran is unknown), an unscored run, an arm root that blended two effort
+arms, a case present in only one arm, and a case whose must-find inventory moved between the two replays.
+
+Within one `(case, plan)` block each arm may hold several replicates — `freeze-suite.js -n 5 --plans <dir>`
+replays one plan five times — and the k-th run of arm A is matched with the k-th run of arm B in sorted
+run-dir order. That alignment is **arbitrary but deterministic**, and it is sound: given the plan, an arm's
+replicates are exchangeable, so under the null P(A hit, B miss) = P(A miss, B hit) for *any* one-to-one
+alignment, and the exact test stays exact. What run k shares with run k is the block and nothing else; the
+pairing claims no more than that.
+
+**What pairing buys, in points.** Unpaired at N=5 over the four cases, the SE of the arm difference is
+~6.7 points — a ~13-point minimum detectable effect at 95 %. Paired, the SE is `√(π_d/n)` over
+`n = 20 × N` opportunities (20 = the suite's must-finds per replicate), where `π_d` is the discordance
+rate with the plan held fixed. Estimated from the runs already on disk, `π_d` brackets between 0.196
+(runs of one case that happened to agree on scope count — the closest proxy for a fixed plan) and 0.255
+(all cross-run pairs, plan roll included), giving:
+
+| N | paired opportunities | MDE at 95 % confidence | MDE at 80 % power |
+| --- | --- | --- | --- |
+| 3 | 60 | 11.2 – 12.8 pts | 16.0 – 18.3 pts |
+| 5 | 100 | 8.7 – 9.9 pts | 12.4 – 14.1 pts |
+
+Both are upper bounds — a same-scope-count pair is not a same-*plan* pair — so the real figures are at or
+below these. The practical reading: **a paired N=3 resolves about what an unpaired N=5 did**, on 60 % of the
+replays, each of which is also cheaper for skipping the scout spawn. `paired.js` reports the realised
+resolution from the discordance it actually observed, so a design's claim is checked against the run that
+tested it.
+
+Exit codes are a **dichotomy**, deliberately narrower than `compare.js`'s: `0` = ran, `2` = refused.
+Nothing exits `1`, because a paired p-value is evidence for a decision and not the decision — the gate
+lives in `compare.js`. Artifacts land at `<out>/paired.{md,json}`, defaulting to
+`eval/out/paired-<armA>-vs-<armB>`.
+
 ## Scoring a replay
 
 `eval/score.js` (`npm run review:score`) reduces a case's replay artifacts to the
