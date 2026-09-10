@@ -253,8 +253,9 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     no CI log to scrape.
   plan.json       — the replay's STRUCTURE, as the engine's own record (src/plan.js's planRecord):
                     { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
-                    partition the workers actually ran (each { name, focus, files }; every changed path
-                    lands in exactly one scope) and context is the planning text prefixed onto every
+                    partition the workers actually ran (each { name, focus, files, reads }; every changed
+                    path lands in exactly one scope's files, and reads is what the scope opens in full
+                    beyond its own — the sibling parts of a concern cut for size) and context is the planning text prefixed onto every
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
                     scopes are a pure function of the changed paths, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
@@ -339,11 +340,17 @@ effect the gate had just neutralized. Re-freeze the baseline, or price the lever
 
 The **scope plan** is the review's structure: how many scopes the change splits into, which files each
 scope claims, and the shared context every worker is shown. In PR mode it is now a **pure function of
-the changed file paths** (`partitionByDirectory` in `src/partition.js`): a test file joins the changed
-source file with the same stem, every file keys on its directory, a directory group smaller than
-`MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Same diff,
-same structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no
-diff to compute one from.
+the changed file paths and their churn** (`partitionByDirectory` in `src/partition.js`): a test file joins
+the changed source file with the same stem, every file keys on its directory, a directory group smaller
+than `MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Then
+the size dimension (zai-timing-8jk.4): on a lopsided plan — the largest group at least `LOPSIDED_RATIO`
+(2) times the runner-up — a largest group of `SCOPE_CHURN_CAP` (360) or more changed lines is cut into
+parts of near-equal churn, each part owning its files and reading every sibling part's in full, so the
+concern is still seen whole by every worker judging a piece of it. The part count is bounded so the
+extra reads never exceed the changed set, a source and the test that names it are never parted, and a
+cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. Same diff, same
+structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no diff
+to compute one from.
 
 It was not always so. The plan used to be re-decided by an LLM scout on every single invocation and
 recorded nowhere durable, and on the frozen case `links-317` identical input gave 1 to 5 scopes, 4 to 28

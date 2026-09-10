@@ -411,7 +411,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
       ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
       : '';
     const fullSentence = full.length > 0
-      ? `Read the complete content of THESE files — this scope's assigned changed files: ${full.join(', ')}. `
+      ? `Read the complete content of THESE files — the changed files this scope reads in full: ${full.join(', ')}. `
         + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       : '';
     return (readFiles.length > 0

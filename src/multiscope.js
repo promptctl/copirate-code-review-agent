@@ -9,7 +9,7 @@ const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningT
 const { planRecord } = require('./plan');
 const { partitionByDirectory } = require('./partition');
 const { renderDependencyDiffNote } = require('./dependency-diff');
-const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
+const { NO_EXCLUSIONS, excludedPathList, fileChurn } = require('./diff');
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -393,15 +393,16 @@ function curtailmentLogText(curtailed) {
 async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
   // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
-  // scope's assignment (readFilesFor, resolved once at the pass boundary): under the shipped 'assigned' arm
-  // that IS scope.files, so N workers split the read; under 'changed' it is the empty list, which is the
-  // material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
+  // scope's eyesight — the files it owns plus the sibling files it reads as a second reader (readFilesFor,
+  // resolved once at the pass boundary): under the shipped 'assigned' arm that IS the pair, so N workers
+  // split the read and only a cut concern is read twice; under 'changed' it is the empty list, which is
+  // the material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
   // [LAW:one-source-of-truth] The pair keeps the two facts apart: `read` is that projection; `assigned` is
   // `scope.files` unprojected — the COVERAGE record the plan carries,
   // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
   // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) =>
-    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor(scope.files), window: contextWindow }, priorFindings);
+    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor([...scope.files, ...scope.reads]), window: contextWindow }, priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -459,14 +460,14 @@ function uniquelyNamed(scopes) {
 // Each producer owns its own progress lines, so the shared path below carries no logging branch.
 // [LAW:dataflow-not-control-flow]
 
-// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths
-// (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
+// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths and
+// their churn (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
 // scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
 // is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
 // one progress line, exactly as pinnedProposal is.
-function partitionProposal({ changedPaths, log }) {
-  const { scopes, context } = partitionByDirectory(changedPaths);
-  log(`partitioned ${changedPaths.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
+function partitionProposal({ changed, log }) {
+  const { scopes, context } = partitionByDirectory(changed);
+  log(`partitioned ${changed.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
   return { provenance: 'partition', scopes, context, scoutUsage: null };
 }
 
@@ -848,6 +849,9 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     throw new Error(`buildPrMaterial: changed file '${unmeasured.filename}' carries no content measurement; the changed set must pass through measureChangedFiles (src/window.js) before it becomes review material.`);
   }
   const changedPaths = files.map(f => f.filename);
+  // [LAW:one-source-of-truth] The partition's size dimension is the SAME per-file count the budget and the
+  // difficulty classifier sum (fileChurn) — never a second line-counter beside them.
+  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f) }));
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
   // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
@@ -856,10 +860,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: it is the partition's input and the pinned producer's proof set.
     changedPaths,
-    // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed paths (src/partition.js):
-    // no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS survivors — no
-    // withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
-    proposal: ({ log }) => partitionProposal({ changedPaths, log }),
+    // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed files and their churn
+    // (src/partition.js): no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS
+    // survivors — no withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
+    proposal: ({ log }) => partitionProposal({ changed, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
     // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and

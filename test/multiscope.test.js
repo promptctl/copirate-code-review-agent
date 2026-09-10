@@ -24,6 +24,7 @@ const { defaultEffortProfile, DEFAULT_READ_SET } = require('../src/effort');
 const { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput } = require('../src/prompt');
 const { partitionByDirectory } = require('../src/partition');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
+const { fileChurn } = require('../src/diff');
 const { TransientError } = require('../src/failover');
 const { DeadlineExceededError } = require('../src/deadline');
 const { totalInputTokens } = require('../src/usage');
@@ -46,17 +47,17 @@ const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
 
 describe('parseScopeValue', () => {
   test('accepts a {name, focus} record, trims both fields, defaults files to []', () => {
-    assert.deepEqual(parseScopeValue({ name: ' cost ', focus: ' src/usage.js ' }, 0), { name: 'cost', focus: 'src/usage.js', files: [] });
+    assert.deepEqual(parseScopeValue({ name: ' cost ', focus: ' src/usage.js ' }, 0), { name: 'cost', focus: 'src/usage.js', files: [], reads: [] });
   });
   test('parses and trims the files array when present', () => {
     assert.deepEqual(
-      parseScopeValue({ name: 'cost', focus: 'x', files: [' src/usage.js ', 'src/report.js'] }, 0),
-      { name: 'cost', focus: 'x', files: ['src/usage.js', 'src/report.js'] },
+      parseScopeValue({ name: 'cost', focus: 'x', files: [' src/usage.js ', 'src/report.js'], reads: [] }, 0),
+      { name: 'cost', focus: 'x', files: ['src/usage.js', 'src/report.js'], reads: [] },
     );
   });
   test('drops non-string / blank file entries rather than injecting an empty path', () => {
     assert.deepEqual(
-      parseScopeValue({ name: 'a', focus: 'x', files: ['a.js', '', '  ', 42, null] }, 0).files,
+      parseScopeValue({ name: 'a', focus: 'x', files: ['a.js', '', '  ', 42, null], reads: [] }, 0).files,
       ['a.js'],
     );
   });
@@ -274,7 +275,7 @@ describe('sumUsage', () => {
 // ── composeSummary ────────────────────────────────────────────────────────────────────────────
 
 describe('composeSummary', () => {
-  const scopes = [{ name: 'cost', focus: 'x', files: [] }, { name: 'diff', focus: 'y', files: [] }];
+  const scopes = [{ name: 'cost', focus: 'x', files: [], reads: [] }, { name: 'diff', focus: 'y', files: [], reads: [] }];
   test('leads with the scout summary and names every scope, never raw JSON', () => {
     const summary = composeSummary('Adds a retry budget to the spawn seam.', scopes);
     assert.match(summary, /^Adds a retry budget to the spawn seam\./);
@@ -389,7 +390,7 @@ describe('sweepsByDepth', () => {
 
 // ── runScopeChain — one scope's whole convergence chain, and the one place the budget meets it ────
 describe('runScopeChain', () => {
-  const scope = { name: 'a', focus: 'fa', files: [] };
+  const scope = { name: 'a', focus: 'fa', files: [], reads: [] };
   const material = { buildWorkerPrompt: (focusText, _t, _f, prior) => `${focusText}||prior:${prior.map(f => f.body).join(',')}` };
   const bug = (body) => ({ path: 'a.js', line: 1, body, severity: 3 });
   const chainArgs = (spawn, extra = {}) => ({
@@ -510,9 +511,9 @@ describe('runScopeChain', () => {
 
 describe('runMultiScopePass — spawn-level transient resilience', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa', files: [] },
-    { name: 'b', focus: 'fb', files: [] },
-    { name: 'c', focus: 'fc', files: [] },
+    { name: 'a', focus: 'fa', files: [], reads: [] },
+    { name: 'b', focus: 'fb', files: [], reads: [] },
+    { name: 'c', focus: 'fc', files: [], reads: [] },
   ];
   // A hand-built material buys its plan from a fake scout spawn, as repo material does, so the fake
   // adapter below can answer the scout by its prompt and every later spawn as a worker.
@@ -612,7 +613,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
     proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText) => focusText,
   };
-  const SCOPES = [{ name: 'a', focus: 'fa', files: [] }];
+  const SCOPES = [{ name: 'a', focus: 'fa', files: [], reads: [] }];
 
   // A fake adapter that records the `reasoning` of every config it is spawned with.
   function recordingRegistry(seen) {
@@ -696,7 +697,7 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
 // hunting only for what is missing; the loop stops when a sweep adds nothing new (by the dedupeFindings
 // key — the one sameness definition) or at the effort profile's sweepCap.
 describe('runMultiScopePass — convergence sweeps', () => {
-  const SCOPES = [{ name: 'a', focus: 'fa', files: [] }, { name: 'b', focus: 'fb', files: [] }];
+  const SCOPES = [{ name: 'a', focus: 'fa', files: [], reads: [] }, { name: 'b', focus: 'fb', files: [], reads: [] }];
   // The material ENCODES the priorFindings value into the worker prompt, so the tests can assert the
   // per-pass threading (pass 0 gets none; a sweep gets the cumulative list).
   const material = {
@@ -857,7 +858,7 @@ describe('buildPrMaterial', () => {
       { filename: 'README.md', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+3' },
     ]);
     const proposal = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }).proposal({ log: () => {} });
-    const expected = partitionByDirectory(['src/a.js', 'src/b.js', 'README.md']);
+    const expected = partitionByDirectory(files.map(f => ({ filename: f.filename, churn: fileChurn(f) })));
     assert.deepEqual(proposal, { provenance: 'partition', scopes: expected.scopes, context: expected.context, scoutUsage: null });
   });
 
@@ -1018,7 +1019,7 @@ describe('buildRepoMaterial', () => {
   // surveys the tree and records scopes via the add_scope tool.
   test('the proposal spawns a scout whose prompt surveys the tree and records scopes via the add_scope tool', async () => {
     let prompt;
-    const spawn = async (buildPrompt) => { prompt = buildPrompt(TOOL_NAMES); return { summary: 'ctx', scopes: [{ name: 'a', focus: 'f', files: [] }], usage: null }; };
+    const spawn = async (buildPrompt) => { prompt = buildPrompt(TOOL_NAMES); return { summary: 'ctx', scopes: [{ name: 'a', focus: 'f', files: [], reads: [] }], usage: null }; };
     const proposal = await material.proposal({ spawn, log: () => {} });
     assert.equal(proposal.provenance, 'scout');
     assert.match(prompt, /There is no diff/);
@@ -1318,9 +1319,9 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
 // which fails fast with the knob named.
 describe('runMultiScopePass — wall-clock time budget', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa', files: [] },
-    { name: 'b', focus: 'fb', files: [] },
-    { name: 'c', focus: 'fc', files: [] },
+    { name: 'a', focus: 'fa', files: [], reads: [] },
+    { name: 'b', focus: 'fb', files: [], reads: [] },
+    { name: 'c', focus: 'fc', files: [], reads: [] },
   ];
   const material = {
     changedPaths: [],
@@ -1474,9 +1475,9 @@ describe('runMultiScopePass — wall-clock time budget', () => {
 // RECORDS the right facts: tags, outcomes, spans, and the scheduling values as actually used.
 describe('runMultiScopePass — the pass records its phase and schedule', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa', files: [] },
-    { name: 'b', focus: 'fb', files: [] },
-    { name: 'c', focus: 'fc', files: [] },
+    { name: 'a', focus: 'fa', files: [], reads: [] },
+    { name: 'b', focus: 'fb', files: [], reads: [] },
+    { name: 'c', focus: 'fc', files: [], reads: [] },
   ];
   const material = {
     changedPaths: [],
@@ -1625,7 +1626,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
 // that makes them unique, so name-keyed consumers are sound by construction. Observed through the
 // recorded plan: the names the workers actually ran under. [LAW:behavior-not-structure]
 describe('the pass stamps unique scope names', () => {
-  const scoped = (name, focus) => ({ name, focus, files: [] });
+  const scoped = (name, focus) => ({ name, focus, files: [], reads: [] });
   async function planFor(scoutScopes) {
     const adapter = {
       contextWindow: null, async produceReview({ buildPromptFor }) {
@@ -1656,7 +1657,7 @@ describe('the pass stamps unique scope names', () => {
     // reviewed, not subtract both via the shared name.
     const summary = composeSummary(
       'Splits the sync path in two.',
-      [{ name: 'sync', focus: 'f1', files: [] }, { name: 'sync (2)', focus: 'f2', files: [] }],
+      [{ name: 'sync', focus: 'f1', files: [], reads: [] }, { name: 'sync (2)', focus: 'f2', files: [], reads: [] }],
       { unreviewed: [{ name: 'sync (2)', cause: 'budget' }], scopeFailures: [], sweeps: [], budgetExhausted: true },
     );
     assert.match(summary, /Reviewed 1 scope\(s\): sync\./);
@@ -1714,8 +1715,8 @@ describe('runMultiScope — failover budget bounded by the deadline', () => {
 describe('runMultiScopePass — phase timings stream to the run log live', () => {
   const MIN = 60_000;
   const SCOPES = [
-    { name: 'a', focus: 'fa', files: [] },
-    { name: 'b', focus: 'fb', files: [] },
+    { name: 'a', focus: 'fa', files: [], reads: [] },
+    { name: 'b', focus: 'fb', files: [], reads: [] },
   ];
   const material = {
     changedPaths: [],
@@ -1800,9 +1801,9 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
 // cause and message carried as data (scopeFailures) beside the budget's (budgetExhausted).
 describe('runMultiScopePass — a terminally failed scope worker', () => {
   const SCOPES = [
-    { name: 'a', focus: 'fa', files: [] },
-    { name: 'b', focus: 'fb', files: [] },
-    { name: 'c', focus: 'fc', files: [] },
+    { name: 'a', focus: 'fa', files: [], reads: [] },
+    { name: 'b', focus: 'fb', files: [], reads: [] },
+    { name: 'c', focus: 'fc', files: [], reads: [] },
   ];
   const material = {
     changedPaths: [],
@@ -1941,7 +1942,7 @@ describe('buildReviewInput window fit', () => {
   test('with no window every hunk is shown, and an added+shown file is reviewed from the diff — never Read again', () => {
     const prompt = build({ readFiles: ['go.sum', 'src/new.js', 'src/old.js'] });
     assert.match(prompt, /### go\.sum \(added\)/);
-    assert.match(prompt, /this scope's assigned changed files: src\/old\.js\. Skip any among them/);
+    assert.match(prompt, /the changed files this scope reads in full: src\/old\.js\. Skip any among them/);
     assert.match(prompt, /NEW in this change and their diff below is their complete content — do NOT Read them again, review them from the diff: go\.sum, src\/new\.js\./);
     assert.doesNotMatch(prompt, /could not be shown/);
   });
@@ -1952,7 +1953,7 @@ describe('buildReviewInput window fit', () => {
     assert.match(prompt, /### src\/new\.js \(added\)/);
     assert.match(prompt, /could not be shown \(too large or binary, or the diff exceeded `MAX_DIFF_CHARS`, or withheld so the rest of the diff fits your context window\)/);
     assert.match(prompt, new RegExp(`> - ${REPO_ROOT}/go\\.sum — read it in full`)); // its content stamp is '' here, so it fits whole
-    assert.match(prompt, /assigned changed files: go\.sum, src\/old\.js\. Skip any among them/);
+    assert.match(prompt, /this scope reads in full: go\.sum, src\/old\.js\. Skip any among them/);
     assert.match(prompt, /do NOT Read them again, review them from the diff: src\/new\.js\./);
     assert.deepEqual(files.map(f => f.filename), ['go.sum', 'src/new.js', 'src/old.js']); // anchorable set unchanged by the fit
   });
@@ -1962,7 +1963,7 @@ describe('buildReviewInput window fit', () => {
       .map(f => ({ ...f, content: { tokens: 150_000, lines: 9000 } }));
     const prompt = buildReviewInput({ files: big, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/old.js'], window: 200_000 }).prompt;
     assert.match(prompt, /do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: src\/old\.js \(lines 10-12, 41 of 9000\)\./);
-    assert.doesNotMatch(prompt, /assigned changed files:/);
+    assert.doesNotMatch(prompt, /this scope reads in full:/);
     assert.match(prompt, /Another scope's worker reads the other changed files/);
   });
 
@@ -1986,7 +1987,7 @@ describe('buildReviewInput window fit', () => {
     const window = 200_000;
     const prompt = buildReviewInput({ files: many, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: many.map(f => f.filename), window }).prompt;
     assert.doesNotMatch(prompt, /could not be shown|do not fit whole/); // nothing withheld, nothing targeted
-    assert.match(prompt, /assigned changed files: locales\/region-1\/strings\.json/);
+    assert.match(prompt, /this scope reads in full: locales\/region-1\/strings\.json/);
     assert.match(prompt, /review them from the diff: locales\/region-0\/strings\.json/);
     assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
   });

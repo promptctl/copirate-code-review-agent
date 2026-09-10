@@ -389,7 +389,7 @@ const { workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord } =
 const mintedPlan = () => require('../src/plan').planRecord({
   provenance: 'scout',
   context: 'ctx',
-  scopes: [{ name: 'auth', focus: 'the auth change', files: ['src/auth.js'] }],
+  scopes: [{ name: 'auth', focus: 'the auth change', files: ['src/auth.js'], reads: [] }],
   scoutUsage: null,
 });
 

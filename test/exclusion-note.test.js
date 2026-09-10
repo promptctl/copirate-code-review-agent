@@ -131,7 +131,7 @@ describe('a withheld path is never a read target — the partition is over what 
     // in this same prompt on purpose, so a bare "does not include" would pass against nothing.
     for (const prompt of workerPrompts) {
       assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js/);
-      const readTargets = prompt.match(/assigned changed files: (.*?)\. Skip any among them/);
+      const readTargets = prompt.match(/this scope reads in full: (.*?)\. Skip any among them/);
       assert.ok(readTargets, 'the worker was given no read-targets line to check');
       assert.ok(!readTargets[1].includes('build/out.js'), `a withheld path is a read target: ${readTargets[1]}`);
     }
