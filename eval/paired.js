@@ -36,7 +36,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { parsePlanRecord } = require('../src/plan');
-const { parseMeta, describeEffort, listRunDirs } = require('./score');
+const { parseMeta, describeEffort, listRunDirs, requireRunCase } = require('./score');
 
 const USAGE = `Usage: node eval/paired.js <arm-a-out> <arm-b-out> [options]
 
@@ -183,15 +183,13 @@ function readArm(root, label) {
   return { label, root: resolved, effort: agreedArmEffort(runs, label), runs };
 }
 
-// [LAW:single-enforcer] The rule about a MISPLACED run is one rule, and eval/compare.js's readPriorRuns
-// already states it at the identical boundary — a walker over case dirs reading each run's meta.json. A
-// run whose meta names another case would otherwise be pooled into the dir it sits in, where the
-// inventory check downstream catches it by accident and blames expected.json drift for a misfiled dir.
 function readRun(dir, caseName, label) {
   const meta = parseMeta(readFileOrRefuse(path.join(dir, 'meta.json'), label, 'was never replayed to completion'), path.join(dir, 'meta.json'));
-  if (meta.case !== caseName) {
-    throw new Error(`Arm ${label}: ${dir} records case '${meta.case}' but sits under '${caseName}' — a misplaced run; move or remove it.`);
-  }
+  // score.js owns what a misplaced run is; compare.js's readPriorRuns refuses one at the same kind of
+  // boundary. Proven before the run's other artifacts are read, because which case a run belongs to is
+  // what makes "this run recorded no plan" a sentence about the right case at all. Left to the inventory
+  // check downstream, a misfiled run surfaces as expected.json drift and sends the operator hunting.
+  const runCase = requireRunCase(meta, caseName, `Arm ${label}: ${dir}`);
   const plan = parsePlanRecord(
     readFileOrRefuse(path.join(dir, 'plan.json'), label, 'recorded no plan — it predates copirate-determinism-5od.ea7, so what structure it ran is unknown and it cannot be paired'),
     path.join(dir, 'plan.json'),
@@ -199,7 +197,7 @@ function readRun(dir, caseName, label) {
   const scorecard = JSON.parse(readFileOrRefuse(path.join(dir, 'scorecard.json'), label, 'is unscored — run eval/score.js over its case dir first'));
   return {
     dir,
-    case: meta.case,
+    case: runCase,
     effort: describeEffort(meta.effort),
     planKey: planKey(plan),
     provenance: plan.provenance,

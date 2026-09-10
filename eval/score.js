@@ -317,6 +317,21 @@ function agreedScope(runs) {
   return scope;
 }
 
+// [LAW:single-enforcer] What a MISPLACED run is, stated once: a run whose meta.json names a case other
+// than the directory it sits under. Every walker over an out root meets it — compare.js's readPriorRuns
+// refuses one before the spend, paired.js's readArm before it pools runs into a pairing block — and two
+// copies of the rule would drift into refusing different things for the same run. The caller passes the
+// LABEL it points at the run by (a meta.json path, an arm's run dir), so each keeps its own way of naming
+// the offender while the rule and the sentence have one home.
+// [LAW:parse-dont-validate] It returns the case name it proved, so the caller reads a value rather than
+// re-deriving what it just checked.
+function requireRunCase(meta, caseName, label) {
+  if (meta.case !== caseName) {
+    throw new Error(`${label} names case '${meta.case}' but lives under '${caseName}' — a misplaced run; move or remove it.`);
+  }
+  return caseName;
+}
+
 // [LAW:effects-at-boundaries] Pure: which of these runs were produced at a different arm than the one
 // given. Runs are {dir, effort} — whatever read them off disk. This lives beside describeEffort rather
 // than in either CLI because both need it and the rule is one: freeze-suite.js refuses a resume that
@@ -863,7 +878,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, misarmedRuns,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, misarmedRuns, requireRunCase,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,

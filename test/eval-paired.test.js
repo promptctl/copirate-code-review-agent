@@ -223,7 +223,7 @@ test('a run filed under the wrong case dir is refused by name, not blamed on inv
   const root = tmpRoot('armA');
   writeArm(root, { 'case-one': [{ found: [1], missed: [] }] });
   fs.renameSync(path.join(root, 'case-one'), path.join(root, 'case-two'));
-  assert.throws(() => readArm(root, 'A'), /records case 'case-one' but sits under 'case-two' — a misplaced run/);
+  assert.throws(() => readArm(root, 'A'), /Arm A: .*names case 'case-one' but lives under 'case-two' — a misplaced run/);
 });
 
 test('a scorecard whose must-find ids collide cannot be paired and says why', () => {

@@ -38,7 +38,7 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort, misarmedRuns } = require('./score');
+const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort, misarmedRuns, requireRunCase } = require('./score');
 const { workingTree, treeIdentity } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
@@ -520,7 +520,7 @@ function readPriorRuns(candidateRoot, caseNames) {
   return caseNames.flatMap(name => listRunDirs(path.join(candidateRoot, name)).map(dir => {
     const metaPath = path.join(dir, 'meta.json');
     const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
-    if (meta.case !== name) throw new Error(`${metaPath} names case '${meta.case}' but lives under '${name}' — a misplaced run; move or remove it.`);
+    requireRunCase(meta, name, metaPath);
     return { case: name, dir, candidate: meta.candidate, effort: meta.effort };
   }));
 }
