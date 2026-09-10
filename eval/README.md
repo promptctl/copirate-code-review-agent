@@ -367,20 +367,49 @@ pointing at nothing.
 
 `freeze-suite.js` takes `--plans <dir>`. It is **plural, and a directory rather than a file**, because a
 plan partitions *one* case's changed files — a single file forwarded to every case would be refused by all
-but one. The dir holds one `<case-name>.json` per case being replayed:
+but one. The dir holds one **subdirectory per case**, each holding one `.json` plan per replicate:
+
+```
+<plans-dir>/
+  cc-candybar-150-transcript-perf/   1.json  2.json  3.json  4.json  5.json
+  copirate-93-dependency-diff/       1.json  2.json  3.json  4.json  5.json
+  …
+```
+
+**Replicate *r* replays plan *r*, in filename order.** So `-n 5` replays five *distinct* structures per
+case, not one structure five times. That matters because a paired A/B gets its resolution from holding the
+plan fixed across arms — and with a single plan per case, "held fixed" and "held at exactly one value" are
+the same thing, so the comparison would say nothing about whether the effect survives a different
+partition. Given the 26-point spread on scope count alone, the structure a case happens to be pinned at is
+not a neutral choice. N distinct plans buy **generality and pairing at the same replicate count and the
+same spend** (`copirate-determinism-5od.2sd`).
+
+Pairing survives it because both arms resolve the same dir the same way, so arm A's replicate *r* and arm
+B's replicate *r* share a structure. It also survives a **resume**: level *r* names plan *r* no matter
+which invocation queued it, so an arm run in one pass and an arm that crashed and resumed replay the same
+multiset. `eval/paired.js` needs no knowledge of any of this — it keys on plan *content*.
 
 ```bash
-# every case replays its own frozen structure; the arm is the only thing that differs
+# every case replays its own five frozen structures; the arm is the only thing that differs
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep2 --sweep-cap 2 --plans <plans-dir>
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep0 --sweep-cap 0 --plans <plans-dir>
 ```
 
-If a selected case has no plan there, or a plan does not parse, the **whole suite is refused before a
-single credential resolves**. A partially-pinned suite is the failure worth refusing: some cases would
-replay a frozen structure while the rest re-rolled it, putting the exact variance the pin removes back
-into the comparison, with nothing in the report saying which cases carried it. What the suite runner
-checks is only existence and shape — the plan's fit to a case's *diff* needs that case's material, so it
-is proven per replay, inside the engine pass.
+If a selected case has no directory there, has **fewer plans than `-n`**, or holds a plan that does not
+parse, the **whole suite is refused before a single credential resolves**. Two failures are worth refusing
+for the same reason: a partially-pinned suite (some cases replay a frozen structure while the rest re-roll
+it) and a shallow one (levels past the last plan fall back to scouting), because each puts the exact
+variance the pin removes back into the comparison, with nothing in the report saying which replicates
+carried it. *More* plans than `-n` is fine and deliberate — the extras are the depth a later `-n` resume
+grows into, against this same dir. What the suite runner checks is only existence, count and shape — the
+plan's fit to a case's *diff* needs that case's material, so it is proven per replay, inside the engine
+pass.
+
+**Where the plans come from.** Every run writes `plan.json`, so a plan set is harvested rather than
+authored — but only runs from `copirate-determinism-5od.ea7` onward carry one, and the runs stored under
+`eval/out/` predate it. The way to mint a set at no extra cost is to run the **first arm un-pinned** and
+harvest its `plan.json` files into `<plans-dir>/<case>/`, then run the second arm pinned to them. The
+multisets then match by construction, and the only scout spawns paid are the ones a fresh arm pays anyway.
 
 Unlike an effort arm, a mix of pinned and scouted runs under one `--out` is **not** refused: the arm
 check (`misarmedRuns`) was left alone on purpose, since a plan is not an arm. What distinguishes them
@@ -428,8 +457,9 @@ between the two replays — that last one naming the ids that differ, since a sa
 in a count. Plans are named in refusals and in the report by a short digest of their key, because scope
 count alone does not identify a partition.
 
-Within one `(case, plan)` block each arm may hold several replicates — `freeze-suite.js -n 5 --plans <dir>`
-replays one plan five times — and the k-th run of arm A is matched with the k-th run of arm B in sorted
+Within one `(case, plan)` block each arm may hold several replicates — a `--plans` dir that repeats a
+structure, or one harvested from a scout that rolled the same partition twice — and the k-th run of arm A
+is matched with the k-th run of arm B in sorted
 run-dir order. That alignment is **arbitrary but deterministic**, and it is sound: given the plan, an arm's
 replicates are exchangeable, so under the null P(A hit, B miss) = P(A miss, B hit) for *any* one-to-one
 alignment, and the exact test stays exact. What run k shares with run k is the block and nothing else; the
