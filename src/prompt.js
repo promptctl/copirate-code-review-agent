@@ -427,14 +427,14 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
   // [LAW:one-source-of-truth] The prose that depends on the plan — the withheld-files note and the three
   // read lists — is rendered by the same two functions that render the final prompt, so the fit measures
   // exactly what will be sent. It is measured at its CEILING: every file withheld with the longest
-  // instruction (targeted), every file in the read list with the longest entry (targeted), and one file
-  // in each of the other two lists so every sentence's fixed prefix is present. A real plan places each
-  // file in at most one line of the note and exactly one read list, at an entry no longer than these, so
-  // it never renders more — the budget the hunks and reads are sized against already holds the prose.
-  const first = files.slice(0, 1).map(f => f.filename);
+  // instruction (targeted), and every file named in all three read lists at once. A real plan places
+  // each file in at most one line of the note and exactly one read list, so it is a sub-selection of
+  // this rendering and never longer — the budget the hunks and reads are sized against already holds
+  // the prose. The over-count is a few tokens per file, paid once, for a bound that needs no argument.
+  const names = files.map(f => f.filename);
   const plan = fitWorkerMaterial({
     window,
-    fixedTokens: estimateTokens(render(readTargetsText({ full: first, inDiff: first, targeted: files }), withheldNoteText(files.map(f => ({ file: f, read: 'targeted' }))) + excludedNote + dependencyNote)),
+    fixedTokens: estimateTokens(render(readTargetsText({ full: names, inDiff: names, targeted: files }), withheldNoteText(files.map(f => ({ file: f, read: 'targeted' }))) + excludedNote + dependencyNote)),
     files: files.map(f => ({ filename: f.filename, status: f.status, hunk: entries.get(f.filename), content: f.content })),
     // [LAW:dataflow-not-control-flow] The read-set arm as the fit's value: this scope's assigned
     // files, or null for "every changed file" (single-scope PR, repo mode, the 'changed' arm).

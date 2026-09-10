@@ -115,9 +115,14 @@ describe('measureChangedFiles', () => {
     const seen = [];
     const out = measureChangedFiles(files, '/repo', (p) => { seen.push(p); return 'line one\nline two\n'; });
     assert.deepEqual(seen, ['/repo/src/a.js']);
-    assert.deepEqual(out[0].content, { tokens: estimateTokens('line one\nline two\n'), lines: 3 });
+    assert.deepEqual(out[0].content, { tokens: estimateTokens('line one\nline two\n'), lines: 2 }); // the trailing newline ends line two
     assert.deepEqual(out[1].content, { tokens: 0, lines: 0 });
     assert.equal(out[0].patch, files[0].patch); // the record is extended, never replaced
+  });
+  test('a file with no trailing newline keeps its last line, and an empty file has none', () => {
+    const out = measureChangedFiles([files[0], files[0]], '/repo', (() => { let n = 0; return () => (n++ === 0 ? 'a\nb' : ''); })());
+    assert.equal(out[0].content.lines, 2);
+    assert.equal(out[1].content.lines, 0);
   });
   test('a listed file missing from the checkout is refused with the path and root named', () => {
     assert.throws(

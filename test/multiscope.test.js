@@ -1978,6 +1978,19 @@ describe('buildReviewInput window fit', () => {
     assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
   });
 
+  test('the same bound holds when every file lands in the full and in-diff lists instead of targeted', () => {
+    const { WORKER_HEADROOM_TOKENS, estimateTokens } = require('../src/window');
+    const many = stamp(Array.from({ length: 400 }, (_, i) => ({
+      filename: `locales/region-${i}/strings.json`, status: i % 2 === 0 ? 'added' : 'modified', patch: `@@ -1 +1 @@\n+{"k": ${i}}`,
+    }))).map(f => ({ ...f, content: { tokens: 20, lines: 1 } }));
+    const window = 200_000;
+    const prompt = buildReviewInput({ files: many, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: many.map(f => f.filename), window }).prompt;
+    assert.doesNotMatch(prompt, /could not be shown|do not fit whole/); // nothing withheld, nothing targeted
+    assert.match(prompt, /assigned changed files: locales\/region-1\/strings\.json/);
+    assert.match(prompt, /review them from the diff: locales\/region-0\/strings\.json/);
+    assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
+  });
+
   test('a pure deletion at the top of a file is read from line 1, never a line 0 no file has', () => {
     const { hunkRanges } = require('../src/diff');
     assert.deepEqual(hunkRanges('@@ -1,3 +0,0 @@\n-a\n-b\n-c'), [{ from: 1, to: 1 }]);

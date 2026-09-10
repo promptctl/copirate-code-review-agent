@@ -134,6 +134,13 @@ function fitWorkerMaterial({ window, fixedTokens, files, readSet }) {
 // a full read of a file that is not there. `readContent` is the injected reader (fs by default) so the
 // measurement is a value a test can supply. Changed files under review are UTF-8 text in practice; a
 // binary file measured as text errs high, the safe direction.
+// The line count a Read tool sees: a file's trailing newline ends its last line, it does not start
+// another, so "a\nb\n" is two lines and an empty file is none.
+function lineCount(text) {
+  if (text.length === 0) return 0;
+  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+}
+
 function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) => fs.readFileSync(absPath, 'utf8')) {
   return files.map(f => {
     if (f.status === 'removed') return { ...f, content: { tokens: 0, lines: 0 } };
@@ -144,7 +151,7 @@ function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) =>
     } catch (e) {
       throw new Error(`The reviewed checkout at ${reviewedRepoRoot} has no readable ${f.filename} (listed as ${f.status} in this change): ${e.message}. The review reads changed files from that checkout, so it must be at the change's head.`);
     }
-    return { ...f, content: { tokens: estimateTokens(text), lines: text.split('\n').length } };
+    return { ...f, content: { tokens: estimateTokens(text), lines: lineCount(text) } };
   });
 }
 
