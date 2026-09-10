@@ -406,37 +406,23 @@ Review this repository for what would hurt if it shipped. There is no diff — t
   };
 }
 
-// [LAW:one-source-of-truth] The scout's OUTPUT protocol lives here, once, shared by both scout
-// builders below. A scout plans the review; it does not flag code. It records each scope through the
-// add_scope COLLECTOR TOOL — a typed, schema-validated record, exactly as a worker records a finding
-// through request_change — so the plan is never parsed from prose. [FRAMING:representation] The number
-// of scopes is whatever the grouping rules produce — adaptivity is the grouping, never a counted
-// threshold. [LAW:dataflow-not-control-flow]
-// assignFiles adds the `files` field to the contract: in PR mode the scout assigns every changed file
-// to exactly one scope (its worker reads those in full), so the field is required; in repo mode there
-// is no diff to partition, so the contract omits it. [LAW:dataflow-not-control-flow] one contract,
-// varied by a value, not two copies.
-function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
-  const filesField = assignFiles
-    ? `\n      - files: the array of changed file paths this scope owns, copied EXACTLY as listed above. `
-      + `Every changed file must appear in exactly ONE scope's files — the worker for that scope reads those files in full.`
-    : '';
-  // The summary's SUBJECT and its second reader both vary by mode, and nothing else about the
-  // contract does. [LAW:dataflow-not-control-flow] one contract, varied by a value, not two copies.
-  const summaryContract = assignFiles
-    ? `The summary says what this pull request changes and why — the change in the author's own terms, `
-      + `not a file-by-file list. TWO readers get it verbatim: every scope worker, as the orientation it `
-      + `reviews against, and the pull request author, as the ONLY summary this review posts.`
-    : `The summary says what this codebase is and how its main parts relate. TWO readers get it verbatim: `
-      + `every scope worker, as the orientation it reviews against, and the report's reader, as the ONLY `
-      + `summary this review posts.`;
+// [LAW:one-source-of-truth] The repo scout's OUTPUT protocol. A scout plans the review; it does not
+// flag code. It records each scope through the add_scope COLLECTOR TOOL — a typed, schema-validated
+// record, exactly as a worker records a finding through request_change — so the plan is never parsed
+// from prose. [FRAMING:representation] The number of scopes is whatever the grouping rules produce —
+// adaptivity is the grouping, never a counted threshold. [LAW:dataflow-not-control-flow]
+// Only repo mode scouts: a PR's partition is computed from its changed paths (src/partition.js), so
+// there is no file assignment in this contract and no changed list for one to copy from.
+function scoutOutputContract(toolNames) {
   return `Do NOT call ${toolNames.requestChange}. You are planning the review here, not reviewing code.
 
     Record your plan by calling ${toolNames.addScope} ONCE PER SCOPE, providing:
       - name: a short label (for example "cost", "line-anchoring", or "parser→renderer" for a boundary).
-      - focus: one or two sentences naming the exact files and what to examine in them.${filesField}
+      - focus: one or two sentences naming the exact files and what to examine in them.
 
-    Then call ${toolNames.finishReview} exactly once. ${summaryContract}
+    Then call ${toolNames.finishReview} exactly once. The summary says what this codebase is and how its main parts relate. TWO readers get it verbatim:
+    every scope worker, as the orientation it reviews against, and the report's reader, as the ONLY
+    summary this review posts.
 
     ONE TO FOUR plain sentences, and never more. This bound bites at the end, after you have planned
     every scope and your head is full of detail that all feels worth saying — a summary that runs past
@@ -447,58 +433,6 @@ function scoutOutputContract(toolNames, { assignFiles = false } = {}) {
     and a verdict here would be a second one contradicting it. [LAW:one-source-of-truth]
 
     These collector tools are your only output channel; never print the plan as text.`;
-}
-
-// [LAW:decomposition] The PR scout MATERIAL: it is handed the list of files this pull request changed
-// and divides them into review scopes by the explicit rules below. It surveys; the workers judge.
-// The rules are written for a weak model — concrete, example-grounded, and free of any "is it big"
-// threshold: the scope COUNT falls out of grouping changed files by concern and following the import
-// edges the change actually crosses. [LAW:dataflow-not-control-flow]
-function buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded = NO_EXCLUSIONS }) {
-  // Rendered raw, and correctly so: changedPaths are diff filenames, and parseReviewableFiles refused
-  // any that could break this list. Do not "harden" this with a flatten — these are paths the scout
-  // assigns and a worker later opens, so collapsing one would name a file that does not exist.
-  const fileList = changedPaths.map(p => `      - ${p}`).join('\n');
-  // The same confession the worker gets (buildReviewInput), aimed at the job this role actually does:
-  // the scout PLANS, so the failure it must not commit is scoping an invisible path or sending a worker
-  // to investigate an absence. One fact, two audiences — never re-derived, only re-aimed.
-  const exclusionNote = excluded.paths.length > 0
-    ? `\n\n    **Withheld from the list above — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
-      + `    EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed these ${excluded.paths.length} changed file(s) from the list, so their absence is a display setting, not a gap. Create no scope for them, aim no scope's focus at them, and treat nothing about their state as reviewable in this run.`
-    : '';
-  return {
-    prompt: `
-Plan the review of a pull request. The repository under review is checked out at ${reviewedRepoRoot}; your working
-    directory is intentionally outside it, so reach files by that absolute path with your Read, Grep, and Glob tools.
-
-    This pull request changed these source files:
-${fileList}${exclusionNote}
-
-    Divide these changed files into review scopes by this ONE rule. Do not invent scopes for anything these files do not
-    change.
-
-    Group the changed files by the ONE concern each serves, and emit exactly ONE scope per group — no more. [LAW:decomposition]:
-    a part does one thing, so each group is one concern. A concern is usually the directory a file sits in, but judge by what
-    the code DOES, not only where it sits. Read the changed files if you are unsure what they do.
-      - Example: a change to a price table and a change to the function that reads that table both serve the
-        cost concern — ONE group, ONE scope, though they are different files.
-      - Example: a change to line-anchor parsing and a change to report rendering serve two different
-        concerns — TWO groups, TWO scopes.
-
-    The number of scopes EQUALS the number of distinct concerns these changed files touch: a change to one concern yields
-    exactly one scope; a change touching five concerns yields exactly five scopes. Do NOT split one concern across several
-    scopes, and do NOT create a separate scope for a boundary between concerns — boundaries are reviewed from inside a scope,
-    next. EVERY changed file listed above must belong to exactly one scope — none left out, or its changes go unreviewed.
-
-    In each scope's "focus", do THREE things: (1) name that group's changed files and what to review in them; (2) tell the
-    reviewer to ALSO read the files this group imports (its require(...) targets) and check the connection — that the
-    dependency points one way [LAW:one-way-deps] and that no single fact is defined or owned on both sides
-    [LAW:one-source-of-truth]; (3) keep it to one or two sentences.
-
-    Separately, put that group's changed file paths in the scope's "files" field — that is the set the scope's worker reads in full.
-
-    ${scoutOutputContract(toolNames, { assignFiles: true })}`,
-  };
 }
 
 // [LAW:decomposition] The whole-repo scout MATERIAL: no diff, so it surveys the working tree and
@@ -545,4 +479,4 @@ Plan the review of this repository. There is no diff. The repository under revie
   };
 }
 
-module.exports = { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput };
+module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput };

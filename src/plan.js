@@ -6,21 +6,21 @@ const { parseScopeValue } = require('./review');
 
 // The pass's PLAN — the partition a review actually ran, as an owned value.
 //
-// [LAW:one-source-of-truth] The scout decides the STRUCTURE of every review: how many scopes the
-// change splits into, which files land in each, and the shared context every worker is shown. That
+// [LAW:one-source-of-truth] The plan is the STRUCTURE of every review: how many scopes the change
+// splits into, which files land in each, and the shared context every worker is shown. That
 // decision was previously recoverable only by parsing worker transcripts — schedule.json records
 // scopeCount and the per-spawn scope NAMES, which is the plan's shadow, not the plan. A value with
-// no authoritative representation cannot be inspected, pinned, replayed, or optimized, and on a
-// frozen case this one re-rolls from 1 to 5 scopes across runs with a 26-point recall spread riding
-// on it (copirate-determinism-5od). This module gives that value one home, so everything downstream
-// — the pinned replay, the paired A/B, any future partitioner — reads THIS and never re-parses prose.
+// no authoritative representation cannot be inspected, pinned, replayed, or optimized, and while an
+// LLM scout decided it, on a frozen case it re-rolled from 1 to 5 scopes across runs with a 26-point
+// recall spread riding on it (copirate-determinism-5od). This module gives that value one home, so
+// everything downstream — the pinned replay, the paired A/B, the partition — reads THIS and never
+// re-parses prose.
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the post-planScopes list AS THE WORKERS RAN IT — withheld paths stripped, unassigned
-// paths swept into the catch-all, names uniquified — each { name, focus, files }, recorded whole
-// rather than projected, so a scope field added later cannot be silently dropped on the way to disk.
-// context is the scout summary prefixed onto every worker's focus (workerFocusText); it is NOT
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
+// whole rather than projected, so a scope field added later cannot be silently dropped on the way to
+// disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so
 // a plan without it could not reconstruct the prompts it claims to describe. [FRAMING:representation]
 
@@ -35,12 +35,13 @@ const PLAN_SCHEMA = 'copirate-plan/v1';
 
 // [LAW:dataflow-not-control-flow] Provenance as a TABLE from each origin's NAME to whether a scout
 // spawn PRICED this plan — the vocabulary is the table's keys, so an origin can never exist without
-// the fact that decides what its price field may hold. 'scout' is the shipped producer (this run
-// planned its own partition); 'pinned' is the replay of a plan decided elsewhere, whose producer
-// lands in copirate-determinism-5od.fku. [LAW:parse-dont-validate] provenance is required and closed,
+// the fact that decides what its price field may hold. 'partition' is the shipped PR producer (the
+// structure computed from the changed paths, src/partition.js — no spawn); 'scout' is the repo-mode
+// producer (a survey spawn, priced); 'pinned' is the replay of a plan decided elsewhere
+// (copirate-determinism-5od.fku). [LAW:parse-dont-validate] provenance is required and closed,
 // never optional: a plan whose origin is unknown is an absence that reads like an answer, which is
 // the whole defect class this lane exists to close.
-const PLAN_PROVENANCE_PRICED = { scout: true, pinned: false };
+const PLAN_PROVENANCE_PRICED = { partition: false, scout: true, pinned: false };
 const PLAN_PROVENANCES = Object.keys(PLAN_PROVENANCE_PRICED);
 
 // [LAW:one-source-of-truth] The field set the record carries, as ONE list: the mint copies these
@@ -52,9 +53,9 @@ const PLAN_FIELDS = ['provenance', 'context', 'scopes', 'scoutUsage'];
 // [LAW:parse-dont-validate] The ONE mint of a plan record, and the checkpoint between a live pass and
 // a durable artifact: a plan exists only by passing through here, so every reader downstream reads
 // the stamp instead of re-checking the shape. [LAW:single-enforcer] the scope INTERIORS are not
-// re-checked — every model-authored scope was already stamped single-line by parseScopeValue
-// (src/review.js) at the collector boundary, and the catch-all is host-authored — so a second papers
-// check here would be a rival definition of what a scope is.
+// re-checked — every scope was already stamped single-line by parseScopeValue (src/review.js), at the
+// collector boundary for a scout's and at the partition for a computed one — so a second papers check
+// here would be a rival definition of what a scope is.
 // [LAW:effects-at-boundaries] Pure: the caller does the writing.
 function planRecord(fields) {
   const record = { planSchema: PLAN_SCHEMA };

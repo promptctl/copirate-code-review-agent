@@ -6,7 +6,7 @@ const {
   workerFocusText,
   sumUsage,
   composeSummary,
-  planScopes,
+  scoutProposal,
   LANE_MEMORY_BYTES,
   laneCeilingFromMemory,
   findingsLedger,
@@ -19,7 +19,8 @@ const {
   buildRepoMaterial,
 } = require('../src/multiscope');
 const { defaultEffortProfile, DEFAULT_READ_SET } = require('../src/effort');
-const { buildReviewInput, buildRepoReviewInput, buildPrScoutInput, buildRepoScoutInput } = require('../src/prompt');
+const { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput } = require('../src/prompt');
+const { partitionByDirectory } = require('../src/partition');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { TransientError } = require('../src/failover');
 const { DeadlineExceededError } = require('../src/deadline');
@@ -484,9 +485,11 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
     { name: 'b', focus: 'fb', files: [] },
     { name: 'c', focus: 'fc', files: [] },
   ];
+  // A hand-built material buys its plan from a fake scout spawn, as repo material does, so the fake
+  // adapter below can answer the scout by its prompt and every later spawn as a worker.
   const material = {
-    changedPaths: [], // no coverage sweep in this suite; scope-worker resilience is what's under test
-    buildScoutPrompt: () => 'SCOUT',
+    changedPaths: [],
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText) => focusText, // focusText carries `${scope.name} — ${scope.focus}`
   };
   const config = { engine: 'fake', name: 'c1' };
@@ -577,7 +580,7 @@ describe('runMultiScopePass — spawn-level transient resilience', () => {
 describe('runMultiScope — reasoningTier fold onto the chain', () => {
   const material = {
     changedPaths: [],
-    buildScoutPrompt: () => 'SCOUT',
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText) => focusText,
   };
   const SCOPES = [{ name: 'a', focus: 'fa', files: [] }];
@@ -657,153 +660,6 @@ describe('runMultiScope — reasoningTier fold onto the chain', () => {
   });
 });
 
-// ── planScopes — mechanical scout-coverage verification (598.3, now file-set based) ───────────────
-// The scout assigns every changed file to a scope via scope.files; planScopes verifies that assignment
-// by EXACT set membership. A changed path no scope claimed is swept into ONE synthetic 'unassigned
-// files' scope (carrying those paths in its own files) so some worker reads it in full — DEEP coverage
-// guaranteed as a value, not left to the plan or recovered from prose.
-
-describe('planScopes', () => {
-  const scopes = [
-    { name: 'cost', focus: 'pricing math', files: ['src/usage.js'] },
-    { name: 'transport', focus: 'GitHub review submission', files: ['src/transport.js'] },
-  ];
-
-  test('a changed path claimed by no scope is swept into one synthetic scope + reported', () => {
-    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js', 'src/report.js']);
-    assert.deepEqual(sweptPaths, ['src/report.js']);
-    assert.equal(planned.length, 3);
-    const synthetic = planned[planned.length - 1];
-    assert.equal(synthetic.name, 'unassigned files');
-    assert.match(synthetic.focus, /src\/report\.js/);
-    assert.match(synthetic.focus, /Review their changes fully/);
-    assert.deepEqual(synthetic.files, ['src/report.js']); // the catch-all carries its own files to read
-  });
-
-  test('coverage is exact set membership — a path is covered iff it appears in some scope.files', () => {
-    const { sweptPaths } = planScopes(
-      [{ name: 'cost', focus: 'the usage table', files: ['src/usage.js'] }],
-      ['src/usage.js'],
-    );
-    assert.deepEqual(sweptPaths, []);
-  });
-
-  test('full coverage yields no synthetic scope and returns the plan array unchanged', () => {
-    const { scopes: planned, sweptPaths } = planScopes(scopes, ['src/usage.js', 'src/transport.js']);
-    assert.deepEqual(sweptPaths, []);
-    assert.equal(planned, scopes); // same reference — no rebuild when nothing is swept
-  });
-
-  test('an empty changedPaths list (repo material) never yields a synthetic scope', () => {
-    const { scopes: planned, sweptPaths } = planScopes(scopes, []);
-    assert.deepEqual(sweptPaths, []);
-    assert.equal(planned, scopes);
-  });
-
-  // A path mentioned in a scope's prose but NOT listed in its files is uncovered — the assignment is the
-  // files field, not the focus text. This is the exactness the file-set model buys over text-matching:
-  // no substring collisions, and no "mentioned in passing" false positives either.
-  test('a path named only in focus prose but absent from scope.files is swept', () => {
-    const { sweptPaths } = planScopes(
-      [{ name: 'engine', focus: 'Review src/multiscope.js and its neighbor src/scope.js', files: ['src/multiscope.js'] }],
-      ['src/scope.js'],
-    );
-    assert.deepEqual(sweptPaths, ['src/scope.js']);
-  });
-
-  test('all unassigned paths land in ONE synthetic scope, never one scope each', () => {
-    const { scopes: planned, sweptPaths } = planScopes(scopes, ['a.js', 'b.js', 'c.js']);
-    assert.deepEqual(sweptPaths, ['a.js', 'b.js', 'c.js']);
-    assert.equal(planned.length, 3); // 2 planned + exactly 1 catch-all
-    assert.match(planned[2].focus, /a\.js, b\.js, c\.js/);
-    assert.deepEqual(planned[2].files, ['a.js', 'b.js', 'c.js']);
-  });
-
-  test('a file claimed by two scopes (over-assignment) is reported as a duplicate', () => {
-    const overlap = [
-      { name: 'a', focus: 'x', files: ['src/shared.js', 'src/a.js'] },
-      { name: 'b', focus: 'y', files: ['src/shared.js', 'src/b.js'] },
-    ];
-    const { duplicatePaths, sweptPaths } = planScopes(overlap, ['src/shared.js', 'src/a.js', 'src/b.js']);
-    assert.deepEqual(duplicatePaths, ['src/shared.js']); // read by both workers — the redundant cost
-    assert.deepEqual(sweptPaths, []); // every changed file is covered (by at least one scope)
-  });
-
-  test('no over-assignment yields an empty duplicatePaths', () => {
-    const { duplicatePaths } = planScopes(scopes, ['src/usage.js', 'src/transport.js']);
-    assert.deepEqual(duplicatePaths, []);
-  });
-
-  test('a file claimed by THREE scopes appears exactly once in duplicatePaths', () => {
-    const triple = [
-      { name: 'a', focus: 'x', files: ['src/shared.js'] },
-      { name: 'b', focus: 'y', files: ['src/shared.js'] },
-      { name: 'c', focus: 'z', files: ['src/shared.js'] },
-    ];
-    const { duplicatePaths } = planScopes(triple, ['src/shared.js']);
-    assert.deepEqual(duplicatePaths, ['src/shared.js']); // once, not twice — the includes() guard holds
-  });
-});
-
-// ── the sweep actually reaches the worker pool (end-to-end through runMultiScopePass) ─────────────
-
-describe('runMultiScopePass — scout coverage sweep', () => {
-  const config = { engine: 'fake', name: 'c1' };
-  // Scout returns the given plan; each worker echoes its own prompt so we can see which scopes ran.
-  function registryFor(scoutScopes) {
-    const seen = [];
-    const adapter = {
-      async produceReview({ buildPromptFor }) {
-        const prompt = buildPromptFor({});
-        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: scoutScopes, usage: null };
-        seen.push(prompt);
-        return { summary: 'ok', findings: [], assessments: [], usage: null };
-      },
-    };
-    return { registry: { get: () => adapter }, seen };
-  }
-  const runWith = ({ registry, scoutScopes, changedPaths, log }) =>
-    runMultiScopePass({
-      config,
-      material: { changedPaths, buildScoutPrompt: () => 'SCOUT', buildWorkerPrompt: (f) => f },
-      registry, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log, sleepFn: async () => {},
-    });
-
-  test('an unassigned changed file gets its own worker (the synthetic scope) and a warning', async () => {
-    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js', files: ['a.js'] }]);
-    const logs = [];
-    await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
-    assert.ok(seen.some(p => p.includes('unassigned files') && p.includes('b.js')), 'synthetic worker ran for b.js');
-    assert.ok(logs.some(m => /unassigned/.test(m) && m.includes('b.js')), 'warning names the swept path');
-  });
-
-  test('full coverage runs no synthetic worker and logs no sweep warning', async () => {
-    const { registry, seen } = registryFor([{ name: 'a', focus: 'a.js', files: ['a.js'] }, { name: 'b', focus: 'b.js', files: ['b.js'] }]);
-    const logs = [];
-    await runWith({ registry, changedPaths: ['a.js', 'b.js'], log: (m) => logs.push(m) });
-    assert.ok(!seen.some(p => p.includes('unassigned files')));
-    assert.ok(!logs.some(m => /unassigned/.test(m)));
-  });
-
-  test('repo material (changedPaths: []) never sweeps even when the scout plans one scope', async () => {
-    const { registry, seen } = registryFor([{ name: 'whole', focus: 'everything', files: [] }]);
-    const logs = [];
-    await runWith({ registry, changedPaths: [], log: (m) => logs.push(m) });
-    assert.ok(!seen.some(p => p.includes('unassigned files')));
-    assert.ok(!logs.some(m => /unassigned/.test(m)));
-  });
-
-  test('a file over-assigned to two scopes logs the duplicate warning at the pass level', async () => {
-    const { registry } = registryFor([
-      { name: 'a', focus: 'a', files: ['shared.js', 'a.js'] },
-      { name: 'b', focus: 'b', files: ['shared.js', 'b.js'] },
-    ]);
-    const logs = [];
-    await runWith({ registry, changedPaths: ['shared.js', 'a.js', 'b.js'], log: (m) => logs.push(m) });
-    assert.ok(logs.some(m => /more than one scope/.test(m) && m.includes('shared.js')), 'warns naming the doubly-claimed file');
-  });
-});
-
 // ── materials — closures that build the real engine prompts ──────────────────────────────────────
 
 // ── runMultiScopePass — convergence sweeps (zai-recall-upr.2) ──────────────────────────────────────
@@ -816,7 +672,7 @@ describe('runMultiScopePass — convergence sweeps', () => {
   // per-pass threading (pass 0 gets none; a sweep gets the cumulative list).
   const material = {
     changedPaths: [],
-    buildScoutPrompt: () => 'SCOUT',
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText, _toolNames, _scopeFiles, priorFindings) =>
       `${focusText}||prior:${priorFindings.map(f => f.body).join(',')}`,
   };
@@ -953,16 +809,21 @@ describe('buildPrMaterial', () => {
   const files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
   const material = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
 
-  test('exposes the changed-file list so the pass can verify scout coverage against it', () => {
+  test("exposes the changed-file list — the partition's input and the pinned producer's proof set", () => {
     assert.deepEqual(material.changedPaths, ['src/a.js']);
   });
 
-  test('scout prompt lists the changed file paths and records scopes via the add_scope tool', () => {
-    const prompt = material.buildScoutPrompt(TOOL_NAMES);
-    assert.match(prompt, /src\/a\.js/);
-    assert.match(prompt, /mcp__review_collector__add_scope ONCE PER SCOPE/);
-    assert.match(prompt, /mcp__review_collector__finish_review/);
-    assert.doesNotMatch(prompt, /JSON array/);
+  // [LAW:one-source-of-truth] The proposal IS partitionByDirectory over the filenames: no spawn is made
+  // (the producer takes none), and the value is the same one test/partition.test.js pins per case.
+  test('the proposal is the partition of the changed filenames, bought from no spawn', () => {
+    const files = [
+      { filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+1' },
+      { filename: 'src/b.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+2' },
+      { filename: 'README.md', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+3' },
+    ];
+    const proposal = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }).proposal({ log: () => {} });
+    const expected = partitionByDirectory(['src/a.js', 'src/b.js', 'README.md']);
+    assert.deepEqual(proposal, { provenance: 'partition', scopes: expected.scopes, context: expected.context, scoutUsage: null });
   });
 
   test('worker prompt is the diff review with a CONCENTRATE focus block', () => {
@@ -1114,12 +975,17 @@ describe('buildPrMaterial', () => {
 describe('buildRepoMaterial', () => {
   const material = buildRepoMaterial({ scope: '', excludePatterns: [], reviewedRepoRoot: REPO_ROOT });
 
-  test('exposes an empty changed-file list, making the coverage sweep a no-op by construction', () => {
+  test('exposes an empty changed-file list — repo mode has no changed set to partition or to prove a pin against', () => {
     assert.deepEqual(material.changedPaths, []);
   });
 
-  test('scout prompt surveys the tree and records scopes via the add_scope tool', () => {
-    const prompt = material.buildScoutPrompt(TOOL_NAMES);
+  // Repo material BUYS its plan: the proposal spawns one scout, and the prompt that spawn is handed
+  // surveys the tree and records scopes via the add_scope tool.
+  test('the proposal spawns a scout whose prompt surveys the tree and records scopes via the add_scope tool', async () => {
+    let prompt;
+    const spawn = async (buildPrompt) => { prompt = buildPrompt(TOOL_NAMES); return { summary: 'ctx', scopes: [{ name: 'a', focus: 'f', files: [] }], usage: null }; };
+    const proposal = await material.proposal({ spawn, log: () => {} });
+    assert.equal(proposal.provenance, 'scout');
     assert.match(prompt, /There is no diff/);
     assert.match(prompt, /mcp__review_collector__add_scope ONCE PER SCOPE/);
     assert.doesNotMatch(prompt, /JSON array/);
@@ -1134,35 +1000,26 @@ describe('buildRepoMaterial', () => {
 
 // ── scout prompts — adaptive by grouping, never by a counted threshold ────────────────────────────
 
-describe('scout prompts carry no size threshold', () => {
-  const prScout = buildPrScoutInput({ changedPaths: ['src/a.js', 'src/b.js'], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
+describe('the repo scout prompt carries no size threshold', () => {
   const repoScout = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
 
-  test('both tie the scope count to the number of concerns, never a target number', () => {
-    assert.match(prScout, /number of scopes EQUALS the number of distinct concerns/);
+  test('ties the scope count to the number of concerns, never a target number', () => {
     assert.match(repoScout, /number of scopes EQUALS the number of distinct concerns/);
   });
 
-  test('both fold boundary review INTO a scope rather than emitting a scope per import edge', () => {
+  test('folds boundary review INTO a scope rather than emitting a scope per import edge', () => {
     // The 25-scope explosion came from a separate boundary scope per importing pair; the rule now
     // reviews boundaries from inside a scope, so the count stays linear in concerns.
-    assert.match(prScout, /do NOT create a separate scope for a boundary/);
     assert.match(repoScout, /do NOT create a separate scope for a boundary/);
-    assert.match(prScout, /ALSO read the files this group imports/);
   });
 
-  test('the PR scout assigns changed files to scopes (files field); the repo scout does not', () => {
-    // PR mode partitions the diff so each worker reads only its files; repo mode has no diff to assign.
-    // The contract describes the fields to provide rather than asserting an exact count — the tool
-    // schema always makes files optional, so "exactly two/three fields" would misrepresent it.
-    assert.match(prScout, /files: the array of changed file paths this scope owns/);
+  test('does not ask for a files field — repo mode has no diff to assign', () => {
     assert.doesNotMatch(repoScout, /files: the array of changed file paths/);
-    assert.doesNotMatch(prScout, /exactly (two|three) fields/);
   });
 
-  test('both forward the engine tool identifiers (incl. add_scope), never hardcoded names', () => {
+  test('forwards the engine tool identifiers (incl. add_scope), never hardcoded names', () => {
     const custom = { requestChange: 'tool_rc', finishReview: 'tool_fr', addScope: 'tool_as' };
-    const p = buildPrScoutInput({ changedPaths: ['src/a.js'], toolNames: custom, reviewedRepoRoot: REPO_ROOT }).prompt;
+    const p = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: custom, reviewedRepoRoot: REPO_ROOT }).prompt;
     assert.match(p, /tool_fr/);
     assert.match(p, /tool_as/);
     assert.doesNotMatch(p, /mcp__review_collector__/);
@@ -1398,11 +1255,10 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
   // feeding it inputs free of what you are hunting.)
   const NEUTRAL_FILES = [{ filename: 'lib/thing.go', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+x := 1' }];
   const review = buildReviewInput({ files: NEUTRAL_FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
-  const prScout = buildPrScoutInput({ changedPaths: ['lib/thing.go', 'app/main.rb'], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
   const repoScout = buildRepoScoutInput({ scope: '', excludePatterns: [], toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT }).prompt;
 
-  test('none of the three prompts hardcode a reviewed-repo path (src/, scripts/, dist/, or a src/*.js file)', () => {
-    for (const [name, prompt] of [['review', review], ['prScout', prScout], ['repoScout', repoScout]]) {
+  test('neither prompt hardcodes a reviewed-repo path (src/, scripts/, dist/, or a src/*.js file)', () => {
+    for (const [name, prompt] of [['review', review], ['repoScout', repoScout]]) {
       assert.doesNotMatch(prompt, /(?:src|scripts|dist)\//, `${name} prompt must not name this repo's directories`);
     }
   });
@@ -1414,9 +1270,7 @@ describe('shipped prompts carry no reviewed-repo layout', () => {
     assert.doesNotMatch(review, /files under src/);
   });
 
-  test('both scouts teach concern-grouping with abstract examples, not this repo\'s filenames', () => {
-    assert.match(prScout, /the function that reads that table/);
-    assert.match(prScout, /line-anchor parsing and a change to report rendering/);
+  test('the repo scout teaches concern-grouping with abstract examples, not this repo\'s filenames', () => {
     assert.match(repoScout, /a price table and the function that reads that table/);
     assert.match(repoScout, /line-anchor parsing and report rendering/);
   });
@@ -1435,7 +1289,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   ];
   const material = {
     changedPaths: [],
-    buildScoutPrompt: () => 'SCOUT',
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     // priorFindings discriminates the phase in the prompt, so a fake worker can behave differently
     // on the initial pass vs a convergence sweep — exactly the value the real prompt varies on.
     buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
@@ -1591,7 +1445,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   ];
   const material = {
     changedPaths: [],
-    buildScoutPrompt: () => 'SCOUT',
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
   };
   const config = { engine: 'fake', name: 'c1' };
@@ -1730,36 +1584,36 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
   });
 });
 
-// ── planScopes stamps unique names (zai-timing-sn1 review round) ──────────────────────────────────
+// ── the pass stamps unique scope names (zai-timing-sn1 review round) ─────────────────────────────
 // Scope names are identifiers downstream — logs, sweep labels, and the time budget's coverage
-// bookkeeping key on them — but the scout contract only promises non-empty. planScopes is the one
-// boundary that makes them unique, so name-keyed consumers are sound by construction.
-describe('planScopes — unique scope names', () => {
-  test('a repeated name gets a deterministic suffix; distinct names pass through untouched', () => {
-    const { scopes } = planScopes([
-      { name: 'sync', focus: 'f1', files: ['a.js'] },
-      { name: 'sync', focus: 'f2', files: ['b.js'] },
-      { name: 'docs', focus: 'f3', files: ['c.js'] },
-    ], ['a.js', 'b.js', 'c.js']);
-    assert.deepEqual(scopes.map(s => s.name), ['sync', 'sync (2)', 'docs']);
+// bookkeeping key on them — but a repo scout only promises non-empty. The pass is the one boundary
+// that makes them unique, so name-keyed consumers are sound by construction. Observed through the
+// recorded plan: the names the workers actually ran under. [LAW:behavior-not-structure]
+describe('the pass stamps unique scope names', () => {
+  const scoped = (name, focus) => ({ name, focus, files: [] });
+  async function planFor(scoutScopes) {
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        if (buildPromptFor({}) === 'SCOUT') return { summary: 'ctx', findings: [], assessments: [], scopes: scoutScopes, usage: null };
+        return { summary: 'sum', findings: [], assessments: [], usage: null };
+      },
+    };
+    const review = await runMultiScopePass({
+      config: { engine: 'fake', name: 'c1' },
+      material: { changedPaths: [], proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }), buildWorkerPrompt: (t) => t },
+      registry: { get: () => adapter }, instructionsPath: 'x', laneCeiling: 4, sweepCap: 0, readSet: DEFAULT_READ_SET, log: () => {}, sleepFn: async () => {},
+    });
+    return review.plan;
+  }
+
+  test('a repeated name gets a deterministic suffix; distinct names pass through untouched', async () => {
+    const plan = await planFor([scoped('sync', 'f1'), scoped('sync', 'f2'), scoped('docs', 'f3')]);
+    assert.deepEqual(plan.scopes.map(s => s.name), ['sync', 'sync (2)', 'docs']);
   });
 
-  test('a suffixed name colliding with a literally-planned one keeps bumping until free', () => {
-    const { scopes } = planScopes([
-      { name: 'x', focus: 'f1', files: ['a.js'] },
-      { name: 'x (2)', focus: 'f2', files: ['b.js'] },
-      { name: 'x', focus: 'f3', files: ['c.js'] },
-    ], ['a.js', 'b.js', 'c.js']);
-    assert.deepEqual(scopes.map(s => s.name), ['x', 'x (2)', 'x (3)']);
-  });
-
-  test("a scout scope named 'unassigned files' cannot collide with the catch-all", () => {
-    const { scopes } = planScopes(
-      [{ name: 'unassigned files', focus: 'f1', files: ['a.js'] }],
-      ['a.js', 'stray.js'],
-    );
-    assert.deepEqual(scopes.map(s => s.name), ['unassigned files', 'unassigned files (2)']);
-    assert.deepEqual(scopes[1].files, ['stray.js']);
+  test('a suffixed name colliding with a literally-planned one keeps bumping until free', async () => {
+    const plan = await planFor([scoped('x', 'f1'), scoped('x (2)', 'f2'), scoped('x', 'f3')]);
+    assert.deepEqual(plan.scopes.map(s => s.name), ['x', 'x (2)', 'x (3)']);
   });
 
   test('coverage bookkeeping stays consistent under formerly-duplicate names (the reporting bug this fixes)', () => {
@@ -1787,7 +1641,7 @@ describe('runMultiScope — failover budget bounded by the deadline', () => {
     let spawns = 0;
     const material = {
       changedPaths: [],
-      buildScoutPrompt: () => 'SCOUT',
+      proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
       buildWorkerPrompt: (t) => t,
     };
     const adapter = {
@@ -1831,7 +1685,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
   ];
   const material = {
     changedPaths: [],
-    buildScoutPrompt: () => 'SCOUT',
+    proposal: ({ spawn, log }) => scoutProposal({ buildScoutPrompt: () => 'SCOUT', spawn, log }),
     buildWorkerPrompt: (focusText, _tools, _files, priorFindings) => `${priorFindings.length > 0 ? 'SWEEP ' : ''}${focusText}`,
   };
   const config = { engine: 'fake', name: 'c1' };

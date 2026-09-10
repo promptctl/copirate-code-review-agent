@@ -33,7 +33,7 @@ describe('spawnRecord', () => {
 // The outer envelope's mint, mirroring spawnRecord: a drifted field name fails here, never as a
 // footer rendering 'undefined lane(s)'. [LAW:one-source-of-truth]
 describe('scheduleRecord', () => {
-  const good = { laneCount: 2, sweepCap: 1, scopeCount: 3, spawns: [] };
+  const good = { plan: 'scout', laneCount: 2, sweepCap: 1, scopeCount: 3, spawns: [] };
   test('mints the envelope as given', () => {
     assert.deepEqual(scheduleRecord(good), good);
   });
@@ -46,6 +46,16 @@ describe('scheduleRecord', () => {
   });
   test('a lane count wider than the plan is refused — a lane is only ever occupied by a scope', () => {
     assert.throws(() => scheduleRecord({ ...good, laneCount: 4 }), /laneCount \(4\) cannot exceed scopeCount \(3\)/);
+    assert.throws(() => scheduleRecord({ ...good, plan: 'dice' }), /plan must be one of partition, scout, pinned/);
+    assert.throws(() => scheduleRecord({ ...good, plan: undefined }), /plan must be one of/);
+  });
+  // [LAW:types-are-the-program] A computed or pinned plan spawned no scout; a scout row beside it is a
+  // record of a spawn the pass never made, and the mint is where that contradiction is refused.
+  test('a scout record is refused under a plan that spawns no scout', () => {
+    const scout = { phase: 'scout', outcome: 'completed', usage: null };
+    assert.throws(() => scheduleRecord({ ...good, plan: 'partition', spawns: [scout] }), /a 'partition' plan spawns no scout/);
+    assert.throws(() => scheduleRecord({ ...good, plan: 'pinned', spawns: [scout] }), /a 'pinned' plan spawns no scout/);
+    assert.deepEqual(scheduleRecord({ ...good, plan: 'scout', spawns: [scout] }).spawns, [scout]);
   });
 });
 
@@ -86,6 +96,7 @@ describe('describeSchedule', () => {
   const worker = (scope, pass, fromMin, toMin, outcome = 'completed') =>
     ({ phase: 'worker', scope, pass, outcome, usage: { span: span(fromMin, toMin) } });
   const schedule = {
+    plan: 'scout',
     laneCount: 2,
     sweepCap: 2,
     scopeCount: 4,
@@ -123,7 +134,7 @@ describe('describeSchedule', () => {
 
   test('a deadline-killed scope still contributes its elapsed time to the breakdown', () => {
     const d = describeSchedule({
-      laneCount: 2,
+      plan: 'scout', laneCount: 2,
       sweepCap: 0,
       scopeCount: 2,
       spawns: [
@@ -137,7 +148,7 @@ describe('describeSchedule', () => {
 
   test('a retried attempt is its own row beside the attempt that settled', () => {
     const d = describeSchedule({
-      laneCount: 1,
+      plan: 'scout', laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [
@@ -156,7 +167,7 @@ describe('describeSchedule', () => {
     // The plan said 3 scopes, but the budget refused the third before it spawned: the breakdown rows
     // exactly the two that ran, and scopeCount still says 3 — the gap between them IS the diagnosis.
     const d = describeSchedule({
-      laneCount: 2,
+      plan: 'scout', laneCount: 2,
       sweepCap: 0,
       scopeCount: 3,
       spawns: [
@@ -172,7 +183,7 @@ describe('describeSchedule', () => {
 
   test('a spawn that never ran (usage null) reports a null duration, never zero', () => {
     const d = describeSchedule({
-      laneCount: 1,
+      plan: 'scout', laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [{ phase: 'worker', scope: 's1', pass: 0, outcome: 'failed', usage: null }],
@@ -183,14 +194,14 @@ describe('describeSchedule', () => {
 
   test('a record with a phase outside the vocabulary fails the derive loudly, never vanishing', () => {
     assert.throws(
-      () => describeSchedule({ laneCount: 1, sweepCap: 0, scopeCount: 1, spawns: [{ phase: 'sweeper', outcome: 'completed', usage: null }] }),
+      () => describeSchedule({ plan: 'scout', laneCount: 1, sweepCap: 0, scopeCount: 1, spawns: [{ phase: 'sweeper', outcome: 'completed', usage: null }] }),
       /unknown phase "sweeper"/,
     );
   });
 
   test('a scout retried before settling reports the summed spawn time of all its attempts', () => {
     const d = describeSchedule({
-      laneCount: 1,
+      plan: 'scout', laneCount: 1,
       sweepCap: 0,
       scopeCount: 1,
       spawns: [
@@ -255,6 +266,7 @@ describe('renderTimingBreakdown', () => {
     ({ phase: 'worker', scope, pass, outcome, usage: { span: span(fromMin, toMin) } });
   // The hand-measured shape from the epic: a scout, then two passes of workers.
   const schedule = {
+    plan: 'scout',
     laneCount: 2,
     sweepCap: 1,
     scopeCount: 2,
@@ -295,15 +307,32 @@ describe('renderTimingBreakdown', () => {
     // [LAW:no-silent-failure] a schedule with no scout record (the phase never ran or its record
     // was lost) names the gap rather than pretending the phase was free.
     const block = renderTimingBreakdown({
-      laneCount: 1, sweepCap: 0, scopeCount: 1,
+      plan: 'scout', laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [worker('only', 0, 0, 1)],
     }, 2 * MIN);
     assert.match(block, /scout missing/);
   });
 
+  // The shipped PR default spawns no scout at all, and that is not a gap: a healthy run must not post a
+  // footer that reads as a lost record. The clause names what decided the plan instead.
+  test('a plan that spawned no scout by design renders what decided it, never "missing"', () => {
+    for (const [plan, clause] of [['partition', 'plan computed'], ['pinned', 'plan pinned']]) {
+      const block = renderTimingBreakdown({
+        plan, laneCount: 1, sweepCap: 0, scopeCount: 1,
+        spawns: [worker('only', 0, 0, 1)],
+      }, 2 * MIN);
+      assert.match(block, new RegExp(`— ${clause} · review 1m00s`));
+      assert.doesNotMatch(block, /missing/);
+    }
+  });
+
+  test('a schedule of unknown plan provenance is refused, never rendered with a guessed clause', () => {
+    assert.throws(() => renderTimingBreakdown({ laneCount: 1, sweepCap: 0, scopeCount: 1, spawns: [] }, MIN), /unknown plan provenance undefined/);
+  });
+
   test('an unclocked spawn marks its phase sum as a lower bound and never wins slowest-scope', () => {
     const block = renderTimingBreakdown({
-      laneCount: 2, sweepCap: 0, scopeCount: 2,
+      plan: 'scout', laneCount: 2, sweepCap: 0, scopeCount: 2,
       spawns: [
         { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
         worker('clocked', 0, 1, 3),
@@ -319,7 +348,7 @@ describe('renderTimingBreakdown', () => {
 
   test("a chain with one unclocked attempt renders its sum as a lower bound, with the phase clauses' '+'", () => {
     const block = renderTimingBreakdown({
-      laneCount: 2, sweepCap: 1, scopeCount: 2,
+      plan: 'scout', laneCount: 2, sweepCap: 1, scopeCount: 2,
       spawns: [
         { phase: 'scout', outcome: 'completed', usage: { span: span(0, 1) } },
         worker('mixed', 0, 1, 3),
@@ -337,7 +366,7 @@ describe('renderTimingBreakdown', () => {
     // Scope names are LLM-minted free text; the renderer's one escape kills the characters that
     // ARE the structure (pipes, newlines) and neuters markdown/HTML metacharacters.
     const block = renderTimingBreakdown({
-      laneCount: 1, sweepCap: 0, scopeCount: 1,
+      plan: 'scout', laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [worker('a | b\n<x>_y_', 0, 0, 1)],
     }, MIN);
     assert.doesNotMatch(block, /\| a \| b/);
@@ -348,7 +377,7 @@ describe('renderTimingBreakdown', () => {
 
   test('a wholly unclocked worker phase reports slowest scope as unclocked, never a fabricated winner', () => {
     const block = renderTimingBreakdown({
-      laneCount: 1, sweepCap: 0, scopeCount: 1,
+      plan: 'scout', laneCount: 1, sweepCap: 0, scopeCount: 1,
       spawns: [{ phase: 'worker', scope: 's', pass: 0, outcome: 'failed', usage: null }],
     }, MIN);
     assert.match(block, /slowest scope: unclocked/);

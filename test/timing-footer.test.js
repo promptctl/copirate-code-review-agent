@@ -30,6 +30,7 @@ const CONFIG = { name: 'zai', engine: 'claude-code', model: 'glm-5' };
 // A fabricated pass with known timings: scout 2m, pass-0 workers 3m + 2m, one sweep worker 1m — so
 // engine's chain is 4m against transport's 2m.
 const SCHEDULE = {
+  plan: 'scout',
   laneCount: 2,
   sweepCap: 1,
   scopeCount: 2,

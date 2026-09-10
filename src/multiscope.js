@@ -7,12 +7,12 @@ const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review
 const { sumCost, emptyTokens, addTokens } = require('./usage');
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = require('./schedule');
 const { planRecord } = require('./plan');
+const { partitionByDirectory } = require('./partition');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
   buildReviewInput,
   buildRepoReviewInput,
-  buildPrScoutInput,
   buildRepoScoutInput,
 } = require('./prompt');
 
@@ -318,7 +318,7 @@ async function runScopeWorker({ scope, context, material, spawn, log, readFilesF
   // that IS scope.files, so N workers split the read; under 'changed' it is the empty list, which is the
   // material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
   // [LAW:one-source-of-truth] The pair keeps the two facts apart: `read` is that projection; `assigned` is
-  // `scope.files` unprojected — the COVERAGE record planScopes' set membership and the exclusion strip own,
+  // `scope.files` unprojected — the COVERAGE record the plan carries,
   // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
   // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) =>
@@ -345,124 +345,13 @@ function sweepLabelPrefix(pass) {
   return pass === 0 ? '' : `sweep ${pass} `;
 }
 
-// [LAW:effects-at-boundaries] Pure: given the scout's planned scopes and the changed paths the plan was
-// meant to cover, return the scope list the workers actually run — the plan, plus ONE synthetic
-// 'unassigned files' scope holding any changed path no scope claimed in its `files`. [LAW:verifiable-goals]
-// The scout prompt asserts "every changed file belongs to exactly one scope"; the scope schema now carries
-// that assignment as DATA (scope.files), so coverage is exact SET MEMBERSHIP, not a text-match heuristic.
-// [LAW:types-are-the-program] the representation a machine checks (the assigned-file set) replaced the one
-// we hoped to recover from prose (a path token mentioned somewhere in the focus), and the whole class of
-// substring-collision bugs went with it — no more 'scope.js' ⊂ 'multiscope.js' false positives to guard.
-//
-// A dropped file is the most common weak-model planning slip: since sibling 598.2 stopped workers
-// suppressing out-of-scope findings it is no longer invisible, but a file no scope claims gets no worker
-// reading it in FULL — so the catch-all guarantees DEEP coverage, not merely non-zero coverage. A path
-// the scout mis-typed (so it matches no changed file) simply lands in the catch-all and is read there:
-// the sweep errs toward over-reading, never toward dropping. [LAW:no-silent-failure]
-//
-// [LAW:dataflow-not-control-flow] The sweep is a value flowing into the same worker pool, not a new
-// engine branch: repo material carries changedPaths = [], so nothing is ever swept and the plan is
-// returned unchanged — a no-op by construction, an empty value, not a mode. sweptPaths is returned so
-// the caller can surface scout quality as an observable signal, never a silent correction. [LAW:no-silent-failure]
-//
-// withheldPaths is the third slip, and the one this boundary exists to make impossible rather than merely
-// discourage. Naming the EXCLUDE_PATTERNS-withheld paths to the scout is what lets it avoid scoping them,
-// and it is also the only reason it could ever name one: before it was told, those filenames were not in
-// its material at all. A withheld path that survived into a scope would reach buildReviewInput's
-// scopeFiles and render as "Read the complete content of THESE files" — the literal opposite of the same
-// prompt's "Do not read these paths", decided in the worker's favour by whichever instruction it weighs
-// harder. So the plan boundary strips it; the prompt's sentence is the request, this is the guarantee.
-// [LAW:types-are-the-program]
-//
-// The predicate is the withheld set ITSELF, never "not in changedPaths". Those are two different facts —
-// what this review covers vs. what is out of bounds — and the complement of the first is the second only
-// in PR mode: repo material carries changedPaths = [] by design, so a complement-based check would strip
-// every file of every scope on every repo run. [FRAMING:representation]
-//
-// A scope emptied by the strip is DROPPED, not passed through: buildReviewInput reads an empty scopeFiles
-// as "no assigned files" and falls back to "read every changed file in full", so an empty scope would
-// silently undo scope-bounded reads (c783325) — a cost regression wearing the shape of a safety check.
-// Anything orphaned by a dropped scope is picked up by the catch-all below, because the strip runs BEFORE
-// coverage is computed; no second coverage mechanism. [LAW:one-type-per-behavior]
-function planScopes(scopes, changedPaths, withheldPaths = []) {
-  const { scopes: planned, withheldAssignments } = withoutWithheldFiles(scopes, withheldPaths);
-  const assigned = new Set(planned.flatMap(s => s.files));
-  const sweptPaths = changedPaths.filter(p => !assigned.has(p));
-  // [LAW:verifiable-goals] The scout promises each changed file appears in EXACTLY one scope. The sweep
-  // catches the lower bound (a file in no scope); this catches the upper bound (a file in two+ scopes),
-  // where two workers each read it in full — the redundant cost the whole change exists to remove. It is
-  // surfaced as an observable value, not silently folded away by the Set above. [LAW:no-silent-failure]
-  const seen = new Set();
-  const recordedDup = new Set();
-  const duplicatePaths = [];
-  // `planned`, not `scopes`: a withheld path the scout put in two scopes is stripped from both, so it is
-  // not a duplicate to warn about — it is not read by any worker at all. Reporting the pre-strip plan here
-  // would describe a review that no longer exists. [FRAMING:representation]
-  for (const p of planned.flatMap(s => s.files)) {
-    if (seen.has(p) && !recordedDup.has(p)) {
-      recordedDup.add(p);
-      duplicatePaths.push(p); // first-seen order, each duplicate once — O(1) membership, O(n) overall
-    }
-    seen.add(p);
-  }
-  if (sweptPaths.length === 0) return { scopes: uniquelyNamed(planned), sweptPaths, duplicatePaths, withheldAssignments };
-  // [LAW:single-enforcer] The catch-all is built through parseScopeValue like every scout-recorded
-  // scope, so EVERY Scope value in the system carries the same single-line stamp — a hand-built one
-  // would be the one object in the program whose fields skipped the boundary, which is precisely the
-  // hole a "just construct it here" shortcut opens. [LAW:one-type-per-behavior]
-  const catchAll = parseScopeValue({
-    name: 'unassigned files',
-    focus: `These changed files were not covered by the planned scopes: ${sweptPaths.join(', ')}. Review their changes fully.`,
-    files: sweptPaths,
-  }, 0);
-  return { scopes: uniquelyNamed([...planned, catchAll]), sweptPaths, duplicatePaths, withheldAssignments };
-}
-
-// [LAW:decomposition] One job: remove the withheld paths from the plan and say which ones were there.
-// The removals are returned, never merely dropped — a scout that keeps scoping withheld files is a signal
-// about the prompt, and a silent strip would hide the very thing worth measuring. [LAW:no-silent-failure]
-// No early return for the empty set — the loop already answers that question, and a guard would be a
-// second answer to it. Identity is preserved at the END instead, keyed on what was actually removed
-// rather than on what was passed in: a configured-but-unmatched withheld set strips nothing and must be
-// as provably a no-op as an unconfigured one. Same shape as uniquelyNamed below, and the two together are
-// what let planScopes hand back its own input when the scout's plan needed no reconciliation at all.
-function withoutWithheldFiles(scopes, withheldPaths) {
-  const withheld = new Set(withheldPaths);
-  const withheldAssignments = [];
-  const recorded = new Set();
-  const kept = [];
-  for (const scope of scopes) {
-    const files = scope.files.filter(f => {
-      if (!withheld.has(f)) return true;
-      if (!recorded.has(f)) {
-        recorded.add(f);
-        withheldAssignments.push(f); // first-seen order, each path once, however many scopes claimed it
-      }
-      return false;
-    });
-    // Spread rather than parseScopeValue: every field here already crossed that boundary when the scout
-    // recorded the scope, and `files` is a SUBSET of an already-stamped list — removing elements cannot
-    // introduce an unstamped one. [LAW:single-enforcer] holds; there is no new value to parse.
-    // EMPTIED BY THE STRIP, not merely empty. A scope the scout left unlisted arrives with files: []
-    // straight from parseScopeValue (src/review.js) — a legal Scope this mechanism never touched — and
-    // dropping it would make one scope's survival depend on whether some UNRELATED scope named a withheld
-    // path, since `kept` is only returned when something was stripped at all. A strip must be inert on
-    // everything it did not strip. [LAW:dataflow-not-control-flow]
-    const emptiedByStrip = files.length === 0 && scope.files.length > 0;
-    if (!emptiedByStrip) kept.push(files.length === scope.files.length ? scope : { ...scope, files });
-  }
-  // No path removed ⇒ no scope rewritten and none dropped, so `kept` is element-for-element `scopes`;
-  // return the INPUT rather than the copy that merely matches it.
-  return { scopes: withheldAssignments.length === 0 ? scopes : kept, withheldAssignments };
-}
-
 // [LAW:parse-dont-validate] A scope's name is its IDENTIFIER downstream — log lines, sweep labels,
 // and the time budget's coverage bookkeeping (unreviewedScopes vs reviewed) all key on it — but the
-// scout contract only promises non-empty, not unique. Stamp uniqueness once here at the plan
-// boundary, so every name-keyed consumer inland is sound by construction: a repeated name (scout
-// dupes, or a scout scope colliding with the 'unassigned files' catch-all) gets a deterministic
-// ' (2)', ' (3)' suffix; the suffixed name is itself checked against the used set, so a scout that
-// literally planned 'x' and 'x (2)' still comes out collision-free.
+// repo scout's contract only promises non-empty, not unique (the partition names scopes by directory,
+// unique by construction). Stamp uniqueness once here at the plan boundary, so every name-keyed
+// consumer inland is sound by construction: a repeated name gets a deterministic ' (2)', ' (3)'
+// suffix; the suffixed name is itself checked against the used set, so a scout that literally
+// planned 'x' and 'x (2)' still comes out collision-free.
 function uniquelyNamed(scopes) {
   const used = new Set();
   let renamed = false;
@@ -479,23 +368,36 @@ function uniquelyNamed(scopes) {
   return renamed ? out : scopes;
 }
 
-// [LAW:one-type-per-behavior] The two PRODUCERS of a pass's proposal — the value runMultiScopePass
-// reconciles into the partition its workers run. Both hand back the identical shape:
+// [LAW:one-type-per-behavior] The PRODUCERS of a pass's proposal — the partition its workers run, as a
+// value. Every producer hands back the identical shape:
 //   { provenance, scopes, context, scoutUsage }
-// which is PLAN_FIELDS minus the one field only the pass can know (the post-reconciliation scopes it
-// actually ran). One producer buys the partition; the other reads one already decided. Nothing after
-// the choice can tell which ran, which is the whole point: a pinned replay is not a second engine.
+// which is PLAN_FIELDS as the pass records them. A material owns its own producer (`material.proposal`):
+// PR material computes the partition from the changed paths (partitionProposal — pure, no spawn), repo
+// material buys one from a scout spawn (scoutProposal — there is no diff to compute one from). A pinned
+// plan (pinnedProposal) replaces either. Nothing after the choice can tell which ran, which is the whole
+// point: a pinned replay is not a second engine, and neither is a computed partition.
 //
-// Each producer owns its own progress lines, so the shared path below carries no logging branch and a
-// scouted run's log stays byte-identical to the pre-pinned engine. [LAW:dataflow-not-control-flow]
+// Each producer owns its own progress lines, so the shared path below carries no logging branch.
+// [LAW:dataflow-not-control-flow]
 
-// The scout: a survey-only spawn. Its product is the typed scope records it logged through the add_scope
-// collector tool (validated at the collector boundary), plus a structural summary that becomes shared
-// worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure] a scout that
+// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths
+// (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
+// scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
+// is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
+// one progress line, exactly as pinnedProposal is.
+function partitionProposal({ changedPaths, log }) {
+  const { scopes, context } = partitionByDirectory(changedPaths);
+  log(`partitioned ${changedPaths.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
+  return { provenance: 'partition', scopes, context, scoutUsage: null };
+}
+
+// The repo-mode scout: a survey-only spawn. Its product is the typed scope records it logged through the
+// add_scope collector tool (validated at the collector boundary), plus a structural summary that becomes
+// shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure] a scout that
 // planned zero scopes fails loud here rather than running zero workers and "succeeding" having reviewed
 // nothing — a hole a pinned plan cannot have, since planRecord already refuses the empty partition.
-async function scoutProposal({ material, spawn, log }) {
-  const scoutResult = await spawn(material.buildScoutPrompt, 'scout', { phase: 'scout' });
+async function scoutProposal({ buildScoutPrompt, spawn, log }) {
+  const scoutResult = await spawn(buildScoutPrompt, 'scout', { phase: 'scout' });
   // The scout's elapsed time lands the moment it settles — BEFORE the zero-scope gate, so a run
   // that dies planning still logged where its first two minutes went (zai-timing-31d.7). Same
   // span-in-hand derivation as the worker done line. [LAW:one-source-of-truth]
@@ -520,14 +422,17 @@ async function scoutProposal({ material, spawn, log }) {
 // type every line downstream consumes. The check cannot be skipped, because skipping it means having no
 // proposal to hand the workers.
 //
-// [LAW:no-silent-failure] The refusal is EXACT SET EQUALITY against the changed paths, in both
-// directions, and it happens before the first worker at zero model spend. Neither direction may be
-// waved through. A plan omitting a changed file would be silently repaired by planScopes' catch-all —
-// the run would review the whole PR while its plan.json claimed a partition it did not run, so the
-// pinned replay would be a different review wearing the plan's name. A plan naming a file this diff does
-// not contain is the same error read from the other side: the plan belongs to some other change (a
-// re-frozen case, a different EXCLUDE_PATTERNS), and the paths it names would reach a worker's
-// "read these files in full" line pointing at nothing. Both mean the frozen structure is not this
+// [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
+// exact set equality against the changed paths in both directions, and no path claimed twice — before
+// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
+// changed file would leave that file read in full by no worker while its plan.json claimed a
+// partition of the whole change, so the pinned replay would be a different review wearing the plan's
+// name. A plan naming a file this diff does not contain is the same error read from the other side:
+// the plan belongs to some other change (a re-frozen case, a different EXCLUDE_PATTERNS), and the
+// paths it names would reach a worker's "read these files in full" line pointing at nothing. A plan
+// claiming one file in two scopes (a hand edit, or a scout's plan whose duplicate the deleted
+// reconciliation once warned about) would have two workers read and review the same code, doubling
+// its cost while the run scored as a valid sample. All three mean the frozen structure is not this
 // change's structure, and the whole reason to pin is that the structure is the same.
 //
 // Provenance is stamped 'pinned' HERE regardless of what the file says, because provenance records which
@@ -537,17 +442,20 @@ async function scoutProposal({ material, spawn, log }) {
 // to get wrong. [LAW:one-source-of-truth]
 // [LAW:effects-at-boundaries] Pure but for the one progress line, exactly as its sibling is.
 function pinnedProposal({ plan, changedPaths, log }) {
-  const assigned = new Set(plan.scopes.flatMap(s => s.files));
+  const claimed = plan.scopes.flatMap(s => s.files);
+  const assigned = new Set(claimed);
   const changed = new Set(changedPaths);
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
-  if (omitted.length + foreign.length > 0) {
+  const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
+  if (omitted.length + foreign.length + duplicated.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
+      `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
-      'pin a plan recorded from THIS case, or drop --plan and let the scout partition it.',
+      'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );
   }
   log(`pinned plan: ${plan.scopes.length} scope(s): ${plan.scopes.map(s => s.name).join(', ')}`);
@@ -638,36 +546,23 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   };
 
   // Layer 1 — the PROPOSAL: where this pass's partition comes from, as a value. `plan` is that value's
-  // discriminator and its whole content — absent, the pass buys a partition from the scout; present, it
-  // replays a partition somebody already decided (copirate-determinism-5od.fku). There is deliberately no
-  // 'pinned mode' boolean: the two producers hand back the SAME proposal shape, and every line below this
-  // one is identical for both, so a pinned run and a scouted run are one code path fed different values.
+  // discriminator and its whole content — absent, the material produces the partition its mode calls for
+  // (computed for a PR, scouted for a repo); present, the pass replays a partition somebody already
+  // decided (copirate-determinism-5od.fku). There is deliberately no 'pinned mode' boolean: every producer
+  // hands back the SAME proposal shape, and every line below this one is identical for all of them.
   // [LAW:dataflow-not-control-flow] The one thing that genuinely differs — whether an engine spawn is
   // bought at all — is precisely what choosing a producer means, and it happens here, once.
   const proposal = plan === null
-    ? await scoutProposal({ material, spawn, log })
+    ? await material.proposal({ spawn, log })
     : pinnedProposal({ plan, changedPaths: material.changedPaths, log });
 
-  // [LAW:verifiable-goals] Mechanically verify the proposed partition covers every changed file (PR only
-  // — repo material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
-  // synthetic catch-all scope so some worker reads them in full. The zero-scope throw inside scoutProposal
-  // stays FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
-  // A PINNED proposal reaches here already proven to cover the change exactly, so every reconciliation
-  // below is a provable no-op on that path — the same single enforcer, running inert, rather than a
-  // second coverage mechanism the pinned path would have to be trusted to skip. [LAW:single-enforcer]
-  const { scopes, sweptPaths, duplicatePaths, withheldAssignments } = planScopes(proposal.scopes, material.changedPaths, material.withheldPaths);
-  if (sweptPaths.length > 0) {
-    log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
-  }
-  if (duplicatePaths.length > 0) {
-    log(`⚠️ scout assigned ${duplicatePaths.length} changed file(s) to more than one scope; each is read by every claiming worker: ${duplicatePaths.join(', ')}`);
-  }
-  // The strip is announced, so a scout that keeps scoping withheld paths is visible as a prompt problem
-  // rather than absorbed as a silent correction. Rendered through the shared bounded list for the same
-  // reason the prompts and the operator log are. [LAW:no-silent-failure]
-  if (withheldAssignments.length > 0) {
-    log(`⚠️ scout assigned ${withheldAssignments.length} EXCLUDE_PATTERNS-withheld file(s) to a scope; removed so no worker is told to read them: ${excludedPathList(withheldAssignments)}`);
-  }
+  // [LAW:types-are-the-program] Coverage is a property of the producers, not a check here: a computed
+  // partition assigns every changed path exactly once by construction, a pinned plan was proven to
+  // partition this change before it was accepted, and repo material has no changed set to cover. The
+  // catch-all sweep, the duplicate warning, and the withheld-path strip that once reconciled an LLM
+  // scout's PR plan are gone with the PR scout. Names are stamped unique once, here, because a repo
+  // scout only promises non-empty ones.
+  const scopes = uniquelyNamed(proposal.scopes);
   const context = proposal.context;
 
   // Layer 2 — the convergence chains (zai-recall-upr.2; one chain per scope since zai-timing-ptp).
@@ -747,13 +642,14 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
     // [LAW:one-source-of-truth]
     schedule: scheduleRecord({
+      plan: proposal.provenance,
       laneCount,
       sweepCap,
       scopeCount: scopes.length,
       spawns: spawnRecords,
     }),
     // The pass's PLAN as a value (copirate-determinism-5od.ea7): the partition these workers actually
-    // ran, minted through src/plan.js. `scopes` is the post-planScopes list — the very array
+    // ran, minted through src/plan.js. `scopes` is the uniquely-named list — the very array
     // runScopeWorkers iterated and each worker was handed as its assignment — so the record and the
     // behavior are ONE value, not a copy that could describe a partition the run did not use.
     // [LAW:one-source-of-truth]
@@ -853,14 +749,12 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
   const dependencyBumps = dependencySummaries.filter(s => s.resolved);
   return {
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
-    // recovered from the prompt: runMultiScopePass verifies the scout's plan covers it (planScopes).
+    // recovered from the prompt: it is the partition's input and the pinned producer's proof set.
     changedPaths,
-    // [LAW:types-are-the-program] The out-of-bounds set, carried as its own field rather than inferred
-    // from changedPaths' complement — see planScopes for why the complement is a different fact. The
-    // scout is TOLD these paths (so it can avoid them) and the plan boundary ENFORCES it; this field is
-    // what makes the second possible without the material re-deriving what filterFiles already decided.
-    withheldPaths: excluded.paths,
-    buildScoutPrompt: (toolNames) => buildPrScoutInput({ changedPaths, toolNames, reviewedRepoRoot, excluded }).prompt,
+    // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed paths (src/partition.js):
+    // no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS survivors — no
+    // withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
+    proposal: ({ log }) => partitionProposal({ changedPaths, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
     // [LAW:dataflow-not-control-flow] The assignment and the read set arrive as one pair and land on the two
@@ -873,14 +767,16 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
 // focus IS the repo-review `scope` value — so a worker is exactly a focused whole-repo review.
 function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
   return {
-    // Repo mode has no changed-file list to verify against, so coverage-sweeping is a no-op by
-    // construction: an empty value flows to planScopes, never a mode. [LAW:dataflow-not-control-flow]
+    // Repo mode has no changed-file list: an empty value, never a mode — the pinned producer's proof
+    // set and nothing else reads it. [LAW:dataflow-not-control-flow]
     changedPaths: [],
-    // Repo mode has no diff, so nothing was withheld FROM one: its exclusion patterns are a bound on
-    // exploration the scout prompt already carries, not a set of named paths hidden from a file list.
-    // Empty for the same reason changedPaths is — an empty value, never a mode. [LAW:dataflow-not-control-flow]
-    withheldPaths: [],
-    buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
+    // Repo mode has no diff to compute a partition from, so it BUYS one: the scout surveys the tree.
+    // Its exclusion patterns are a bound on that exploration, carried in the scout prompt.
+    proposal: ({ spawn, log }) => scoutProposal({
+      buildScoutPrompt: (toolNames) => buildRepoScoutInput({ scope, excludePatterns, toolNames, reviewedRepoRoot }).prompt,
+      spawn,
+      log,
+    }),
     // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
     // tree; the assigned/read pair the PR worker uses is deliberately ignored here, while the convergence
     // sweep's priorFindings flows through exactly as in PR material. [LAW:dataflow-not-control-flow]
@@ -892,11 +788,12 @@ module.exports = {
   workerFocusText,
   sumUsage,
   composeSummary,
-  planScopes,
   LANE_MEMORY_BYTES,
   laneCeilingFromMemory,
   findingsLedger,
   sweepsByDepth,
+  scoutProposal,
+  partitionProposal,
   runScopeWorkers,
   runScopeChain,
   runMultiScopePass,

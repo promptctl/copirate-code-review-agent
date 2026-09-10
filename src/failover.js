@@ -120,7 +120,7 @@ const TRANSIENT_SPAWN_ATTEMPTS = 3;
 // [LAW:decomposition] Spawn-level transient recovery — a DIFFERENT axis from produceReview's config
 // failover. produceReview walks a chain of CONFIGS with a global budget; this retries ONE flaky
 // engine request in place, so a single blip in one of N concurrent scope workers is absorbed there
-// instead of failing the whole scout->workers pass (which would re-run the scout + every sibling
+// instead of failing the whole partition->workers pass (which would re-run every sibling
 // worker and discard their already-recorded findings — a failure probability that GROWS with N).
 // [LAW:one-source-of-truth] It owns no new timing math: the backoff curve and Retry-After precedence
 // are the SAME shared primitives produceReview uses (transientBackoffMs, err.retryAfterMs), so retry
@@ -223,10 +223,10 @@ async function produceReview(chain, buildPromptFor, anchors, produceOnce, sleepF
   // What a SINGLE-config chain gets — the default (`PROVIDER: auto`, no `fallback`), and the case the
   // count bound's "PER_CONFIG_LIMIT × chain.length" phrasing reads right past. The ladder is TWO NESTED
   // axes, not one: every engine spawn is wrapped in retryTransientSpawn (TRANSIENT_SPAWN_ATTEMPTS = 3,
-  // src/multiscope.js), and each produceOnce below is an entire scout→workers pass, so one config is
-  // 3 × 3 = 9 spawns and 8 backoff sleeps (~12–24s) before the error surfaces. Tens of seconds of
-  // patience, not the tens of minutes the deleted sweep bought — which means a genuine 60s provider
-  // outage now reds the run where it once self-healed.
+  // src/multiscope.js), and each produceOnce below is an entire partition→workers pass (scout→workers
+  // in repo mode), so one config is 3 × 3 = 9 spawns and 8 backoff sleeps (~12–24s) before the error
+  // surfaces. Tens of seconds of patience, not the tens of minutes the deleted sweep bought — which
+  // means a genuine 60s provider outage now reds the run where it once self-healed.
   //
   // That regression is the intended trade, and the asymmetry is the whole argument. Failing fast costs
   // ONE red run naming the true cause, and a code reviewer has no state to lose — no partial write, no

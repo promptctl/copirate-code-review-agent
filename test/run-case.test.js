@@ -74,7 +74,7 @@ describe('parseArgs takes --read-set as one of the declared arms, in both flag f
 
 // [LAW:effects-at-boundaries] The plan leaves the parser as a PATH, never a record: reading and parsing
 // the file is IO, and main does it at the run boundary beside every other file this replay opens. null is
-// the absence with a meaning — 'this replay scouts its own partition' — and it is the SAME value
+// the absence with a meaning — 'this replay computes its own partition' — and it is the SAME value
 // runMultiScope's own parameter defaults to, so it flows all the way to the pass untranslated.
 describe('parseArgs takes --plan as the path to a pinned plan', () => {
   test('both flag forms carry the path through unresolved', () => {
@@ -307,7 +307,6 @@ test("buildCaseMaterial threads the exclusion record into the material, so a rep
   });
   const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
   assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
-  assert.match(material.buildScoutPrompt(CASE_TOOL_NAMES), /Withheld from the list above — changed in this pull request:\*\* dist\/index\.js/);
 });
 
 test('buildCaseMaterial with no exclusions reviews every file and says nothing about exclusion', () => {
@@ -423,7 +422,7 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
     fs.mkdirSync(ok, { recursive: true });
     // Minted, not fabricated — this test is about write ORDER, but a wrong-shaped schedule sitting in it is
     // still a shape a reader could copy. [LAW:one-source-of-truth]
-    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
+    const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
     const plan = mintedPlan();
     writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan, findings: [{ path: 'a', line: 1 }] });
     assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'plan.json', 'schedule.json', 'summary.txt', 'usage.json']);
@@ -442,7 +441,7 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
 test('writeRunRecord: an absent fact fails loudly instead of landing as a file that parses as nothing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-undef-'));
   try {
-    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
+    const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
     const record = { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan: mintedPlan(), findings: [] };
     // `JSON.stringify(undefined)` is the VALUE undefined, and `undefined + '\n'` is the literal text
     // "undefined" — so an unguarded write lands an artifact that reports as JSON and parses as nothing.
@@ -479,6 +478,7 @@ test('writeRunRecord: a replay\'s wall clock survives as an artifact, readable t
     // PR footer read one timing fact, not two. The span rides on `usage`, which is where describeSchedule
     // reads it from.
     const schedule = scheduleRecord({
+      plan: 'scout',
       laneCount: 1,
       sweepCap: 2,
       scopeCount: 1,

@@ -3,15 +3,15 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { filterFiles, NO_EXCLUSIONS, excludedPathList } = require('../src/diff');
-const { buildPrMaterial, buildRepoMaterial, planScopes, runMultiScopePass } = require('../src/multiscope');
+const { buildPrMaterial, runMultiScopePass } = require('../src/multiscope');
 const { DEFAULT_READ_SET } = require('../src/effort');
 
 // EXCLUDE_PATTERNS removes changed files from the reviewed diff, and the reviewer used to be told
 // nothing about it — so a file it EXPECTED to change was absent, and absence-by-configuration was
 // indistinguishable from absence-by-omission. Observed on PR #117: a confident, release-blocking
 // "the build output was never regenerated" finding against a PR that regenerated it in every commit.
-// The contract asserted here is the fix: what the filter removed reaches BOTH prompts of the pass,
-// as a value carried from the filter — never re-globbed downstream. (zai-review-prompt-2tx)
+// The contract asserted here is the fix: what the filter removed reaches every worker prompt of the
+// pass, as a value carried from the filter — never re-globbed downstream. (zai-review-prompt-2tx)
 
 const TOOL_NAMES = {
   requestChange: 'mcp__review_collector__request_change',
@@ -93,136 +93,25 @@ describe('the reviewer is told what was removed from its view', () => {
     assert.match(prompt, /THIS IS A CONVERGENCE SWEEP/);
     assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
   });
-
-  test('the scout is told too, and forbidden to scope a withheld path', () => {
-    const prompt = material.buildScoutPrompt(TOOL_NAMES);
-    assert.match(prompt, /Withheld from the list above — changed in this pull request:\*\* build\/out\.js, deps\.lock/);
-    assert.match(prompt, /removed these 2 changed file\(s\) from the list, so their absence is a display setting, not a gap/);
-    assert.match(prompt, /Create no scope for them/);
-  });
 });
 
-// Telling the scout the withheld filenames is what lets it avoid scoping them — and is also the only
-// reason it could ever name one, since before this change those names were not in its material at all.
-// A withheld path surviving into a scope reaches buildReviewInput's scopeFiles and renders as "Read the
-// complete content of THESE files", the literal opposite of the same prompt's "Do not read these paths".
-// The prompt sentence is the request; the plan boundary is the guarantee. [LAW:types-are-the-program]
-describe('the plan boundary strips what the prompt merely forbids', () => {
-  const scoped = (name, files) => ({ name, focus: `review ${name}`, files });
-
-  test('a withheld path the scout scoped is removed from the plan and reported', () => {
-    const { scopes, withheldAssignments } = planScopes(
-      [scoped('code', ['src/a.js', 'build/out.js'])],
-      ['src/a.js'],
-      ['build/out.js'],
-    );
-    assert.deepEqual(scopes[0].files, ['src/a.js']);
-    assert.deepEqual(withheldAssignments, ['build/out.js']);
-  });
-
-  // An emptied scope must not survive: buildReviewInput reads an empty scopeFiles as "no assigned files"
-  // and falls back to "read every changed file in full", so passing one through would silently undo
-  // scope-bounded reads — a cost regression wearing the shape of a safety check.
-  test('a scope left empty by the strip is dropped, not passed through with no files', () => {
-    const { scopes } = planScopes(
-      [scoped('code', ['src/a.js']), scoped('bundle', ['build/out.js'])],
-      ['src/a.js'],
-      ['build/out.js'],
-    );
-    assert.deepEqual(scopes.map(s => s.name), ['code']);
-    assert.ok(scopes.every(s => s.files.length > 0));
-  });
-
-  // The strip runs BEFORE coverage is computed, so a reviewable path orphaned by a dropped scope is
-  // caught by the existing catch-all rather than needing a second coverage mechanism.
-  test('a reviewable path orphaned by a dropped scope falls into the catch-all', () => {
-    const { scopes, sweptPaths } = planScopes(
-      [scoped('mixed', ['src/a.js', 'build/out.js']), scoped('bundle', ['build/out.js'])],
-      ['src/a.js', 'src/b.js'],
-      ['build/out.js'],
-    );
-    // The drop is asserted, not assumed: without it 'bundle' survives and the catch-all assertions
-    // below still hold, so this test would pass against a strip that never ran.
-    assert.deepEqual(scopes.map(s => s.name), ['mixed', 'unassigned files']);
-    assert.deepEqual(sweptPaths, ['src/b.js']);
-    assert.deepEqual(scopes[scopes.length - 1].files, ['src/b.js']);
-  });
-
-  // The strip must be inert on what it did not strip. A scope the scout left unlisted arrives with
-  // files: [] from parseScopeValue — a legal Scope — and dropping it here would make its survival depend
-  // on whether an UNRELATED scope named a withheld path, since the rewritten plan is only returned when
-  // something was stripped at all. "Emptied by the strip" and "empty" are different sets.
-  test('a scope that was ALREADY empty survives a strip that emptied a different scope', () => {
-    const { scopes } = planScopes(
-      [scoped('unlisted', []), scoped('bundle', ['build/out.js']), scoped('code', ['src/a.js'])],
-      ['src/a.js'],
-      ['build/out.js'],
-    );
-    assert.deepEqual(scopes.map(s => s.name), ['unlisted', 'code']);
-    assert.deepEqual(scopes[0].files, []);
-  });
-
-  // Reported once however many scopes claimed it — and NOT as a duplicate, because after the strip no
-  // worker reads it at all. A duplicate warning here would describe a review that does not exist.
-  test('a withheld path claimed by two scopes is reported once, and never as a duplicate read', () => {
-    const { withheldAssignments, duplicatePaths } = planScopes(
-      [scoped('one', ['src/a.js', 'build/out.js']), scoped('two', ['src/b.js', 'build/out.js'])],
-      ['src/a.js', 'src/b.js'],
-      ['build/out.js'],
-    );
-    assert.deepEqual(withheldAssignments, ['build/out.js']);
-    assert.deepEqual(duplicatePaths, []);
-  });
-
-  // The regression a `changedPaths`-complement check would cause. buildRepoMaterial carries
-  // changedPaths: [] BY DESIGN, so "strip anything not in changedPaths" would strip every file of every
-  // scope on every repo run and leave the plan empty. The predicate is the withheld set itself.
-  test('repo material scopes survive untouched — changedPaths is empty by design, not a signal', () => {
-    const material = buildRepoMaterial({ scope: 'security', excludePatterns: ['build/**'], reviewedRepoRoot: '/repo' });
-    const plan = [scoped('auth', ['src/auth.js']), scoped('io', ['src/io.js'])];
-    const { scopes, withheldAssignments } = planScopes(plan, material.changedPaths, material.withheldPaths);
-    assert.equal(scopes, plan);                                    // the input itself, not a copy
-    assert.deepEqual(scopes.map(s => s.files), [['src/auth.js'], ['src/io.js']]);
-    assert.deepEqual(withheldAssignments, []);
-  });
-
-  test('a withheld set that matched no scope leaves the plan provably untouched', () => {
-    const plan = [scoped('code', ['src/a.js'])];
-    const { scopes, withheldAssignments } = planScopes(plan, ['src/a.js'], ['build/out.js']);
-    assert.equal(scopes, plan);
-    assert.deepEqual(withheldAssignments, []);
-  });
-
-  test('PR material carries the withheld set as its own field, ready for the boundary', () => {
-    const { reviewed, excluded } = filterFiles(FILES, ['build/**', '*.lock']);
-    const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
-    assert.deepEqual(material.withheldPaths, ['build/out.js', 'deps.lock']);
-  });
-});
-
-// The unit tests above prove the strip; this proves it is REACHED. material.withheldPaths silently
-// dropping out of the planScopes call would leave every unit test green while production shipped the
-// unguarded prompt — the same wiring gap that made buildCaseMaterial worth extracting.
-describe('the strip is wired end to end — material → plan boundary → worker prompt', () => {
-  test('a scout that scopes a withheld path yields a worker prompt that never names it as a read target', async () => {
+// A withheld path surviving into a scope would reach buildReviewInput's scopeFiles and render as "Read
+// the complete content of THESE files" — the literal opposite of the same prompt's "Do not read these
+// paths". The partition is computed from the files that SURVIVED the filter, so a withheld path cannot
+// be assigned at all: the guarantee is the producer's input type, not a strip downstream.
+// [LAW:types-are-the-program] This proves it is reached end to end — material → plan → worker prompt.
+describe('a withheld path is never a read target — the partition is over what survived the filter', () => {
+  test('the worker prompt names the withheld path only in the note, never on its read-targets line', async () => {
     const { reviewed, excluded } = filterFiles(FILES, ['build/**']);
     const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
-    const scopes = [{ name: 'code', focus: 'the change', files: ['src/a.js', 'build/out.js'] }];
     const workerPrompts = [];
-    const logs = [];
-    // The scout is the pass's first and only solo spawn; every later one is a worker. `deps.lock` is
-    // reviewable and unscoped, so the catch-all worker runs too — the read-target check below picks the
-    // 'code' prompt out by name rather than assuming a single worker.
-    let spawn = 0;
     const adapter = {
       async produceReview({ buildPromptFor }) {
-        const prompt = buildPromptFor({});
-        if (spawn++ === 0) return { summary: 'ctx', findings: [], assessments: [], scopes, usage: null };
-        workerPrompts.push(prompt);
+        workerPrompts.push(buildPromptFor({}));
         return { summary: 'sum', findings: [], assessments: [], usage: null };
       },
     };
-    await runMultiScopePass({
+    const review = await runMultiScopePass({
       config: { engine: 'fake', name: 'c1' },
       material,
       registry: { get: () => adapter },
@@ -230,19 +119,18 @@ describe('the strip is wired end to end — material → plan boundary → worke
       laneCeiling: 4,
       sweepCap: 0,
       readSet: DEFAULT_READ_SET,
-      log: m => logs.push(m),
+      log: () => {},
       sleepFn: async () => {},
     });
-
+    assert.ok(review.plan.scopes.every(s => !s.files.includes('build/out.js')), 'the plan assigned a withheld path');
     // Anchored on the read-targets sentence specifically: the withheld NOTE names build/out.js elsewhere
-    // in this same prompt on purpose, so a bare "does not include" would pass against an unstripped plan.
-    const codePrompt = workerPrompts.find(p => p.includes('code — the change'));
-    assert.ok(codePrompt, 'the scoped worker never ran');
-    const readTargets = codePrompt.match(/assigned changed files: (.*?)\. Skip any among them/);
-    assert.ok(readTargets, 'the worker was given no read-targets line to check');
-    assert.equal(readTargets[1], 'src/a.js');
-    assert.ok(logs.some(m => m.includes('EXCLUDE_PATTERNS-withheld') && m.includes('build/out.js')),
-      'the strip was not announced to the operator');
+    // in this same prompt on purpose, so a bare "does not include" would pass against nothing.
+    for (const prompt of workerPrompts) {
+      assert.match(prompt, /Withheld from this diff — changed in this pull request:\*\* build\/out\.js/);
+      const readTargets = prompt.match(/assigned changed files: (.*?)\. Skip any among them/);
+      assert.ok(readTargets, 'the worker was given no read-targets line to check');
+      assert.ok(!readTargets[1].includes('build/out.js'), `a withheld path is a read target: ${readTargets[1]}`);
+    }
   });
 });
 
@@ -264,23 +152,20 @@ describe('excludedPathList — the one bounded rendering', () => {
 describe('a run that hid nothing says nothing', () => {
   const unfiltered = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
 
-  test('neither prompt mentions exclusion when no patterns are configured', () => {
+  test('the prompt does not mention exclusion when no patterns are configured', () => {
     assert.ok(!unfiltered.buildWorkerPrompt('all', TOOL_NAMES).includes('EXCLUDE_PATTERNS'));
-    assert.ok(!unfiltered.buildScoutPrompt(TOOL_NAMES).includes('EXCLUDE_PATTERNS'));
   });
 
   test('NO_EXCLUSIONS is the same material as omitting the value', () => {
     const explicit = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded: NO_EXCLUSIONS });
     assert.equal(explicit.buildWorkerPrompt('all', TOOL_NAMES), unfiltered.buildWorkerPrompt('all', TOOL_NAMES));
-    assert.equal(explicit.buildScoutPrompt(TOOL_NAMES), unfiltered.buildScoutPrompt(TOOL_NAMES));
   });
 
   // Configured-but-unmatched is the case a length-subtracting or pattern-re-globbing implementation
   // gets wrong: it would announce a filtering that never happened. Byte-identical, or it is lying.
-  test('patterns that matched nothing leave both prompts byte-identical to an unconfigured run', () => {
+  test('patterns that matched nothing leave the prompt byte-identical to an unconfigured run', () => {
     const { reviewed, excluded } = filterFiles(FILES, ['vendor/**']);
     const material = buildPrMaterial({ files: reviewed, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT, excluded });
     assert.equal(material.buildWorkerPrompt('all', TOOL_NAMES), unfiltered.buildWorkerPrompt('all', TOOL_NAMES));
-    assert.equal(material.buildScoutPrompt(TOOL_NAMES), unfiltered.buildScoutPrompt(TOOL_NAMES));
   });
 });
