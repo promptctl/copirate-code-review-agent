@@ -661,7 +661,7 @@ describe('the arm a run was produced under', () => {
       { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile, sweepCap: 0 } } },
     ];
     assert.throws(() => agreedScope(runs), /r2 ran at effort roundCap=0 sweepCap=0 .* earlier runs ran at roundCap=0 sweepCap=2/);
-    assert.throws(() => agreedScope(runs), /give each A\/B arm its own --out/);
+    assert.throws(() => agreedScope(runs), /A run pool holds one arm — give each A\/B arm its own --out/);
   });
 
   test('an unrecorded run mixed with a recorded one is refused too — unknown is not a match', () => {

@@ -299,22 +299,51 @@ function describeEffort(effort) {
 // hundred runs deep is a message that sends the reader searching.
 function agreedScope(runs) {
   const [first, ...rest] = runs;
-  const scope = { case: first.meta.case, effort: describeEffort(first.meta.effort) };
+  const caseName = first.meta.case;
   for (const { dir, meta } of rest) {
-    if (meta.case !== scope.case) {
-      throw new Error(`Run ${dir} is case '${meta.case}' but earlier runs are '${scope.case}'. A case-out dir holds one case.`);
+    if (meta.case !== caseName) {
+      throw new Error(`Run ${dir} is case '${meta.case}' but earlier runs are '${caseName}'. A case-out dir holds one case.`);
     }
-    // The rule an A/B leans on: a suite resumed under a different --sweep-cap looks exactly like a
-    // completed suite, and its band would blend two arms. An UNRECORDED arm is its own value — it does
-    // not match a recorded one, because nothing proves what it ran at.
-    if (describeEffort(meta.effort) !== scope.effort) {
+  }
+  return { case: caseName, effort: agreedEffort(runs.map(({ dir, meta }) => ({ dir, effort: meta.effort }))) };
+}
+
+// [LAW:single-enforcer] The ONE arm a pool of runs shares, or a refusal — the rule an A/B leans on, stated
+// once for every pool that has one. A case-out dir is one such pool (agreedScope, above), an A/B arm root
+// is another (paired.js), and freeze-suite.js checks the same thing against an externally supplied target
+// through misarmedRuns beside this. Three hand-rolled describeEffort comparisons would drift into
+// refusing different mixes of the same runs, and the mix is invisible in the band it produces.
+// An UNRECORDED arm is its own value — it does not match a recorded one, because nothing proves what it
+// ran at. Runs are {dir, effort}, whatever read them off disk.
+// [LAW:parse-dont-validate] [LAW:effects-at-boundaries] Pure: what it returns is the pool's one arm,
+// already rendered, so the caller stores a proven value rather than re-describing run 0.
+function agreedEffort(runs) {
+  const [first, ...rest] = runs;
+  const effort = describeEffort(first.effort);
+  for (const run of rest) {
+    if (describeEffort(run.effort) !== effort) {
       throw new Error(
-        `Run ${dir} ran at effort ${describeEffort(meta.effort)} but earlier runs ran at ${scope.effort}. ` +
-        `A case-out dir holds one arm — give each A/B arm its own --out.`,
+        `Run ${run.dir} ran at effort ${describeEffort(run.effort)} but earlier runs ran at ${effort}. ` +
+        'A run pool holds one arm — give each A/B arm its own --out.',
       );
     }
   }
-  return scope;
+  return effort;
+}
+
+// [LAW:single-enforcer] What a MISPLACED run is, stated once: a run whose meta.json names a case other
+// than the directory it sits under. Every walker over an out root meets it — compare.js's readPriorRuns
+// refuses one before the spend, paired.js's readArm before it pools runs into a pairing block — and two
+// copies of the rule would drift into refusing different things for the same run. The caller passes the
+// LABEL it points at the run by (a meta.json path, an arm's run dir), so each keeps its own way of naming
+// the offender while the rule and the sentence have one home.
+// [LAW:parse-dont-validate] It returns the case name it proved, so the caller reads a value rather than
+// re-deriving what it just checked.
+function requireRunCase(meta, caseName, label) {
+  if (meta.case !== caseName) {
+    throw new Error(`${label} names case '${meta.case}' but lives under '${caseName}' — a misplaced run; move or remove it.`);
+  }
+  return caseName;
 }
 
 // [LAW:effects-at-boundaries] Pure: which of these runs were produced at a different arm than the one
@@ -863,7 +892,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, misarmedRuns,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, agreedEffort, misarmedRuns, requireRunCase,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,
