@@ -318,6 +318,20 @@ test('buildCaseMaterial with no exclusions reviews every file and says nothing a
   assert.ok(!material.buildWorkerPrompt('scope', CASE_TOOL_NAMES).includes('EXCLUDE_PATTERNS'));
 });
 
+// The default reader is the production wiring: main() never passes readContent, so a replay measures
+// the extracted tree exactly as run.js measures the checkout. A stub in every other test here would let
+// a shadowed default (say, () => '') pass the suite while every real replay measured its files empty.
+test('buildCaseMaterial without readContent measures the file as it stands on disk', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-case-material-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const x = 1;\nconst y = 2;\n');
+  const { files } = buildCaseMaterial({ allFiles: [CASE_FILES[0]], excludePatterns: [], reviewedRepoRoot: root });
+  assert.equal(files[0].content.lines, 3);
+  assert.ok(files[0].content.tokens > 0);
+});
+
 test('buildCaseMaterial refuses a case whose patterns exclude everything, rather than replaying it empty', () => {
   assert.throws(
     () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '' }),

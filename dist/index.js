@@ -32751,10 +32751,13 @@ const classifyClaudeError = classifyError;
 const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
-  // [LAW:one-source-of-truth] The window every model this adapter is pointed at reviews inside — the
-  // 200k-token Claude context window, measured on the case that overflowed it (a 232k first request
-  // failing "Prompt is too long"). A model with a larger window gets material fit to 200k, which
-  // withholds early rather than late: the safe direction. Moves with a measurement, never a wish.
+  // [LAW:one-source-of-truth] The FLOOR across every model this engine fronts, measured on the case
+  // that overflowed it (a 232k first request failing "Prompt is too long" against Claude's 200k).
+  // The engine is not Claude-only — src/provider.js routes zai and deepseek through it — but no
+  // model routed here has a smaller window (GLM-5.x and DeepSeek V4 both declare 200k or more), and
+  // a model with a larger one gets material fit to 200k, which withholds early rather than late: the
+  // safe direction. Unlike codex/opencode, whose fronted models' windows are unknown to this repo,
+  // this floor is a known fact. Moves with a measurement, never a wish.
   contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
