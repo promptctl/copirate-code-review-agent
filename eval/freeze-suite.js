@@ -69,8 +69,11 @@ Usage: node eval/freeze-suite.js [options]
                            review's structure is held fixed across arms. The dir holds one SUBDIRECTORY
                            per case being replayed, <dir>/<case-name>/, holding one .json plan per
                            replicate — any run's plan.json is a valid file. Replicate r replays the r-th
-                           plan in filename order, so -n 5 replays five DISTINCT structures per case and
-                           a paired A/B measures the arm across all five rather than at one. A selected
+                           plan in filename order, so a paired A/B measures the arm across every plan in
+                           the dir rather than at one. Whether those plans DIFFER is decided by how they
+                           were minted, not by -n: a PR case computes one partition on every replicate,
+                           so its harvested plans are copies; distinct structures come from runs under
+                           different MIN_SCOPE_FILES values or from hand-authored files. A selected
                            case with no directory there, with fewer plans than -n, or with a plan that
                            does not parse, refuses the whole suite before a single credential resolves.
                            Extra plans beyond -n are the depth a later resume grows into. The flag is

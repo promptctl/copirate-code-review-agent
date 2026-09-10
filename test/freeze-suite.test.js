@@ -1065,7 +1065,8 @@ describe('resolvePlanSet proves the plan set before the suite spends anything', 
 });
 
 // THE POINT OF copirate-determinism-5od.2sd: replicate r replays plan r, so `-n 5 --plans <dir>` replays
-// five DISTINCT structures per case instead of one structure five times. The pairing survives it — both
+// the dir's five plans per case, one each, rather than the first one five times. Whether the five differ
+// is the dir's business (a PR case's harvested plans are copies; see eval/README.md). The pairing survives it — both
 // arms resolve the same dir the same way, so arm A's replicate r and arm B's replicate r share a plan —
 // and eval/paired.js blocks on plan CONTENT, so it needs no knowledge of this mapping at all.
 describe('planJobs stamps each replicate with its own plan', () => {

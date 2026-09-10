@@ -258,7 +258,7 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
                     scopes are a pure function of the changed paths, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
-                    spawn; scoutUsage is what deciding cost) or 'pinned' (a --plan replay, scoutUsage
+                    spawn; scoutUsage is what deciding it cost) or 'pinned' (a --plan replay, scoutUsage
                     null). This file is a valid --plan input: see below.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
                     effort ({roundCap, sweepCap, reasoningTier, readSet}: the arm the run ACTUALLY ran at; null
@@ -378,14 +378,17 @@ that spawn took 58 seconds and ~122k tokens. Relative to a PR-mode run it costs 
 spawns anything to decide the plan.
 
 A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
-at zero spend, and **both** directions are refused. Nothing downstream repairs coverage — every changed
+at zero spend. A partition is a cover with no overlap, and all three ways to miss it are refused: a
+changed file no scope claims, a file the plan names that the diff lacks, and a file claimed by more than
+one scope. Nothing downstream repairs coverage — every changed
 path lands in exactly one scope because the producer puts it there, not because a later sweep catches
 what it missed — so a changed file no scope claims would simply go unreviewed while its `plan.json`
 claimed a partition of the whole change: a different review wearing the plan's name, which is the one
 thing a pin exists to prevent. A file the plan names that the diff does not contain is the same error read from
 the other side: the plan belongs to some *other* change (a re-frozen case, a different
 `EXCLUDE_PATTERNS`), and the paths it names would reach a worker's "read these files in full" line
-pointing at nothing.
+pointing at nothing. A file in two scopes is read and reviewed twice, by two workers, at double the
+cost, while the run scores as a valid sample — the case a hand-authored plan is likeliest to hit.
 
 `freeze-suite.js` takes `--plans <dir>`. It is **plural, and a directory rather than a file**, because a
 plan partitions *one* case's changed files — a single file forwarded to every case would be refused by all
