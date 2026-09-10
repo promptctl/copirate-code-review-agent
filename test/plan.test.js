@@ -301,6 +301,21 @@ describe('a plan that does not describe this change is refused at zero spend', (
     );
   });
 
+  test('a plan whose scope READS a file this change does not contain is refused — eyesight is checked like ownership', async () => {
+    const [first, ...rest] = PINNED.scopes;
+    await assert.rejects(
+      () => passRecording({ pinnedPlan: { ...PINNED, scopes: [{ ...first, reads: ['src/gone.js'] }, ...rest] } }),
+      /File\(s\) a scope reads that this change does not contain \(1\): src\/gone\.js/,
+    );
+  });
+
+  test('a plan whose scope reads a sibling\'s changed file replays as pinned — the cut concern round-trips', async () => {
+    const [first, second] = PINNED.scopes;
+    const cut = { ...PINNED, scopes: [{ ...first, reads: second.files }, { ...second, reads: first.files }] };
+    const { plan } = await passRecording({ pinnedPlan: cut });
+    assert.deepEqual(plan.scopes.map(s => s.reads), [second.files, first.files]);
+  });
+
   // Coverage alone is not a partition: a file in two scopes is read and reviewed twice, at double the
   // cost, by a run that would otherwise score as a valid sample. [LAW:no-silent-failure]
   test('a plan claiming one file in two scopes is refused — a cover with overlap is not a partition', async () => {

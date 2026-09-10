@@ -35116,8 +35116,9 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // proposal to hand the workers.
 //
 // [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
-// exact set equality against the changed paths in both directions, and no path claimed twice — before
-// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
+// exact set equality against the changed paths in both directions, and no path claimed twice — and
+// that every second read names a path in the change, before the first worker at zero model spend. None
+// of the four may be waved through. A plan omitting a
 // changed file would leave that file read in full by no worker while its plan.json claimed a
 // partition of the whole change, so the pinned replay would be a different review wearing the plan's
 // name. A plan naming a file this diff does not contain is the same error read from the other side:
@@ -35141,12 +35142,18 @@ function pinnedProposal({ plan, changedPaths, log }) {
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
   const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
-  if (omitted.length + foreign.length + duplicated.length > 0) {
+  // `reads` is eyesight, not ownership, so it takes no part in the cover — but a read naming a path this
+  // change does not contain is the same "plan belongs to some other change" error read from a fourth
+  // side, and it would otherwise surface only as a worker told to open a file that is not there, after
+  // the spawn was paid for. Refused here with the rest, at zero spend.
+  const unreadable = [...new Set(plan.scopes.flatMap(s => s.reads))].filter(p => !changed.has(p));
+  if (omitted.length + foreign.length + duplicated.length + unreadable.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
       `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
+      `File(s) a scope reads that this change does not contain (${unreadable.length}): ${excludedPathList(unreadable)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
       'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );
@@ -35561,7 +35568,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
-//      largest group above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
+//      largest group at or above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
 //      order (a subdirectory kept together; a test and the source it names are one unit, never parted). Each part OWNS its files
 //      and READS every sibling part's files in full, so the concern is still seen whole by every worker
 //      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
@@ -35816,7 +35823,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files, reads }, recorded
 // whole rather than projected, so a scope field added later cannot be silently dropped on the way to
 // disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so

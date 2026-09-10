@@ -503,8 +503,9 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // proposal to hand the workers.
 //
 // [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
-// exact set equality against the changed paths in both directions, and no path claimed twice — before
-// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
+// exact set equality against the changed paths in both directions, and no path claimed twice — and
+// that every second read names a path in the change, before the first worker at zero model spend. None
+// of the four may be waved through. A plan omitting a
 // changed file would leave that file read in full by no worker while its plan.json claimed a
 // partition of the whole change, so the pinned replay would be a different review wearing the plan's
 // name. A plan naming a file this diff does not contain is the same error read from the other side:
@@ -528,12 +529,18 @@ function pinnedProposal({ plan, changedPaths, log }) {
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
   const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
-  if (omitted.length + foreign.length + duplicated.length > 0) {
+  // `reads` is eyesight, not ownership, so it takes no part in the cover — but a read naming a path this
+  // change does not contain is the same "plan belongs to some other change" error read from a fourth
+  // side, and it would otherwise surface only as a worker told to open a file that is not there, after
+  // the spawn was paid for. Refused here with the rest, at zero spend.
+  const unreadable = [...new Set(plan.scopes.flatMap(s => s.reads))].filter(p => !changed.has(p));
+  if (omitted.length + foreign.length + duplicated.length + unreadable.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
       `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
+      `File(s) a scope reads that this change does not contain (${unreadable.length}): ${excludedPathList(unreadable)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
       'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );

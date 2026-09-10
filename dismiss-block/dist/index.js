@@ -30549,7 +30549,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files, reads }, recorded
 // whole rather than projected, so a scope field added later cannot be silently dropped on the way to
 // disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so

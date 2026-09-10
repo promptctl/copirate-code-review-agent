@@ -24,7 +24,7 @@ const { parseScopeValue } = require('./review');
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
-//      largest group above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
+//      largest group at or above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
 //      order (a subdirectory kept together; a test and the source it names are one unit, never parted). Each part OWNS its files
 //      and READS every sibling part's files in full, so the concern is still seen whole by every worker
 //      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
