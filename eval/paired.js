@@ -112,12 +112,25 @@ function planKey(plan) {
   return JSON.stringify(canonicalize({ context: plan.context, scopes: plan.scopes }));
 }
 
-// [LAW:one-source-of-truth] The plan key SHOWN to an operator, derived from the key itself so a message
-// and the grouping it describes can never name different plans. Scope count alone does not identify a
-// partition — a --plans dir can hold two different 3-scope splits of the same change — so a refusal
-// offering only the count cannot say which plan is missing from which arm.
-function planDigest(key) {
-  return crypto.createHash('sha1').update(key).digest('hex').slice(0, 8);
+// [LAW:one-source-of-truth] ONE short, collision-proof stand-in for a long exact value, used everywhere
+// this file needs a name that is short enough to print and still injective: a plan key in a refusal, and
+// the pair of roots a default --out directory belongs to. A second hash beside it would be a second answer
+// to "are these the same thing".
+function digest(text) {
+  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 8);
+}
+
+// [LAW:one-source-of-truth] The DEFAULT report directory for a comparison, minted from the same pair of
+// roots armLabels names it by, so the name a reader sees and the directory it lands in describe one
+// comparison. The labels are readable but not path-safe — a label that had to keep a parent carries a
+// separator — and flattening those separators to '-' is a second non-injective map: `ab-sweep2`/`ab-sweep0`
+// and `ab/sweep2`/`ab/sweep0` are two different comparisons that would flatten onto one directory and
+// silently overwrite each other's report. So the readable part stays readable and the uniqueness is
+// carried by a digest of the two resolved roots, which cannot collide with any character in a path.
+// It is order-sensitive because A-vs-B and B-vs-A are different reports.
+function pairedOutName(rootA, rootB) {
+  const flatten = (label) => label.split(path.sep).join('-');
+  return `paired-${armLabels(rootA, rootB).map(flatten).join('-vs-')}-${digest(`${rootA}\0${rootB}`)}`;
 }
 
 // [LAW:one-source-of-truth] The two arms' NAMES in the report, minted together from both roots, because
@@ -272,7 +285,7 @@ function pairArms(armA, armB) {
       blocks.push({
         case: caseName,
         planKey: key,
-        plan: planDigest(key),
+        plan: digest(key),
         scopeCount: JSON.parse(key).scopes.length,
         provenance: [...new Set([...replicatesA, ...replicatesB].map(r => r.provenance))].sort().join('+'),
         replicates: replicatesA.length,
@@ -336,7 +349,9 @@ function agreedCaseSet(armA, armB) {
 function agreedPlanSet(caseName, armA, byPlanA, armB, byPlanB) {
   const keys = [...byPlanA.keys()].sort();
   const describe = (byPlan) => (byPlan.size === 0 ? 'none' : [...byPlan.entries()]
-    .map(([key, runs]) => `${JSON.parse(key).scopes.length} scope(s) [${planDigest(key)}] ×${runs.length}`).sort().join(', '));
+    // The digest, not just the scope count: a --plans dir can hold two different 3-scope splits of one
+    // change, and a refusal offering only the count cannot say which plan is missing from which arm.
+    .map(([key, runs]) => `${JSON.parse(key).scopes.length} scope(s) [${digest(key)}] ×${runs.length}`).sort().join(', '));
   for (const key of new Set([...byPlanA.keys(), ...byPlanB.keys()])) {
     const a = byPlanA.get(key);
     const b = byPlanB.get(key);
@@ -513,9 +528,7 @@ function main() {
   // whole plan JSON and would swamp the artifact.
   for (const block of report.blocks) delete block.planKey;
 
-  // Separators flattened so a label that had to keep some path stays ONE directory component.
-  const slug = (label) => label.split(path.sep).join('-');
-  const outDir = path.resolve(opts.out || path.join(__dirname, 'out', `paired-${slug(report.armA.label)}-vs-${slug(report.armB.label)}`));
+  const outDir = path.resolve(opts.out || path.join(__dirname, 'out', pairedOutName(armA.root, armB.root)));
   fs.mkdirSync(outDir, { recursive: true });
   const markdown = renderPairedMarkdown(report);
   fs.writeFileSync(path.join(outDir, 'paired.json'), JSON.stringify(report, null, 2) + '\n');
@@ -535,4 +548,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { parseArgs, planKey, planDigest, armLabels, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory, binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown };
+module.exports = { parseArgs, planKey, digest, armLabels, pairedOutName, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory, binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown };

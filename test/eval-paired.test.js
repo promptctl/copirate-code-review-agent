@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const {
-  parseArgs, planKey, planDigest, armLabels, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory,
+  parseArgs, planKey, digest, armLabels, pairedOutName, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory,
   binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown,
 } = require('../eval/paired');
 const { PLAN_SCHEMA } = require('../src/plan');
@@ -111,11 +111,23 @@ test('the arms are named by whatever distinguishes them, never by a basename bot
   assert.deepEqual(armLabels('/a/b/c/d', '/a/z'), ['b/c/d', 'z']);
 });
 
-test('planDigest distinguishes two plans of the same scope count', () => {
+test('a plan digest distinguishes two plans of the same scope count', () => {
   const other = { context: 'the shared context', scopes: [{ name: 'left', focus: 'l', files: ['a.ts'] }, { name: 'right', focus: 'r', files: ['b.ts'] }] };
-  assert.equal(planDigest(planKey(PLAN_TWO_SCOPES)).length, 8);
-  assert.notEqual(planDigest(planKey(PLAN_TWO_SCOPES)), planDigest(planKey(other)));
-  assert.equal(planDigest(planKey(PLAN_TWO_SCOPES)), planDigest(planKey(PLAN_TWO_SCOPES)));
+  assert.equal(digest(planKey(PLAN_TWO_SCOPES)).length, 8);
+  assert.notEqual(digest(planKey(PLAN_TWO_SCOPES)), digest(planKey(other)));
+  assert.equal(digest(planKey(PLAN_TWO_SCOPES)), digest(planKey(PLAN_TWO_SCOPES)));
+});
+
+test('the default report directory stays readable and cannot collide with another comparison', () => {
+  // The common case reads as the two arm names, unchanged.
+  assert.match(pairedOutName('/e/out/ab-sweep2', '/e/out/ab-sweep0'), /^paired-ab-sweep2-vs-ab-sweep0-[0-9a-f]{8}$/);
+  // Two DIFFERENT comparisons whose labels flatten to the same text: same readable half, different dir.
+  const flat = pairedOutName('/e/ab-sweep2', '/e/cd-sweep0');
+  const nested = pairedOutName('/e/ab/sweep2', '/e/cd/sweep0');
+  assert.equal(flat.slice(0, flat.lastIndexOf('-')), nested.slice(0, nested.lastIndexOf('-')));
+  assert.notEqual(flat, nested);
+  // Which arm is A is part of the comparison, so swapping them is a different report and a different dir.
+  assert.notEqual(pairedOutName('/e/out/a', '/e/out/b'), pairedOutName('/e/out/b', '/e/out/a'));
 });
 
 // ── pairing ────────────────────────────────────────────────────────────────────────────────────────

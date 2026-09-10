@@ -456,7 +456,8 @@ tested it.
 Exit codes are a **dichotomy**, deliberately narrower than `compare.js`'s: `0` = ran, `2` = refused.
 Nothing exits `1`, because a paired p-value is evidence for a decision and not the decision — the gate
 lives in `compare.js`. Artifacts land at `<out>/paired.{md,json}`, defaulting to
-`eval/out/paired-<armA>-vs-<armB>`.
+`eval/out/paired-<armA>-vs-<armB>-<digest>` — the arm names for a reader, and a digest of the two resolved
+roots so two comparisons whose names happen to flatten alike cannot overwrite each other's report.
 
 ## Scoring a replay
 
