@@ -141,8 +141,8 @@ test('only runs of the same case can be near; another case is not a near miss', 
 // A torn record is a run whose identity cannot be read, which is what `unidentified` means — so it takes a
 // row in that vocabulary and is reported by name. It must NOT abort: the scan is the whole corpus, so a
 // throw would let one stray dir in an experiment root nobody touches block every future invocation for
-// every --out. The strict rule keeps its own enforcer in freeze-suite's priorRunArms, on the root being
-// WRITTEN, where the blast radius is the operator's own target.
+// every --out. The strict rule keeps its own enforcer in score.js's readPriorRuns, which the resume reads
+// on the root being WRITTEN, where the blast radius is the operator's own target.
 test('a torn run record is reported by name, and does not abort the corpus around it', () => {
   const dir = writeCorpus({ 'a/case-a/torn': null, 'a/case-a/whole': meta() });
   const corpus = collect(dir);
@@ -184,17 +184,15 @@ test('only a case with a scheduled replay asks the corpus anything', () => {
   assert.deepEqual(plannedCases(cases, []), []);
 });
 
-// Nothing planned means nothing asked — and asking is what costs a corpus walk and two git subprocesses.
-// A status re-invocation must acquire neither, so the injected effects are proven UNCALLED, not just unused.
-test('a suite with nothing planned reads no corpus and shells out to no git', () => {
+// Nothing planned means nothing asked — and asking is what costs a corpus walk. A status re-invocation
+// must not pay it; the tree snapshot it would compare against is the caller's, and a caller with nothing
+// planned took none (null).
+test('a suite with nothing planned reads no corpus', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
-  let gitCalls = 0;
   const answer = consultCorpus({
     planned: [], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs,
-    workingTree: () => { gitCalls++; return { sha: SHA, dirty: false }; },
+    parseMeta, treeIdentity, listRunDirs, tree: null,
   });
-  assert.equal(gitCalls, 0);
   assert.deepEqual(answer, { notice: null, consultations: [], unidentified: [] });
   fs.rmSync(dir, { recursive: true });
 });
@@ -205,7 +203,7 @@ test('a dirty tree consults nothing and says why', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
   const answer = consultCorpus({
     planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: true }),
+    parseMeta, treeIdentity, listRunDirs, tree: { sha: SHA, dirty: true },
   });
   assert.match(answer.notice, /DIRTY/);
   assert.deepEqual(answer.consultations, []);
@@ -216,7 +214,7 @@ test('a planned case consults the corpus and reports what it holds', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
   const answer = consultCorpus({
     planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: false }),
+    parseMeta, treeIdentity, listRunDirs, tree: { sha: SHA, dirty: false },
   });
   assert.match(answer.notice, /1 identified run\(s\) on disk/);
   assert.equal(answer.consultations.length, 1);

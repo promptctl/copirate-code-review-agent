@@ -332,7 +332,7 @@ function agreedEffort(runs) {
 }
 
 // [LAW:single-enforcer] What a MISPLACED run is, stated once: a run whose meta.json names a case other
-// than the directory it sits under. Every walker over an out root meets it — compare.js's readPriorRuns
+// than the directory it sits under. Every walker over an out root meets it — readPriorRuns below (the resume's reader)
 // refuses one before the spend, paired.js's readArm before it pools runs into a pairing block — and two
 // copies of the rule would drift into refusing different things for the same run. The caller passes the
 // LABEL it points at the run by (a meta.json path, an arm's run dir), so each keeps its own way of naming
@@ -358,6 +358,28 @@ function misarmedRuns(effort, runs) {
   return runs
     .filter(r => describeEffort(r.effort) !== describeEffort(effort))
     .map(({ dir, effort: was }) => ({ dir, reason: `was replayed at effort ${describeEffort(was)}; this invocation replays at ${describeEffort(effort)}` }));
+}
+
+// Every completed run already under `root` for the named cases, with the arm and the tree that produced
+// it: the census a resume tops up, read ONCE for every pre-spend refusal that needs it — misarmedRuns above
+// and run-case.js's foreignRuns. "Completed" is listRunDirs, the predicate the suite census and the scorer's
+// reduction read, so what this returns is exactly what a replay will count.
+// [LAW:one-source-of-truth] freeze-suite.js and compare.js both resume a root, and each used to read it its
+// own way — one checking the record was whole, the other that it named its case. One reader, both checks.
+// [LAW:no-silent-failure] run-case.js writes meta.json first and findings.json last (atomically), so a
+// killed replay leaves a dir listRunDirs never counts. A counted run WITHOUT meta.json is therefore a record
+// torn after the fact — refused by name, never skipped, since skipping would let a run whose arm and tree
+// cannot be proven pass every resume check as if it matched. A record naming a different case than the
+// directory it sits in is refused here with the check the scorer would otherwise make after the spend.
+// [LAW:parse-dont-validate]
+function readPriorRuns(root, caseNames) {
+  return caseNames.flatMap(name => listRunDirs(path.join(root, name)).map(dir => {
+    const metaPath = path.join(dir, 'meta.json');
+    if (!fs.existsSync(metaPath)) throw new Error(`${dir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
+    const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
+    requireRunCase(meta, name, metaPath);
+    return { case: name, dir, candidate: meta.candidate, effort: meta.effort };
+  }));
 }
 
 // The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
@@ -892,7 +914,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, agreedEffort, misarmedRuns, requireRunCase,
+  parseArgs, parseJson, parseJsonObject, parseExpected, parseProduced, parseUsage, parseMeta, parseEffort, describeEffort, agreedScope, agreedEffort, misarmedRuns, readPriorRuns, requireRunCase,
   normalizeBody, pairCandidates, computeMetrics, scoreRun, aggregateRuns, renderTable,
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, callJudge, loadCache,

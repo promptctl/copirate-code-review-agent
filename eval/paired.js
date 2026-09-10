@@ -189,7 +189,7 @@ function readArm(root, label) {
 
 function readRun(dir, caseName, label) {
   const meta = parseMeta(readFileOrRefuse(path.join(dir, 'meta.json'), label, 'was never replayed to completion'), path.join(dir, 'meta.json'));
-  // score.js owns what a misplaced run is; compare.js's readPriorRuns refuses one at the same kind of
+  // score.js owns what a misplaced run is; its readPriorRuns refuses one at the same kind of
   // boundary. Proven before the run's other artifacts are read, because which case a run belongs to is
   // what makes "this run recorded no plan" a sentence about the right case at all. Left to the inventory
   // check downstream, a misfiled run surfaces as expected.json drift and sends the operator hunting.

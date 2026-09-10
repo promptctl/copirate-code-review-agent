@@ -258,9 +258,9 @@ function findRunDirsDeep(dir, listRunDirs) {
 //
 // It does NOT abort. The scan is the whole corpus by design, so throwing would let one stray dir in an
 // experiment root nobody touches hard-block every future invocation for every --out — a blast radius the
-// strict rule never had. The strict rule keeps its own enforcer where it bites: freeze-suite's
-// `priorRunArms` still refuses a torn record in the root being WRITTEN. [LAW:single-enforcer] the index
-// reports on the corpus; priorRunArms enforces on the target.
+// strict rule never had. The strict rule keeps its own enforcer where it bites: score.js's
+// `readPriorRuns`, which freeze-suite's resume reads, still refuses a torn record in the root being
+// WRITTEN. [LAW:single-enforcer] the index reports on the corpus; readPriorRuns enforces on the target.
 function collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs }) {
   const runDirs = fs.existsSync(corpusRoot) ? findRunDirsDeep(corpusRoot, listRunDirs) : [];
   const records = runDirs.map(dir => {
@@ -293,18 +293,22 @@ function collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs 
 // identity to resolve, which means no subject, which means no corpus to walk — each step's empty value is
 // what makes the next one free, and all three arrive at the same empty answer by the same path.
 //
-// That matters because acquiring these inputs is not free and not local: `workingTree` shells out to git
-// twice, and the walk parses every meta.json in an ever-growing corpus. A status re-invocation — this
-// command's ONLY resume and its only status check — must not pay either, nor acquire git as a
-// precondition it never had. freeze-suite gates lane resolution on precisely this reasoning; this is the
+// That matters because acquiring these inputs is not free and not local: the walk parses every meta.json
+// in an ever-growing corpus. A status re-invocation — this command's ONLY resume and its only status
+// check — must not pay it. freeze-suite gates lane resolution on precisely this reasoning; this is the
 // same rule applied to the same kind of precondition. [LAW:one-source-of-truth]
+//
+// `tree` is the caller's ONE snapshot of the tree about to replay — null when nothing is planned, since a
+// suite with no replays has no tree to name and must shell out to no git to learn so. The same snapshot
+// gates the resume (foreignRuns), and each replay records the same function's answer, so the consultation
+// cannot disagree with either about which tree this is. [LAW:one-source-of-truth]
 //
 // A DIRTY tree is the second empty: it names no reproducible content, so nothing on disk can be proven to
 // be a replay of it, and a lookup performed anyway would miss on sha for every case and report a
 // difference the operator cannot act on. The notice says so rather than leaving the silence to be read as
 // "nothing found". [LAW:no-silent-failure]
-function consultCorpus({ planned, effort, corpusRoot, parseMeta, treeIdentity, listRunDirs, workingTree }) {
-  const sha = planned.length === 0 ? null : treeIdentity(workingTree());
+function consultCorpus({ planned, effort, corpusRoot, parseMeta, treeIdentity, listRunDirs, tree }) {
+  const sha = tree === null ? null : treeIdentity(tree);
   const subjects = sha === null ? [] : planned.map(c => measurementFields({ caseName: c.name, sha, effort }));
   const corpus = subjects.length === 0 ? { measurements: [], unidentified: [] } : collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs });
   return {

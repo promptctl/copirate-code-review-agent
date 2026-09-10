@@ -265,6 +265,27 @@ function treeIdentity({ sha, dirty }) {
   return dirty ? null : sha;
 }
 
+// A tree as a phrase, for a refusal: the reader must see BOTH sides to know which to fix.
+function describeTree(candidate) {
+  if (candidate === null) return 'no recorded identity';
+  return `${candidate.dirty ? 'a dirty tree at ' : ''}commit ${candidate.sha.slice(0, 7)}`;
+}
+
+// [LAW:effects-at-boundaries] Pure: which runs cannot be `current`'s own. A run is the tree's own only
+// when both carry the SAME identity — one clean commit (treeIdentity); a dirty tree on either side has
+// none, so nothing can be proven and everything is foreign. Every foreign run is named with both trees, so
+// the operator knows whether to move the runs or check out the commit that produced them.
+// [LAW:single-enforcer] The one rule for joining a run to a root: freeze-suite.js applies it to a resumed
+// --out, compare.js to its candidate root. score.js pools every run under a case as one arm, so a root
+// that mixed trees would average two engines into one rate with no error — the same invalid run the
+// harness refuses on every other axis (misarmedRuns), refused here for this one.
+function foreignRuns(current, runs) {
+  const identity = treeIdentity(current);
+  return runs
+    .filter(({ candidate }) => identity === null || candidate === null || treeIdentity(candidate) !== identity)
+    .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; this tree is ${describeTree(current)}` }));
+}
+
 // [LAW:parse-dont-validate] The crossing between a live value and a durable artifact. `JSON.stringify` answers
 // the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined" —
 // a file that reports as an artifact and parses as nothing. Every field of a run record is a fact the replay
@@ -542,4 +563,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity, writeRunRecord };
+module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord };
