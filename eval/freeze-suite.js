@@ -65,6 +65,13 @@ Usage: node eval/freeze-suite.js [options]
                            (default: the engine's own DEFAULT_READ_SET). 'assigned' is the shipped
                            split read; 'changed' is the pre-split arm where every worker reads the whole
                            changed set. Same rule as --sweep-cap: give each arm its OWN --out.
+  --plans <dir>            Replay every case against a PINNED scope plan instead of scouting one, so the
+                           review's structure is held fixed across runs and arms. The dir holds one
+                           <case-name>.json per case being replayed — any run's plan.json is a valid
+                           file — and a selected case with no plan there, or a plan that does not parse,
+                           refuses the whole suite before a single credential resolves. The flag is
+                           plural and takes a DIRECTORY because a plan partitions ONE case's changed
+                           files: a single file forwarded to every case would be refused by all but one.
   --help                   Show this help.
 
 Every case must pin the same engine — the rule eval/baseline.js enforces on the resulting suite, applied
@@ -85,8 +92,8 @@ const MAX_TIMER_MS = 2147483647;
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO. Mirrors
 // run-case.js's parser, including its `--flag looks-like-another-flag` refusal. [LAW:one-source-of-truth]
 function parseArgs(argv) {
-  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET };
-  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout', 'sweep-cap': 'sweepCap', 'read-set': 'readSet' };
+  const opts = { repeats: 5, out: 'eval/out', casesDir: 'eval/cases', cases: null, credentials: null, jobTimeout: 120, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET, plans: null };
+  const keyFor = { repeats: 'repeats', out: 'out', 'cases-dir': 'casesDir', cases: 'cases', credentials: 'credentials', 'job-timeout': 'jobTimeout', 'sweep-cap': 'sweepCap', 'read-set': 'readSet', plans: 'plans' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -348,6 +355,33 @@ function censusCases(caseDirs, outRoot) {
   });
 }
 
+// [LAW:parse-dont-validate] The PLAN SET: the dir the operator named, resolved into a map from case name
+// to a plan file PROVEN to exist and to parse as a PlanRecord. What comes out is the value the spawn spec
+// reads, so a path in that map cannot be one nobody checked — and the map's own membership is the
+// discriminator downstream, which is why the un-pinned suite returns an EMPTY map rather than a null:
+// "no case is pinned" and "these cases are pinned" are one type, and the lookup is one expression.
+// [LAW:dataflow-not-control-flow]
+//
+// [LAW:no-silent-failure] EVERY selected case must have a plan, refused here — before any credential
+// resolves, at zero spend. A partially-pinned suite is the worst of both: some cases replay a frozen
+// structure and some re-roll it, so the very variance the pin exists to remove is back in the comparison
+// with nothing in the report saying which cases carried it. The plan's fit to a case's DIFF is not
+// checked here — that needs the case's material, and run-case.js's pass owns it; this gate answers only
+// the questions that cost nothing to ask twice and everything to discover on lane 1 of hour 4.
+function resolvePlanSet(plansDir, caseNames) {
+  const { parsePlanRecord } = require('../src/plan');
+  const resolved = new Map();
+  for (const name of caseNames) {
+    const planPath = path.join(plansDir, `${name}.json`);
+    if (!fs.existsSync(planPath)) {
+      throw new Error(`--plans ${plansDir} has no plan for case '${name}' (expected ${planPath}). Every replayed case needs its own plan, or the suite would pin some cases and re-roll the rest.`);
+    }
+    parsePlanRecord(fs.readFileSync(planPath, 'utf8'), planPath);
+    resolved.set(name, planPath);
+  }
+  return resolved;
+}
+
 // The arm every run already under --out was produced at. DELIBERATELY separate from censusCases, which
 // only counts: the census runs twice — once before the spend and once after every replay, to report what
 // the scorer will find — and a read that can fail on run CONTENT must never sit in the closing one, where
@@ -515,7 +549,12 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
 // provider reads is the security-relevant half of this file, and it inherited process.env — so a wrong
 // key does not fail, it silently replays on whatever credential the parent happened to be holding. A
 // mapping only a real spawn can observe is a mapping nothing asserts.
-function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet }) {
+function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet, planPaths }) {
+  // [LAW:dataflow-not-control-flow] The pin travels as a LIST of argv words — empty when this suite scouts,
+  // two words when it replays a plan set — so the spawn line stays ONE expression with one shape, and the
+  // un-pinned suite's argv is byte-identical to what it was before plans existed. The map is the single
+  // enforcer of "this path exists and parses" (resolvePlanSet), so nothing is re-checked here.
+  const planArgs = planPaths.has(job.name) ? ['--plan', planPaths.get(job.name)] : [];
   return {
     command: process.execPath,
     // --sweep-cap and --read-set are passed on EVERY replay, never only when they differ from the
@@ -527,7 +566,7 @@ function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sw
     // it already left parseOneOf as one of the vocabulary's strings. Coercing it would turn a lost arm into
     // the literal '--read-set undefined' — a spawn that reaches the child and fails there, describing a
     // flag value nobody typed. Passed as-is, a lost arm cannot spawn at all.
-    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget), '--sweep-cap', String(sweepCap), '--read-set', readSet],
+    args: [path.join(__dirname, 'run-case.js'), job.dir, '-n', '1', '--out', outRoot, '--memory-budget', String(memoryBudget), '--sweep-cap', String(sweepCap), '--read-set', readSet, ...planArgs],
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, [credentialInput]: lane.value },
   };
@@ -548,14 +587,14 @@ function laneMemoryShare(totalMemBytes, laneCount) {
 // host folded in. The share is the suite's fact — it knows how many lanes share the machine — so it is
 // bound here, once, and the lane loop never learns it. Derived when a replay runs, not when the closure
 // is built: a suite with nothing to run resolves no lanes, and there is no share of nothing.
-function laneReplay({ lanes, totalMemBytes, sweepCap, readSet, replay }) {
-  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length), sweepCap, readSet });
+function laneReplay({ lanes, totalMemBytes, sweepCap, readSet, planPaths, replay }) {
+  return args => replay({ ...args, memoryBudget: laneMemoryShare(totalMemBytes, lanes.length), sweepCap, readSet, planPaths });
 }
 
 // [LAW:decomposition] One job: hand the supervision the command a replay is. Everything about surviving
 // it — the deadline, the process group, the log — belongs to superviseSpawn above.
-function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet, logPath, timeoutMinutes }) {
-  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet }), logPath, timeoutMinutes });
+function runReplay({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet, planPaths, logPath, timeoutMinutes }) {
+  return superviseSpawn({ ...replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet, planPaths }), logPath, timeoutMinutes });
 }
 
 // A lane replays one job at a time and takes the first queued job it has NOT already failed, requeueing
@@ -674,6 +713,11 @@ async function main() {
   if (misarmed.length > 0) {
     throw new Error(`--out ${outRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(m => `  ${m.dir} ${m.reason}`).join('\n')}\nA case-out dir holds one arm — resume with the arm these runs were produced at (--sweep-cap, --read-set), or give this arm its own --out.`);
   }
+  // The plan set is resolved in the same breath as the arm above and for the same reason: both are frozen
+  // inputs every replay of this invocation shares, and both are cheapest to refuse now — before a lane
+  // resolves a credential, at zero spend. An absent --plans resolves to the empty map, which is the value
+  // meaning "every case scouts its own partition". [LAW:dataflow-not-control-flow]
+  const planPaths = opts.plans === null ? new Map() : resolvePlanSet(path.resolve(opts.plans), cases.map(c => c.name));
   const credentialInput = credentialInputFor(pin.provider);
 
   const jobs = planJobs({ cases, repeats: opts.repeats });
@@ -772,7 +816,7 @@ async function main() {
   const done = [];
   const started = Date.now();
   // Each replay plans its lanes against its share of the host, bound in laneReplay.
-  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), sweepCap: opts.sweepCap, readSet: opts.readSet, replay: runReplay });
+  const replay = laneReplay({ lanes, totalMemBytes: os.totalmem(), sweepCap: opts.sweepCap, readSet: opts.readSet, planPaths, replay: runReplay });
   await Promise.all(lanes.map(lane => runLane({ lane, queue, credentialInput, outRoot, logDir, done, log, timeoutMinutes: opts.jobTimeout, replay, group })));
 
   // The closing census is re-read from disk, never inferred from the job results: what the scorer will
@@ -814,4 +858,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, resolveLanes, priorRunArms, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, resolveLanes, priorRunArms, resolvePlanSet, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

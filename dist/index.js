@@ -35029,6 +35029,81 @@ function uniquelyNamed(scopes) {
   return renamed ? out : scopes;
 }
 
+// [LAW:one-type-per-behavior] The two PRODUCERS of a pass's proposal — the value runMultiScopePass
+// reconciles into the partition its workers run. Both hand back the identical shape:
+//   { provenance, scopes, context, scoutUsage }
+// which is PLAN_FIELDS minus the one field only the pass can know (the post-reconciliation scopes it
+// actually ran). One producer buys the partition; the other reads one already decided. Nothing after
+// the choice can tell which ran, which is the whole point: a pinned replay is not a second engine.
+//
+// Each producer owns its own progress lines, so the shared path below carries no logging branch and a
+// scouted run's log stays byte-identical to the pre-pinned engine. [LAW:dataflow-not-control-flow]
+
+// The scout: a survey-only spawn. Its product is the typed scope records it logged through the add_scope
+// collector tool (validated at the collector boundary), plus a structural summary that becomes shared
+// worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure] a scout that
+// planned zero scopes fails loud here rather than running zero workers and "succeeding" having reviewed
+// nothing — a hole a pinned plan cannot have, since planRecord already refuses the empty partition.
+async function scoutProposal({ material, spawn, log }) {
+  const scoutResult = await spawn(material.buildScoutPrompt, 'scout', { phase: 'scout' });
+  // The scout's elapsed time lands the moment it settles — BEFORE the zero-scope gate, so a run
+  // that dies planning still logged where its first two minutes went (zai-timing-31d.7). Same
+  // span-in-hand derivation as the worker done line. [LAW:one-source-of-truth]
+  log(`scout done — ${formatMs(spanMs(scoutResult.usage?.span))}`);
+  if (scoutResult.scopes.length === 0) {
+    throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
+  }
+  log(`scout planned ${scoutResult.scopes.length} scope(s): ${scoutResult.scopes.map(s => s.name).join(', ')}`);
+  return {
+    provenance: 'scout',
+    scopes: scoutResult.scopes,
+    context: scoutResult.summary.trim(),
+    // The price of deciding. A null is the engine reporting no usage — the recorded absence spanMs
+    // already spells 'unclocked' — never a fabricated zero. [LAW:no-silent-failure]
+    scoutUsage: scoutResult.usage ?? null,
+  };
+}
+
+// [LAW:parse-dont-validate] The pinned producer, and THE checkpoint a frozen plan crosses: in goes a
+// PlanRecord that merely parsed (its shape is proven, its relationship to this diff is not), out comes a
+// proposal proven to partition THIS change — the type no plan has until this function has run, and the
+// type every line downstream consumes. The check cannot be skipped, because skipping it means having no
+// proposal to hand the workers.
+//
+// [LAW:no-silent-failure] The refusal is EXACT SET EQUALITY against the changed paths, in both
+// directions, and it happens before the first worker at zero model spend. Neither direction may be
+// waved through. A plan omitting a changed file would be silently repaired by planScopes' catch-all —
+// the run would review the whole PR while its plan.json claimed a partition it did not run, so the
+// pinned replay would be a different review wearing the plan's name. A plan naming a file this diff does
+// not contain is the same error read from the other side: the plan belongs to some other change (a
+// re-frozen case, a different EXCLUDE_PATTERNS), and the paths it names would reach a worker's
+// "read these files in full" line pointing at nothing. Both mean the frozen structure is not this
+// change's structure, and the whole reason to pin is that the structure is the same.
+//
+// Provenance is stamped 'pinned' HERE regardless of what the file says, because provenance records which
+// producer RAN, not which one wrote the bytes. The ordinary input is a plan.json recorded by a scouted
+// run, which says 'scout' and carries that run's price; replaying it spawns no scout, so the record this
+// pass emits must say so and must carry no price — which planRecord's table then makes unrepresentable
+// to get wrong. [LAW:one-source-of-truth]
+// [LAW:effects-at-boundaries] Pure but for the one progress line, exactly as its sibling is.
+function pinnedProposal({ plan, changedPaths, log }) {
+  const assigned = new Set(plan.scopes.flatMap(s => s.files));
+  const changed = new Set(changedPaths);
+  const omitted = changedPaths.filter(p => !assigned.has(p));
+  const foreign = [...assigned].filter(p => !changed.has(p));
+  if (omitted.length + foreign.length > 0) {
+    throw new Error(
+      'Pinned plan does not partition this change — refusing before any spawn. ' +
+      `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
+      `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
+      'A plan that covers less than the change reviews less than the change and reports success; ' +
+      'pin a plan recorded from THIS case, or drop --plan and let the scout partition it.',
+    );
+  }
+  log(`pinned plan: ${plan.scopes.length} scope(s): ${plan.scopes.map(s => s.name).join(', ')}`);
+  return { provenance: 'pinned', scopes: plan.scopes, context: plan.context, scoutUsage: null };
+}
+
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
 // unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return —
@@ -35043,7 +35118,7 @@ function uniquelyNamed(scopes) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   // [LAW:parse-dont-validate] The read-set arm is resolved to its projection ONCE, here, before the scout
   // spawns: every worker below is handed the resolved projection, so an arm outside the vocabulary is
   // refused at zero spend rather than at the first worker's prompt. Same position and reason as the two
@@ -35112,26 +35187,25 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     }
   };
 
-  // Layer 1 — the scout: a survey-only spawn. Its product is the typed scope records it logged through
-  // the add_scope collector tool (validated at the collector boundary), plus a structural summary that
-  // becomes shared worker context. Its findings, if any, are ignored by design. [LAW:no-silent-failure]
-  // a scout that planned zero scopes fails loud here rather than running zero workers and "succeeding"
-  // having reviewed nothing.
-  const scoutResult = await spawn(material.buildScoutPrompt, 'scout', { phase: 'scout' });
-  // The scout's elapsed time lands the moment it settles — BEFORE the zero-scope gate, so a run
-  // that dies planning still logged where its first two minutes went (zai-timing-31d.7). Same
-  // span-in-hand derivation as the worker done line. [LAW:one-source-of-truth]
-  log(`scout done — ${formatMs(spanMs(scoutResult.usage?.span))}`);
-  if (scoutResult.scopes.length === 0) {
-    throw new Error(`Scout planned no scopes (no add_scope calls). Scout summary:\n${scoutResult.summary}`);
-  }
-  log(`scout planned ${scoutResult.scopes.length} scope(s): ${scoutResult.scopes.map(s => s.name).join(', ')}`);
+  // Layer 1 — the PROPOSAL: where this pass's partition comes from, as a value. `plan` is that value's
+  // discriminator and its whole content — absent, the pass buys a partition from the scout; present, it
+  // replays a partition somebody already decided (copirate-determinism-5od.fku). There is deliberately no
+  // 'pinned mode' boolean: the two producers hand back the SAME proposal shape, and every line below this
+  // one is identical for both, so a pinned run and a scouted run are one code path fed different values.
+  // [LAW:dataflow-not-control-flow] The one thing that genuinely differs — whether an engine spawn is
+  // bought at all — is precisely what choosing a producer means, and it happens here, once.
+  const proposal = plan === null
+    ? await scoutProposal({ material, spawn, log })
+    : pinnedProposal({ plan, changedPaths: material.changedPaths, log });
 
-  // [LAW:verifiable-goals] Mechanically verify the plan covers every changed file (PR only — repo
-  // material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
-  // synthetic catch-all scope so some worker reads them in full. The zero-scope throw above stays
-  // FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
-  const { scopes, sweptPaths, duplicatePaths, withheldAssignments } = planScopes(scoutResult.scopes, material.changedPaths, material.withheldPaths);
+  // [LAW:verifiable-goals] Mechanically verify the proposed partition covers every changed file (PR only
+  // — repo material carries changedPaths = [], so this is a no-op). Unmentioned paths are swept into ONE
+  // synthetic catch-all scope so some worker reads them in full. The zero-scope throw inside scoutProposal
+  // stays FIRST, so a scout that planned nothing fails loud rather than being papered over by the sweep.
+  // A PINNED proposal reaches here already proven to cover the change exactly, so every reconciliation
+  // below is a provable no-op on that path — the same single enforcer, running inert, rather than a
+  // second coverage mechanism the pinned path would have to be trusted to skip. [LAW:single-enforcer]
+  const { scopes, sweptPaths, duplicatePaths, withheldAssignments } = planScopes(proposal.scopes, material.changedPaths, material.withheldPaths);
   if (sweptPaths.length > 0) {
     log(`⚠️ scout left ${sweptPaths.length} changed file(s) unassigned; swept into an 'unassigned files' scope: ${sweptPaths.join(', ')}`);
   }
@@ -35144,7 +35218,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   if (withheldAssignments.length > 0) {
     log(`⚠️ scout assigned ${withheldAssignments.length} EXCLUDE_PATTERNS-withheld file(s) to a scope; removed so no worker is told to read them: ${excludedPathList(withheldAssignments)}`);
   }
-  const context = scoutResult.summary.trim();
+  const context = proposal.context;
 
   // Layer 2 — the convergence chains (zai-recall-upr.2; one chain per scope since zai-timing-ptp).
   // Every scope runs its own chain in its own lane: pass 0 (the review of record), then up to sweepCap
@@ -35234,16 +35308,16 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // behavior are ONE value, not a copy that could describe a partition the run did not use.
     // [LAW:one-source-of-truth]
     //
-    // `scoutUsage` is the settled scout spawn's price, carried here so the plan states what it cost to
-    // decide. The ATTEMPT-level authority stays the schedule's spawn list above (it alone carries the
-    // retried and failed attempts); this field is the completed spawn's usage, taken from the same
-    // in-memory value rather than re-derived from that list. An engine that reported nothing gives the
-    // typed absence spanMs already spells 'unclocked' — never a fabricated zero. [LAW:no-silent-failure]
+    // `provenance` and `scoutUsage` come from the PRODUCER that ran, so the record states which one it
+    // was and what deciding cost — a scouted pass's settled spawn price, or the null a pinned pass has
+    // because it bought nothing. The ATTEMPT-level authority stays the schedule's spawn list above (it
+    // alone carries the retried and failed attempts); this field is the completed spawn's usage, taken
+    // from the same in-memory value rather than re-derived from that list. [LAW:no-silent-failure]
     plan: planRecord({
-      provenance: 'scout',
+      provenance: proposal.provenance,
       context,
       scopes,
-      scoutUsage: scoutResult.usage ?? null,
+      scoutUsage: proposal.scoutUsage,
     }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
@@ -35272,14 +35346,19 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
 // that produces it (os.totalmem) sits HERE, at the seam's default, never inside the pass: the pass
 // takes a number, so a test hands it one and the production callers hand it nothing. It is not on the
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const readSet = effort.readSet;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
   }));
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, sleepFn, deadline, now, startedAt });
+  // [LAW:dataflow-not-control-flow] The pinned plan threads through as a plain value with a null
+  // default: every caller that does not pin one (run.js, scripts/local-review.js) passes nothing and
+  // gets the scouted path byte-identically, and no seam between here and the producer knows there are
+  // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
+  // structure an arm is held constant against (copirate-determinism-5od.w2r).
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, plan, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -35380,10 +35459,14 @@ module.exports = {
 /***/ }),
 
 /***/ 8194:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+// [LAW:one-way-deps] plan.js depends on review.js, never the reverse: review.js owns what a SCOPE is
+// (parseScopeValue) and knows nothing about the record a pass writes around one. review.js has an empty
+// require graph, so this edge points downhill and closes no loop.
+const { parseScopeValue } = __nccwpck_require__(1565);
 
 // The pass's PLAN — the partition a review actually ran, as an owned value.
 //
@@ -35472,7 +35555,64 @@ function planRecord(fields) {
   return record;
 }
 
-module.exports = { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord };
+// [LAW:parse-dont-validate] The READER side of the mint — the one crossing a plan makes coming BACK
+// from disk, and the checkpoint that makes `--plan` possible. What goes in is bytes somebody handed us
+// (a recorded plan.json, a hand-edited one, a plan a future partitioner synthesised); what comes out is
+// a PlanRecord, which is the same stamped value a live pass mints, because it is minted by the same
+// function. Nothing downstream re-checks a plan's shape, exactly as nothing re-checks a scouted one.
+// [LAW:effects-at-boundaries] Pure: it takes the TEXT and a label naming where the text came from, so
+// the caller owns the read and every failure below can say which file to go look at.
+function parsePlanRecord(raw, source) {
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${source} is not valid JSON: ${e.message}`);
+  }
+  if (json === null || typeof json !== 'object' || Array.isArray(json)) {
+    throw new Error(`${source} is not a plan record object (got ${JSON.stringify(json)}).`);
+  }
+  // [LAW:no-silent-failure] The stamp is checked BEFORE the fields, and an unrecognised one is fatal
+  // rather than back-filled — the deliberate difference from EFFORT_SCHEMA, restated at the only
+  // boundary where it can bite. There is no era of plan.json without a version to guess a shape from,
+  // so a mismatch means the file describes a partition this engine cannot faithfully reconstruct, and
+  // replaying it anyway would produce a review that silently is not the one the plan names.
+  if (json.planSchema !== PLAN_SCHEMA) {
+    throw new Error(
+      `${source} declares planSchema ${JSON.stringify(json.planSchema)}, but this engine reads ${JSON.stringify(PLAN_SCHEMA)}. ` +
+      'A plan has no back-fill: refusing rather than replaying a shape this engine cannot reconstruct.',
+    );
+  }
+  // [LAW:one-source-of-truth] The fields are lifted BY PLAN_FIELDS, so a field added to the record is
+  // read off disk on the same day it is demanded of every producer — the reader can never be the half
+  // that forgot. Unknown keys in the file are dropped by the same act: the mint's output is the record.
+  return planRecord({
+    ...Object.fromEntries(PLAN_FIELDS.map(field => [field, json[field]])),
+    scopes: parseScopeList(json.scopes, source),
+  });
+}
+
+// [LAW:single-enforcer] Scopes off disk never crossed the collector boundary, so for THIS producer this
+// is that boundary — the same parseScopeValue, not a second idea of what a scope is. It matters at the
+// prompt: a scope's name and focus are model-authored text that lands in a worker's CONCENTRATE block,
+// and an unflattened multi-line one puts steerable text at column 0, where a continuation line reads as
+// an instruction. planRecord owns "non-empty"; this owns "is a list at all", because it must map over one.
+// [LAW:no-silent-failure] The scope's own error names the field and the index; the source is prefixed
+// here so an operator holding a directory of plans learns WHICH file to open, not merely that one broke.
+function parseScopeList(scopes, source) {
+  if (!Array.isArray(scopes)) {
+    throw new Error(`${source}: 'scopes' must be the list of scopes the plan partitions the change into (got ${JSON.stringify(scopes)}).`);
+  }
+  return scopes.map((scope, index) => {
+    try {
+      return parseScopeValue(scope, index);
+    } catch (e) {
+      throw new Error(`${source}: ${e.message}`);
+    }
+  });
+}
+
+module.exports = { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord, parsePlanRecord };
 
 
 /***/ }),
@@ -51770,7 +51910,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.61.5","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.62.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

@@ -54,6 +54,14 @@ Usage: node eval/run-case.js <case-dir> [options]
                       own DEFAULT_SWEEP_CAP). 0 replays the pre-convergence single-pass behavior — the
                       lever an A/B prices. The value used is recorded in every run's meta.json, and the
                       scorer refuses a case-out dir whose runs disagree, so an arm cannot be mixed.
+  --plan <plan.json>  Replay a PINNED scope plan instead of scouting one. The partition — how many scopes
+                      the change splits into, which files each claims, and the shared context every
+                      worker is shown — is read from the file rather than re-decided per run, so the
+                      structure is held FIXED across runs and the scout spawn disappears entirely.
+                      Any run's plan.json is a valid input. A plan that does not partition THIS case's
+                      changed files exactly (a file it omits, or one it names that the diff lacks) is
+                      refused before the first spawn. Omitted (the default), the scout partitions as
+                      it always has.
   --read-set <arm>    Which changed files each scope worker opens IN FULL (default: the engine's own
                       DEFAULT_READ_SET). 'assigned' is the shipped behavior — a worker reads only its own
                       scope, so the read is split across the plan. 'changed' is the pre-split behavior —
@@ -70,8 +78,8 @@ EFFORT is not pinned by the case: it is the lever an A/B varies over one frozen 
 // [LAW:effects-at-boundaries] Pure arg parse: flags + one required positional map to a plain options
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
-  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET };
-  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap', 'read-set': 'readSet' };
+  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET, plan: null };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap', 'read-set': 'readSet', plan: 'plan' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -118,6 +126,11 @@ function parseArgs(argv) {
   // than a number because the axis has no off position — 'changed' is not "less" reading, it is a
   // different partitioning of the same reading. [LAW:dataflow-not-control-flow]
   opts.readSet = parseOneOf(opts.readSet, '--read-set', READ_SETS);
+  // The plan leaves the parser as a PATH, not a record: reading and parsing the file is IO, and this
+  // parser does none — main resolves it at the run boundary, where every other file this replay opens is
+  // opened. null is the absence with a meaning ('this replay scouts its own partition'), which is the
+  // same value runMultiScope's own parameter defaults to, so it flows through untranslated.
+  // [LAW:effects-at-boundaries]
   return opts;
 }
 
@@ -413,6 +426,15 @@ async function main() {
     // instructions file) is not pinned by it — a moving local tree is the operator's; CI's checkout is immutable.
     const candidate = workingTree();
     const config = resolvePinnedConfig(manifest.engine, process.env);
+    // [LAW:parse-dont-validate] The plan crosses its boundary HERE, beside the engine pin and for the
+    // same reason: both are frozen inputs whose disagreement with the case would corrupt every run this
+    // invocation produces, so both are proven before the first repeat rather than at the first spawn.
+    // What comes out is a PlanRecord (or the null that means 'scout it'), which is exactly what
+    // runMultiScope's parameter accepts — no second shape, no re-check inland. The plan's fit to THIS
+    // case's changed files is proven one seam further in, at the pass's own pinned producer, which is
+    // the one place that holds both the plan and the material. [LAW:single-enforcer]
+    const { parsePlanRecord } = require('../src/plan');
+    const plan = opts.plan === null ? null : parsePlanRecord(fs.readFileSync(opts.plan, 'utf8'), opts.plan);
     const { TRANSCRIPT_DIR } = require('../src/debug');
     const { runMultiScope, laneCeilingFromMemory } = require('../src/multiscope');
     const registry = require('../src/engine/registry');
@@ -432,8 +454,12 @@ async function main() {
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
     fs.mkdirSync(caseOutRoot, { recursive: true });
 
+    // The partition clause is a VALUE, not a second banner: an empty string when the scout decides, the
+    // pinned file's path when it does not — so an operator reading a log can always tell which structure
+    // the numbers below belong to. [LAW:dataflow-not-control-flow]
+    const planClause = plan === null ? '' : ` with the pinned plan ${opts.plan} (${plan.scopes.length} scope(s))`;
     process.stderr.write(
-      `Replaying case '${manifest.name}' ${opts.repeats}× on ${config.name} (${config.model}) over ${files.length} file(s)…\n`,
+      `Replaying case '${manifest.name}' ${opts.repeats}× on ${config.name} (${config.model}) over ${files.length} file(s)${planClause}…\n`,
     );
 
     // [LAW:one-source-of-truth] ONE profile for the whole invocation, built before the loop: every repeat
@@ -455,7 +481,7 @@ async function main() {
       // freeze-suite, L replays share one machine, and each one sizing itself to os.totalmem() multiplies
       // the per-lane guardrail by L. [LAW:one-source-of-truth]
       const { review } = await runMultiScope({
-        chain: [config], material, registry, instructionsPath, effort,
+        chain: [config], material, registry, instructionsPath, effort, plan,
         laneCeiling: laneCeilingFromMemory(opts.memoryBudget ?? os.totalmem()),
         log: msg => process.stderr.write(`[run ${i}] ${msg}\n`),
       });

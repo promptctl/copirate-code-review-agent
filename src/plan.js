@@ -1,4 +1,8 @@
 'use strict';
+// [LAW:one-way-deps] plan.js depends on review.js, never the reverse: review.js owns what a SCOPE is
+// (parseScopeValue) and knows nothing about the record a pass writes around one. review.js has an empty
+// require graph, so this edge points downhill and closes no loop.
+const { parseScopeValue } = require('./review');
 
 // The pass's PLAN — the partition a review actually ran, as an owned value.
 //
@@ -87,4 +91,61 @@ function planRecord(fields) {
   return record;
 }
 
-module.exports = { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord };
+// [LAW:parse-dont-validate] The READER side of the mint — the one crossing a plan makes coming BACK
+// from disk, and the checkpoint that makes `--plan` possible. What goes in is bytes somebody handed us
+// (a recorded plan.json, a hand-edited one, a plan a future partitioner synthesised); what comes out is
+// a PlanRecord, which is the same stamped value a live pass mints, because it is minted by the same
+// function. Nothing downstream re-checks a plan's shape, exactly as nothing re-checks a scouted one.
+// [LAW:effects-at-boundaries] Pure: it takes the TEXT and a label naming where the text came from, so
+// the caller owns the read and every failure below can say which file to go look at.
+function parsePlanRecord(raw, source) {
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${source} is not valid JSON: ${e.message}`);
+  }
+  if (json === null || typeof json !== 'object' || Array.isArray(json)) {
+    throw new Error(`${source} is not a plan record object (got ${JSON.stringify(json)}).`);
+  }
+  // [LAW:no-silent-failure] The stamp is checked BEFORE the fields, and an unrecognised one is fatal
+  // rather than back-filled — the deliberate difference from EFFORT_SCHEMA, restated at the only
+  // boundary where it can bite. There is no era of plan.json without a version to guess a shape from,
+  // so a mismatch means the file describes a partition this engine cannot faithfully reconstruct, and
+  // replaying it anyway would produce a review that silently is not the one the plan names.
+  if (json.planSchema !== PLAN_SCHEMA) {
+    throw new Error(
+      `${source} declares planSchema ${JSON.stringify(json.planSchema)}, but this engine reads ${JSON.stringify(PLAN_SCHEMA)}. ` +
+      'A plan has no back-fill: refusing rather than replaying a shape this engine cannot reconstruct.',
+    );
+  }
+  // [LAW:one-source-of-truth] The fields are lifted BY PLAN_FIELDS, so a field added to the record is
+  // read off disk on the same day it is demanded of every producer — the reader can never be the half
+  // that forgot. Unknown keys in the file are dropped by the same act: the mint's output is the record.
+  return planRecord({
+    ...Object.fromEntries(PLAN_FIELDS.map(field => [field, json[field]])),
+    scopes: parseScopeList(json.scopes, source),
+  });
+}
+
+// [LAW:single-enforcer] Scopes off disk never crossed the collector boundary, so for THIS producer this
+// is that boundary — the same parseScopeValue, not a second idea of what a scope is. It matters at the
+// prompt: a scope's name and focus are model-authored text that lands in a worker's CONCENTRATE block,
+// and an unflattened multi-line one puts steerable text at column 0, where a continuation line reads as
+// an instruction. planRecord owns "non-empty"; this owns "is a list at all", because it must map over one.
+// [LAW:no-silent-failure] The scope's own error names the field and the index; the source is prefixed
+// here so an operator holding a directory of plans learns WHICH file to open, not merely that one broke.
+function parseScopeList(scopes, source) {
+  if (!Array.isArray(scopes)) {
+    throw new Error(`${source}: 'scopes' must be the list of scopes the plan partitions the change into (got ${JSON.stringify(scopes)}).`);
+  }
+  return scopes.map((scope, index) => {
+    try {
+      return parseScopeValue(scope, index);
+    } catch (e) {
+      throw new Error(`${source}: ${e.message}`);
+    }
+  });
+}
+
+module.exports = { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord, parsePlanRecord };

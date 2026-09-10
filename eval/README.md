@@ -210,6 +210,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
 #          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
+#          --plan <plan.json> (default: the scout re-decides the partition every run),
 #          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
 ```
 
@@ -248,6 +249,13 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     { phase, outcome, usage } with the span at usage.span — a 'worker' spawn also
                     names its scope and pass, a 'scout' carries neither. A per-replay duration is the
                     envelope of those spans, derivable from the artifact with no CI log to scrape.
+  plan.json       — the replay's STRUCTURE, as the engine's own record (src/plan.js's planRecord):
+                    { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
+                    partition the workers actually ran (each { name, focus, files }, catch-all included)
+                    and context is the planning text prefixed onto every worker's focus. provenance
+                    names which producer RAN — 'scout' (this run partitioned the change itself, and
+                    scoutUsage is what deciding cost) or 'pinned' (a --plan replay, scoutUsage null).
+                    This file is a valid --plan input: see below.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
                     effort ({roundCap, sweepCap, reasoningTier, readSet}: the arm the run ACTUALLY ran at; null
                     on runs from before it was recorded, which matches only other nulls), and candidate
@@ -321,6 +329,65 @@ axis added to `src/effort.js` is gated the day it lands with no edit here. It re
 the candidate at the baseline's arm on purpose: for a PR that moves one of those defaults the arm change
 *is* the change under test, and pinning it away would report a confident OK on a PR whose recall
 effect the gate had just neutralized. Re-freeze the baseline, or price the lever with an A/B.
+
+### Holding the structure still: `--plan` and `--plans`
+
+The **scope plan** is the review's structure: how many scopes the change splits into, which files each
+scope claims, and the shared context every worker is shown. It was re-decided by an LLM scout on every
+single invocation and recorded nowhere durable — so on a frozen case, same diff and same arm, the same
+change partitioned into anywhere from 1 to 5 scopes across runs. That is not a harmless roll: pooled
+across the cells where the scope count varied, the fewest-scope runs found **9 of 36** must-finds (25 %)
+and the most-scope runs **38 of 74** (51 %). A 26-point recall spread on a variable nobody chose — larger
+than the 16-point sweeps effect the first row of the table above was built to price
+(`copirate-determinism-5od`). `--plan` makes it a chosen value.
+
+**It is deliberately not a row in that table.** An effort arm is a dial you *turn* to see what changes; a
+pinned plan is the structure you *hold constant* while turning one. It is not on the effort profile
+(`src/multiscope.js` threads it as its own value), because it is not one of the things being compared —
+it removes the comparison's dominant noise term, which is what turns an unpaired A/B into a paired one.
+
+```bash
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> --plan <plan.json>
+```
+
+Any run's `plan.json` is a valid input — the artifact every replay already writes, so pinning a structure
+costs nothing to obtain. A pinned replay **skips the scout spawn entirely**: on one observed run
+(`eval/out/ab-sweep2/laws-4-eval-tasks/2026-09-09T09-25-37-753Z-run1/schedule.json`) that spawn took 58
+seconds and ~122k tokens. A pinned replay is therefore both cheaper and faster than the runs this harness
+bills today.
+
+A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
+at zero spend, and **both** directions are refused. A changed file no scope claims would be silently
+repaired by `planScopes`' catch-all sweep: the run would review the whole change while its `plan.json`
+claimed a partition it never ran — a different review wearing the plan's name, which is the one thing a
+pin exists to prevent. A file the plan names that the diff does not contain is the same error read from
+the other side: the plan belongs to some *other* change (a re-frozen case, a different
+`EXCLUDE_PATTERNS`), and the paths it names would reach a worker's "read these files in full" line
+pointing at nothing.
+
+`freeze-suite.js` takes `--plans <dir>`. It is **plural, and a directory rather than a file**, because a
+plan partitions *one* case's changed files — a single file forwarded to every case would be refused by all
+but one. The dir holds one `<case-name>.json` per case being replayed:
+
+```bash
+# every case replays its own frozen structure; the arm is the only thing that differs
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep2 --sweep-cap 2 --plans <plans-dir>
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-sweep0 --sweep-cap 0 --plans <plans-dir>
+```
+
+If a selected case has no plan there, or a plan does not parse, the **whole suite is refused before a
+single credential resolves**. A partially-pinned suite is the failure worth refusing: some cases would
+replay a frozen structure while the rest re-rolled it, putting the exact variance the pin removes back
+into the comparison, with nothing in the report saying which cases carried it. What the suite runner
+checks is only existence and shape — the plan's fit to a case's *diff* needs that case's material, so it
+is proven per replay, inside the engine pass.
+
+Unlike an effort arm, a mix of pinned and scouted runs under one `--out` is **not** refused: the arm
+check (`misarmedRuns`) was left alone on purpose, since a plan is not an arm. What distinguishes them
+after the fact is each run's own `plan.json`: a pinned replay records `provenance: "pinned"` and
+`scoutUsage: null`. Provenance records which producer **ran**, not which one wrote the bytes — replaying
+a file that says `"scout"` still records `"pinned"`, and the price field it carries is dropped, because
+no scout spawn happened to bill for.
 
 ## Scoring a replay
 
