@@ -230,7 +230,8 @@ describe('partitionByDirectory — the size dimension', () => {
     assert.deepEqual(src.reads, ['lib/c.js']);
     assert.match(src.focus, new RegExp(`^Review the changes to src/a\\.js, src/b\\.js in src\\.`));
     assert.match(src.focus, /The change couples these files to yours — lib\/c\.js — and other scopes own them\./);
-    assert.match(src.focus, /Read them in full too: the seam between your files and theirs is yours to check, and a defect you notice in one of them is recorded, never left for the worker that owns it\./);
+    assert.match(src.focus, /Read those files in full too: the seam between your files and theirs is yours to check, and a defect you notice in one of them is recorded, never left for the worker that owns it\./);
+    assert.doesNotMatch(src.focus, /reviewed in parts for size/);
     assert.match(src.focus, /Also read the files they import and check each connection/);
     // The seam is unordered: lib reads src/a.js by the same seam, and its focus says so.
     assert.deepEqual(scopes.find(s => s.name === 'lib').reads, ['src/a.js']);
@@ -299,7 +300,20 @@ describe('partitionByDirectory — the size dimension', () => {
     // 1/2 reads d.js first (the seam), then c.js (a sibling at coupling zero); 2/2 reads a.js (the seam),
     // then b.js. 720 of a 740-line budget: the cut is covered as it was before seams existed.
     assert.deepEqual(parts.map(s => s.reads), [['src/d.js', 'src/c.js'], ['src/a.js', 'src/b.js']]);
-    assert.deepEqual(scopes.find(s => s.name === 'docs').reads, []);
+    // The focus says which is which: a coupled file is a seam; a sibling at no detected coupling is the rest of the concern.
+    assert.match(parts[0].focus, /The change couples these files to yours — src\/d\.js — and other scopes own them\. This concern is reviewed in parts for size; the rest of it that you also read — src\/c\.js — is owned by sibling parts\. Read those files in full too/);
+  });
+
+  test('a many-part cut with no detected seams spreads the budget across the parts — each part\'s first sibling before any part\'s second — and names the rest unread', () => {
+    // Nine 360-line files, nine parts, no seams: 72 sibling candidates of 360 lines against a 3240-line
+    // budget — nine fit, one per part, and the plan says 63 went unread. Less than the two-part cut read
+    // across, and said so rather than assumed.
+    const churn = Object.fromEntries('abcdefghi'.split('').map(n => [`src/${n}.js`, 360]));
+    const { scopes, context } = partitionByDirectory(sized(Object.keys(churn), churn), []);
+    assert.equal(scopes.length, 9);
+    assert.deepEqual(scopes.map(s => s.reads.length), [1, 1, 1, 1, 1, 1, 1, 1, 1]);
+    assert.deepEqual(scopes.map(s => s.reads[0]), ['src/b.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js']);
+    assert.match(context, /covered 9 of 72 coupled reads; 63 left unread beyond their owner/);
   });
 
   test('the cut goes as fine as the cap asks: a part reads its seams, not the whole group, so the read budget no longer bounds the part count', () => {

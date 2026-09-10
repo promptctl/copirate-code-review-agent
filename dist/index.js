@@ -35594,8 +35594,11 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //      concern, so every sibling file is a candidate at whatever coupling the seams give it, zero
 //      included — ranked with the rest, so a part reads the sibling it is coupled to first and the
 //      others as the budget allows. That is what lets the cut go finer than two (8jk.4 halved with full
-//      eyesight and bought no wall clock; the material a worker sees is what its spawn costs), and what
-//      keeps a concern in a language the seam shapes do not parse read across its cut as before.
+//      eyesight and bought no wall clock; the material a worker sees is what its spawn costs). In a
+//      language the seam shapes do not parse every sibling ties at zero, and the budget — one read of
+//      the set — cannot cover k parts each reading k-1 siblings once k passes two: it is spread evenly
+//      (each part's first sibling before any part's second) and the unread rest is named in the plan.
+//      A many-part cut in such a language is read across less than the two-part cut #167 shipped.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
 // `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
@@ -35703,17 +35706,26 @@ function depthOf(dir) {
 // authored once. It names the files (so the worker knows its assignment even before the read-targets
 // line) and points the worker at the import edges the change crosses — the seam checks are where
 // multi-file defects live. [LAW:one-source-of-truth]
-// `reads` renders as a value: [] (no seam reaches this scope) says nothing; a non-empty list names the
-// coupled files and says what the second read is FOR — the seam, and any defect seen there. A finding
-// in another scope's file is recorded, never left for its owner: dedupe merges the overlap.
-// [LAW:dataflow-not-control-flow]
+// `reads` renders as a value — [{ file, coupling }], [] (no seam reaches this scope) says nothing — in
+// two sentences that each say what the second read is FOR: a file the change COUPLES to this scope (a
+// detected seam), and a sibling part of the same concern read at no detected coupling because the cut
+// alone made them one concern. Overclaiming a seam the change never showed would mislead the worker
+// about what to check. Either way a finding in another scope's file is recorded, never left for its
+// owner: dedupe merges the overlap. [LAW:dataflow-not-control-flow]
 function focusFor(dir, files, reads) {
   const where = dir === '.' ? 'the repository root' : dir;
-  const seam = reads.length > 0
-    ? ` The change couples these files to yours — ${reads.join(', ')} — and other scopes own them. `
-      + 'Read them in full too: the seam between your files and theirs is yours to check, and a defect you '
-      + 'notice in one of them is recorded, never left for the worker that owns it.'
-    : '';
+  const coupled = reads.filter(r => r.coupling > 0).map(r => r.file);
+  const siblings = reads.filter(r => r.coupling === 0).map(r => r.file);
+  const seam = (coupled.length > 0
+    ? ` The change couples these files to yours — ${coupled.join(', ')} — and other scopes own them.`
+    : '')
+    + (siblings.length > 0
+      ? ` This concern is reviewed in parts for size; the rest of it that you also read — ${siblings.join(', ')} — is owned by sibling parts.`
+      : '')
+    + (reads.length > 0
+      ? ' Read those files in full too: the seam between your files and theirs is yours to check, and a defect you '
+        + 'notice in one of them is recorded, never left for the worker that owns it.'
+      : '');
   return `Review the changes to ${files.join(', ')} in ${where}.${seam} Also read the files they import and check `
     + 'each connection: the dependency points one way, and no single fact is defined or owned on both sides.';
 }
@@ -35764,7 +35776,10 @@ function partsOf(units, churnOf, lanesFree) {
 // the same cut concern (coupling as the seams give it, zero included). Candidates are taken heaviest
 // first; each costs the file's line count (what a full read opens), and one that no longer fits is
 // passed over for the lighter ones that still do, so the budget is spent, never merely stopped at.
-// Deterministic: ties break by scope index then file. [LAW:effects-at-boundaries] pure over the seam table.
+// Deterministic: at equal coupling the candidates INTERLEAVE across scopes — every scope's first such
+// read before any scope's second, then by scope index and file — so a budget that cannot cover every
+// tie (a many-part cut with no detected seams) is spread across the parts, not handed to the first.
+// [LAW:effects-at-boundaries] pure over the seam table.
 // Scopes are addressed by INDEX throughout: a name is a rendering (two directories can render alike —
 // a directory literally called `top-level` and the root — and multiscope.js uniquifies names later), and
 // keying the spend on one would let two scopes share a reads list. [LAW:one-source-of-truth]
@@ -35785,17 +35800,24 @@ function seamReads(owned, seams, linesOf) {
     for (const file of allFiles) {
       if (own.has(file)) continue;
       const coupling = files.reduce((sum, f) => sum + (weight.get(`${f}\0${file}`) ?? 0), 0);
-      if (coupling > 0 || sibling.has(file)) candidates.push({ scope, file, coupling });
+      if (coupling > 0 || sibling.has(file)) candidates.push({ scope, file, coupling, rank: 0 });
     }
   });
-  candidates.sort((x, y) => y.coupling - x.coupling || x.scope - y.scope || (x.file < y.file ? -1 : 1));
+  // A candidate's rank is its position among its own scope's candidates at the same coupling.
+  const ranked = new Map();
+  for (const c of candidates.sort((x, y) => x.scope - y.scope || (x.file < y.file ? -1 : 1))) {
+    const key = `${c.scope}\0${c.coupling}`;
+    c.rank = ranked.get(key) ?? 0;
+    ranked.set(key, c.rank + 1);
+  }
+  candidates.sort((x, y) => y.coupling - x.coupling || x.rank - y.rank || x.scope - y.scope || (x.file < y.file ? -1 : 1));
   let remaining = allFiles.reduce((sum, f) => sum + linesOf(f), 0);
   const reads = owned.map(() => []);
   const unread = [];
   for (const c of candidates) {
     if (linesOf(c.file) <= remaining) {
       remaining -= linesOf(c.file);
-      reads[c.scope].push(c.file);
+      reads[c.scope].push({ file: c.file, coupling: c.coupling });
     } else {
       unread.push(c);
     }
@@ -35869,7 +35891,7 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, lane
   });
   const { reads, unread, covered } = seamReads(owned, seams, linesOf);
   const scopes = owned
-    .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i] }))
+    .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i].map(r => r.file) }))
     .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
   // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
@@ -36628,8 +36650,10 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     // infers "the bundle was never rebuilt" from an absence it was never told about reports the gap as a
     // defect (the same lesson the withheld-by-EXCLUDE_PATTERNS note above records). Unlike an excluded
     // file, one of these MAY be consulted when a finding needs it — it is another worker's, not out of bounds.
+    // Named through the same bounded list the excluded note uses (excludedPathList): the count is always
+    // stated, the names are a sample, so a wide change cannot grow the fixed prose past the window.
     const elsewhereSentence = elsewhere.length > 0
-      ? `The other changed files in this pull request — ${elsewhere.join(', ')} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
+      ? `The other ${elsewhere.length} changed file(s) in this pull request — ${excludedPathList(elsewhere)} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
       : '';
     return (readFiles.length > 0
       ? fullSentence + inDiffSentence + targetedSentence + elsewhereSentence
@@ -39004,24 +39028,35 @@ const DEFINITION_SHAPES = [
   /^\s*(?:module\.)?exports\.([A-Za-z_]\w*)\s*=/,
   // Shell: `name() {`.
   /^\s*([A-Za-z_]\w*)\s*\(\)\s*\{/,
-  // An indented `Name = value`: a grouped Go const/var block, a class field, a module-level table entry.
-  // `==` is a comparison, not a definition.
-  /^\s+([A-Za-z_]\w*)\s*=[^=]/,
   // A method: `  name(args) {` and TypeScript's `  async name(args): T {`. Keywords that open a block
   // with parentheses (if, for, while, switch, catch) are the shapes this rule must NOT read as methods.
   /^\s+(?:(?:static|async|public|private|protected|readonly|override)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*(?::[^{;]*)?\{\s*$/,
 ];
 const BLOCK_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
+// Go's grouped declarations — `var (` / `const (` / `type (` … `)` — define one name per indented line
+// (`ErrNoRows = errors.New(…)`, `timeout time.Duration`). Only inside such a group is an indented name
+// a definition: an indented `err = f()` in a function body is a reassignment of a local, and reading it
+// as a definition made every file that reassigns `err`, `count` or `result` a definer of that name.
+const GROUP_OPEN = /^(?:var|const|type)\s*\(\s*$/;
+const GROUP_CLOSE = /^\)/;
+const GROUP_MEMBER = /^\s+([A-Za-z_]\w*)\b/;
 
 // [LAW:effects-at-boundaries] Pure: the symbols a text defines and the symbols it uses, each once.
 // Returned as sorted arrays so the stamp is a plain, comparable, serialisable value.
 function symbolsOf(text) {
   const defines = new Set();
   const uses = new Set();
+  let inGroup = false;
   for (const line of text.split('\n')) {
     for (const shape of DEFINITION_SHAPES) {
       const m = shape.exec(line);
       if (m && !BLOCK_KEYWORDS.has(m[1])) defines.add(m[1]);
+    }
+    if (GROUP_OPEN.test(line)) inGroup = true;
+    else if (GROUP_CLOSE.test(line)) inGroup = false;
+    else if (inGroup) {
+      const m = GROUP_MEMBER.exec(line);
+      if (m) defines.add(m[1]);
     }
     for (const shape of [USE_CALL, USE_MEMBER, USE_TYPE]) {
       for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) uses.add(m[1]);

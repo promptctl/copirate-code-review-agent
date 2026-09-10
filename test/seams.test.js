@@ -28,12 +28,17 @@ describe('symbolsOf — what a text defines and mentions', () => {
       'export async function fetchAll() {}', 'export interface Scope {}', 'export type Plan = {};',
       '  if (x) {', '  for (const y of z) {', '  } catch (e) {',
     ].join('\n');
-    assert.deepEqual(symbolsOf(js).defines, ['Ledger', 'Plan', 'SCHEMA', 'Scope', 'count', 'fetchAll', 'flush', 'merge', 'parsePlan', 'planRecord']);
+    assert.deepEqual(symbolsOf(js).defines, ['Ledger', 'Plan', 'SCHEMA', 'Scope', 'fetchAll', 'flush', 'merge', 'parsePlan', 'planRecord']);
   });
 
   test('Python, Rust and shell declaration forms', () => {
     const text = ['def score(run):', 'class Judge:', '    threshold = 0.5', 'pub fn render(x: u8) {}', 'pub(crate) struct Case {}', 'freeze_case() {', '}', 'function verify_tasks {'].join('\n');
-    assert.deepEqual(symbolsOf(text).defines, ['Case', 'Judge', 'freeze_case', 'render', 'score', 'threshold', 'verify_tasks']);
+    assert.deepEqual(symbolsOf(text).defines, ['Case', 'Judge', 'freeze_case', 'render', 'score', 'verify_tasks']);
+  });
+
+  test('an indented assignment defines a name only inside a Go grouped declaration: a reassigned local is not a definition', () => {
+    const go = ['func f() error {', '\terr = g()', '\tcount = 0', '\treturn err', '}', 'var (', '\tErrNoRows = errors.New("x")', '\ttimeout time.Duration', ')', 'const (', '\tA = iota', '\tB', ')'].join('\n');
+    assert.deepEqual(symbolsOf(go).defines, ['A', 'B', 'ErrNoRows', 'f', 'timeout']);
   });
 
   test('a use is call-shaped: a bare word in prose or a hash line is neither a definition nor a use', () => {

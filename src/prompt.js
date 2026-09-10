@@ -433,8 +433,10 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     // infers "the bundle was never rebuilt" from an absence it was never told about reports the gap as a
     // defect (the same lesson the withheld-by-EXCLUDE_PATTERNS note above records). Unlike an excluded
     // file, one of these MAY be consulted when a finding needs it — it is another worker's, not out of bounds.
+    // Named through the same bounded list the excluded note uses (excludedPathList): the count is always
+    // stated, the names are a sample, so a wide change cannot grow the fixed prose past the window.
     const elsewhereSentence = elsewhere.length > 0
-      ? `The other changed files in this pull request — ${elsewhere.join(', ')} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
+      ? `The other ${elsewhere.length} changed file(s) in this pull request — ${excludedPathList(elsewhere)} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
       : '';
     return (readFiles.length > 0
       ? fullSentence + inDiffSentence + targetedSentence + elsewhereSentence

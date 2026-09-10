@@ -46,24 +46,35 @@ const DEFINITION_SHAPES = [
   /^\s*(?:module\.)?exports\.([A-Za-z_]\w*)\s*=/,
   // Shell: `name() {`.
   /^\s*([A-Za-z_]\w*)\s*\(\)\s*\{/,
-  // An indented `Name = value`: a grouped Go const/var block, a class field, a module-level table entry.
-  // `==` is a comparison, not a definition.
-  /^\s+([A-Za-z_]\w*)\s*=[^=]/,
   // A method: `  name(args) {` and TypeScript's `  async name(args): T {`. Keywords that open a block
   // with parentheses (if, for, while, switch, catch) are the shapes this rule must NOT read as methods.
   /^\s+(?:(?:static|async|public|private|protected|readonly|override)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*(?::[^{;]*)?\{\s*$/,
 ];
 const BLOCK_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
+// Go's grouped declarations — `var (` / `const (` / `type (` … `)` — define one name per indented line
+// (`ErrNoRows = errors.New(…)`, `timeout time.Duration`). Only inside such a group is an indented name
+// a definition: an indented `err = f()` in a function body is a reassignment of a local, and reading it
+// as a definition made every file that reassigns `err`, `count` or `result` a definer of that name.
+const GROUP_OPEN = /^(?:var|const|type)\s*\(\s*$/;
+const GROUP_CLOSE = /^\)/;
+const GROUP_MEMBER = /^\s+([A-Za-z_]\w*)\b/;
 
 // [LAW:effects-at-boundaries] Pure: the symbols a text defines and the symbols it uses, each once.
 // Returned as sorted arrays so the stamp is a plain, comparable, serialisable value.
 function symbolsOf(text) {
   const defines = new Set();
   const uses = new Set();
+  let inGroup = false;
   for (const line of text.split('\n')) {
     for (const shape of DEFINITION_SHAPES) {
       const m = shape.exec(line);
       if (m && !BLOCK_KEYWORDS.has(m[1])) defines.add(m[1]);
+    }
+    if (GROUP_OPEN.test(line)) inGroup = true;
+    else if (GROUP_CLOSE.test(line)) inGroup = false;
+    else if (inGroup) {
+      const m = GROUP_MEMBER.exec(line);
+      if (m) defines.add(m[1]);
     }
     for (const shape of [USE_CALL, USE_MEMBER, USE_TYPE]) {
       for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) uses.add(m[1]);

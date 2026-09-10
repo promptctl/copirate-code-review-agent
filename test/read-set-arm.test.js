@@ -76,7 +76,7 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
     assert.match(auth, /Read the complete content of THESE files — the changed files this scope reads in full: src\/auth\/login\.js, src\/auth\/token\.js/);
     // The cost cut is this sentence, not the file list: without it a worker that reads its neighbour
     // anyway would make the two arms converge in behavior while still differing on paper.
-    assert.match(auth, /The other changed files in this pull request — src\/io\/read\.js, src\/io\/write\.js — are owned and read by other scopes' workers, so their diffs are not shown here.*Do NOT read them in full/);
+    assert.match(auth, /The other 2 changed file\(s\) in this pull request — src\/io\/read\.js, src\/io\/write\.js — are owned and read by other scopes' workers, so their diffs are not shown here.*Do NOT read them in full/);
     assert.equal(readTargetsOf(auth), 'src/auth/login.js, src/auth/token.js', 'the split did not hold');
   });
 

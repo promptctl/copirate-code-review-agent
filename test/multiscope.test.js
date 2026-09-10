@@ -874,7 +874,7 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, /Read the complete content of THESE files/);
     assert.match(prompt, /src\/usage\.js, src\/report\.js/);
     // the rest of the change is NAMED, not shown: its hunk is another worker's grid
-    assert.match(prompt, /The other changed files in this pull request — src\/a\.js — are owned and read by other scopes' workers, so their diffs are not shown here/);
+    assert.match(prompt, /The other 1 changed file\(s\) in this pull request — src\/a\.js — are owned and read by other scopes' workers, so their diffs are not shown here/);
     assert.match(prompt, /### src\/usage\.js \(modified\)/);
     assert.doesNotMatch(prompt, /### src\/a\.js \(modified\)/);
     // roaming is bounded: prefer Grep for imports, don't pre-read the tree
@@ -2017,7 +2017,7 @@ describe('buildReviewInput window fit', () => {
     // go.sum is another scope's: not on the grid, not in the withheld note, and the worker is told so by name.
     assert.doesNotMatch(prompt, /### go\.sum/);
     assert.doesNotMatch(prompt, /could not be shown/); // nothing on THIS grid needed withholding once go.sum left it
-    assert.match(prompt, /The other changed files in this pull request — go\.sum — are owned and read by other scopes' workers/);
+    assert.match(prompt, /The other 1 changed file\(s\) in this pull request — go\.sum — are owned and read by other scopes' workers/);
     assert.match(prompt, /### src\/gone\.js \(removed\)/); // its hunk (deletions only) is shown, so it is on the grid
     assert.match(prompt, /### src\/mine\.js \(modified\)/);
   });
@@ -2029,7 +2029,7 @@ describe('buildReviewInput window fit', () => {
     const narrow = build({ readFiles: ['src/old.js'] });
     assert.match(narrow, /### src\/old\.js \(modified\)/);
     assert.doesNotMatch(narrow, /### go\.sum|### src\/new\.js/);
-    assert.match(narrow, /The other changed files in this pull request — go\.sum, src\/new\.js — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change\. Do NOT read them in full/);
+    assert.match(narrow, /The other 2 changed file\(s\) in this pull request — go\.sum, src\/new\.js — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change\. Do NOT read them in full/);
   });
 
   test("the 'changed' arm (empty readFiles) keeps its wording and still exempts added+shown files from a re-read", () => {
