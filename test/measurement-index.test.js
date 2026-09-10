@@ -125,6 +125,19 @@ test('runs with no provable identity are counted and explained, never dropped', 
   fs.rmSync(dir, { recursive: true });
 });
 
+// A run of another case is not near this measurement at any distance — it answers a different question.
+// Reporting it as a near miss buries the line the operator can act on under one row per case in the suite.
+test('only runs of the same case can be near; another case is not a near miss', () => {
+  const dir = writeCorpus({
+    'r/case-a/run1': meta({ caseName: 'case-a', sha: OTHER_SHA }),   // same question, stale conditions
+    'r/case-b/run1': meta({ caseName: 'case-b' }),                    // a different question entirely
+  });
+  const miss = lookupMeasurement(collect(dir), measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile() }));
+  assert.deepEqual(miss.nearest.map(n => n.differing), [['sha']]);
+  assert.doesNotMatch(renderConsultation({ consultations: [miss], unidentified: [] }), /case: has/);
+  fs.rmSync(dir, { recursive: true });
+});
+
 test('a torn run record is refused by name, never indexed around', () => {
   const dir = writeCorpus({ 'a/case-a/run1': null });
   assert.throws(() => collect(dir), /has findings.json but no meta.json/);

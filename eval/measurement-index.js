@@ -31,20 +31,26 @@ const { effortAxes } = require('../src/effort');
 // pure
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// [LAW:one-source-of-truth] The fields naming a measurement's SUBJECT — WHAT was measured (the golden
-// case) and WHAT CODE was measured (the candidate tree's commit). The effort axes name the CONDITIONS.
-// Both halves are the identity: same case at a different sha is a different fact, and so is the same sha
-// under a different arm.
-const SUBJECT_FIELDS = ['case', 'sha'];
+// [LAW:one-source-of-truth] The identity splits into a SUBJECT and its CONDITIONS, and the split is not
+// cosmetic — it is what makes "near" mean something.
+//
+// The SUBJECT is the QUESTION a measurement answers: which golden case was reviewed. The CONDITIONS are
+// what the answer is contingent on: which commit of the reviewer produced it, and under which effort
+// arm. All of them together are the identity — a differing condition is a different fact and can never
+// be counted as a match — but only a run sharing the SUBJECT can be NEAR: "you measured this case, at an
+// older sha" is a difference an operator acts on, while a run of another case is not close to this one
+// at any distance, it simply answers something else.
+const SUBJECT_FIELD = 'case';
+const CONDITION_FIELDS = ['sha', ...effortAxes()];
 
-// A subject field and an effort axis sharing a name would collapse two facts into one key — silently, and
+// A condition field and the subject sharing a name would collapse two facts into one key — silently, and
 // only for whoever added the axis. The overlap is refused at LOAD, where it cannot reach a measurement.
 // [LAW:no-silent-failure] [LAW:types-are-the-program]
-const collided = effortAxes().filter(axis => SUBJECT_FIELDS.includes(axis));
+const collided = effortAxes().filter(axis => axis === SUBJECT_FIELD || axis === 'sha');
 if (collided.length > 0) {
   throw new Error(
-    `Effort axis ${collided.join(', ')} collides with a measurement subject field (${SUBJECT_FIELDS.join(', ')}). ` +
-    'Rename the axis, or give the subject fields their own namespace — a shared name silently merges two facts.',
+    `Effort axis ${collided.join(', ')} collides with a measurement identity field ('${SUBJECT_FIELD}', 'sha'). ` +
+    'Rename the axis, or give the identity fields their own namespace — a shared name silently merges two facts.',
   );
 }
 
@@ -59,8 +65,8 @@ if (collided.length > 0) {
 // profile" structural — callers hand in what score.js's parseMeta produced, which has already been
 // through completeEffort.
 function measurementFields({ caseName, sha, effort }) {
-  const fields = { case: caseName, sha };
-  for (const axis of effortAxes()) fields[axis] = effort[axis];
+  const fields = { [SUBJECT_FIELD]: caseName };
+  for (const field of CONDITION_FIELDS) fields[field] = field === 'sha' ? sha : effort[field];
   return fields;
 }
 
@@ -114,15 +120,17 @@ function measurementOf({ dir, root, meta, treeIdentity }) {
 // Both are computed by the SAME fold, so a hit is `differing.length === 0` and nothing else — there is no
 // second equality rule that could disagree with the difference the report names. [LAW:one-source-of-truth]
 //
-// `nearest` keeps only the minimum-difference tier: a corpus of forty runs yields forty misses for any
-// identity, and listing them all buries the one that matters. The runs differing in a single field are
-// the ones an operator can act on.
+// `nearest` is drawn only from runs sharing the SUBJECT, and then keeps only the minimum-difference tier.
+// Both narrowings exist because the corpus is large and an unfiltered miss list buries the line that
+// matters: runs of another case are not near this measurement at any distance (they answer a different
+// question), and among same-case runs the ones differing in a single condition are the ones an operator
+// can act on.
 //
 // The corpus's `unidentified` runs are deliberately NOT part of this result: they are a fact about the
 // corpus, not about this identity, and folding them in would reprint the same list once per case.
 function lookupMeasurement(corpus, wanted) {
   const scored = corpus.measurements.map(m => ({ ...m, differing: differingFields(wanted, m.fields) }));
-  const misses = scored.filter(s => s.differing.length > 0);
+  const misses = scored.filter(s => s.differing.length > 0 && s.fields[SUBJECT_FIELD] === wanted[SUBJECT_FIELD]);
   const closest = misses.reduce((min, s) => Math.min(min, s.differing.length), Infinity);
   return {
     key: measurementKey(wanted),
@@ -226,7 +234,8 @@ function collectMeasurements({ corpusRoot, parseMeta, treeIdentity }) {
 }
 
 module.exports = {
-  SUBJECT_FIELDS,
+  SUBJECT_FIELD,
+  CONDITION_FIELDS,
   measurementFields,
   measurementKey,
   differingFields,
