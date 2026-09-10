@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const {
-  parseArgs, planKey, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory,
+  parseArgs, planKey, planDigest, armLabels, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory,
   binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown,
 } = require('../eval/paired');
 const { PLAN_SCHEMA } = require('../src/plan');
@@ -101,6 +101,23 @@ test('planKey distinguishes different partitions and survives key reordering', (
   assert.deepEqual(canonicalize({ b: 1, a: [{ d: 2, c: 3 }] }), { a: [{ c: 3, d: 2 }], b: 1 });
 });
 
+test('the arms are named by whatever distinguishes them, never by a basename both share', () => {
+  // The common case keeps the short names.
+  assert.deepEqual(armLabels('/e/out/ab-sweep2', '/e/out/ab-sweep0'), ['ab-sweep2', 'ab-sweep0']);
+  // Two roots with the SAME basename keep enough path to tell them apart.
+  assert.deepEqual(armLabels('/runsA/case-out', '/runsB/case-out'), ['runsA/case-out', 'runsB/case-out']);
+  // A root inside the other still yields two non-empty, distinct labels.
+  assert.deepEqual(armLabels('/x', '/x/y'), ['x', 'x/y']);
+  assert.deepEqual(armLabels('/a/b/c/d', '/a/z'), ['b/c/d', 'z']);
+});
+
+test('planDigest distinguishes two plans of the same scope count', () => {
+  const other = { context: 'the shared context', scopes: [{ name: 'left', focus: 'l', files: ['a.ts'] }, { name: 'right', focus: 'r', files: ['b.ts'] }] };
+  assert.equal(planDigest(planKey(PLAN_TWO_SCOPES)).length, 8);
+  assert.notEqual(planDigest(planKey(PLAN_TWO_SCOPES)), planDigest(planKey(other)));
+  assert.equal(planDigest(planKey(PLAN_TWO_SCOPES)), planDigest(planKey(PLAN_TWO_SCOPES)));
+});
+
 // ── pairing ────────────────────────────────────────────────────────────────────────────────────────
 
 test('pairs are keyed by (case, plan, finding) across every replicate', () => {
@@ -146,7 +163,7 @@ test('runs whose plans differ are refused, not paired', () => {
   const b = writeArm(tmpRoot('armB'), { 'case-one': [{ plan: PLAN_TWO_SCOPES, sweepCap: 0, found: [1], missed: [] }] });
   assert.throws(
     () => pairArms(readArm(a, 'A'), readArm(b, 'B')),
-    /did not replay the same plans[\s\S]*1 scope\(s\) ×1[\s\S]*2 scope\(s\) ×1/,
+    /did not replay the same plans[\s\S]*1 scope\(s\) \[[0-9a-f]{8}\] ×1[\s\S]*2 scope\(s\) \[[0-9a-f]{8}\] ×1/,
   );
 });
 
@@ -177,10 +194,31 @@ test('an arm root that blended two efforts is refused', () => {
   assert.throws(() => readArm(a, 'A'), /ran at effort roundCap=0 sweepCap=0 .* but earlier runs ran at roundCap=0 sweepCap=2 /);
 });
 
-test('a case whose must-find inventory moved between replays is refused', () => {
+test('a case whose must-find inventory moved between replays is refused, naming the ids that differ', () => {
   const a = writeArm(tmpRoot('armA'), { 'case-one': [{ found: [1], missed: [2] }] });
   const b = writeArm(tmpRoot('armB'), { 'case-one': [{ sweepCap: 0, found: [1], missed: [] }] });
   assert.throws(() => pairArms(readArm(a, 'A'), readArm(b, 'B')), /inventory moved between these replays/);
+  // A SAME-SIZE swap is the case counts cannot describe: the refusal must name the ids themselves.
+  const c = writeArm(tmpRoot('armA'), { 'case-one': [{ found: [5], missed: [] }] });
+  const d = writeArm(tmpRoot('armB'), { 'case-one': [{ sweepCap: 0, found: [6], missed: [] }] });
+  assert.throws(
+    () => pairArms(readArm(c, 'A'), readArm(d, 'B')),
+    /only in the first: \[6\]; only in the second: \[5\]/,
+  );
+});
+
+test('a run filed under the wrong case dir is refused by name, not blamed on inventory drift', () => {
+  const root = tmpRoot('armA');
+  writeArm(root, { 'case-one': [{ found: [1], missed: [] }] });
+  fs.renameSync(path.join(root, 'case-one'), path.join(root, 'case-two'));
+  assert.throws(() => readArm(root, 'A'), /records case 'case-one' but sits under 'case-two' — a misplaced run/);
+});
+
+test('a scorecard whose must-find ids collide cannot be paired and says why', () => {
+  const root = tmpRoot('armA');
+  const dir = writeRun(path.join(root, 'case-one'), 'run', { found: [null], missed: [null] });
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  assert.throws(() => readArm(root, 'A'), /records 2 inventory must-find outcome\(s\) under 1 distinct id\(s\)/);
 });
 
 // ── the statistic ──────────────────────────────────────────────────────────────────────────────────
@@ -254,7 +292,7 @@ test('the report states discordant pairs, the paired p-value, and both pooled ra
     armA: { label: 'ab-sweep2', root: '/x/ab-sweep2', effort: 'sweepCap=2' },
     armB: { label: 'ab-sweep0', root: '/x/ab-sweep0', effort: 'sweepCap=0' },
     cases: ['case-one'],
-    blocks: [{ case: 'case-one', scopeCount: 3, provenance: 'pinned', replicates: 5, findings: 2, stat }],
+    blocks: [{ case: 'case-one', plan: 'deadbeef', scopeCount: 3, provenance: 'pinned', replicates: 5, findings: 2, stat }],
     stat,
   });
   assert.match(md, /8 pair\(s\) found only by A, 1 only by B/);
@@ -262,7 +300,7 @@ test('the report states discordant pairs, the paired p-value, and both pooled ra
   assert.match(md, /A 90\.0% vs B 20\.0%/);
   assert.match(md, /approximate 95% resolution \*\*58\.8%\*\*/);
   assert.match(md, /VERDICT: arm A found more/);
-  assert.match(md, /\| `case-one` \| 3 \| pinned \| 5 \| 2 \| 8 \| 1 \| 1 \| 0 \|/);
+  assert.match(md, /\| `case-one` \| `deadbeef` \| 3 \| pinned \| 5 \| 2 \| 8 \| 1 \| 1 \| 0 \|/);
 });
 
 test('a null result names the effect it could not have seen', () => {

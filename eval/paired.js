@@ -31,6 +31,7 @@
 // is evidence for a decision, not the decision, and the one gate this repo has (eval/compare.js) is the
 // place a floor is enforced. [LAW:single-enforcer]
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -111,6 +112,31 @@ function planKey(plan) {
   return JSON.stringify(canonicalize({ context: plan.context, scopes: plan.scopes }));
 }
 
+// [LAW:one-source-of-truth] The plan key SHOWN to an operator, derived from the key itself so a message
+// and the grouping it describes can never name different plans. Scope count alone does not identify a
+// partition — a --plans dir can hold two different 3-scope splits of the same change — so a refusal
+// offering only the count cannot say which plan is missing from which arm.
+function planDigest(key) {
+  return crypto.createHash('sha1').update(key).digest('hex').slice(0, 8);
+}
+
+// [LAW:one-source-of-truth] The two arms' NAMES in the report, minted together from both roots, because
+// a name is only useful if it distinguishes — and `basename` does not: `runsA/case-out` and
+// `runsB/case-out` are two different arms with one name, which prints two indistinguishable halves and
+// collides the default --out dir for two genuinely different comparisons.
+//
+// Each label is the root relative to the common ancestor of the two roots' PARENTS, so it is injective by
+// construction and keeps exactly as much path as it takes to tell them apart: `eval/out/ab-sweep2` and
+// `eval/out/ab-sweep0` still read `ab-sweep2` / `ab-sweep0`. Anchoring on the parents rather than the
+// roots is what guarantees a label never shrinks to the empty string when one root sits inside the other.
+// [LAW:dataflow-not-control-flow] One expression, always the same one — no "if the basenames collide" fork.
+function armLabels(rootA, rootB) {
+  const [a, b] = [path.dirname(rootA).split(path.sep), path.dirname(rootB).split(path.sep)];
+  const firstDiff = a.findIndex((seg, i) => seg !== b[i]);
+  const anchor = a.slice(0, firstDiff === -1 ? Math.min(a.length, b.length) : firstDiff).join(path.sep) || path.sep;
+  return [path.relative(anchor, rootA), path.relative(anchor, rootB)];
+}
+
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value === null || typeof value !== 'object') return value;
@@ -139,13 +165,20 @@ function readArm(root, label) {
 
   const runs = [];
   for (const caseDir of caseDirs) {
-    for (const dir of listRunDirs(caseDir)) runs.push(readRun(dir, label));
+    for (const dir of listRunDirs(caseDir)) runs.push(readRun(dir, path.basename(caseDir), label));
   }
   return { label, root: resolved, effort: agreedArmEffort(runs, label), runs };
 }
 
-function readRun(dir, label) {
+// [LAW:single-enforcer] The rule about a MISPLACED run is one rule, and eval/compare.js's readPriorRuns
+// already states it at the identical boundary — a walker over case dirs reading each run's meta.json. A
+// run whose meta names another case would otherwise be pooled into the dir it sits in, where the
+// inventory check downstream catches it by accident and blames expected.json drift for a misfiled dir.
+function readRun(dir, caseName, label) {
   const meta = parseMeta(readFileOrRefuse(path.join(dir, 'meta.json'), label, 'was never replayed to completion'), path.join(dir, 'meta.json'));
+  if (meta.case !== caseName) {
+    throw new Error(`Arm ${label}: ${dir} records case '${meta.case}' but sits under '${caseName}' — a misplaced run; move or remove it.`);
+  }
   const plan = parsePlanRecord(
     readFileOrRefuse(path.join(dir, 'plan.json'), label, 'recorded no plan — it predates copirate-determinism-5od.ea7, so what structure it ran is unknown and it cannot be paired'),
     path.join(dir, 'plan.json'),
@@ -178,6 +211,17 @@ function outcomesOf(scorecard, dir) {
   const outcomes = new Map();
   for (const id of bucket.foundIds) outcomes.set(String(id), true);
   for (const id of bucket.missedIds) outcomes.set(String(id), false);
+  // [LAW:no-silent-failure] The scorecard says how many outcomes it recorded; a smaller map means two
+  // findings shared an id (two null commentIds in a hand-authored inventory is the plausible way) and one
+  // silently overwrote the other. Since every run collapses them identically, the inventory check below
+  // cannot see it — the paired statistic would just quietly measure fewer findings than the case declares.
+  const declared = bucket.foundIds.length + bucket.missedIds.length;
+  if (outcomes.size !== declared) {
+    throw new Error(
+      `${dir}/scorecard.json records ${declared} inventory must-find outcome(s) under ${outcomes.size} distinct id(s) — ` +
+      'ids collide, so a finding\'s outcome is unrecoverable. Pairing treats the finding id as the unit of comparison and cannot proceed.',
+    );
+  }
   return outcomes;
 }
 
@@ -228,6 +272,7 @@ function pairArms(armA, armB) {
       blocks.push({
         case: caseName,
         planKey: key,
+        plan: planDigest(key),
         scopeCount: JSON.parse(key).scopes.length,
         provenance: [...new Set([...replicatesA, ...replicatesB].map(r => r.provenance))].sort().join('+'),
         replicates: replicatesA.length,
@@ -291,7 +336,7 @@ function agreedCaseSet(armA, armB) {
 function agreedPlanSet(caseName, armA, byPlanA, armB, byPlanB) {
   const keys = [...byPlanA.keys()].sort();
   const describe = (byPlan) => (byPlan.size === 0 ? 'none' : [...byPlan.entries()]
-    .map(([key, runs]) => `${JSON.parse(key).scopes.length} scope(s) ×${runs.length}`).sort().join(', '));
+    .map(([key, runs]) => `${JSON.parse(key).scopes.length} scope(s) [${planDigest(key)}] ×${runs.length}`).sort().join(', '));
   for (const key of new Set([...byPlanA.keys(), ...byPlanB.keys()])) {
     const a = byPlanA.get(key);
     const b = byPlanB.get(key);
@@ -316,8 +361,12 @@ function agreedInventory(caseName, runs) {
   for (const run of rest) {
     const ids = [...run.outcomes.keys()].sort();
     if (ids.join(',') !== inventory.join(',')) {
+      // The ids themselves, not their counts: a same-size swap (5 for 6) prints two identical halves and
+      // leaves the operator with a refusal they cannot act on. [LAW:no-silent-failure]
+      const only = (a, b) => a.filter(id => !b.includes(id));
       throw new Error(
-        `Case '${caseName}': ${run.dir} was scored against ${ids.length} must-find(s) but ${first.dir} against ${inventory.length}. ` +
+        `Case '${caseName}': ${run.dir} was scored against must-find(s) [${ids.join(', ')}] but ${first.dir} against [${inventory.join(', ')}] — ` +
+        `only in the first: [${only(ids, inventory).join(', ')}]; only in the second: [${only(inventory, ids).join(', ')}]. ` +
         'The case inventory moved between these replays; they measure different things and cannot be paired.',
       );
     }
@@ -412,12 +461,12 @@ function renderPairedMarkdown(report) {
     `**Pooled over the same paired set:** A ${pct(s.rateA)} vs B ${pct(s.rateB)} → Δ **${signedPct(s.difference)}** ` +
       `(paired SE ${pct(s.standardError)}; approximate 95% resolution **${pct(s.mde95)}** — the design figure, not the ruling).`,
     '',
-    '| case | scopes | plan provenance | replicates/arm | must-finds | A only | B only | both | neither |',
-    '|------|--------|-----------------|----------------|------------|--------|--------|------|---------|',
+    '| case | plan | scopes | provenance | replicates/arm | must-finds | A only | B only | both | neither |',
+    '|------|------|--------|------------|----------------|------------|--------|--------|------|---------|',
   ];
   for (const block of report.blocks) {
     lines.push(
-      `| \`${block.case}\` | ${block.scopeCount} | ${block.provenance} | ${block.replicates} | ${block.findings} | ` +
+      `| \`${block.case}\` | \`${block.plan}\` | ${block.scopeCount} | ${block.provenance} | ${block.replicates} | ${block.findings} | ` +
       `${block.stat.discordantAB} | ${block.stat.discordantBA} | ${block.stat.bothFound} | ${block.stat.bothMissed} |`,
     );
   }
@@ -447,9 +496,10 @@ function main() {
   const armB = readArm(opts.armB, 'B');
   const { pairs, blocks } = pairArms(armA, armB);
 
+  const [labelA, labelB] = armLabels(armA.root, armB.root);
   const report = {
-    armA: { label: path.basename(armA.root), root: armA.root, effort: armA.effort },
-    armB: { label: path.basename(armB.root), root: armB.root, effort: armB.effort },
+    armA: { label: labelA, root: armA.root, effort: armA.effort },
+    armB: { label: labelB, root: armB.root, effort: armB.effort },
     cases: [...new Set(blocks.map(b => b.case))],
     // Every block carries its own reduction of the same shape as the whole — one statistic function, so a
     // per-block number and the headline can never be computed two different ways. [LAW:one-source-of-truth]
@@ -463,7 +513,9 @@ function main() {
   // whole plan JSON and would swamp the artifact.
   for (const block of report.blocks) delete block.planKey;
 
-  const outDir = path.resolve(opts.out || path.join(__dirname, 'out', `paired-${report.armA.label}-vs-${report.armB.label}`));
+  // Separators flattened so a label that had to keep some path stays ONE directory component.
+  const slug = (label) => label.split(path.sep).join('-');
+  const outDir = path.resolve(opts.out || path.join(__dirname, 'out', `paired-${slug(report.armA.label)}-vs-${slug(report.armB.label)}`));
   fs.mkdirSync(outDir, { recursive: true });
   const markdown = renderPairedMarkdown(report);
   fs.writeFileSync(path.join(outDir, 'paired.json'), JSON.stringify(report, null, 2) + '\n');
@@ -483,4 +535,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { parseArgs, planKey, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory, binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown };
+module.exports = { parseArgs, planKey, planDigest, armLabels, canonicalize, readArm, pairArms, agreedCaseSet, agreedPlanSet, agreedInventory, binomialTailHalf, mcnemarExact, reducePaired, renderPairedMarkdown };

@@ -421,7 +421,12 @@ mistake the refusal exists to catch. Because of that, no separate pinned-vs-scou
 a scouted arm re-rolls its plans, so its keys will not match a pinned arm's and the comparison refuses on
 its own. The other refusals, each naming the offending dir: a run with no `plan.json` (it predates the
 plan record, so what structure it ran is unknown), an unscored run, an arm root that blended two effort
-arms, a case present in only one arm, and a case whose must-find inventory moved between the two replays.
+arms, a run whose `meta.json` names a different case than the dir it sits under (the same misplaced-run
+rule `compare.js` applies at the same kind of boundary), a scorecard whose must-find ids collide so an
+outcome is unrecoverable, a case present in only one arm, and a case whose must-find inventory moved
+between the two replays — that last one naming the ids that differ, since a same-size swap is invisible
+in a count. Plans are named in refusals and in the report by a short digest of their key, because scope
+count alone does not identify a partition.
 
 Within one `(case, plan)` block each arm may hold several replicates — `freeze-suite.js -n 5 --plans <dir>`
 replays one plan five times — and the k-th run of arm A is matched with the k-th run of arm B in sorted
