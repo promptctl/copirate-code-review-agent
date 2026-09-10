@@ -257,7 +257,7 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     path lands in exactly one scope's files, and reads is what the scope opens in full
                     beyond its own — the sibling parts of a concern cut for size) and context is the planning text prefixed onto every
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
-                    scopes are a pure function of the changed paths, no spawn, scoutUsage null), 'scout'
+                    scopes are a pure function of the changed file paths and their churn, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
                     spawn; scoutUsage is what deciding it cost) or 'pinned' (a --plan replay, scoutUsage
                     null). This file is a valid --plan input: see below.
@@ -362,8 +362,9 @@ of the table above was built to price (`copirate-determinism-5od`). Worse, in 3 
 emitted scopes with no files at all, so every worker fell back to reading the whole diff at about 3× the
 cost while the run scored as a valid sample — and two of those runs scored best on recall, poisoning the
 A/B. The partition removed that variance at the source: 5 replays of one case now share one structure by
-construction, and `MIN_SCOPE_FILES` is the one width lever the rule exposes, the thing to measure with
-this harness later.
+construction, and the rule's levers are named constants to measure with this harness later:
+`MIN_SCOPE_FILES` for width, and `LOPSIDED_RATIO`, `SCOPE_CHURN_CAP` and `SCOPE_CHURN_FLOOR` for the
+balance cut of rule 4.
 
 So on a frozen PR case every un-pinned replay already runs the same structure. `--plan` remains the way
 to hold a review to a structure *other* than the computed one — a partition produced under a different
@@ -387,7 +388,8 @@ spawns anything to decide the plan.
 A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
 at zero spend. A partition is a cover with no overlap, and all three ways to miss it are refused: a
 changed file no scope claims, a file the plan names that the diff lacks, and a file claimed by more than
-one scope. Nothing downstream repairs coverage — every changed
+one scope. A fourth refusal reads the same error from the `reads` side: a scope that reads a file the
+diff lacks belongs to some other change, and is refused with the rest. Nothing downstream repairs coverage — every changed
 path lands in exactly one scope because the producer puts it there, not because a later sweep catches
 what it missed — so a changed file no scope claims would simply go unreviewed while its `plan.json`
 claimed a partition of the whole change: a different review wearing the plan's name, which is the one

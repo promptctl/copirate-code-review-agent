@@ -36213,9 +36213,11 @@ function reviewCharter(toolNames) {
 // [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
 // value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
 // owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
-// arm, src/effort.js, applied to that assignment). They coincide under the shipped 'assigned' arm, which
-// is why one list once passed for both — and diverge under 'changed', where readFiles is empty and every
-// worker reads the whole set while exactly one still owns the bump. Empty readFiles is the whole-set read
+// arm, src/effort.js, applied to that assignment). Under the shipped 'assigned' arm readFiles is the
+// assignment plus the scope's `reads` — the sibling parts of a concern cut for size (src/partition.js
+// rule 4) — so the two coincide only for an uncut scope, which is why one list once passed for both.
+// Under 'changed' they diverge fully: readFiles is empty and every worker reads the whole set while
+// exactly one still owns the bump. Empty readFiles is the whole-set read
 // (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
