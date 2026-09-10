@@ -307,7 +307,6 @@ test("buildCaseMaterial threads the exclusion record into the material, so a rep
   });
   const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
   assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
-  assert.match(material.buildScoutPrompt(CASE_TOOL_NAMES), /Withheld from the list above — changed in this pull request:\*\* dist\/index\.js/);
 });
 
 test('buildCaseMaterial with no exclusions reviews every file and says nothing about exclusion', () => {

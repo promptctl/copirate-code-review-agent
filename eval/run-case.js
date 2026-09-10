@@ -6,7 +6,7 @@
 // second review implementation drifting. [LAW:one-source-of-truth]
 //
 // It drives the exact seams scripts/local-review.js already drives — synthesizeProviderConfig (config),
-// parseUnifiedDiff (diff), buildPrMaterial + runMultiScope (the SAME adaptive scout→workers engine
+// parseUnifiedDiff (diff), buildPrMaterial + runMultiScope (the SAME plan→workers engine
 // production runs). Nothing about config, diffs, prompts, or the pass is reimplemented here; this file
 // is an INSTRUMENT that arranges frozen inputs and captures outputs, not a review. [LAW:decomposition]
 //
@@ -54,14 +54,15 @@ Usage: node eval/run-case.js <case-dir> [options]
                       own DEFAULT_SWEEP_CAP). 0 replays the pre-convergence single-pass behavior — the
                       lever an A/B prices. The value used is recorded in every run's meta.json, and the
                       scorer refuses a case-out dir whose runs disagree, so an arm cannot be mixed.
-  --plan <plan.json>  Replay a PINNED scope plan instead of scouting one. The partition — how many scopes
-                      the change splits into, which files each claims, and the shared context every
-                      worker is shown — is read from the file rather than re-decided per run, so the
-                      structure is held FIXED across runs and the scout spawn disappears entirely.
+  --plan <plan.json>  Replay a PINNED scope plan instead of the computed one. The partition — how many
+                      scopes the change splits into, which files each claims, and the shared context
+                      every worker is shown — is read from the file rather than computed from the
+                      changed paths, so a replay can hold the review to a structure other than the one
+                      the engine computes (a different MIN_SCOPE_FILES, a hand-authored plan).
                       Any run's plan.json is a valid input. A plan that does not partition THIS case's
                       changed files exactly (a file it omits, or one it names that the diff lacks) is
-                      refused before the first spawn. Omitted (the default), the scout partitions as
-                      it always has.
+                      refused before the first spawn. Omitted (the default), the engine computes the
+                      partition from the changed paths — the same structure on every replay.
   --read-set <arm>    Which changed files each scope worker opens IN FULL (default: the engine's own
                       DEFAULT_READ_SET). 'assigned' is the shipped behavior — a worker reads only its own
                       scope, so the read is split across the plan. 'changed' is the pre-split behavior —
@@ -128,7 +129,7 @@ function parseArgs(argv) {
   opts.readSet = parseOneOf(opts.readSet, '--read-set', READ_SETS);
   // The plan leaves the parser as a PATH, not a record: reading and parsing the file is IO, and this
   // parser does none — main resolves it at the run boundary, where every other file this replay opens is
-  // opened. null is the absence with a meaning ('this replay scouts its own partition'), which is the
+  // opened. null is the absence with a meaning ('this replay computes its own partition'), which is the
   // same value runMultiScope's own parameter defaults to, so it flows through untranslated.
   // [LAW:effects-at-boundaries]
   return opts;
@@ -429,7 +430,7 @@ async function main() {
     // [LAW:parse-dont-validate] The plan crosses its boundary HERE, beside the engine pin and for the
     // same reason: both are frozen inputs whose disagreement with the case would corrupt every run this
     // invocation produces, so both are proven before the first repeat rather than at the first spawn.
-    // What comes out is a PlanRecord (or the null that means 'scout it'), which is exactly what
+    // What comes out is a PlanRecord (or the null that means 'compute it'), which is exactly what
     // runMultiScope's parameter accepts — no second shape, no re-check inland. The plan's fit to THIS
     // case's changed files is proven one seam further in, at the pass's own pinned producer, which is
     // the one place that holds both the plan and the material. [LAW:single-enforcer]
@@ -454,7 +455,7 @@ async function main() {
     const caseOutRoot = path.join(path.resolve(opts.out), manifest.name);
     fs.mkdirSync(caseOutRoot, { recursive: true });
 
-    // The partition clause is a VALUE, not a second banner: an empty string when the scout decides, the
+    // The partition clause is a VALUE, not a second banner: an empty string when the engine computes the partition, the
     // pinned file's path when it does not — so an operator reading a log can always tell which structure
     // the numbers below belong to. [LAW:dataflow-not-control-flow]
     const planClause = plan === null ? '' : ` with the pinned plan ${opts.plan} (${plan.scopes.length} scope(s))`;

@@ -69,9 +69,9 @@ const DEFAULT_SWEEP_CAP = 2;
 //                that was always value-driven, and adds no second prompt path. [LAW:composability]
 // The projection takes the scope's assigned files and returns the read set, so the two arms are one
 // signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
-// `scope.files` remains the coverage record either way (planScopes' set-membership check, and the
-// exclusion strip in withoutWithheldFiles), so an arm changes what a worker READS and nothing about
-// what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
+// `scope.files` remains the coverage record either way (the partition assigns every changed path once,
+// and pinnedProposal proves a replayed plan against the changed set), so an arm changes what a worker
+// READS and nothing about what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
 const READ_SET_PROJECTION = {
   assigned: (scopeFiles) => scopeFiles,
   changed: () => [],

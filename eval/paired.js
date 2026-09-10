@@ -97,9 +97,9 @@ function parseArgs(argv) {
 // It keys on what the workers RAN — the scopes and the shared context — and deliberately not on
 // `provenance` or `scoutUsage`. Provenance names the producer, and two runs can both say "pinned" while
 // carrying different partitions; that mistake would silently pair arms across different structures,
-// which is the one thing this file exists to prevent. Conversely a scouted run that happened to re-roll
-// the identical partition IS the same structure and pairs legitimately — so no separate pinned/scouted
-// check is needed here, and adding one would be a rival definition of the same rule.
+// which is the one thing this file exists to prevent. Conversely a computed run whose partition equals
+// a pinned one IS the same structure and pairs legitimately — so no separate pinned/computed check is
+// needed here, and adding one would be a rival definition of the same rule.
 // [LAW:single-enforcer]
 //
 // Object keys are sorted so a hand-written or re-serialized plan file keys the same as a recorded one;

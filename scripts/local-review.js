@@ -8,7 +8,7 @@
 // It reuses the action's own seams — synthesizeProviderConfig (config), parseUnifiedDiff (diff), and
 // runMultiScope (the SAME adaptive multi-scope engine production runs) — so its behavior matches a
 // production run for the same inputs. [LAW:one-source-of-truth] Nothing about config, diffs, prompts,
-// or the scout→workers pass is reimplemented here.
+// or the plan→workers pass is reimplemented here.
 //
 // [LAW:one-type-per-behavior] Both modes drive runMultiScope and differ ONLY in the material (a PR
 // diff vs the repo tree) — the exact differential run.js has. So either mode is equally drivable here;

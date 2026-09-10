@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 
 const { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord, parsePlanRecord } = require('../src/plan');
 const { buildPrMaterial, runMultiScopePass } = require('../src/multiscope');
+const { partitionByDirectory } = require('../src/partition');
 
 // The plan is the review's STRUCTURE, and until this artifact existed it was recoverable only by parsing
 // worker transcripts — which is why a variable carrying a 26-point recall spread on a frozen case could
@@ -42,8 +43,8 @@ describe('the plan mint — a recorded partition a reader can trust', () => {
   });
 
   test('provenance is a closed vocabulary — an unknown origin is refused, naming the ones that exist', () => {
-    assert.deepEqual(PLAN_PROVENANCES, ['scout', 'pinned']);
-    assert.throws(() => planRecord({ ...VALID, provenance: 'guessed' }), /unknown provenance "guessed".*scout, pinned/s);
+    assert.deepEqual(PLAN_PROVENANCES, ['partition', 'scout', 'pinned']);
+    assert.throws(() => planRecord({ ...VALID, provenance: 'guessed' }), /unknown provenance "guessed".*partition, scout, pinned/s);
     // The absent case is the one the epic calls out by name: a plan whose origin is unknown is an
     // absence that reads like an answer, so it can never be spelled as a missing field.
     assert.throws(() => planRecord({ ...VALID, provenance: undefined }), /provenance is undefined/);
@@ -55,12 +56,14 @@ describe('the plan mint — a recorded partition a reader can trust', () => {
     assert.equal(planRecord({ ...VALID, scoutUsage: null }).scoutUsage, null);
   });
 
-  test('a pinned plan cannot be billed for a spawn it never made', () => {
-    assert.throws(
-      () => planRecord({ ...VALID, provenance: 'pinned' }),
-      /provenance 'pinned' plans no scout spawn, so scoutUsage must be null/,
-    );
-    assert.equal(planRecord({ ...VALID, provenance: 'pinned', scoutUsage: null }).provenance, 'pinned');
+  test('a plan that spawned no scout — pinned, or computed by the partition — cannot be billed for one', () => {
+    for (const provenance of ['pinned', 'partition']) {
+      assert.throws(
+        () => planRecord({ ...VALID, provenance }),
+        new RegExp(`provenance '${provenance}' plans no scout spawn, so scoutUsage must be null`),
+      );
+      assert.equal(planRecord({ ...VALID, provenance, scoutUsage: null }).provenance, provenance);
+    }
   });
 
   test('a plan with no scope is no plan: the empty partition is refused rather than recorded', () => {
@@ -91,16 +94,15 @@ const FILES = [
 // One pass whose material CAPTURES what each worker was handed. The capture sits at material.buildWorkerPrompt
 // — the exact seam runScopeWorker hands the assignment to — rather than regexing the rendered prompt, so what
 // this test compares against is the argument itself, not a re-reading of its rendering.
-// `pinnedPlan` is the pass's own parameter, threaded straight through: a null scouts (every test below the
-// pinned section), a record replays it. `scoutScopes` is what a scout WOULD have planned, so a pinned run
-// passes null for it and the fake adapter answers every spawn as a worker — a scout spawn on that path is
-// a bug this harness must be able to see, not something it quietly supplies.
-async function passRecording(scoutScopes, { withheldPaths = [], pinnedPlan = null } = {}) {
+// `pinnedPlan` is the pass's own parameter, threaded straight through: a null computes the partition from
+// the changed paths, a record replays it. The fake adapter answers EVERY spawn as a worker — a PR pass buys
+// no scout, so a scout spawn on either path is a bug this harness must be able to see, not something it
+// quietly supplies.
+async function passRecording({ pinnedPlan = null } = {}) {
   const pr = buildPrMaterial({ files: FILES, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
   const handed = [];
   const material = {
     ...pr,
-    withheldPaths,
     buildWorkerPrompt: (focusText, toolNames, assignment, priorFindings) => {
       // The RENDERED prompt is captured beside the argument, because the pinned replay's acceptance test
       // compares the bytes a worker was actually shown, not the values they were composed from.
@@ -109,11 +111,9 @@ async function passRecording(scoutScopes, { withheldPaths = [], pinnedPlan = nul
       return prompt;
     },
   };
-  let spawns = 0;
   const adapter = {
     async produceReview({ buildPromptFor }) {
       buildPromptFor(TOOL_NAMES);
-      if (scoutScopes !== null && spawns++ === 0) return { summary: 'planning context', findings: [], assessments: [], scopes: scoutScopes, usage: null };
       return { summary: 'sum', findings: [], assessments: [], usage: null };
     },
   };
@@ -134,11 +134,8 @@ async function passRecording(scoutScopes, { withheldPaths = [], pinnedPlan = nul
 
 describe('the recorded plan is the partition the workers actually ran', () => {
   test('every scope the plan claims was handed to a worker, with byte-identical files', async () => {
-    const { handed, plan } = await passRecording([
-      { name: 'auth', focus: 'the auth change', files: ['src/auth.js'] },
-      { name: 'io', focus: 'the io change', files: ['src/io.js'] },
-    ]);
-    assert.equal(plan.provenance, 'scout');
+    const { handed, plan } = await passRecording();
+    assert.equal(plan.provenance, 'partition');
     // Compared as a SET of (name → files): the plan states the partition, and the pool's lane order is
     // not part of it. [LAW:behavior-not-structure]
     const claimed = new Map(plan.scopes.map(s => [s.name, s.files]));
@@ -149,31 +146,34 @@ describe('the recorded plan is the partition the workers actually ran', () => {
     }
   });
 
-  test("the plan records the partition AS CORRECTED — the sweep scope the scout never planned is in it, because a worker ran it", async () => {
-    // The scout leaves src/io.js unassigned; planScopes sweeps it into a catch-all so some worker reads
-    // it. A plan recording the SCOUT's output instead of the pass's would omit that scope entirely and
-    // describe a review that covered less than it did. [LAW:one-source-of-truth]
-    const { handed, plan } = await passRecording([{ name: 'auth', focus: 'the auth change', files: ['src/auth.js'] }]);
-    assert.equal(plan.scopes.length, 2);
-    const swept = plan.scopes.find(s => s.files.includes('src/io.js'));
-    assert.ok(swept, 'the swept file is in no recorded scope, so the plan under-reports its own coverage');
-    assert.ok(handed.some(h => h.assigned.includes('src/io.js')), 'no worker was handed the swept file');
-    assert.equal(plan.scopes.filter(s => s.name === 'auth')[0].files.length, 1);
+  // The determinism the whole lane exists for (copirate-determinism-5od): a PR pass COMPUTES its plan
+  // from the changed paths, so it buys no scout spawn, records no price, and — the property the LLM
+  // scout could not offer — the same change yields the same structure on every replay.
+  test('a PR pass computes its plan: provenance partition, no price, no scout spawn, and the same structure every time', async () => {
+    const first = await passRecording();
+    const second = await passRecording();
+    assert.equal(first.plan.provenance, 'partition');
+    assert.equal(first.plan.scoutUsage, null, 'a computed plan was billed for a spawn it never made');
+    assert.deepEqual(first.phases, first.phases.map(() => 'worker'), 'a PR pass bought a partition it could compute');
+    assert.deepEqual(second.plan, first.plan);
+    assert.deepEqual(second.handed.map(h => h.prompt), first.handed.map(h => h.prompt));
+    assert.deepEqual(first.plan.scopes, partitionByDirectory(FILES.map(f => f.filename)).scopes);
   });
 
   test('the context the plan records is the one prefixed onto every worker focus', async () => {
-    const { handed, plan } = await passRecording([{ name: 'auth', focus: 'the auth change', files: ['src/auth.js', 'src/io.js'] }]);
-    assert.equal(plan.context, 'planning context');
+    const { handed, plan } = await passRecording();
+    assert.equal(plan.context, partitionByDirectory(FILES.map(f => f.filename)).context);
     // Not byte-recoverable from summary.txt (composeSummary embeds it in composed prose), which is why
     // the plan carries it: a pinned replay reconstructs workerFocusText from THIS.
-    for (const h of handed) assert.ok(h.focusText.includes('planning context'), 'a worker saw a context the plan does not record');
+    for (const h of handed) assert.ok(h.focusText.includes(plan.context), 'a worker saw a context the plan does not record');
   });
 });
 
 // ── the plan coming BACK: a record that has been to disk ───────────────────────────────────────────────
 
 // The plan the whole `--plan` path exists to carry: a partition of THIS harness's two changed files, in
-// the shape any run's plan.json is written in.
+// the shape any run's plan.json is written in. It says 'scout' and carries a price — the record a
+// repo-mode run writes — so the replay tests below can prove a replay records its OWN origin and price.
 const ON_DISK = JSON.stringify({
   planSchema: PLAN_SCHEMA,
   provenance: 'scout',
@@ -237,7 +237,7 @@ const PINNED = parsePlanRecord(ON_DISK, 'plan.json');
 
 describe('a pinned plan is replayed instead of scouted', () => {
   test('the scout spawn disappears: every spawn a pinned pass makes is a worker', async () => {
-    const { phases, handed } = await passRecording(null, { pinnedPlan: PINNED });
+    const { phases, handed } = await passRecording({ pinnedPlan: PINNED });
     assert.deepEqual(phases, ['worker', 'worker'], 'a pinned pass bought a partition it was handed');
     assert.equal(handed.length, 2);
   });
@@ -245,24 +245,22 @@ describe('a pinned plan is replayed instead of scouted', () => {
   // The ticket's acceptance test, and the reason .ea7 widened the record past {name, files} to carry
   // `focus` and `context`: without them the rendered prompt could not be reconstructed at all.
   test('two pinned replays of the same plan hand their workers byte-identical prompts', async () => {
-    const first = await passRecording(null, { pinnedPlan: PINNED });
-    const second = await passRecording(null, { pinnedPlan: PINNED });
+    const first = await passRecording({ pinnedPlan: PINNED });
+    const second = await passRecording({ pinnedPlan: PINNED });
     assert.deepEqual(second.handed.map(h => h.prompt), first.handed.map(h => h.prompt));
     assert.deepEqual(second.plan, first.plan);
   });
 
-  // The end-to-end claim the artifact was built for: the plan a SCOUTED run recorded, replayed, puts the
-  // same bytes in front of the same workers. A record that merely parsed would pass a shape test and
-  // still describe a review nobody could reproduce. [LAW:verifiable-goals]
-  test("replaying a scouted run's own plan.json reproduces that run's worker prompts", async () => {
-    const scouted = await passRecording([
-      { name: 'auth', focus: 'the auth change', files: ['src/auth.js'] },
-      { name: 'io', focus: 'the io change', files: ['src/io.js'] },
-    ]);
-    assert.equal(scouted.phases[0], 'scout');
+  // The end-to-end claim the artifact was built for: the plan a run recorded, replayed, puts the same
+  // bytes in front of the same workers. A record that merely parsed would pass a shape test and still
+  // describe a review nobody could reproduce. [LAW:verifiable-goals]
+  test("replaying a run's own plan.json reproduces that run's worker prompts", async () => {
+    const computed = await passRecording();
+    assert.equal(computed.plan.provenance, 'partition');
     // Through the file, not the live value: this is the artifact a replay is actually handed.
-    const replayed = await passRecording(null, { pinnedPlan: parsePlanRecord(JSON.stringify(scouted.plan), 'plan.json') });
-    assert.deepEqual(replayed.handed.map(h => h.prompt), scouted.handed.map(h => h.prompt));
+    const replayed = await passRecording({ pinnedPlan: parsePlanRecord(JSON.stringify(computed.plan), 'plan.json') });
+    assert.equal(replayed.plan.provenance, 'pinned');
+    assert.deepEqual(replayed.handed.map(h => h.prompt), computed.handed.map(h => h.prompt));
   });
 
   // [LAW:one-source-of-truth] Provenance records which producer RAN, not which one wrote the bytes. The
@@ -271,7 +269,7 @@ describe('a pinned plan is replayed instead of scouted', () => {
   test('a replay records ITS OWN origin and price, never the ones it inherited from the file', async () => {
     assert.equal(PINNED.provenance, 'scout');
     assert.notEqual(PINNED.scoutUsage, null);
-    const { plan } = await passRecording(null, { pinnedPlan: PINNED });
+    const { plan } = await passRecording({ pinnedPlan: PINNED });
     assert.equal(plan.provenance, 'pinned');
     assert.equal(plan.scoutUsage, null, 'a pinned replay was billed for a spawn it never made');
     assert.deepEqual(plan.scopes, PINNED.scopes, 'the replayed partition is not the pinned one');
@@ -282,18 +280,18 @@ describe('a pinned plan is replayed instead of scouted', () => {
 describe('a plan that does not describe this change is refused at zero spend', () => {
   // Both directions are the same error read from two sides: the frozen structure is not this change's
   // structure, and the entire reason to pin is that it is. [LAW:no-silent-failure]
-  test('a plan omitting a changed file is refused, not silently repaired by the catch-all sweep', async () => {
-    // planScopes would sweep src/io.js into an 'unassigned files' scope and the run would review the whole
-    // change while its plan.json claimed a partition it never ran — a different review wearing this name.
+  test('a plan omitting a changed file is refused — a plan covering less than the change is a different review', async () => {
+    // Nothing downstream repairs coverage: a computed partition covers the change by construction, so a
+    // pinned plan that does not is refused here, before any spawn, rather than run under this name.
     await assert.rejects(
-      () => passRecording(null, { pinnedPlan: { ...PINNED, scopes: [PINNED.scopes[0]] } }),
+      () => passRecording({ pinnedPlan: { ...PINNED, scopes: [PINNED.scopes[0]] } }),
       /Changed file\(s\) no scope claims \(1\): src\/io\.js/,
     );
   });
 
   test('a plan naming a file this change does not contain is refused — it belongs to some other change', async () => {
     await assert.rejects(
-      () => passRecording(null, { pinnedPlan: { ...PINNED, scopes: [...PINNED.scopes, { name: 'other', focus: 'f', files: ['src/gone.js'] }] } }),
+      () => passRecording({ pinnedPlan: { ...PINNED, scopes: [...PINNED.scopes, { name: 'other', focus: 'f', files: ['src/gone.js'] }] } }),
       /File\(s\) the plan names that this change does not contain \(1\): src\/gone\.js/,
     );
   });

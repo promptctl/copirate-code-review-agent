@@ -198,7 +198,7 @@ adds nice-to-finds but no must-finds — an honest reflection of that PR, not a 
 ## Replaying a case
 
 `eval/run-case.js` (`npm run review:case`) re-runs a frozen case through the **real**
-review engine — the same prompts, the same adaptive scout→workers `runMultiScope` pass,
+review engine — the same prompts, the same partition→workers `runMultiScope` pass,
 and the same MCP collector production uses — with **no GitHub**. It reuses the action's
 own seams (`synthesizeProviderConfig`, `parseUnifiedDiff`, `buildPrMaterial`,
 `runMultiScope`), exactly as `scripts/local-review.js` does, so it is an **instrument,
@@ -210,7 +210,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
 #          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
-#          --plan <plan.json> (default: the scout re-decides the partition every run),
+#          --plan <plan.json> (default: the partition is computed from the changed paths),
 #          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
 ```
 
@@ -247,21 +247,26 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     production review read one timing fact, not two):
                     { laneCount, sweepCap, scopeCount, spawns: [...] }, where each spawn is
                     { phase, outcome, usage } with the span at usage.span — a 'worker' spawn also
-                    names its scope and pass, a 'scout' carries neither. A per-replay duration is the
-                    envelope of those spans, derivable from the artifact with no CI log to scrape.
+                    names its scope and pass; a 'scout' spawn carries neither and exists only on a
+                    repo-mode run, where the plan is still bought from one (a PR run has none). A
+                    per-replay duration is the envelope of those spans, derivable from the artifact with
+                    no CI log to scrape.
   plan.json       — the replay's STRUCTURE, as the engine's own record (src/plan.js's planRecord):
                     { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
-                    partition the workers actually ran (each { name, focus, files }, catch-all included)
-                    and context is the planning text prefixed onto every worker's focus. provenance
-                    names which producer RAN — 'scout' (this run partitioned the change itself, and
-                    scoutUsage is what deciding cost) or 'pinned' (a --plan replay, scoutUsage null).
-                    This file is a valid --plan input: see below.
+                    partition the workers actually ran (each { name, focus, files }; every changed path
+                    lands in exactly one scope) and context is the planning text prefixed onto every
+                    worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
+                    scopes are a pure function of the changed paths, no spawn, scoutUsage null), 'scout'
+                    (a repo-mode run, which has no diff to compute from and buys its plan from a scout
+                    spawn; scoutUsage is what deciding cost) or 'pinned' (a --plan replay, scoutUsage
+                    null). This file is a valid --plan input: see below.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
                     effort ({roundCap, sweepCap, reasoningTier, readSet}: the arm the run ACTUALLY ran at; null
                     on runs from before it was recorded, which matches only other nulls), and candidate
                     ({sha, dirty}: the tree that produced the run; null on runs from before it was
                     recorded).
-  transcripts/    — the full per-spawn session transcripts (scout + one per scope).
+  transcripts/    — the full per-spawn session transcripts: one per scope, plus the scout's on a
+                    repo-mode run.
 ```
 
 `eval/out/` is git-ignored — run artifacts are never committed. Like everything under
@@ -333,13 +338,29 @@ effect the gate had just neutralized. Re-freeze the baseline, or price the lever
 ### Holding the structure still: `--plan` and `--plans`
 
 The **scope plan** is the review's structure: how many scopes the change splits into, which files each
-scope claims, and the shared context every worker is shown. It was re-decided by an LLM scout on every
-single invocation and recorded nowhere durable — so on a frozen case, same diff and same arm, the same
-change partitioned into anywhere from 1 to 5 scopes across runs. That is not a harmless roll: pooled
-across the cells where the scope count varied, the fewest-scope runs found **9 of 36** must-finds (25 %)
-and the most-scope runs **38 of 74** (51 %). A 26-point recall spread on a variable nobody chose — larger
-than the 16-point sweeps effect the first row of the table above was built to price
-(`copirate-determinism-5od`). `--plan` makes it a chosen value.
+scope claims, and the shared context every worker is shown. In PR mode it is now a **pure function of
+the changed file paths** (`partitionByDirectory` in `src/partition.js`): a test file joins the changed
+source file with the same stem, every file keys on its directory, a directory group smaller than
+`MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Same diff,
+same structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no
+diff to compute one from.
+
+It was not always so. The plan used to be re-decided by an LLM scout on every single invocation and
+recorded nowhere durable, and on the frozen case `links-317` identical input gave 1 to 5 scopes, 4 to 28
+findings, 0.5M to 3.8M cache-miss tokens, and must-find recall from 1/3 to 3/3 across replays — scope
+count drove every downstream column. Pooled across the cells where the scope count varied, the
+fewest-scope runs found **9 of 36** must-finds (25 %) and the most-scope runs **38 of 74** (51 %): a
+26-point recall spread on a variable nobody chose, larger than the 16-point sweeps effect the first row
+of the table above was built to price (`copirate-determinism-5od`). Worse, in 3 of 40 replays the scout
+emitted scopes with no files at all, so every worker fell back to reading the whole diff at about 3× the
+cost while the run scored as a valid sample — and two of those runs scored best on recall, poisoning the
+A/B. The partition removed that variance at the source: 5 replays of one case now share one structure by
+construction, and `MIN_SCOPE_FILES` is the one width lever the rule exposes, the thing to measure with
+this harness later.
+
+So on a frozen PR case every un-pinned replay already runs the same structure. `--plan` remains the way
+to hold a review to a structure *other* than the computed one — a partition produced under a different
+`MIN_SCOPE_FILES`, or a hand-authored one — and the way to replay a repo-mode plan.
 
 **It is deliberately not a row in that table.** An effort arm is a dial you *turn* to see what changes; a
 pinned plan is the structure you *hold constant* while turning one. It is not on the effort profile
@@ -351,16 +372,17 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> --plan 
 ```
 
 Any run's `plan.json` is a valid input — the artifact every replay already writes, so pinning a structure
-costs nothing to obtain. A pinned replay **skips the scout spawn entirely**: on one observed run
-(`eval/out/ab-sweep2/laws-4-eval-tasks/2026-09-09T09-25-37-753Z-run1/schedule.json`) that spawn took 58
-seconds and ~122k tokens. A pinned replay is therefore both cheaper and faster than the runs this harness
-bills today.
+costs nothing to obtain. Relative to a repo-mode run, a pinned replay also **skips the scout spawn**: on
+one observed run (`eval/out/ab-sweep2/laws-4-eval-tasks/2026-09-09T09-25-37-753Z-run1/schedule.json`)
+that spawn took 58 seconds and ~122k tokens. Relative to a PR-mode run it costs the same, since neither
+spawns anything to decide the plan.
 
 A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
-at zero spend, and **both** directions are refused. A changed file no scope claims would be silently
-repaired by `planScopes`' catch-all sweep: the run would review the whole change while its `plan.json`
-claimed a partition it never ran — a different review wearing the plan's name, which is the one thing a
-pin exists to prevent. A file the plan names that the diff does not contain is the same error read from
+at zero spend, and **both** directions are refused. Nothing downstream repairs coverage — every changed
+path lands in exactly one scope because the producer puts it there, not because a later sweep catches
+what it missed — so a changed file no scope claims would simply go unreviewed while its `plan.json`
+claimed a partition of the whole change: a different review wearing the plan's name, which is the one
+thing a pin exists to prevent. A file the plan names that the diff does not contain is the same error read from
 the other side: the plan belongs to some *other* change (a re-frozen case, a different
 `EXCLUDE_PATTERNS`), and the paths it names would reach a worker's "read these files in full" line
 pointing at nothing.
@@ -376,13 +398,14 @@ but one. The dir holds one **subdirectory per case**, each holding one `.json` p
   …
 ```
 
-**Replicate *r* replays plan *r*, in filename order.** So `-n 5` replays five *distinct* structures per
-case, not one structure five times. That matters because a paired A/B gets its resolution from holding the
-plan fixed across arms — and with a single plan per case, "held fixed" and "held at exactly one value" are
-the same thing, so the comparison would say nothing about whether the effect survives a different
-partition. Given the 26-point spread on scope count alone, the structure a case happens to be pinned at is
-not a neutral choice. N distinct plans buy **generality and pairing at the same replicate count and the
-same spend** (`copirate-determinism-5od.2sd`).
+**Replicate *r* replays plan *r*, in filename order.** So `-n 5` *can* replay five distinct structures per
+case rather than one structure five times — if the five files differ. That matters because a paired A/B
+gets its resolution from holding the plan fixed across arms — and with a single plan per case, "held
+fixed" and "held at exactly one value" are the same thing, so the comparison would say nothing about
+whether the effect survives a different partition. Given the 26-point spread that scope count once produced,
+the structure a case is pinned at is not a neutral choice. N distinct plans buy **generality and pairing at
+the same replicate count and the same spend** (`copirate-determinism-5od.2sd`) — but distinct plans have to
+be minted deliberately now, since an un-pinned PR arm no longer rolls them.
 
 Pairing survives it because both arms resolve the same dir the same way, so arm A's replicate *r* and arm
 B's replicate *r* share a structure. It also survives a **resume**: level *r* names plan *r* no matter
@@ -397,11 +420,11 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-swe
 
 If a selected case has no directory there, has **fewer plans than `-n`**, or holds a plan that does not
 parse, the **whole suite is refused before a single credential resolves**. Two failures are worth refusing
-for the same reason: a partially-pinned suite (some cases replay a frozen structure while the rest re-roll
-it) and a shallow one (levels past the last plan fall back to scouting), because each puts the exact
-variance the pin removes back into the comparison, with nothing in the report saying which replicates
-carried it. *More* plans than `-n` is fine and deliberate — the extras are the depth a later `-n` resume
-grows into, against this same dir. What the suite runner checks is only existence, count and shape — the
+for the same reason: a partially-pinned suite (some cases replay a frozen structure while the rest run
+whatever they compute) and a shallow one (levels past the last plan fall back to the computed partition),
+because each silently mixes structures the pin was meant to choose, with nothing in the report saying
+which replicates carried which. *More* plans than `-n` is fine and deliberate — the extras are the depth
+a later `-n` resume grows into, against this same dir. What the suite runner checks is only existence, count and shape — the
 plan's fit to a case's *diff* needs that case's material, so it is proven per replay, inside the engine
 pass.
 
@@ -409,14 +432,19 @@ pass.
 authored — but only runs from `copirate-determinism-5od.ea7` onward carry one, and the runs stored under
 `eval/out/` predate it. The way to mint a set at no extra cost is to run the **first arm un-pinned** and
 harvest its `plan.json` files into `<plans-dir>/<case>/`, then run the second arm pinned to them. The
-multisets then match by construction, and the only scout spawns paid are the ones a fresh arm pays anyway.
+multisets then match by construction. Be clear about what such a harvest holds: on a PR case an un-pinned
+arm computes the same partition on every replicate, so its N `plan.json` files are N copies of one
+structure, and pinning the second arm to them holds the comparison at exactly that one value. A set of
+genuinely distinct plans comes from runs under different `MIN_SCOPE_FILES` values or from hand-authored
+files, not from replaying. Only a repo-mode arm still rolls distinct plans by itself, and its scout spawns
+are the ones a fresh arm pays anyway.
 
-Unlike an effort arm, a mix of pinned and scouted runs under one `--out` is **not** refused: the arm
+Unlike an effort arm, a mix of pinned and computed runs under one `--out` is **not** refused: the arm
 check (`misarmedRuns`) was left alone on purpose, since a plan is not an arm. What distinguishes them
 after the fact is each run's own `plan.json`: a pinned replay records `provenance: "pinned"` and
 `scoutUsage: null`. Provenance records which producer **ran**, not which one wrote the bytes — replaying
-a file that says `"scout"` still records `"pinned"`, and the price field it carries is dropped, because
-no scout spawn happened to bill for.
+a file that says `"partition"` or `"scout"` still records `"pinned"`, and any price field it carries is
+dropped, because no scout spawn happened to bill for.
 
 ### Reading it as a paired A/B: `eval/paired.js`
 
@@ -446,9 +474,11 @@ The pairing unit is **(case, plan, finding)**, and a pair whose two halves ran d
 **refused, never formed**: for every case, the multiset of plans in arm A must equal the multiset in arm B —
 same plans, same number of replicates each. A plan's identity is its `scopes` and `context`, *not* its
 `provenance`: two runs can both say `"pinned"` and carry different partitions, and that is exactly the
-mistake the refusal exists to catch. Because of that, no separate pinned-vs-scouted check is needed —
-a scouted arm re-rolls its plans, so its keys will not match a pinned arm's and the comparison refuses on
-its own. The other refusals, each naming the offending dir: a run with no `plan.json` (it predates the
+mistake the refusal exists to catch. Because of that, no separate pinned-vs-computed check is needed:
+a computed PR arm's keys match a pinned arm's exactly when the pinned plans are the computed ones, and
+whenever they are anything else — a different `MIN_SCOPE_FILES`, a hand-authored partition, a repo-mode
+arm that re-rolled — the keys differ and the comparison refuses on its own. The other refusals, each
+naming the offending dir: a run with no `plan.json` (it predates the
 plan record, so what structure it ran is unknown), an unscored run, an arm root that blended two effort
 arms, a run whose `meta.json` names a different case than the dir it sits under (the same misplaced-run
 rule `compare.js` applies at the same kind of boundary), a scorecard whose must-find ids collide so an
@@ -458,9 +488,8 @@ in a count. Plans are named in refusals and in the report by a short digest of t
 count alone does not identify a partition.
 
 Within one `(case, plan)` block each arm may hold several replicates — a `--plans` dir that repeats a
-structure, or one harvested from a scout that rolled the same partition twice — and the k-th run of arm A
-is matched with the k-th run of arm B in sorted
-run-dir order. That alignment is **arbitrary but deterministic**, and it is sound: given the plan, an arm's
+structure, or one harvested from a computed PR arm, which repeats its structure on every replicate — and
+the k-th run of arm A is matched with the k-th run of arm B in sorted run-dir order. That alignment is **arbitrary but deterministic**, and it is sound: given the plan, an arm's
 replicates are exchangeable, so under the null P(A hit, B miss) = P(A miss, B hit) for *any* one-to-one
 alignment, and the exact test stays exact. What run k shares with run k is the block and nothing else; the
 pairing claims no more than that.
@@ -479,7 +508,7 @@ rate with the plan held fixed. Estimated from the runs already on disk, `π_d` b
 
 Both are upper bounds — a same-scope-count pair is not a same-*plan* pair — so the real figures are at or
 below these. The practical reading: **a paired N=3 resolves about what an unpaired N=5 did**, on 60 % of the
-replays, each of which is also cheaper for skipping the scout spawn. `paired.js` reports the realised
+replays. `paired.js` reports the realised
 resolution from the discordance it actually observed, so a design's claim is checked against the run that
 tested it.
 

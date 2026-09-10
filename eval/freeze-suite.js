@@ -65,7 +65,7 @@ Usage: node eval/freeze-suite.js [options]
                            (default: the engine's own DEFAULT_READ_SET). 'assigned' is the shipped
                            split read; 'changed' is the pre-split arm where every worker reads the whole
                            changed set. Same rule as --sweep-cap: give each arm its OWN --out.
-  --plans <dir>            Replay every case against PINNED scope plans instead of scouting them, so the
+  --plans <dir>            Replay every case against PINNED scope plans instead of the computed ones, so the
                            review's structure is held fixed across arms. The dir holds one SUBDIRECTORY
                            per case being replayed, <dir>/<case-name>/, holding one .json plan per
                            replicate — any run's plan.json is a valid file. Replicate r replays the r-th
@@ -395,7 +395,7 @@ function censusCases(caseDirs, outRoot) {
 // [LAW:no-silent-failure] EVERY selected case must carry at least `repeats` plans, refused here — before
 // any credential resolves, at zero spend. Two failures are refused for the same reason: a partially-pinned
 // suite (some cases replay a frozen structure and some re-roll it) and a shallow one (levels past the last
-// plan would fall back to scouting), because each puts the very variance the pin exists to remove back in
+// plan would fall back to the computed partition), because each puts the very variance the pin exists to remove back in
 // the comparison with nothing in the report saying which replicates carried it. MORE plans than `repeats`
 // is fine and deliberate: the extras are the depth a later `-n` resume grows into, against this same dir.
 // The plan's fit to a case's DIFF is not checked here — that needs the case's material, and run-case.js's
@@ -411,7 +411,7 @@ function resolvePlanSet(plansDir, caseNames, repeats) {
     }
     const planPaths = fs.readdirSync(caseDir).filter(f => f.endsWith('.json')).sort().map(f => path.join(caseDir, f));
     if (planPaths.length < repeats) {
-      throw new Error(`--plans ${plansDir} gives case '${name}' ${planPaths.length} plan(s), but this suite replays ${repeats} per case. Replicate r replays plan r, so a shallow plan set would leave the deepest levels scouting their own partition — the variance the pin exists to remove. Add plans to ${caseDir}, or lower -n/--repeats.`);
+      throw new Error(`--plans ${plansDir} gives case '${name}' ${planPaths.length} plan(s), but this suite replays ${repeats} per case. Replicate r replays plan r, so a shallow plan set would leave the deepest levels computing their own partition — the variance the pin exists to remove. Add plans to ${caseDir}, or lower -n/--repeats.`);
     }
     for (const planPath of planPaths) parsePlanRecord(fs.readFileSync(planPath, 'utf8'), planPath);
     resolved.set(name, planPaths);
@@ -595,7 +595,7 @@ function superviseSpawn({ command, args, cwd, env, logPath, timeoutMinutes, sign
 // key does not fail, it silently replays on whatever credential the parent happened to be holding. A
 // mapping only a real spawn can observe is a mapping nothing asserts.
 function replaySpawnSpec({ job, lane, credentialInput, outRoot, memoryBudget, sweepCap, readSet }) {
-  // [LAW:dataflow-not-control-flow] The pin travels as a LIST of argv words — empty when this suite scouts,
+  // [LAW:dataflow-not-control-flow] The pin travels as a LIST of argv words — empty when this suite lets the engine compute its partitions,
   // two words when it replays a plan set — so the spawn line stays ONE expression with one shape, and the
   // un-pinned suite's argv is byte-identical to what it was before plans existed. Which plan this replay
   // replays was decided by planJobs, the one place that knows the replicate index; resolvePlanSet is the

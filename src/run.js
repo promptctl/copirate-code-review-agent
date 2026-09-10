@@ -40,9 +40,10 @@ const REVIEW_AGENT_INSTRUCTIONS_PATH = path.join(ACTION_ROOT, 'review-agent', 'i
 // Gitea's act_runner alike; process.cwd() is the local-dev fallback. [LAW:effects-at-boundaries]
 const REVIEWED_REPO_ROOT = process.env.GITHUB_WORKSPACE || process.cwd();
 
-// [LAW:decomposition] The review engine — scout → workers → aggregate, wrapped in failover — now
+// [LAW:decomposition] The review engine — plan → workers → aggregate, wrapped in failover — now
 // lives in src/multiscope.js as runMultiScope, the single seam both modes call. The orchestrator
-// only chooses the `material` (what the scout surveys, what each worker reviews) and the `sink`
+// only chooses the `material` (what the plan partitions, or the repo scout surveys; what each worker
+// reviews) and the `sink`
 // (how findings leave); it owns no CLI lifecycle and no retry timing. [LAW:types-are-the-program]
 
 // [LAW:one-type-per-behavior] Every auth variant names its credential the same, so masking is one read
@@ -704,7 +705,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // Anchors are engine-agnostic (purely diff-line based), so they are computed once here from any
   // toolNames; the material rebuilds the worker prompt per attempt so each engine gets its own tool
   // identifiers. [LAW:types-are-the-program] [LAW:no-ambient-temporal-coupling] runMultiScope (via
-  // produceReview) owns retry timing; the whole scout→workers pass is one attempt per config.
+  // produceReview) owns retry timing; the whole plan→workers pass is one attempt per config.
   const anchorInput = buildReviewInput({ files: filteredFiles, maxDiffChars, toolNames: registry.get(chain[0].engine).toolNames, reviewedRepoRoot: REVIEWED_REPO_ROOT });
   const anchors = buildReviewAnchors(anchorInput.files);
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
