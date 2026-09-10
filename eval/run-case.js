@@ -60,8 +60,8 @@ Usage: node eval/run-case.js <case-dir> [options]
                       changed paths, so a replay can hold the review to a structure other than the one
                       the engine computes (a different MIN_SCOPE_FILES, a hand-authored plan).
                       Any run's plan.json is a valid input. A plan that does not partition THIS case's
-                      changed files exactly (a file it omits, or one it names that the diff lacks) is
-                      refused before the first spawn. Omitted (the default), the engine computes the
+                      changed files exactly (a file it omits, one it names that the diff lacks, or one
+                      it claims in more than one scope) is refused before the first spawn. Omitted (the default), the engine computes the
                       partition from the changed paths — the same structure on every replay.
   --read-set <arm>    Which changed files each scope worker opens IN FULL (default: the engine's own
                       DEFAULT_READ_SET). 'assigned' is the shipped behavior — a worker reads only its own

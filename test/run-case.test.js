@@ -422,7 +422,7 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
     fs.mkdirSync(ok, { recursive: true });
     // Minted, not fabricated — this test is about write ORDER, but a wrong-shaped schedule sitting in it is
     // still a shape a reader could copy. [LAW:one-source-of-truth]
-    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
+    const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
     const plan = mintedPlan();
     writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan, findings: [{ path: 'a', line: 1 }] });
     assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'plan.json', 'schedule.json', 'summary.txt', 'usage.json']);
@@ -441,7 +441,7 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
 test('writeRunRecord: an absent fact fails loudly instead of landing as a file that parses as nothing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-undef-'));
   try {
-    const schedule = require('../src/schedule').scheduleRecord({ laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
+    const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
     const record = { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan: mintedPlan(), findings: [] };
     // `JSON.stringify(undefined)` is the VALUE undefined, and `undefined + '\n'` is the literal text
     // "undefined" — so an unguarded write lands an artifact that reports as JSON and parses as nothing.
@@ -478,6 +478,7 @@ test('writeRunRecord: a replay\'s wall clock survives as an artifact, readable t
     // PR footer read one timing fact, not two. The span rides on `usage`, which is where describeSchedule
     // reads it from.
     const schedule = scheduleRecord({
+      plan: 'scout',
       laneCount: 1,
       sweepCap: 2,
       scopeCount: 1,

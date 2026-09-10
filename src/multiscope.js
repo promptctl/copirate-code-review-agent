@@ -642,6 +642,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
     // [LAW:one-source-of-truth]
     schedule: scheduleRecord({
+      plan: proposal.provenance,
       laneCount,
       sweepCap,
       scopeCount: scopes.length,

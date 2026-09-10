@@ -35192,6 +35192,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
     // [LAW:one-source-of-truth]
     schedule: scheduleRecord({
+      plan: proposal.provenance,
       laneCount,
       sweepCap,
       scopeCount: scopes.length,
@@ -38068,10 +38069,12 @@ module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resol
 /***/ }),
 
 /***/ 7932:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
+// [LAW:one-way-deps] plan.js owns the provenance vocabulary; this module reads it. Downhill only.
+const { PLAN_PROVENANCES } = __nccwpck_require__(8194);
 
 // The pass's SCHEDULE, derived — the facts that turn per-spawn time into wall-clock time.
 //
@@ -38083,8 +38086,10 @@ module.exports = { run, runPrReview, buildReviewFooter, credentialsToMask, resol
 // derivable from them, so the record can never contradict itself. [LAW:one-source-of-truth]
 //
 // The recorded schedule value:
-//   { laneCount, sweepCap, scopeCount, spawns: SpawnRecord[] }
-// where each SpawnRecord is a discriminated value, one per engine spawn ATTEMPT:
+//   { plan, laneCount, sweepCap, scopeCount, spawns: SpawnRecord[] }
+// where plan is the plan's provenance (src/plan.js: 'partition' | 'scout' | 'pinned') — the fact that
+// decides whether a scout phase was ever EXPECTED, so a breakdown with no scout record can say which
+// of two different things it is: the shipped PR default that spawns none, or a gap — and each SpawnRecord is a discriminated value, one per engine spawn ATTEMPT:
 //   { phase: 'scout',                     outcome, usage }
 //   { phase: 'worker', scope, pass,      outcome, usage }
 // pass 0 is the review of record; pass 1..N are convergence sweeps. outcome is
@@ -38122,7 +38127,13 @@ function spawnRecord(tag, outcome, usage) {
 // gates (positive lane ceiling, non-negative sweep cap); the gates exist to fail BEFORE spawns are
 // spent, this mint to stamp the record — same predicate, different instant. laneCount is the count
 // AS USED: the plan's scope count under the machine's ceiling, so it never exceeds scopeCount.
-function scheduleRecord({ laneCount, sweepCap, scopeCount, spawns }) {
+// [LAW:types-are-the-program] `plan` is the provenance the pass ran under, and a scout record may exist
+// only under 'scout': a computed or pinned plan spawned no scout, so a scout row beside it would be a
+// record of a spawn the pass never made — refused here, never rendered as a phase that "ran".
+function scheduleRecord({ plan, laneCount, sweepCap, scopeCount, spawns }) {
+  if (!PLAN_PROVENANCES.includes(plan)) {
+    throw new Error(`scheduleRecord: plan must be one of ${PLAN_PROVENANCES.join(', ')} (got ${JSON.stringify(plan)})`);
+  }
   if (!Number.isInteger(laneCount) || laneCount < 1) {
     throw new Error(`scheduleRecord: laneCount must be a positive integer (got ${JSON.stringify(laneCount)})`);
   }
@@ -38138,7 +38149,10 @@ function scheduleRecord({ laneCount, sweepCap, scopeCount, spawns }) {
   if (laneCount > scopeCount) {
     throw new Error(`scheduleRecord: laneCount (${laneCount}) cannot exceed scopeCount (${scopeCount}) — a lane is only ever occupied by a scope`);
   }
-  return { laneCount, sweepCap, scopeCount, spawns };
+  if (plan !== 'scout' && spawns.some(s => s.phase === 'scout')) {
+    throw new Error(`scheduleRecord: a '${plan}' plan spawns no scout, but the spawn list records one`);
+  }
+  return { plan, laneCount, sweepCap, scopeCount, spawns };
 }
 
 // [LAW:effects-at-boundaries] Pure: a span's duration in milliseconds. Absent span → null — a
@@ -38174,6 +38188,7 @@ function sumMs(values) {
 
 // [LAW:effects-at-boundaries] Pure: derive the reportable breakdown from a recorded schedule.
 // Returns {
+//   plan,               // the provenance the pass ran under, echoed as recorded
 //   scoutMs,            // the scout phase's spawn time (all scout attempts summed), null if unclocked
 //   scouts: [           // one row per scout ATTEMPT, as recorded — scoutMs derives from these,
 //     { outcome, ms }   // so the summed figure and the per-attempt rows cannot disagree
@@ -38188,7 +38203,10 @@ function sumMs(values) {
 // another. The grouping answers "how much did each depth cost" — the sweep multiplier — and the
 // passes list is as deep as the deepest chain that actually spawned, never as deep as sweepCap
 // permits. [LAW:one-source-of-truth]
-function describeSchedule({ laneCount, sweepCap, scopeCount, spawns }) {
+function describeSchedule({ plan, laneCount, sweepCap, scopeCount, spawns }) {
+  if (!PLAN_PROVENANCES.includes(plan)) {
+    throw new Error(`describeSchedule: unknown plan provenance ${JSON.stringify(plan)} in schedule record`);
+  }
   const scouts = [];
   const byPass = new Map();
   // [LAW:no-silent-failure] The dispatch is EXHAUSTIVE over the phase vocabulary this module owns:
@@ -38206,6 +38224,7 @@ function describeSchedule({ laneCount, sweepCap, scopeCount, spawns }) {
   }
   const passes = [...byPass.keys()].sort((a, b) => a - b).map(pass => ({ pass, spawns: byPass.get(pass) }));
   return {
+    plan,
     // scoutMs stays derived from the scout rows it sits beside, so the summary figure and the
     // per-attempt table can never disagree about the scout. [LAW:one-source-of-truth]
     scoutMs: sumMs(scouts.map(s => s.ms)),
@@ -38271,6 +38290,18 @@ function phaseClause(label, durations) {
   return `${label} ${clockedText(durations)}`;
 }
 
+// [LAW:dataflow-not-control-flow] The planning clause as a TABLE from the plan's provenance to its
+// text — the one place the breakdown branches, on the domain's own enum. Under 'scout' the plan was
+// bought by a spawn and the clause is that phase's clocked figure, with 'missing' the explicit gap
+// when the phase that should have run left no record. Under 'partition' and 'pinned' no spawn was
+// ever expected, and the clause says what decided the plan instead — never 'missing', which would
+// read a healthy shipped run as a lost record. [LAW:no-silent-failure]
+const PLAN_CLAUSE = {
+  scout: scouts => phaseClause('scout', scouts),
+  partition: () => 'plan computed',
+  pinned: () => 'plan pinned',
+};
+
 // pass 0 is the review of record; pass 1..N are convergence sweeps — the same vocabulary the run
 // log's 'sweep N ' labels already use. [LAW:one-source-of-truth]
 function passLabel(pass) {
@@ -38333,7 +38364,7 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
   const allDurations = [...d.scouts.map(s => s.ms), ...workerRows.map(s => s.ms)];
   const spawnCount = allDurations.length;
   const phases = [
-    phaseClause('scout', d.scouts.map(s => s.ms)),
+    PLAN_CLAUSE[d.plan](d.scouts.map(s => s.ms)),
     ...d.passes.map(p => phaseClause(passLabel(p.pass), p.spawns.map(s => s.ms))),
   ].join(' · ');
   // The slowest CHAIN, not the slowest attempt: a scope's passes run back to back in its lane, so its
