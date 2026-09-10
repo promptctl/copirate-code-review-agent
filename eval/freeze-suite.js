@@ -677,6 +677,60 @@ async function main() {
   const credentialInput = credentialInputFor(pin.provider);
 
   const jobs = planJobs({ cases, repeats: opts.repeats });
+  // Every line this command narrates goes to stderr, so stdout stays free for whatever a caller pipes.
+  // Declared HERE rather than beside the suite banner below because the measurement consultation — which
+  // must speak before any credential resolves — is now the first thing with something to say. [CLI binding]
+  const log = msg => process.stderr.write(`${msg}\n`);
+
+  // [LAW:one-source-of-truth] "Has this already been measured?" asked of the WHOLE corpus rather than of
+  // this --out alone. The census above is per-root: it answers "is this dir full?", which on 2026-09-09
+  // was YES-it-is-empty while twelve completed runs of the exact arm about to be generated sat one
+  // directory over in eval/out/ab-sweep2. The plan is already computed (a pure value), and nothing has
+  // been spent — no lane has resolved a credential — so this is the last moment the answer is still free.
+  const { collectMeasurements, lookupMeasurement, measurementFields, renderConsultation, tally } = require('./measurement-index');
+  const { parseMeta } = require('./score');
+  const { workingTree, treeIdentity } = require('./run-case');
+  // The corpus is anchored at eval/out, this repo's one home for run records — not at --out (which is the
+  // dir being FILLED) and not at the CWD (which would make the answer depend on where the operator stood).
+  const corpus = collectMeasurements({ corpusRoot: path.join(__dirname, 'out'), parseMeta, treeIdentity });
+  // Which code this suite would measure. run-case.js records exactly this per run, so the two halves of
+  // the comparison come from one producer. A dirty tree resolves to null — it names no reproducible
+  // content, so nothing on disk can be PROVEN to be a replay of it (run-case.js's treeIdentity).
+  const candidateSha = treeIdentity(workingTree());
+  // [LAW:dataflow-not-control-flow] The dirty case is carried by an EMPTY subject list, not by a skip: the
+  // consultation, the render and the refusal all still run, over nothing, and report nothing. A lookup
+  // performed anyway would miss on sha for every case and hand the operator a difference they cannot act
+  // on. [LAW:no-silent-failure] the notice below says the index was not consulted, and why.
+  const subjects = candidateSha === null ? [] : cases.map(c => measurementFields({ caseName: c.name, sha: candidateSha, effort }));
+  const consultations = subjects.map(wanted => lookupMeasurement(corpus, wanted));
+  log(candidateSha === null
+    ? `Measurement index: candidate tree is DIRTY, so its runs match no stored measurement — index not consulted.`
+    : `Measurement index: ${corpus.measurements.length} identified run(s) on disk; asking what this suite already owns…`);
+  const consulted = renderConsultation({ consultations, unidentified: corpus.unidentified });
+  consulted.split('\n').filter(line => line !== '').forEach(line => log(line));
+
+  // [LAW:no-silent-failure] The index REPORTS a reusable measurement; it must never substitute one. So a
+  // hit outside this --out stops the line at the point of spend rather than quietly filling a smaller
+  // plan — and rather than exiting 0 with nothing scheduled, which would send eval/compare.js (this
+  // command's caller on the gate path) on to score an --out the suite deliberately left empty.
+  //
+  // Existence, not deficit, is the rule, and it refuses the WHOLE command: scheduling only the cases that
+  // are missing elsewhere would split one arm across two roots, and baseline.js pools a root as an arm —
+  // an unscoreable artifact bought at full price. The remedy is always to resume into the root that holds
+  // them, where the census fills exactly the deficit.
+  //
+  // Gated on there being replays to run, so a status re-invocation of a finished suite — this command's
+  // only way to ask "where am I?" — still answers instead of refusing. [LAW:dataflow-not-control-flow]
+  const owned = jobs.length > 0 ? consultations.flatMap(c => c.hits.filter(hit => hit.root !== outRoot)) : [];
+  if (owned.length > 0) {
+    throw new Error(
+      `${jobs.length} replay(s) planned into ${outRoot}, but this measurement is already on disk:\n` +
+      `${tally(owned, hit => `in ${hit.root}`).map(line => `  ${line}`).join('\n')}\n` +
+      `A measurement is bought once. Score those runs, or resume with --out <that root> to deepen them — ` +
+      `re-buying them here would spend a full suite to learn what this tree already knows.`,
+    );
+  }
+
   // Lane names are derived from the planned work, so a suite already at target N resolves none and needs
   // no credential. Re-invocation is this command's only resume and its only status check — demanding a
   // credential it would never spend turned reading the census into a spend-shaped precondition. The
@@ -684,7 +738,6 @@ async function main() {
   // there is nothing to run. [LAW:dataflow-not-control-flow]
   const laneNames = jobs.length > 0 ? (opts.credentials ?? credentialInput).split(',') : [];
   const lanes = resolveLanes(laneNames, process.env);
-  const log = msg => process.stderr.write(`${msg}\n`);
   log(`Suite: ${cases.length} case(s) on ${pin.provider}/${pin.model}, target N=${opts.repeats}, ${lanes.length} lane(s) [${lanes.map(l => l.name).join(', ')}], ${opts.jobTimeout}m per replay`);
   cases.forEach(c => log(`  ${c.name}: ${c.completed}/${opts.repeats} completed`));
   log(`${jobs.length} replay(s) to run → ${outRoot}`);
