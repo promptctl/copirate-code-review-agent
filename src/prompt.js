@@ -104,9 +104,11 @@ function reviewCharter(toolNames) {
 // [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
 // value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
 // owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
-// arm, src/effort.js, applied to that assignment). They coincide under the shipped 'assigned' arm, which
-// is why one list once passed for both — and diverge under 'changed', where readFiles is empty and every
-// worker reads the whole set while exactly one still owns the bump. Empty readFiles is the whole-set read
+// arm, src/effort.js, applied to that assignment). Under the shipped 'assigned' arm readFiles is the
+// assignment plus the scope's `reads` — the sibling parts of a concern cut for size (src/partition.js
+// rule 4) — so the two coincide only for an uncut scope, which is why one list once passed for both.
+// Under 'changed' they diverge fully: readFiles is empty and every worker reads the whole set while
+// exactly one still owns the bump. Empty readFiles is the whole-set read
 // (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
@@ -411,7 +413,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
       ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
       : '';
     const fullSentence = full.length > 0
-      ? `Read the complete content of THESE files — this scope's assigned changed files: ${full.join(', ')}. `
+      ? `Read the complete content of THESE files — the changed files this scope reads in full: ${full.join(', ')}. `
         + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       : '';
     return (readFiles.length > 0

@@ -149,7 +149,7 @@ test('collector smoke: a scout records scopes via add_scope and readCollectedRev
 
     // A scout planning a review: two add_scope calls, then finish_review with structural prose. The
     // first assigns its changed files (PR mode); the second omits files (verifying the [] default).
-    const s1 = await rpc(child, 2, 'tools/call', { name: 'add_scope', arguments: { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'] } });
+    const s1 = await rpc(child, 2, 'tools/call', { name: 'add_scope', arguments: { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'], reads: [] } });
     assert.ok(!s1.error, `add_scope must not error: ${JSON.stringify(s1.error)}`);
     await rpc(child, 3, 'tools/call', { name: 'add_scope', arguments: { name: 'run→transport', focus: 'the run→transport boundary' } });
     await rpc(child, 4, 'tools/call', { name: 'finish_review', arguments: { summary: 'A code-review GitHub Action.' } });
@@ -158,7 +158,7 @@ test('collector smoke: a scout records scopes via add_scope and readCollectedRev
     const review = readCollectedReview(recordsPath);
     assert.deepEqual(review.findings, []);
     assert.equal(review.scopes.length, 2);
-    assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'] });
+    assert.deepEqual(review.scopes[0], { name: 'cost', focus: 'the price table', files: ['src/usage.js', 'src/report.js'], reads: [] });
     assert.equal(review.scopes[1].name, 'run→transport');
     assert.equal(review.scopes[1].focus, 'the run→transport boundary');
     assert.deepEqual(review.scopes[1].files, []); // files omitted → clean empty assignment

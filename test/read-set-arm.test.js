@@ -66,14 +66,14 @@ async function passAtArm(readSet, { material = buildPrMaterial({ files: FILES, m
 // A worker's prompt is found by its scope's focus line: `${name} — ${focus}`, where the partition's focus
 // opens with the same directive for every scope.
 const promptFor = (prompts, scopeName) => prompts.find(p => p.includes(`${scopeName} — Review the changes`));
-const readTargetsOf = (prompt) => prompt.match(/assigned changed files: (.*?)\. Skip any among them/)?.[1];
+const readTargetsOf = (prompt) => prompt.match(/this scope reads in full: (.*?)\. Skip any among them/)?.[1];
 
 describe('the read-set arm reaches the worker prompt — the A/B is expressible end to end', () => {
   test("'assigned' tells each worker to read ITS OWN files, and to leave the neighbours to their owner", async () => {
     const { workerPrompts } = await passAtArm('assigned');
     const auth = promptFor(workerPrompts, 'src/auth');
     assert.ok(auth, 'the src/auth worker never ran');
-    assert.match(auth, /Read the complete content of THESE files — this scope's assigned changed files: src\/auth\/login\.js, src\/auth\/token\.js/);
+    assert.match(auth, /Read the complete content of THESE files — the changed files this scope reads in full: src\/auth\/login\.js, src\/auth\/token\.js/);
     // The cost cut is this sentence, not the file list: without it a worker that reads its neighbour
     // anyway would make the two arms converge in behavior while still differing on paper.
     assert.match(auth, /Another scope's worker reads the other changed files, so do NOT read them in full/);
@@ -89,7 +89,7 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
       // The arm is the ABSENCE of the split, so the split's two sentences must both be gone: an arm that
       // said "read everything" while still saying "do NOT read the others" would be incoherent to the
       // model and would measure neither behavior.
-      assert.ok(!prompt.includes("this scope's assigned changed files"), 'the assigned-files instruction survived');
+      assert.ok(!prompt.includes("the changed files this scope reads in full"), 'the assigned-files instruction survived');
       assert.ok(!prompt.includes('do NOT read them in full'), 'the do-not-duplicate instruction survived');
     }
   });
@@ -154,7 +154,7 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
 
   test('the default profile replays the shipped arm — an omitted arm cannot silently become the other one', async () => {
     const { workerPrompts } = await passAtArm(defaultEffortProfile().readSet);
-    assert.match(promptFor(workerPrompts, 'src/auth'), /this scope's assigned changed files: src\/auth\/login\.js/);
+    assert.match(promptFor(workerPrompts, 'src/auth'), /the changed files this scope reads in full: src\/auth\/login\.js/);
   });
 
   test('an arm outside the vocabulary is refused BEFORE any spawn — a bad arm costs nothing', async () => {
@@ -174,5 +174,42 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
     // The position is the load-bearing part: resolved per worker instead of once at the boundary, this
     // would refuse only after a worker spawn had already been paid for.
     assert.equal(spawns, 0, 'a malformed arm reached the engine');
+  });
+});
+
+// ── a cut concern: the parts read each other, so the seam is covered by construction (zai-timing-8jk.4) ──
+// One directory of two 300-line files beside a directory of crumbs: lopsided and over the cap, so the
+// partition halves it and each half OWNS one file and READS the other's. This is the worker-facing proof:
+// the read-targets line of a part's prompt names the sibling's file as a full read, under the shipped
+// arm; under 'changed' every worker already reads everything and the parts add nothing.
+describe('a cut concern reaches the worker as two full-read lists', () => {
+  const long = (n) => `@@ -1,${n} +1,${n} @@\n${'+x\n'.repeat(n)}`;
+  const LOPSIDED = stamp([
+    { filename: 'src/core/a.js', status: 'modified', patch: long(300) },
+    { filename: 'src/core/b.js', status: 'modified', patch: long(300) },
+    { filename: 'docs/x.md', status: 'modified', patch: long(5) },
+    { filename: 'docs/y.md', status: 'modified', patch: long(5) },
+  ]);
+  const material = () => buildPrMaterial({ files: LOPSIDED, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
+
+  test("'assigned': each part reads its own file AND its sibling's; the crumbs worker reads only its own", async () => {
+    const { workerPrompts, review } = await passAtArm('assigned', { material: material() });
+    assert.deepEqual(review.plan.scopes.map(s => [s.name, s.files, s.reads]), [
+      ['docs', ['docs/x.md', 'docs/y.md'], []],
+      ['src/core 1/2', ['src/core/a.js'], ['src/core/b.js']],
+      ['src/core 2/2', ['src/core/b.js'], ['src/core/a.js']],
+    ]);
+    assert.equal(readTargetsOf(promptFor(workerPrompts, 'src/core 1/2')), 'src/core/a.js, src/core/b.js');
+    assert.equal(readTargetsOf(promptFor(workerPrompts, 'src/core 2/2')), 'src/core/a.js, src/core/b.js');
+    assert.equal(readTargetsOf(promptFor(workerPrompts, 'docs')), 'docs/x.md, docs/y.md');
+  });
+
+  test("'changed': the parts are still two scopes, and every worker reads the whole set as before", async () => {
+    const { workerPrompts, review } = await passAtArm('changed', { material: material() });
+    assert.equal(review.plan.scopes.length, 3);
+    for (const prompt of workerPrompts) {
+      assert.equal(readTargetsOf(prompt), undefined);
+      assert.match(prompt, /Read the complete content of every changed file that contains code/);
+    }
   });
 });

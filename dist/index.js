@@ -30067,7 +30067,11 @@ function reasoningFactor(tier) {
 
 // [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
 // 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
-// the changed set about ONCE however many scopes the plan has. 'changed' is the pre-split behavior, where
+// the changed set about ONCE however many scopes the plan has. Since partition.js rule 4, a concern cut
+// into k parts is read k times (each part reads its siblings), but rule 4's partCount bound holds the
+// (k-1) extra reads at or below the changed set, so the arm reads at most 2x the changed set on a
+// lopsided diff and ~1x otherwise; a diff-shape spread inside the constant, not a second arm. 'changed'
+// is the pre-split behavior, where
 // every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
 // scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
 // fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative
@@ -30286,13 +30290,14 @@ function collectorTools() {
     },
     {
       name: 'add_scope',
-      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. Call once per scope. Do not use while reviewing code (use request_change for findings).",
+      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. When a large concern is reviewed in parts, list in 'reads' the changed files the sibling parts own: this scope's worker reads them in full as context but does not own them. Call once per scope. Do not use while reviewing code (use request_change for findings).",
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string', minLength: 1, pattern: '\\S' },
           focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
+          reads: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
         additionalProperties: false,
@@ -31590,15 +31595,18 @@ function buildReviewAnchors(files) {
 // excluded files (dist/**, lockfiles) never inflate the estimate. A patch body runs from its first
 // `@@` onward, so a leading '+'/'-' is an added/deleted content line; the hunk header (`@@`) and the
 // no-newline marker ('\') start with neither. A file with no patch (binary/rename-only) contributes 0.
-function diffChurn(files) {
+// A single file's churn is the unit — the partition sizes each scope by it (src/partition.js) — and the
+// whole set's churn is the sum of the units, so the two can never count a line differently. [LAW:one-source-of-truth]
+function fileChurn(file) {
+  if (!file.patch) return 0;
   let churn = 0;
-  for (const file of files) {
-    if (!file.patch) continue;
-    for (const line of file.patch.split('\n')) {
-      if (line[0] === '+' || line[0] === '-') churn++;
-    }
+  for (const line of file.patch.split('\n')) {
+    if (line[0] === '+' || line[0] === '-') churn++;
   }
   return churn;
+}
+function diffChurn(files) {
+  return files.reduce((sum, file) => sum + fileChurn(file), 0);
 }
 
 function annotatePatchWithLines(patch) {
@@ -31789,6 +31797,7 @@ function reconcileChangedSet(listed, parsed) {
 }
 
 module.exports = {
+  fileChurn,
   hunkRanges,
   matchesPattern,
   parseReviewableFiles,
@@ -32172,8 +32181,8 @@ const DEFAULT_SWEEP_CAP = 2;
 //                EMPTY list because that is already prompt.js's value for "read every changed file in
 //                full" (buildReviewInput's readFiles) — this axis picks which value flows to a seam
 //                that was always value-driven, and adds no second prompt path. [LAW:composability]
-// The projection takes the scope's assigned files and returns the read set, so the two arms are one
-// signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
+// The projection takes the scope's eyesight (its owned files plus its second reads) and returns the read
+// set, so the two arms are one signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
 // `scope.files` remains the coverage record either way (the partition assigns every changed path once,
 // and pinnedProposal proves a replayed plan against the changed set), so an arm changes what a worker
 // READS and nothing about what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
@@ -34618,7 +34627,7 @@ const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningT
 const { planRecord } = __nccwpck_require__(8194);
 const { partitionByDirectory } = __nccwpck_require__(6231);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
-const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
+const { NO_EXCLUSIONS, excludedPathList, fileChurn } = __nccwpck_require__(9898);
 const {
   buildReviewInput,
   buildRepoReviewInput,
@@ -35002,15 +35011,16 @@ function curtailmentLogText(curtailed) {
 async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
   // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
-  // scope's assignment (readFilesFor, resolved once at the pass boundary): under the shipped 'assigned' arm
-  // that IS scope.files, so N workers split the read; under 'changed' it is the empty list, which is the
-  // material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
+  // scope's eyesight — the files it owns plus the sibling files it reads as a second reader (readFilesFor,
+  // resolved once at the pass boundary): under the shipped 'assigned' arm that IS the pair, so N workers
+  // split the read and only a cut concern is read twice; under 'changed' it is the empty list, which is
+  // the material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
   // [LAW:one-source-of-truth] The pair keeps the two facts apart: `read` is that projection; `assigned` is
   // `scope.files` unprojected — the COVERAGE record the plan carries,
   // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
   // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
   const buildPromptFor = (toolNames) =>
-    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor(scope.files), window: contextWindow }, priorFindings);
+    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor([...scope.files, ...scope.reads]), window: contextWindow }, priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -35068,14 +35078,14 @@ function uniquelyNamed(scopes) {
 // Each producer owns its own progress lines, so the shared path below carries no logging branch.
 // [LAW:dataflow-not-control-flow]
 
-// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths
-// (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
+// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths and
+// their churn (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
 // scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
 // is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
 // one progress line, exactly as pinnedProposal is.
-function partitionProposal({ changedPaths, log }) {
-  const { scopes, context } = partitionByDirectory(changedPaths);
-  log(`partitioned ${changedPaths.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
+function partitionProposal({ changed, log }) {
+  const { scopes, context } = partitionByDirectory(changed);
+  log(`partitioned ${changed.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
   return { provenance: 'partition', scopes, context, scoutUsage: null };
 }
 
@@ -35111,8 +35121,9 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // proposal to hand the workers.
 //
 // [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
-// exact set equality against the changed paths in both directions, and no path claimed twice — before
-// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
+// exact set equality against the changed paths in both directions, and no path claimed twice — and
+// that every second read names a path in the change, before the first worker at zero model spend. None
+// of the four may be waved through. A plan omitting a
 // changed file would leave that file read in full by no worker while its plan.json claimed a
 // partition of the whole change, so the pinned replay would be a different review wearing the plan's
 // name. A plan naming a file this diff does not contain is the same error read from the other side:
@@ -35136,12 +35147,18 @@ function pinnedProposal({ plan, changedPaths, log }) {
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
   const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
-  if (omitted.length + foreign.length + duplicated.length > 0) {
+  // `reads` is eyesight, not ownership, so it takes no part in the cover — but a read naming a path this
+  // change does not contain is the same "plan belongs to some other change" error read from a fourth
+  // side, and it would otherwise surface only as a worker told to open a file that is not there, after
+  // the spawn was paid for. Refused here with the rest, at zero spend.
+  const unreadable = [...new Set(plan.scopes.flatMap(s => s.reads))].filter(p => !changed.has(p));
+  if (omitted.length + foreign.length + duplicated.length + unreadable.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
       `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
+      `File(s) a scope reads that this change does not contain (${unreadable.length}): ${excludedPathList(unreadable)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
       'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );
@@ -35457,6 +35474,9 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     throw new Error(`buildPrMaterial: changed file '${unmeasured.filename}' carries no content measurement; the changed set must pass through measureChangedFiles (src/window.js) before it becomes review material.`);
   }
   const changedPaths = files.map(f => f.filename);
+  // [LAW:one-source-of-truth] The partition's size dimension is the SAME per-file count the budget and the
+  // difficulty classifier sum (fileChurn) — never a second line-counter beside them.
+  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f) }));
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
   // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
@@ -35465,10 +35485,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:types-are-the-program] The changed-file list is a first-class field of the material, not
     // recovered from the prompt: it is the partition's input and the pinned producer's proof set.
     changedPaths,
-    // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed paths (src/partition.js):
-    // no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS survivors — no
-    // withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
-    proposal: ({ log }) => partitionProposal({ changedPaths, log }),
+    // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed files and their churn
+    // (src/partition.js): no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS
+    // survivors — no withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
+    proposal: ({ log }) => partitionProposal({ changed, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
     // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and
@@ -35533,7 +35553,7 @@ module.exports = {
 const { parseScopeValue } = __nccwpck_require__(1565);
 
 // THE PARTITION — how a pull request's changed files divide into review scopes — as a pure function of
-// the changed paths. Same input, same structure, every run.
+// the changed paths and their churn. Same input, same structure, every run.
 //
 // [LAW:one-source-of-truth] Until this module the partition was bought from an LLM scout per run and
 // re-rolled every time: on a frozen case the identical diff split into 1 to 5 scopes across replays
@@ -35552,13 +35572,43 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //   2. Every file keys on its directory ('.' for the repository root).
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
-// Every changed path lands in exactly one scope by construction, so no coverage sweep, duplicate check,
-// or withheld-path strip exists downstream: the type of the output IS the theorem. [LAW:types-are-the-program]
+//   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
+//      largest group above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
+//      order (a test and the source it names are one unit, never parted). Each part OWNS its files
+//      and READS every sibling part's files in full, so the concern is still seen whole by every worker
+//      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
+//      part count is bounded by the read budget (the concern's extra reads never exceed the changed
+//      set — the ceiling zai-timing-8jk.5 names), and a cut that would leave a part under
+//      SCOPE_CHURN_FLOOR is not made: that group is at the floor, and stays one scope.
+// Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
+// duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
+// `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
+// membership in the changed set: a read outside the change is refused, a read is never counted as coverage.
+// [LAW:types-are-the-program]
 
 // [LAW:one-source-of-truth] The one width lever this rule has. A scope is one worker spawn (~5 min,
 // ~250k tokens on the shipped engine), so this constant is the cost/recall dial the partition exposes;
 // measure it with the eval harness before moving it, and record the move (zai-tuning-pf0).
 const MIN_SCOPE_FILES = 2;
+
+// The size dimension, calibrated on zai-timing-8jk.3 (n=190 pass-0 spawns, 53 runs): a scope's spawn
+// runs ≈ 83 s × churn^0.21 — every scope pays a ~2-minute floor, and doubling churn adds ~15%. The
+// largest-churn scope was the run's straggler 71% of the time on lopsided plans and at chance on even
+// ones, so the cut fires only where the proxy works. [LAW:one-source-of-truth] three named dials, each
+// with its reason; measure before moving one.
+//   LOPSIDED_RATIO   — the plan shape the proxy predicts: max ≥ 2× runner-up (a single scope is lopsided
+//                      against a runner-up of zero — the one-lane plan gains the most from a second lane).
+//   SCOPE_CHURN_CAP  — where size starts to hurt: the top churn quartile (>214 lines) ran 5m49s median
+//                      against 3m36s for the next, and 13 of 14 failed or retried attempts sat on scopes
+//                      of 364–571 lines. 360 is the bottom of that band.
+//   SCOPE_CHURN_FLOOR — the largest INDIVISIBLE reviewable unit, in lines: below ~100 the fit says a
+//                      part saves under 30 s of a spawn that costs a whole extra lane and a second read,
+//                      and a single file is never cut in two (a half-file has no reader for its seam).
+//                      No review is faster than one spawn over this floor: ≈ 83 s × 100^0.21 ≈ 3m35s of
+//                      pass-0 wall clock plus the sweep chain, and no partition can go below it.
+const LOPSIDED_RATIO = 2;
+const SCOPE_CHURN_CAP = 360;
+const SCOPE_CHURN_FLOOR = 100;
 
 // Test files are recognised by where they live (a test directory ANYWHERE in the path — Jest's
 // src/x/__tests__/, a monorepo's packages/foo/test/) or what they are called — both conventions are
@@ -35590,10 +35640,11 @@ function isTestPath(p) {
   return p.split('/').slice(0, -1).some(seg => TEST_DIRS.has(seg)) || TEST_STEM_SUFFIX.test(stemOf(p));
 }
 
-// Rule 1 as a table: the concern directory each path keys on. A suffixed test path keys on the directory
-// of the ONE changed source whose stem it names; every other path keys on its own directory. Built once
-// so the grouping below is a plain fold over values. [LAW:dataflow-not-control-flow]
-function concernDirOf(changedPaths) {
+// Rule 1 as a table: for each path, its COMPANION (the one changed source a suffixed test names, else
+// itself) and the concern directory that companion keys on. Every other path keys on its own directory.
+// Built once so the grouping below is a plain fold over values, and the companion is what rule 4 orders
+// a cut by, so a test and its source land in the same part. [LAW:dataflow-not-control-flow]
+function concernOf(changedPaths) {
   const sourcesByStem = new Map();
   for (const p of changedPaths) {
     if (isTestPath(p)) continue;
@@ -35603,7 +35654,8 @@ function concernDirOf(changedPaths) {
   return new Map(changedPaths.map(p => {
     const stem = stemOf(p);
     const named = TEST_STEM_SUFFIX.test(stem) ? sourcesByStem.get(stem.replace(TEST_STEM_SUFFIX, '')) : null;
-    return [p, dirnameOf(named ?? p)];
+    const companion = named ?? p;
+    return [p, { dir: dirnameOf(companion), companion }];
   }));
 }
 
@@ -35632,44 +35684,125 @@ function depthOf(dir) {
 // authored once. It names the files (so the worker knows its assignment even before the read-targets
 // line) and points the worker at the import edges the change crosses — the seam checks are where
 // multi-file defects live. [LAW:one-source-of-truth]
-function focusFor(dir, files) {
+// `reads` renders as a value: [] (the whole concern is this scope) says nothing; a split part names the
+// sibling parts' files and says what the second read is FOR — the seam, and any defect seen there. A
+// finding in a sibling's file is recorded, never left for the sibling: dedupe merges the overlap.
+// [LAW:dataflow-not-control-flow]
+function focusFor(dir, files, reads) {
   const where = dir === '.' ? 'the repository root' : dir;
-  return `Review the changes to ${files.join(', ')} in ${where}. Also read the files they import and check `
+  const seam = reads.length > 0
+    ? ` This concern is reviewed in parts for size; the rest of it — ${reads.join(', ')} — is owned elsewhere in the plan. `
+      + 'Read those files in full too: the seam between your files and theirs is yours to check, and a defect you '
+      + 'notice in one of them is recorded, never left for the worker that owns it.'
+    : '';
+  return `Review the changes to ${files.join(', ')} in ${where}.${seam} Also read the files they import and check `
     + 'each connection: the dependency points one way, and no single fact is defined or owned on both sides.';
 }
 
-// [LAW:parse-dont-validate] The one producer of a PR review's partition. In: the changed paths a review
-// will cover (already filtered by EXCLUDE_PATTERNS — a withheld path never reaches here, so it can never
-// be assigned). Out: the scopes as the workers run them, each minted through parseScopeValue so a scope
+// Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
+// fills one, and is not cut — this count is the ONE place the cap is read), but never more than the read
+// budget allows — each part reads the whole group, so k parts read it k times, and the (k-1) extra reads
+// are held at or below the changed set's own churn. [LAW:one-source-of-truth]
+function partCount(groupChurn, totalChurn) {
+  return Math.min(Math.ceil(groupChurn / SCOPE_CHURN_CAP), 1 + Math.floor(totalChurn / groupChurn));
+}
+
+// A cut of `units` into k contiguous parts of near-equal churn: each unit joins the part its churn's
+// midpoint falls in. A unit is a companion group — a source and the tests that name it — so a cut can
+// never part a test from its source: the seam a test covers is the one seam no second reader can replace.
+// Pure arithmetic over the order given.
+function cutInto(units, churnOf, k) {
+  const target = units.reduce((sum, unit) => sum + churnOf(unit), 0) / k;
+  const parts = Array.from({ length: k }, () => []);
+  let before = 0;
+  for (const unit of units) {
+    const churn = churnOf(unit);
+    parts[Math.min(k - 1, Math.floor((before + churn / 2) / target))].push(...unit);
+    before += churn;
+  }
+  return parts;
+}
+
+// The parts a group becomes: the largest k, from partCount down, whose every part clears the floor; k=1
+// is the group itself, uncut. An empty part has churn 0 and so fails the floor with the rest — the same
+// rule, not a second check. Deterministic: same files, same churn, same cut. [LAW:no-ambient-temporal-coupling]
+function partsOf(units, churnOf, totalChurn) {
+  const unitChurn = (unit) => unit.reduce((sum, f) => sum + churnOf(f), 0);
+  const groupChurn = units.reduce((sum, unit) => sum + unitChurn(unit), 0);
+  for (let k = partCount(groupChurn, totalChurn); k > 1; k--) {
+    const parts = cutInto(units, unitChurn, k);
+    if (parts.every(part => unitChurn(part) >= SCOPE_CHURN_FLOOR)) return parts;
+  }
+  return [units.flat()];
+}
+
+// [LAW:parse-dont-validate] The one producer of a PR review's partition. In: the changed files a review
+// will cover as { filename, churn } (already filtered by EXCLUDE_PATTERNS — a withheld path never reaches
+// here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget is
+// calibrated on). Out: the scopes as the workers run them, each minted through parseScopeValue so a scope
 // from this producer is the SAME stamped value as one recorded by a scout or read from a pinned plan,
 // plus the orientation line every worker and the posted summary share. [LAW:single-enforcer]
 // [LAW:no-silent-failure] An empty change has no partition; refusing here names the fact rather than
 // letting planRecord refuse an empty scope list two seams later.
-function partitionByDirectory(changedPaths, { minFiles = MIN_SCOPE_FILES } = {}) {
-  if (changedPaths.length === 0) {
-    throw new Error('partitionByDirectory: no changed paths to partition — a review with no files has no structure.');
+function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES } = {}) {
+  if (changed.length === 0) {
+    throw new Error('partitionByDirectory: no changed files to partition — a review with no files has no structure.');
   }
-  const concernDir = concernDirOf(changedPaths);
+  const churnByPath = new Map(changed.map(f => [f.filename, f.churn]));
+  const churnOf = (p) => churnByPath.get(p);
+  const changedPaths = [...churnByPath.keys()].sort();
+  const concern = concernOf(changedPaths);
   const groups = new Map();
-  for (const p of [...changedPaths].sort()) {
-    const dir = concernDir.get(p);
+  for (const p of changedPaths) {
+    const { dir } = concern.get(p);
     groups.set(dir, [...(groups.get(dir) ?? []), p]);
   }
   const merged = mergeSmallGroups(groups, minFiles);
-  // [LAW:one-source-of-truth] A merged-in subdirectory lands at the END of its parent's group, so the
-  // list is sorted once here and both renderings of the assignment — the focus prose and the files
-  // field — read from that one ordering.
-  const scopes = [...merged.keys()].sort().map((dir, index) => {
-    const files = [...merged.get(dir)].sort();
-    return parseScopeValue({ name: dir === '.' ? ROOT_SCOPE_NAME : dir, focus: focusFor(dir, files), files }, index);
-  });
+
+  // Rule 4 fires on the ONE largest group, and only on a lopsided plan; whether that group is above the
+  // cap is partCount's call, not a second gate here. Ties break by name so the same input always cuts the
+  // same group. The other groups are untouched: a balance target every run chases is exactly what 8jk.3
+  // ruled out — the proxy is noise on even plans.
+  const groupChurn = new Map([...merged].map(([dir, files]) => [dir, files.reduce((sum, f) => sum + churnOf(f), 0)]));
+  const byChurn = [...groupChurn.keys()].sort((a, b) => groupChurn.get(b) - groupChurn.get(a) || (a < b ? -1 : 1));
+  const [largest, runnerUp] = byChurn;
+  const totalChurn = changedPaths.reduce((sum, p) => sum + churnOf(p), 0);
+  const lopsided = groupChurn.get(largest) >= LOPSIDED_RATIO * (runnerUp === undefined ? 0 : groupChurn.get(runnerUp));
+  const cut = lopsided ? largest : null;
+
+  // [LAW:one-source-of-truth] A merged-in subdirectory lands at the END of its parent's group, so each
+  // group is ordered once here — by companion, the source itself first, then path — and every rendering
+  // of an assignment (the focus prose, the files field, the cut) reads from that one ordering.
+  const companionKey = (p) => [concern.get(p).companion, p === concern.get(p).companion ? 0 : 1, p];
+  const companionOrder = (a, b) => {
+    const ka = companionKey(a); const kb = companionKey(b);
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] !== kb[i]) return ka[i] < kb[i] ? -1 : 1;
+    }
+    return 0;
+  };
+  // Companion groups as units: consecutive files (in companion order) that share one companion.
+  const unitsOf = (files) => files.reduce((units, f) => {
+    const last = units[units.length - 1];
+    if (last && concern.get(last[0]).companion === concern.get(f).companion) last.push(f); else units.push([f]);
+    return units;
+  }, []);
+  const scopes = [...merged.keys()].sort().flatMap((dir) => {
+    const files = [...merged.get(dir)].sort(companionOrder);
+    const name = dir === '.' ? ROOT_SCOPE_NAME : dir;
+    const parts = dir === cut ? partsOf(unitsOf(files), churnOf, totalChurn) : [files];
+    return parts.map((own, i) => {
+      const reads = parts.flatMap((part, j) => (j === i ? [] : part));
+      return { name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, focus: focusFor(dir, own, reads), files: own, reads };
+    });
+  }).map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
     + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.`;
   return { scopes, context };
 }
 
-module.exports = { partitionByDirectory, MIN_SCOPE_FILES, ROOT_SCOPE_NAME };
+module.exports = { partitionByDirectory, MIN_SCOPE_FILES, LOPSIDED_RATIO, SCOPE_CHURN_CAP, SCOPE_CHURN_FLOOR, ROOT_SCOPE_NAME };
 
 
 /***/ }),
@@ -35698,7 +35831,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files, reads }, recorded
 // whole rather than projected, so a scope field added later cannot be silently dropped on the way to
 // disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so
@@ -36082,9 +36215,11 @@ function reviewCharter(toolNames) {
 // [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
 // value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
 // owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
-// arm, src/effort.js, applied to that assignment). They coincide under the shipped 'assigned' arm, which
-// is why one list once passed for both — and diverge under 'changed', where readFiles is empty and every
-// worker reads the whole set while exactly one still owns the bump. Empty readFiles is the whole-set read
+// arm, src/effort.js, applied to that assignment). Under the shipped 'assigned' arm readFiles is the
+// assignment plus the scope's `reads` — the sibling parts of a concern cut for size (src/partition.js
+// rule 4) — so the two coincide only for an uncut scope, which is why one list once passed for both.
+// Under 'changed' they diverge fully: readFiles is empty and every worker reads the whole set while
+// exactly one still owns the bump. Empty readFiles is the whole-set read
 // (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
@@ -36389,7 +36524,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
       ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
       : '';
     const fullSentence = full.length > 0
-      ? `Read the complete content of THESE files — this scope's assigned changed files: ${full.join(', ')}. `
+      ? `Read the complete content of THESE files — the changed files this scope reads in full: ${full.join(', ')}. `
         + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
       : '';
     return (readFiles.length > 0
@@ -37158,16 +37293,22 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All three
+  // [LAW:parse-dont-validate] name, focus and every file entry (owned or read) are stamped single-line here. All
   // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
   // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
   // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
   // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
   // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
-  const files = Array.isArray(scope.files)
-    ? scope.files.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => flattenBody(f))
+  // `files` is what the scope OWNS (the coverage record: every changed path in exactly one scope's files);
+  // `reads` is what it opens in full BEYOND that — a split concern's sibling parts (src/partition.js), and
+  // the seam-derived second reads to come (zai-timing-8jk.5). Two facts, one shape each; both default to
+  // the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
+  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files), reads: pathList(scope.reads) };
+}
+function pathList(value) {
+  return Array.isArray(value)
+    ? value.filter(f => typeof f === 'string' && f.trim().length > 0).map(f => flattenBody(f))
     : [];
-  return { name: flattenBody(name), focus: flattenBody(focus), files };
 }
 
 // [LAW:types-are-the-program] A dependency assessment is the same kind of typed, schema-validated
@@ -52391,7 +52532,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.64.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.65.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

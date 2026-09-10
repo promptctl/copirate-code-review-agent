@@ -1055,7 +1055,7 @@ describe('resolvePlanSet proves the plan set before the suite spends anything', 
     fs.mkdirSync(caseDir, { recursive: true });
     fs.writeFileSync(path.join(caseDir, file), JSON.stringify({
       planSchema: PLAN_SCHEMA, provenance: 'scout', context: 'ctx',
-      scopes: [{ name: 's', focus: 'f', files: ['a.js'] }], scoutUsage: null, ...overrides,
+      scopes: [{ name: 's', focus: 'f', files: ['a.js'], reads: [] }], scoutUsage: null, ...overrides,
     }));
   };
 

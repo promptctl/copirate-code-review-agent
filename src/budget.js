@@ -139,7 +139,11 @@ function reasoningFactor(tier) {
 
 // [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
 // 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
-// the changed set about ONCE however many scopes the plan has. 'changed' is the pre-split behavior, where
+// the changed set about ONCE however many scopes the plan has. Since partition.js rule 4, a concern cut
+// into k parts is read k times (each part reads its siblings), but rule 4's partCount bound holds the
+// (k-1) extra reads at or below the changed set, so the arm reads at most 2x the changed set on a
+// lopsided diff and ~1x otherwise; a diff-shape spread inside the constant, not a second arm. 'changed'
+// is the pre-split behavior, where
 // every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
 // scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
 // fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative

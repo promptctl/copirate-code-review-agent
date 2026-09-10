@@ -133,15 +133,18 @@ function buildReviewAnchors(files) {
 // excluded files (dist/**, lockfiles) never inflate the estimate. A patch body runs from its first
 // `@@` onward, so a leading '+'/'-' is an added/deleted content line; the hunk header (`@@`) and the
 // no-newline marker ('\') start with neither. A file with no patch (binary/rename-only) contributes 0.
-function diffChurn(files) {
+// A single file's churn is the unit — the partition sizes each scope by it (src/partition.js) — and the
+// whole set's churn is the sum of the units, so the two can never count a line differently. [LAW:one-source-of-truth]
+function fileChurn(file) {
+  if (!file.patch) return 0;
   let churn = 0;
-  for (const file of files) {
-    if (!file.patch) continue;
-    for (const line of file.patch.split('\n')) {
-      if (line[0] === '+' || line[0] === '-') churn++;
-    }
+  for (const line of file.patch.split('\n')) {
+    if (line[0] === '+' || line[0] === '-') churn++;
   }
   return churn;
+}
+function diffChurn(files) {
+  return files.reduce((sum, file) => sum + fileChurn(file), 0);
 }
 
 function annotatePatchWithLines(patch) {
@@ -332,6 +335,7 @@ function reconcileChangedSet(listed, parsed) {
 }
 
 module.exports = {
+  fileChurn,
   hunkRanges,
   matchesPattern,
   parseReviewableFiles,

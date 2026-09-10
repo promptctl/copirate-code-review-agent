@@ -20,12 +20,12 @@ const { EFFORT_SCHEMA } = require('../src/effort');
 
 // ── fixtures ───────────────────────────────────────────────────────────────────────────────────────
 
-const PLAN_ONE_SCOPE = { context: 'the shared context', scopes: [{ name: 'all', focus: 'everything', files: ['a.ts', 'b.ts'] }] };
+const PLAN_ONE_SCOPE = { context: 'the shared context', scopes: [{ name: 'all', focus: 'everything', files: ['a.ts', 'b.ts'], reads: [] }] };
 const PLAN_TWO_SCOPES = {
   context: 'the shared context',
   scopes: [
-    { name: 'first', focus: 'the first half', files: ['a.ts'] },
-    { name: 'second', focus: 'the second half', files: ['b.ts'] },
+    { name: 'first', focus: 'the first half', files: ['a.ts'], reads: [] },
+    { name: 'second', focus: 'the second half', files: ['b.ts'], reads: [] },
   ],
 };
 
@@ -101,7 +101,7 @@ test('planKey is the partition, not the producer: provenance and scout price do 
 
 test('planKey distinguishes different partitions and survives key reordering', () => {
   assert.notEqual(planKey(PLAN_ONE_SCOPE), planKey(PLAN_TWO_SCOPES));
-  const reordered = { scopes: [{ files: ['a.ts', 'b.ts'], focus: 'everything', name: 'all' }], context: 'the shared context' };
+  const reordered = { scopes: [{ files: ['a.ts', 'b.ts'], focus: 'everything', name: 'all', reads: [] }], context: 'the shared context' };
   assert.equal(planKey(reordered), planKey(PLAN_ONE_SCOPE));
   // A differing context is a differing plan: it is prefixed onto every worker's focus.
   assert.notEqual(planKey({ ...PLAN_ONE_SCOPE, context: 'other' }), planKey(PLAN_ONE_SCOPE));
@@ -119,7 +119,7 @@ test('the arms are named by whatever distinguishes them, never by a basename bot
 });
 
 test('a plan digest distinguishes two plans of the same scope count', () => {
-  const other = { context: 'the shared context', scopes: [{ name: 'left', focus: 'l', files: ['a.ts'] }, { name: 'right', focus: 'r', files: ['b.ts'] }] };
+  const other = { context: 'the shared context', scopes: [{ name: 'left', focus: 'l', files: ['a.ts'], reads: [] }, { name: 'right', focus: 'r', files: ['b.ts'], reads: [] }] };
   assert.equal(digest(planKey(PLAN_TWO_SCOPES)).length, 8);
   assert.notEqual(digest(planKey(PLAN_TWO_SCOPES)), digest(planKey(other)));
   assert.equal(digest(planKey(PLAN_TWO_SCOPES)), digest(planKey(PLAN_TWO_SCOPES)));

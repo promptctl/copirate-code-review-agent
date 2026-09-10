@@ -210,7 +210,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
 #          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
-#          --plan <plan.json> (default: the partition is computed from the changed paths),
+#          --plan <plan.json> (default: the partition is computed from the changed paths and their churn),
 #          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
 ```
 
@@ -253,10 +253,11 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     no CI log to scrape.
   plan.json       — the replay's STRUCTURE, as the engine's own record (src/plan.js's planRecord):
                     { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
-                    partition the workers actually ran (each { name, focus, files }; every changed path
-                    lands in exactly one scope) and context is the planning text prefixed onto every
+                    partition the workers actually ran (each { name, focus, files, reads }; every changed
+                    path lands in exactly one scope's files, and reads is what the scope opens in full
+                    beyond its own — the sibling parts of a concern cut for size) and context is the planning text prefixed onto every
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
-                    scopes are a pure function of the changed paths, no spawn, scoutUsage null), 'scout'
+                    scopes are a pure function of the changed file paths and their churn, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
                     spawn; scoutUsage is what deciding it cost) or 'pinned' (a --plan replay, scoutUsage
                     null). This file is a valid --plan input: see below.
@@ -339,11 +340,17 @@ effect the gate had just neutralized. Re-freeze the baseline, or price the lever
 
 The **scope plan** is the review's structure: how many scopes the change splits into, which files each
 scope claims, and the shared context every worker is shown. In PR mode it is now a **pure function of
-the changed file paths** (`partitionByDirectory` in `src/partition.js`): a test file joins the changed
-source file with the same stem, every file keys on its directory, a directory group smaller than
-`MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Same diff,
-same structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no
-diff to compute one from.
+the changed file paths and their churn** (`partitionByDirectory` in `src/partition.js`): a test file joins
+the changed source file with the same stem, every file keys on its directory, a directory group smaller
+than `MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Then
+the size dimension (zai-timing-8jk.4): on a lopsided plan — the largest group at least `LOPSIDED_RATIO`
+(2) times the runner-up — a largest group of more than `SCOPE_CHURN_CAP` (360) changed lines is cut into
+parts of near-equal churn, each part owning its files and reading every sibling part's in full, so the
+concern is still seen whole by every worker judging a piece of it. The part count is bounded so the
+extra reads never exceed the changed set, a source and the test that names it are never parted, and a
+cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. Same diff, same
+structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no diff
+to compute one from.
 
 It was not always so. The plan used to be re-decided by an LLM scout on every single invocation and
 recorded nowhere durable, and on the frozen case `links-317` identical input gave 1 to 5 scopes, 4 to 28
@@ -355,8 +362,9 @@ of the table above was built to price (`copirate-determinism-5od`). Worse, in 3 
 emitted scopes with no files at all, so every worker fell back to reading the whole diff at about 3× the
 cost while the run scored as a valid sample — and two of those runs scored best on recall, poisoning the
 A/B. The partition removed that variance at the source: 5 replays of one case now share one structure by
-construction, and `MIN_SCOPE_FILES` is the one width lever the rule exposes, the thing to measure with
-this harness later.
+construction, and the rule's levers are named constants to measure with this harness later:
+`MIN_SCOPE_FILES` for width, and `LOPSIDED_RATIO`, `SCOPE_CHURN_CAP` and `SCOPE_CHURN_FLOOR` for the
+balance cut of rule 4.
 
 So on a frozen PR case every un-pinned replay already runs the same structure. `--plan` remains the way
 to hold a review to a structure *other* than the computed one — a partition produced under a different
@@ -380,7 +388,8 @@ spawns anything to decide the plan.
 A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
 at zero spend. A partition is a cover with no overlap, and all three ways to miss it are refused: a
 changed file no scope claims, a file the plan names that the diff lacks, and a file claimed by more than
-one scope. Nothing downstream repairs coverage — every changed
+one scope. A fourth refusal reads the same error from the `reads` side: a scope that reads a file the
+diff lacks belongs to some other change, and is refused with the rest. Nothing downstream repairs coverage — every changed
 path lands in exactly one scope because the producer puts it there, not because a later sweep catches
 what it missed — so a changed file no scope claims would simply go unreviewed while its `plan.json`
 claimed a partition of the whole change: a different review wearing the plan's name, which is the one
