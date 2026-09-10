@@ -62,8 +62,8 @@ function makeCliAdapter(spec) {
     // The model context window this engine reviews inside, in tokens, or null when the engine does
     // not declare one. The multi-scope pass hands it to the material so each worker's prompt is FIT
     // to it (src/window.js) — the diff it is shown and the files it is told to read are sized so the
-    // first request cannot overflow. Forwarded as declared; fitWorkerMaterial is the one checkpoint
-    // of its vocabulary (null | positive integer). [LAW:one-source-of-truth]
+    // first request cannot overflow. Forwarded as declared; runMultiScopePass (src/multiscope.js) is
+    // the one checkpoint of its vocabulary (null | positive integer). [LAW:one-source-of-truth]
     contextWindow: spec.contextWindow,
 
     // buildPromptFor(toolNames) is applied with THIS engine's tool identifiers, so a failover chain

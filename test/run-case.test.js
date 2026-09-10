@@ -325,11 +325,15 @@ test('buildCaseMaterial without readContent measures the file as it stands on di
   const fs = require('fs');
   const os = require('os');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-case-material-'));
-  fs.mkdirSync(path.join(root, 'src'));
-  fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const x = 1;\nconst y = 2;\n');
-  const { files } = buildCaseMaterial({ allFiles: [CASE_FILES[0]], excludePatterns: [], reviewedRepoRoot: root });
-  assert.equal(files[0].content.lines, 3);
-  assert.ok(files[0].content.tokens > 0);
+  try {
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const x = 1;\nconst y = 2;\n');
+    const { files } = buildCaseMaterial({ allFiles: [CASE_FILES[0]], excludePatterns: [], reviewedRepoRoot: root });
+    assert.equal(files[0].content.lines, 3);
+    assert.ok(files[0].content.tokens > 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('buildCaseMaterial refuses a case whose patterns exclude everything, rather than replaying it empty', () => {

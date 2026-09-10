@@ -1951,6 +1951,27 @@ describe('buildReviewInput window fit', () => {
     assert.match(prompt, /Another scope's worker reads the other changed files/);
   });
 
+  test('the rendered prompt never exceeds window − headroom, however many files the note and read lists must name', () => {
+    const { WORKER_HEADROOM_TOKENS, estimateTokens } = require('../src/window');
+    const many = stamp(Array.from({ length: 400 }, (_, i) => ({
+      filename: `pkg/module-${i}/handler.js`, status: 'modified',
+      patch: `@@ -1,2 +1,16 @@\n const a = ${i};\n${Array.from({ length: 15 }, (_, j) => `+const b${j} = a * ${j}; // ${'x'.repeat(60)}`).join('\n')}`,
+    }))).map(f => ({ ...f, content: { tokens: 400, lines: 40 } }));
+    const window = 200_000;
+    const prompt = buildReviewInput({ files: many, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: many.map(f => f.filename), window }).prompt;
+    assert.match(prompt, /could not be shown/); // the fit had to withhold, so the note is at its longest
+    assert.ok(estimateTokens(prompt) <= window - WORKER_HEADROOM_TOKENS, `prompt ${estimateTokens(prompt)} tokens exceeds ${window - WORKER_HEADROOM_TOKENS}`);
+  });
+
+  test('a pure deletion at the top of a file is read from line 1, never a line 0 no file has', () => {
+    const { hunkRanges } = require('../src/diff');
+    assert.deepEqual(hunkRanges('@@ -1,3 +0,0 @@\n-a\n-b\n-c'), [{ from: 1, to: 1 }]);
+    const big = stamp([{ filename: 'src/top.js', status: 'modified', patch: '@@ -1,3 +0,0 @@\n-a\n-b\n-c' }])
+      .map(f => ({ ...f, content: { tokens: 150_000, lines: 9000 } }));
+    const prompt = buildReviewInput({ files: big, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/top.js'], window: 200_000 }).prompt;
+    assert.match(prompt, /src\/top\.js \(lines 1 of 9000\)/);
+  });
+
   test("a withheld file outside this worker's read set is another scope's: consult only when a finding needs it; a removed one has nothing to read", () => {
     const files = stamp([
       { filename: 'go.sum', status: 'added', patch: `@@ -0,0 +1,1500 @@\n${hashes}` },

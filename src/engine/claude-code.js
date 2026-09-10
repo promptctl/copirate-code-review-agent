@@ -314,7 +314,11 @@ const claudeCodeAdapter = makeCliAdapter({
   // model routed here has a smaller window (GLM-5.x and DeepSeek V4 both declare 200k or more), and
   // a model with a larger one gets material fit to 200k, which withholds early rather than late: the
   // safe direction. Unlike codex/opencode, whose fronted models' windows are unknown to this repo,
-  // this floor is a known fact. Moves with a measurement, never a wish.
+  // this floor is a known fact for the models in the provider table. An operator who overrides the
+  // model or base URL to something outside it is not validated against a window list (this repo keeps
+  // none, and a second table of model facts would drift); a smaller window there overflows LOUDLY —
+  // "Prompt is too long", the scope reported unreviewed — never as a silent compaction.
+  // Moves with a measurement, never a wish.
   contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
