@@ -39,7 +39,7 @@ const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
 const { parseOneOf } = require('./cli-enum');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
-artifacts (findings.json, summary.txt, usage.json, schedule.json, transcripts/) for the scorer to reduce.
+artifacts (findings.json, summary.txt, usage.json, schedule.json, plan.json, transcripts/) for the scorer to reduce.
 
 Usage: node eval/run-case.js <case-dir> [options]
 
@@ -283,16 +283,22 @@ function jsonBytes(field, value) {
 // same value run.js posts in the PR footer, so a replay and a production review can only agree or disagree
 // about ONE timing fact. [LAW:one-source-of-truth]
 //
+// plan.json is the review's STRUCTURE — the partition the workers actually ran (src/plan.js's planRecord,
+// reached here as review.plan), which the engine decides per invocation and which nothing durable used to
+// record. It lands with the other artifacts and BEFORE the findings rename, so a dir that counts as
+// complete always carries the plan that produced its findings. [LAW:no-ambient-temporal-coupling]
+//
 // It is an ARTIFACT and not a printed line because wall clock is what the eval gate is now bound by: the
 // suite has always measured per-replay duration and only ever written it to stdout, where CI log truncation
 // eats it, so the per-replay figure the gate sizes itself against had to be re-derived by archaeology and
 // went stale across #148 unnoticed. A measured fact with no durable map is a fact the next reader must
 // guess at. [FRAMING:representation]
-function writeRunRecord(runDir, { meta, summary, usage, schedule, findings }) {
+function writeRunRecord(runDir, { meta, summary, usage, schedule, plan, findings }) {
   fs.writeFileSync(path.join(runDir, 'meta.json'), jsonBytes('meta', meta));
   fs.writeFileSync(path.join(runDir, 'summary.txt'), `${present('summary', summary)}\n`);
   fs.writeFileSync(path.join(runDir, 'usage.json'), jsonBytes('usage', usage));
   fs.writeFileSync(path.join(runDir, 'schedule.json'), jsonBytes('schedule', schedule));
+  fs.writeFileSync(path.join(runDir, 'plan.json'), jsonBytes('plan', plan));
   const findingsPath = path.join(runDir, 'findings.json');
   fs.writeFileSync(`${findingsPath}.partial`, jsonBytes('findings', findings));
   fs.renameSync(`${findingsPath}.partial`, findingsPath);
@@ -476,6 +482,7 @@ async function main() {
         summary: review.summary || '',
         usage: review.usage,
         schedule: review.schedule,
+        plan: review.plan,
         findings: review.findings,
       });
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));

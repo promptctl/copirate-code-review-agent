@@ -6,6 +6,7 @@ const { defaultEffortProfile, maxTier, readSetProjection } = require('./effort')
 const { dedupeFindings, dedupeAssessments, parseScopeValue } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = require('./schedule');
+const { planRecord } = require('./plan');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const {
@@ -676,6 +677,23 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       sweepCap,
       scopeCount: scopes.length,
       spawns: spawnRecords,
+    }),
+    // The pass's PLAN as a value (copirate-determinism-5od.ea7): the partition these workers actually
+    // ran, minted through src/plan.js. `scopes` is the post-planScopes list — the very array
+    // runScopeWorkers iterated and each worker was handed as its assignment — so the record and the
+    // behavior are ONE value, not a copy that could describe a partition the run did not use.
+    // [LAW:one-source-of-truth]
+    //
+    // `scoutUsage` is the settled scout spawn's price, carried here so the plan states what it cost to
+    // decide. The ATTEMPT-level authority stays the schedule's spawn list above (it alone carries the
+    // retried and failed attempts); this field is the completed spawn's usage, taken from the same
+    // in-memory value rather than re-derived from that list. An engine that reported nothing gives the
+    // typed absence spanMs already spells 'unclocked' — never a fabricated zero. [LAW:no-silent-failure]
+    plan: planRecord({
+      provenance: 'scout',
+      context,
+      scopes,
+      scoutUsage: scoutResult.usage ?? null,
     }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview), and run.js warns when
