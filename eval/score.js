@@ -332,7 +332,7 @@ function agreedEffort(runs) {
 }
 
 // [LAW:single-enforcer] What a MISPLACED run is, stated once: a run whose meta.json names a case other
-// than the directory it sits under. Every walker over an out root meets it — compare.js's readPriorRuns
+// than the directory it sits under. Every walker over an out root meets it — readPriorRuns below (the resume's reader)
 // refuses one before the spend, paired.js's readArm before it pools runs into a pairing block — and two
 // copies of the rule would drift into refusing different things for the same run. The caller passes the
 // LABEL it points at the run by (a meta.json path, an arm's run dir), so each keeps its own way of naming
