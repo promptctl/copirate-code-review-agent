@@ -76,7 +76,7 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
     assert.match(auth, /Read the complete content of THESE files — the changed files this scope reads in full: src\/auth\/login\.js, src\/auth\/token\.js/);
     // The cost cut is this sentence, not the file list: without it a worker that reads its neighbour
     // anyway would make the two arms converge in behavior while still differing on paper.
-    assert.match(auth, /Another scope's worker reads the other changed files, so do NOT read them in full/);
+    assert.match(auth, /The other 2 changed file\(s\) in this pull request — src\/io\/read\.js, src\/io\/write\.js — are owned and read by other scopes' workers, so their diffs are not shown here.*Do NOT read them in full/);
     assert.equal(readTargetsOf(auth), 'src/auth/login.js, src/auth/token.js', 'the split did not hold');
   });
 
@@ -100,12 +100,14 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
     const assigned = promptFor((await passAtArm('assigned')).workerPrompts, 'src/auth');
     const changed = promptFor((await passAtArm('changed')).workerPrompts, 'src/auth');
     assert.notEqual(assigned, changed);
-    // Everything a finding's validity rests on is untouched: the same whole diff, the same anchors, the
-    // same focus. If the arms differed in the DIFF as well, a recall delta could not be attributed to the
-    // read set — which is the only thing the A/B is trying to price.
+    // The arm is ONE value — a worker's eyesight — and everything else is untouched: the same anchors,
+    // the same focus, the same plan. Under 'changed' the eyesight is the whole diff; under 'assigned'
+    // it is the scope's own files plus its seams, and the rest of the change is named, not shown.
     for (const shared of ['src/auth/login.js', 'src/io/read.js', 'src/auth — Review the changes']) {
       assert.ok(assigned.includes(shared) && changed.includes(shared), `both arms should carry ${shared}`);
     }
+    assert.match(changed, /### src\/io\/read\.js \(modified\)/);
+    assert.doesNotMatch(assigned, /### src\/io\/read\.js \(modified\)/);
   });
 
   test('the arm changes what a worker READS, never what the plan claims to COVER', async () => {
@@ -177,22 +179,24 @@ describe('the read-set arm reaches the worker prompt — the A/B is expressible 
   });
 });
 
-// ── a cut concern: the parts read each other, so the seam is covered by construction (zai-timing-8jk.4) ──
+// ── a cut concern: a part reads the sibling the change couples it to (zai-timing-8jk.4, 8jk.5) ──
 // One directory of two 300-line files beside a directory of crumbs: lopsided and over the cap, so the
-// partition halves it and each half OWNS one file and READS the other's. This is the worker-facing proof:
-// the read-targets line of a part's prompt names the sibling's file as a full read, under the shipped
+// partition halves it. a.js defines a symbol b.js's change calls, so the two parts have a seam and each
+// reads the other's file; the docs couple to nothing and read nothing. This is the worker-facing proof:
+// the read-targets line of a part's prompt names the coupled sibling as a full read, under the shipped
 // arm; under 'changed' every worker already reads everything and the parts add nothing.
 describe('a cut concern reaches the worker as two full-read lists', () => {
-  const long = (n) => `@@ -1,${n} +1,${n} @@\n${'+x\n'.repeat(n)}`;
-  const LOPSIDED = stamp([
+  const long = (n, line = '+x') => `@@ -1,${n} +1,${n} @@\n${`${line}\n`.repeat(n)}`;
+  const CONTENT = { '/home/runner/work/acme/acme/src/core/a.js': 'function alpha() {}\n', '/home/runner/work/acme/acme/src/core/b.js': 'alpha();\n' };
+  const LOPSIDED = measureChangedFiles([
     { filename: 'src/core/a.js', status: 'modified', patch: long(300) },
-    { filename: 'src/core/b.js', status: 'modified', patch: long(300) },
+    { filename: 'src/core/b.js', status: 'modified', patch: long(300, '+alpha();') },
     { filename: 'docs/x.md', status: 'modified', patch: long(5) },
     { filename: 'docs/y.md', status: 'modified', patch: long(5) },
-  ]);
+  ], REPO_ROOT, (p) => CONTENT[p] ?? '');
   const material = () => buildPrMaterial({ files: LOPSIDED, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT });
 
-  test("'assigned': each part reads its own file AND its sibling's; the crumbs worker reads only its own", async () => {
+  test("'assigned': each part reads its own file AND the sibling it is coupled to; the crumbs worker reads only its own", async () => {
     const { workerPrompts, review } = await passAtArm('assigned', { material: material() });
     assert.deepEqual(review.plan.scopes.map(s => [s.name, s.files, s.reads]), [
       ['docs', ['docs/x.md', 'docs/y.md'], []],
@@ -202,6 +206,10 @@ describe('a cut concern reaches the worker as two full-read lists', () => {
     assert.equal(readTargetsOf(promptFor(workerPrompts, 'src/core 1/2')), 'src/core/a.js, src/core/b.js');
     assert.equal(readTargetsOf(promptFor(workerPrompts, 'src/core 2/2')), 'src/core/a.js, src/core/b.js');
     assert.equal(readTargetsOf(promptFor(workerPrompts, 'docs')), 'docs/x.md, docs/y.md');
+    // Eyesight is the grid: a part sees its own hunk and its seam's, never the docs'.
+    const first = promptFor(workerPrompts, 'src/core 1/2');
+    assert.match(first, /### src\/core\/b\.js \(modified\)/);
+    assert.doesNotMatch(first, /### docs\/x\.md/);
   });
 
   test("'changed': the parts are still two scopes, and every worker reads the whole set as before", async () => {

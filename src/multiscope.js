@@ -8,6 +8,7 @@ const { sumCost, emptyTokens, addTokens } = require('./usage');
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = require('./schedule');
 const { planRecord } = require('./plan');
 const { partitionByDirectory } = require('./partition');
+const { seamsOf } = require('./seams');
 const { renderDependencyDiffNote } = require('./dependency-diff');
 const { NO_EXCLUSIONS, excludedPathList, fileChurn } = require('./diff');
 const {
@@ -460,13 +461,13 @@ function uniquelyNamed(scopes) {
 // Each producer owns its own progress lines, so the shared path below carries no logging branch.
 // [LAW:dataflow-not-control-flow]
 
-// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths and
-// their churn (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
+// [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths, their
+// churn, their size and their seams (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
 // scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
 // is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
 // one progress line, exactly as pinnedProposal is.
-function partitionProposal({ changed, log }) {
-  const { scopes, context } = partitionByDirectory(changed);
+function partitionProposal({ changed, seams, laneCeiling, log }) {
+  const { scopes, context } = partitionByDirectory(changed, seams, { laneCeiling });
   log(`partitioned ${changed.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
   return { provenance: 'partition', scopes, context, scoutUsage: null };
 }
@@ -649,7 +650,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // [LAW:dataflow-not-control-flow] The one thing that genuinely differs — whether an engine spawn is
   // bought at all — is precisely what choosing a producer means, and it happens here, once.
   const proposal = plan === null
-    ? await material.proposal({ spawn, log })
+    ? await material.proposal({ spawn, log, laneCeiling })
     : pinnedProposal({ plan, changedPaths: material.changedPaths, log });
 
   // [LAW:types-are-the-program] Coverage is a property of the producers, not a check here: a computed
@@ -851,14 +852,17 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // material boundary, before any lane spawns, so an unmeasured changed set is refused at zero spend with
 // the seam named, never discovered inside a worker as a TypeError absorbed into "scope failed".
 function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
-  const unmeasured = files.find(f => !f.content || !Number.isInteger(f.content.tokens) || !Number.isInteger(f.content.lines));
+  const unmeasured = files.find(f => !f.content || !Number.isInteger(f.content.tokens) || !Number.isInteger(f.content.lines) || !f.content.symbols);
   if (unmeasured) {
     throw new Error(`buildPrMaterial: changed file '${unmeasured.filename}' carries no content measurement; the changed set must pass through measureChangedFiles (src/window.js) before it becomes review material.`);
   }
   const changedPaths = files.map(f => f.filename);
   // [LAW:one-source-of-truth] The partition's size dimension is the SAME per-file count the budget and the
-  // difficulty classifier sum (fileChurn) — never a second line-counter beside them.
-  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f) }));
+  // difficulty classifier sum (fileChurn) — never a second line-counter beside them; its read cost is the
+  // SAME line count the window fit sizes a full read by; and its seams are derived once here, from the
+  // symbols the measurement stamped, for every scope the partition hands a second read to.
+  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f), lines: f.content.lines }));
+  const seams = seamsOf(files);
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
   // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
@@ -870,7 +874,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed files and their churn
     // (src/partition.js): no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS
     // survivors — no withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
-    proposal: ({ log }) => partitionProposal({ changed, log }),
+    // [LAW:dataflow-not-control-flow] The lane ceiling reaches the cut as a value — the one machine fact
+    // the plan consults, so a concern is never cut into more parts than the runner can run beside the
+    // other scopes (rule 4). A pinned plan replays whatever width it was cut at.
+    proposal: ({ log, laneCeiling }) => partitionProposal({ changed, seams, laneCeiling, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
     // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and
