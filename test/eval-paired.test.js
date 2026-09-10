@@ -62,9 +62,17 @@ function writeArm(root, cases) {
   return root;
 }
 
+// One registry of what these tests minted, drained once — rather than an rmSync repeated in every test,
+// which is the copy that gets forgotten when a test is added.
+const minted = [];
 function tmpRoot(name) {
-  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'paired-test-')), name);
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'paired-test-'));
+  minted.push(parent);
+  return path.join(parent, name);
 }
+test.after(() => {
+  for (const dir of minted) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 // ── arg parsing ────────────────────────────────────────────────────────────────────────────────────
 
@@ -79,7 +87,6 @@ test('parseArgs takes two arm roots and an optional --out', () => {
 test('parseArgs refuses missing, extra, and self-paired arms', () => {
   assert.throws(() => parseArgs(['eval/out/a']), /Missing arm roots/);
   assert.throws(() => parseArgs(['a', 'b', 'c']), /Unexpected third positional/);
-  assert.throws(() => parseArgs(['a', './a']), /resolve to/);
   assert.throws(() => parseArgs(['a', 'b', '--nope=1']), /Unknown option/);
   assert.throws(() => parseArgs(['a', 'b', '--out']), /requires a non-empty value/);
 });
@@ -204,6 +211,20 @@ test('an unscored run is refused before it can be paired', () => {
 test('an arm root that blended two efforts is refused', () => {
   const a = writeArm(tmpRoot('armA'), { 'case-one': [{ sweepCap: 2, found: [1], missed: [] }, { sweepCap: 0, found: [1], missed: [] }] });
   assert.throws(() => readArm(a, 'A'), /ran at effort roundCap=0 sweepCap=0 .* but earlier runs ran at roundCap=0 sweepCap=2 /);
+});
+
+test('two spellings of one root are refused, symlink included — a self-comparison agrees by construction', () => {
+  const a = writeArm(tmpRoot('armA'), { 'case-one': [{ found: [1], missed: [] }] });
+  const link = path.join(path.dirname(a), 'link-to-armA');
+  fs.symlinkSync(a, link);
+  assert.throws(() => pairArms(readArm(a, 'A'), readArm(link, 'B')), /Pairing a root with itself compares nothing/);
+});
+
+test('a corrupt scorecard names the file it could not parse', () => {
+  const root = tmpRoot('armA');
+  const dir = writeRun(path.join(root, 'case-one'), 'run', { found: [1], missed: [] });
+  fs.writeFileSync(path.join(dir, 'scorecard.json'), '{"inventoryMustFind": ');
+  assert.throws(() => readArm(root, 'A'), /scorecard\.json is not valid JSON/);
 });
 
 test('a case whose must-find inventory moved between replays is refused, naming the ids that differ', () => {

@@ -36,7 +36,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { parsePlanRecord } = require('../src/plan');
-const { parseMeta, describeEffort, listRunDirs, requireRunCase } = require('./score');
+const { parseMeta, parseJsonObject, agreedEffort, listRunDirs, requireRunCase } = require('./score');
 
 const USAGE = `Usage: node eval/paired.js <arm-a-out> <arm-b-out> [options]
 
@@ -48,7 +48,7 @@ Arguments:
   <arm-b-out>              the other arm's --out root
 
 Options:
-  --out <dir>              where paired.{md,json} land (default: eval/out/paired-<armA>-vs-<armB>)
+  --out <dir>              where paired.{md,json} land (default: eval/out/paired-<armA>-vs-<armB>-<digest>)
   -h, --help               this message
 
 Both arms must have replayed the same cases against the same plans: for every case, the multiset of
@@ -83,9 +83,6 @@ function parseArgs(argv) {
   if (positional.length < 2) throw new Error('Missing arm roots: paired.js takes TWO --out roots to compare. See --help.');
   if (positional.length > 2) throw new Error(`Unexpected third positional: ${positional[2]}. paired.js compares exactly two arms. See --help.`);
   [opts.armA, opts.armB] = positional;
-  if (path.resolve(opts.armA) === path.resolve(opts.armB)) {
-    throw new Error(`Both arm roots resolve to ${path.resolve(opts.armA)}. Pairing a root with itself compares nothing.`);
-  }
   return opts;
 }
 
@@ -167,8 +164,12 @@ function canonicalize(value) {
 // plan.json existed — each is refused BY NAME, because "your two arms don't line up" fifty runs deep is
 // a message that sends the reader searching.
 function readArm(root, label) {
-  const resolved = path.resolve(root);
-  if (!fs.existsSync(resolved)) throw new Error(`Arm ${label}: root not found: ${resolved}.`);
+  if (!fs.existsSync(path.resolve(root))) throw new Error(`Arm ${label}: root not found: ${path.resolve(root)}.`);
+  // The CANONICAL root, symlinks followed: it is what makes "these two arms are the same directory"
+  // answerable at all, and a symlinked second root is exactly how a self-comparison sneaks past a
+  // string check — it would report zero discordants and p=1, which reads as a null result rather than
+  // the degenerate comparison it is.
+  const resolved = fs.realpathSync(path.resolve(root));
   const caseDirs = fs.readdirSync(resolved, { withFileTypes: true })
     .filter(e => e.isDirectory())
     .map(e => path.join(resolved, e.name))
@@ -180,7 +181,10 @@ function readArm(root, label) {
   for (const caseDir of caseDirs) {
     for (const dir of listRunDirs(caseDir)) runs.push(readRun(dir, path.basename(caseDir), label));
   }
-  return { label, root: resolved, effort: agreedArmEffort(runs, label), runs };
+  // An arm root is a run pool like any other, and score.js owns what one arm means. It matters most
+  // here: the arm is the only thing meant to differ between the two roots, so a root that blended two
+  // of them would put the difference under test on both sides of the comparison.
+  return { label, root: resolved, effort: agreedEffort(runs), runs };
 }
 
 function readRun(dir, caseName, label) {
@@ -194,11 +198,14 @@ function readRun(dir, caseName, label) {
     readFileOrRefuse(path.join(dir, 'plan.json'), label, 'recorded no plan — it predates copirate-determinism-5od.ea7, so what structure it ran is unknown and it cannot be paired'),
     path.join(dir, 'plan.json'),
   );
-  const scorecard = JSON.parse(readFileOrRefuse(path.join(dir, 'scorecard.json'), label, 'is unscored — run eval/score.js over its case dir first'));
+  const scorecardPath = path.join(dir, 'scorecard.json');
+  const scorecard = parseJsonObject(readFileOrRefuse(scorecardPath, label, 'is unscored — run eval/score.js over its case dir first'), scorecardPath);
   return {
     dir,
     case: runCase,
-    effort: describeEffort(meta.effort),
+    // The RAW profile, not a rendering of it: agreedEffort owns how an effort is described, and a run
+    // carrying a pre-rendered string would be compared as text by a function expecting a profile.
+    effort: meta.effort,
     planKey: planKey(plan),
     provenance: plan.provenance,
     outcomes: outcomesOf(scorecard, dir),
@@ -215,7 +222,7 @@ function readFileOrRefuse(file, label, why) {
 // deliberately and only — it is the gate metric eval/compare.js already protects, and a paired report
 // over four different buckets would be four experiments wearing one p-value. [LAW:no-mode-explosion]
 function outcomesOf(scorecard, dir) {
-  const bucket = scorecard && scorecard.inventoryMustFind;
+  const bucket = scorecard.inventoryMustFind;
   if (!bucket || !Array.isArray(bucket.foundIds) || !Array.isArray(bucket.missedIds)) {
     throw new Error(`${dir}/scorecard.json has no inventoryMustFind {foundIds, missedIds} — it was written by a scorer this reducer cannot read.`);
   }
@@ -236,23 +243,6 @@ function outcomesOf(scorecard, dir) {
   return outcomes;
 }
 
-// [LAW:parse-dont-validate] An arm runs at ONE effort, proven here. The whole point of the exercise is
-// that the ARM is the only thing that differs between the two roots; a root that blended two of them
-// internally would put the difference under test on both sides of the comparison. score.js refuses this
-// per case dir; this is the same rule at root scope, where a paired A/B lives.
-function agreedArmEffort(runs, label) {
-  const [first, ...rest] = runs;
-  for (const run of rest) {
-    if (run.effort !== first.effort) {
-      throw new Error(
-        `Arm ${label}: ${run.dir} ran at effort ${run.effort} but earlier runs ran at ${first.effort}. ` +
-        'An arm root holds one arm — give each A/B arm its own --out.',
-      );
-    }
-  }
-  return first.effort;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // Pairing (pure) — the checkpoint that turns two arms into a matched sample, or refuses
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -270,6 +260,12 @@ function agreedArmEffort(runs, label) {
 // 26-point plan term the epic measured. What run k shares with run k is the block, and nothing else;
 // the pairing claims nothing more than that.
 function pairArms(armA, armB) {
+  // The roots are canonical (readArm resolves symlinks), so this is the one place two spellings of one
+  // directory can be told apart — and it must be told apart here, because pairing a dataset with itself
+  // produces zero discordant pairs and p = 1, indistinguishable in the report from a real null result.
+  if (armA.root === armB.root) {
+    throw new Error(`Both arm roots are ${armA.root}. Pairing a root with itself compares nothing — every pair would agree by construction.`);
+  }
   const cases = agreedCaseSet(armA, armB);
   const pairs = [];
   const blocks = [];
