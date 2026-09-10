@@ -25,7 +25,7 @@ const { parseScopeValue } = require('./review');
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
 //      largest group at or above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
-//      order (a subdirectory kept together; a test and the source it names are one unit, never parted). Each part OWNS its files
+//      order (a test and the source it names are one unit, never parted). Each part OWNS its files
 //      and READS every sibling part's files in full, so the concern is still seen whole by every worker
 //      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
 //      part count is bounded by the read budget (the concern's extra reads never exceed the changed
@@ -33,7 +33,8 @@ const { parseScopeValue } = require('./review');
 //      SCOPE_CHURN_FLOOR is not made: that group is at the floor, and stays one scope.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
-// `reads` is eyesight, never ownership — pinnedProposal proves a plan against `files` alone.
+// `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
+// membership in the changed set: a read outside the change is refused, a read is never counted as coverage.
 // [LAW:types-are-the-program]
 
 // [LAW:one-source-of-truth] The one width lever this rule has. A scope is one worker spawn (~5 min,

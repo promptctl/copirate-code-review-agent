@@ -45,13 +45,14 @@ function collectorTools() {
     },
     {
       name: 'add_scope',
-      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. Call once per scope. Do not use while reviewing code (use request_change for findings).",
+      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. When a large concern is reviewed in parts, list in 'reads' the changed files the sibling parts own: this scope's worker reads them in full as context but does not own them. Call once per scope. Do not use while reviewing code (use request_change for findings).",
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string', minLength: 1, pattern: '\\S' },
           focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
+          reads: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
         additionalProperties: false,

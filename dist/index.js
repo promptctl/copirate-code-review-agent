@@ -30067,7 +30067,11 @@ function reasoningFactor(tier) {
 
 // [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
 // 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
-// the changed set about ONCE however many scopes the plan has. 'changed' is the pre-split behavior, where
+// the changed set about ONCE however many scopes the plan has. Since partition.js rule 4, a concern cut
+// into k parts is read k times (each part reads its siblings), but rule 4's partCount bound holds the
+// (k-1) extra reads at or below the changed set, so the arm reads at most 2x the changed set on a
+// lopsided diff and ~1x otherwise; a diff-shape spread inside the constant, not a second arm. 'changed'
+// is the pre-split behavior, where
 // every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
 // scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
 // fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative
@@ -30286,13 +30290,14 @@ function collectorTools() {
     },
     {
       name: 'add_scope',
-      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. Call once per scope. Do not use while reviewing code (use request_change for findings).",
+      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. When a large concern is reviewed in parts, list in 'reads' the changed files the sibling parts own: this scope's worker reads them in full as context but does not own them. Call once per scope. Do not use while reviewing code (use request_change for findings).",
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string', minLength: 1, pattern: '\\S' },
           focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
+          reads: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
         additionalProperties: false,
@@ -35569,7 +35574,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
 //      largest group at or above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
-//      order (a subdirectory kept together; a test and the source it names are one unit, never parted). Each part OWNS its files
+//      order (a test and the source it names are one unit, never parted). Each part OWNS its files
 //      and READS every sibling part's files in full, so the concern is still seen whole by every worker
 //      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
 //      part count is bounded by the read budget (the concern's extra reads never exceed the changed
@@ -35577,7 +35582,8 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //      SCOPE_CHURN_FLOOR is not made: that group is at the floor, and stays one scope.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
-// `reads` is eyesight, never ownership — pinnedProposal proves a plan against `files` alone.
+// `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
+// membership in the changed set: a read outside the change is refused, a read is never counted as coverage.
 // [LAW:types-are-the-program]
 
 // [LAW:one-source-of-truth] The one width lever this rule has. A scope is one worker spawn (~5 min,
