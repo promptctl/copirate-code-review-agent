@@ -1914,6 +1914,21 @@ describe('coverageOf — the one fold of the chains\' outcomes into the pass\'s 
 });
 
 // ── buildReviewInput — the window fit decides what a worker is shown and told to read ─────────────
+describe('composeSummary with a failed scope and a budget-cut sweep', () => {
+  test('the budget line does not claim every scope was reviewed while the failure line names one that was not', () => {
+    const scopes = [{ name: 'a' }, { name: 'b' }];
+    const summary = composeSummary('ctx', scopes, {
+      unreviewed: [{ name: 'a', cause: 'failure' }],
+      scopeFailures: [{ scope: 'a', pass: 0, message: 'boom' }],
+      sweeps: [{ added: 0, curtailed: ['budget'] }],
+      budgetExhausted: true,
+    });
+    assert.match(summary, /⏳ \*\*Time budget exhausted\*\* — convergence sweeps were cut short; late-round findings may be missing\./);
+    assert.doesNotMatch(summary, /every scope was reviewed/);
+    assert.match(summary, /⚠️ \*\*Scope worker failed\*\* — 'a' at review: boom\. NOT reviewed: a\./);
+  });
+});
+
 describe('buildReviewInput window fit', () => {
   const hashes = Array.from({ length: 1500 }, (_, i) => `+mod/${i} v1.0.0 h1:A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6a7b8=`).join('\n');
   const FILES = stamp([

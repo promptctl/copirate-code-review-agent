@@ -34769,7 +34769,10 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
     lines.push(budgetUnreviewed.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
         + `NOT reviewed: ${budgetUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
-      : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
+      // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
+      // not the budget's share of it: a scope whose worker died is named on the failure line below, and
+      // this line must not contradict it.
+      : `⏳ **Time budget exhausted** — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
         + 'late-round findings may be missing.');
   }
   // [LAW:no-silent-failure] A worker that died terminally is named with what killed it, at the pass it
@@ -34861,6 +34864,15 @@ function sweepsByDepth(chains) {
 //                   the operator warning can carry it as-is;
 //   sweeps        — sweepsByDepth over the chains' sweep passes;
 //   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
+// [LAW:one-source-of-truth] The review record carries the unreviewed set as names (unreviewedScopes —
+// the verdict's input) and the failures as a record (scopeFailures); the split of the names by cause is
+// derived here, ONCE, for every sink that must attribute a gap correctly: a scope unreviewed because its
+// worker died at the review of record is the failure's, and only the rest are the budget's.
+function unreviewedByCause({ unreviewedScopes, scopeFailures }) {
+  const failure = scopeFailures.filter(f => f.pass === 0).map(f => f.scope);
+  return { failure, budget: unreviewedScopes.filter(name => !failure.includes(name)) };
+}
+
 function coverageOf(scopes, outcomes) {
   const unreviewed = scopes.flatMap((s, i) => {
     const c = outcomes[i].passes[0].curtailed;
@@ -35488,6 +35500,7 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 }
 
 module.exports = {
+  unreviewedByCause,
   workerFocusText,
   sumUsage,
   composeSummary,
@@ -36344,7 +36357,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
   // body — so the riskiest (biggest) changed files stay reviewable, and an issue in them can never
   // bypass the merge gate via summary prose.
   const withheldNoteText = (entries) => entries.length > 0
-    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
+    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — a line the diff below carries is anchored inline as usual, and one it does not carry is posted by the host in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
     : '';
 
   // [LAW:effects-at-boundaries] Pure over its lists: what the worker opens, as three lists that each
@@ -37445,7 +37458,7 @@ const { showableFiles } = __nccwpck_require__(3479);
 const { measureChangedFiles } = __nccwpck_require__(8705);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
-const { runMultiScope, buildPrMaterial, buildRepoMaterial } = __nccwpck_require__(3746);
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause } = __nccwpck_require__(3746);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = __nccwpck_require__(5120);
 const { assessDifficulty } = __nccwpck_require__(4260);
@@ -37637,9 +37650,14 @@ function warnBudgetExhausted(review) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
-  const state = review.unreviewedScopes.length > 0
-    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
-    : 'every scope was reviewed, but convergence sweeps were cut short';
+  // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
+  // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
+  const { budget } = unreviewedByCause(review);
+  const state = budget.length > 0
+    ? `${budget.length} scope(s) went unreviewed (${budget.join(', ')})`
+    : review.unreviewedScopes.length === 0
+      ? 'every scope was reviewed, but convergence sweeps were cut short'
+      : 'convergence sweeps were cut short';
   core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
 }
 
@@ -37650,8 +37668,14 @@ function warnBudgetExhausted(review) {
 // is operator news: the failure must be visible in the run's annotations, not only in the review body.
 function warnScopeFailures(review) {
   if (review.scopeFailures.length === 0) return;
+  // The same two facts the summary's failure line states: a death at the review of record is a coverage
+  // gap and names the scope; a death in a sweep leaves pass 0's judgment standing.
   const failed = review.scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ');
-  core.warning(`${review.scopeFailures.length} scope worker(s) failed and their scope(s) went unreviewed at that pass — ${failed}. The other scopes' findings were still delivered.`);
+  const { failure } = unreviewedByCause(review);
+  const coverage = failure.length > 0
+    ? `NOT reviewed: ${failure.join(', ')}. The other scopes' findings were still delivered.`
+    : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.';
+  core.warning(`${review.scopeFailures.length} scope worker(s) failed — ${failed}. ${coverage}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the

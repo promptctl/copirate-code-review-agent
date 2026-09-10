@@ -160,7 +160,10 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
     lines.push(budgetUnreviewed.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
         + `NOT reviewed: ${budgetUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
-      : '⏳ **Time budget exhausted** — every scope was reviewed, but convergence sweeps were cut short; '
+      // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
+      // not the budget's share of it: a scope whose worker died is named on the failure line below, and
+      // this line must not contradict it.
+      : `⏳ **Time budget exhausted** — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
         + 'late-round findings may be missing.');
   }
   // [LAW:no-silent-failure] A worker that died terminally is named with what killed it, at the pass it
@@ -252,6 +255,15 @@ function sweepsByDepth(chains) {
 //                   the operator warning can carry it as-is;
 //   sweeps        — sweepsByDepth over the chains' sweep passes;
 //   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
+// [LAW:one-source-of-truth] The review record carries the unreviewed set as names (unreviewedScopes —
+// the verdict's input) and the failures as a record (scopeFailures); the split of the names by cause is
+// derived here, ONCE, for every sink that must attribute a gap correctly: a scope unreviewed because its
+// worker died at the review of record is the failure's, and only the rest are the budget's.
+function unreviewedByCause({ unreviewedScopes, scopeFailures }) {
+  const failure = scopeFailures.filter(f => f.pass === 0).map(f => f.scope);
+  return { failure, budget: unreviewedScopes.filter(name => !failure.includes(name)) };
+}
+
 function coverageOf(scopes, outcomes) {
   const unreviewed = scopes.flatMap((s, i) => {
     const c = outcomes[i].passes[0].curtailed;
@@ -879,6 +891,7 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 }
 
 module.exports = {
+  unreviewedByCause,
   workerFocusText,
   sumUsage,
   composeSummary,

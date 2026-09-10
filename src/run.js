@@ -10,7 +10,7 @@ const { showableFiles } = require('./prompt');
 const { measureChangedFiles } = require('./window');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
-const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('./multiscope');
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause } = require('./multiscope');
 const { defaultEffortProfile } = require('./effort');
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = require('./budget');
 const { assessDifficulty } = require('./difficulty');
@@ -202,9 +202,14 @@ function warnBudgetExhausted(review) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
-  const state = review.unreviewedScopes.length > 0
-    ? `${review.unreviewedScopes.length} scope(s) went unreviewed (${review.unreviewedScopes.join(', ')})`
-    : 'every scope was reviewed, but convergence sweeps were cut short';
+  // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
+  // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
+  const { budget } = unreviewedByCause(review);
+  const state = budget.length > 0
+    ? `${budget.length} scope(s) went unreviewed (${budget.join(', ')})`
+    : review.unreviewedScopes.length === 0
+      ? 'every scope was reviewed, but convergence sweeps were cut short'
+      : 'convergence sweeps were cut short';
   core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
 }
 
@@ -215,8 +220,14 @@ function warnBudgetExhausted(review) {
 // is operator news: the failure must be visible in the run's annotations, not only in the review body.
 function warnScopeFailures(review) {
   if (review.scopeFailures.length === 0) return;
+  // The same two facts the summary's failure line states: a death at the review of record is a coverage
+  // gap and names the scope; a death in a sweep leaves pass 0's judgment standing.
   const failed = review.scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ');
-  core.warning(`${review.scopeFailures.length} scope worker(s) failed and their scope(s) went unreviewed at that pass — ${failed}. The other scopes' findings were still delivered.`);
+  const { failure } = unreviewedByCause(review);
+  const coverage = failure.length > 0
+    ? `NOT reviewed: ${failure.join(', ')}. The other scopes' findings were still delivered.`
+    : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.';
+  core.warning(`${review.scopeFailures.length} scope worker(s) failed — ${failed}. ${coverage}`);
 }
 
 // [LAW:decomposition] The one fetch site for the reviewed diff: select the host transport, pull the

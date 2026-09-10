@@ -379,7 +379,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
   // body — so the riskiest (biggest) changed files stay reviewable, and an issue in them can never
   // bypass the merge gate via summary prose.
   const withheldNoteText = (entries) => entries.length > 0
-    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — the line cannot be anchored inline, so the host will post that finding in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
+    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — a line the diff below carries is anchored inline as usual, and one it does not carry is posted by the host in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
     : '';
 
   // [LAW:effects-at-boundaries] Pure over its lists: what the worker opens, as three lists that each
