@@ -4,8 +4,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { measurementFields, measurementKey, differingFields, measurementOf, lookupMeasurement, renderConsultation, collectMeasurements } = require('../eval/measurement-index');
-const { parseMeta } = require('../eval/score');
+const { measurementFields, measurementKey, differingFields, measurementOf, lookupMeasurement, renderConsultation, ownedElsewhere, collectMeasurements } = require('../eval/measurement-index');
+const { parseMeta, listRunDirs } = require('../eval/score');
 const { treeIdentity } = require('../eval/run-case');
 const { defaultEffortProfile, EFFORT_SCHEMA } = require('../src/effort');
 
@@ -35,7 +35,7 @@ function writeCorpus(layout) {
   return dir;
 }
 
-const collect = corpusRoot => collectMeasurements({ corpusRoot, parseMeta, treeIdentity });
+const collect = corpusRoot => collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs });
 
 test('a run at the same case, sha and arm is a hit; the whole comparison is one fold', () => {
   const wanted = measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile() });
@@ -138,10 +138,28 @@ test('only runs of the same case can be near; another case is not a near miss', 
   fs.rmSync(dir, { recursive: true });
 });
 
-test('a torn run record is refused by name, never indexed around', () => {
-  const dir = writeCorpus({ 'a/case-a/run1': null });
-  assert.throws(() => collect(dir), /has findings.json but no meta.json/);
+// A torn record is a run whose identity cannot be read, which is what `unidentified` means — so it takes a
+// row in that vocabulary and is reported by name. It must NOT abort: the scan is the whole corpus, so a
+// throw would let one stray dir in an experiment root nobody touches block every future invocation for
+// every --out. The strict rule keeps its own enforcer in freeze-suite's priorRunArms, on the root being
+// WRITTEN, where the blast radius is the operator's own target.
+test('a torn run record is reported by name, and does not abort the corpus around it', () => {
+  const dir = writeCorpus({ 'a/case-a/torn': null, 'a/case-a/whole': meta() });
+  const corpus = collect(dir);
+  assert.equal(corpus.measurements.length, 1);
+  assert.deepEqual(corpus.unidentified.map(u => u.unidentified), ['a torn run record: findings.json with no meta.json']);
+  assert.match(renderConsultation({ consultations: [], unidentified: corpus.unidentified }), /torn run record/);
   fs.rmSync(dir, { recursive: true });
+});
+
+// The judgement the whole feature turns on: a hit inside the root being filled is this suite's own census,
+// which planJobs has already counted; only a hit OUTSIDE it is a measurement about to be re-bought.
+test('only a hit outside the root being filled is something already owned', () => {
+  const here = '/out/here';
+  const consultation = hits => [{ key: 'k', wanted: {}, hits, nearest: [] }];
+  assert.deepEqual(ownedElsewhere(consultation([{ root: here }]), here), []);
+  assert.deepEqual(ownedElsewhere([], here), []);
+  assert.deepEqual(ownedElsewhere(consultation([{ root: '/out/elsewhere' }, { root: here }]), here), [{ root: '/out/elsewhere' }]);
 });
 
 test('an absent corpus is an empty corpus, not a crash', () => {

@@ -179,31 +179,44 @@ function renderConsultation({ consultations, unidentified }) {
   return lines.join('\n');
 }
 
+// [LAW:effects-at-boundaries] Pure. The refusal DECISION as a value: the hits that live outside the root
+// this suite is filling. A hit inside `outRoot` is not a duplicate at all — it is this suite's own census,
+// which planJobs has already counted and will not re-buy.
+//
+// Extracted rather than written inline at the call site because this is the judgement the whole feature
+// turns on — it can wrongly refuse an entire suite — and inline it would be reachable only by spawning the
+// CLI against whatever run dirs happen to exist on the developer's disk. [LAW:verifiable-goals]
+function ownedElsewhere(consultations, outRoot) {
+  return consultations.flatMap(c => c.hits.filter(hit => hit.root !== outRoot));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 // effects
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// [LAW:one-source-of-truth] A completed run is "a directory carrying findings.json" — score.js's
-// `listRunDirs` predicate, applied recursively here rather than restated, so the index and the scorer
-// can never disagree about what exists.
+// [LAW:one-source-of-truth] A completed run is "a directory carrying findings.json", and that predicate
+// has ONE owner: score.js's `listRunDirs`, which answers it for the children of a given directory. It is
+// CALLED here at each level rather than re-derived, so the index and the scorer cannot come to disagree
+// about what exists — a restatement would keep the old rule the day score.js's definition changes.
 //
-// The walk is by PREDICATE and not by depth, because eval/out has two shapes at once: the default root
-// holds case dirs directly (eval/out/<case>/<run>) while a named root nests one level deeper
+// The walk is by that predicate and not by depth, because eval/out has two shapes at once: the default
+// root holds case dirs directly (eval/out/<case>/<run>) while a named root nests one level deeper
 // (eval/out/ab-sweep2/<case>/<run>). A hardcoded depth reads one of them and is blind to the other —
 // and the runs that were re-bought lived in the nested shape.
 //
 // The output ROOT of a run is the directory two levels above it, which is the same value in both shapes:
 // the run's parent is its case dir, and that dir's parent is the root baseline.js pools as one arm.
-function findRunDirsDeep(dir) {
-  const entries = fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory()).sort((a, b) => a.name.localeCompare(b.name));
-  // A run dir is a leaf of this walk: it holds findings.json, and its children are the review's own
-  // artifacts, never further runs. Descending into one would be a search for measurements inside a
-  // measurement. [LAW:dataflow-not-control-flow] the predicate decides what a directory IS; the walk
-  // itself is the same operation at every level.
-  return entries.flatMap(e => {
-    const child = path.join(dir, e.name);
-    return fs.existsSync(path.join(child, 'findings.json')) ? [child] : findRunDirsDeep(child);
-  });
+function findRunDirsDeep(dir, listRunDirs) {
+  // A run dir is a leaf of this walk: its children are the review's own artifacts, never further runs, so
+  // descending into one would be a search for measurements inside a measurement. Every OTHER directory is
+  // recursed into by the same operation. [LAW:dataflow-not-control-flow]
+  const runs = listRunDirs(dir);
+  const rest = fs.readdirSync(dir, { withFileTypes: true })
+    .filter(e => e.isDirectory())
+    .map(e => path.join(dir, e.name))
+    .filter(child => !runs.includes(child))
+    .sort();
+  return [...runs, ...rest.flatMap(child => findRunDirsDeep(child, listRunDirs))];
 }
 
 // [LAW:effects-at-boundaries] The one fs-touching function: it reads the corpus and hands back a pure
@@ -214,17 +227,22 @@ function findRunDirsDeep(dir) {
 // discipline freeze-suite already applies to score.js and run-case.js. [LAW:one-way-deps]
 //
 // [LAW:no-silent-failure] A counted run WITHOUT meta.json is a TORN record — run-case.js writes meta.json
-// first and findings.json last, so the pair can only be broken after the fact. It is refused by name,
-// never skipped: a run whose identity cannot be read must not pass through an index whose whole job is
-// to prove what has already been measured. Same rule, same reason, as freeze-suite's priorRunArms.
-function collectMeasurements({ corpusRoot, parseMeta, treeIdentity }) {
-  const runDirs = fs.existsSync(corpusRoot) ? findRunDirsDeep(corpusRoot) : [];
+// first and findings.json last, so the pair can only be broken after the fact, and a walled token leaving
+// incomplete run dirs (this file's own documented incident) is how one appears. It is a run whose identity
+// cannot be read, which is precisely what `unidentified` MEANS here, so it takes a row in that vocabulary
+// and is reported by name with its reason — never dropped, and never a special case.
+//
+// It does NOT abort. The scan is the whole corpus by design, so throwing would let one stray dir in an
+// experiment root nobody touches hard-block every future invocation for every --out — a blast radius the
+// strict rule never had. The strict rule keeps its own enforcer where it bites: freeze-suite's
+// `priorRunArms` still refuses a torn record in the root being WRITTEN. [LAW:single-enforcer] the index
+// reports on the corpus; priorRunArms enforces on the target.
+function collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs }) {
+  const runDirs = fs.existsSync(corpusRoot) ? findRunDirsDeep(corpusRoot, listRunDirs) : [];
   const records = runDirs.map(dir => {
     const metaPath = path.join(dir, 'meta.json');
-    if (!fs.existsSync(metaPath)) {
-      throw new Error(`${dir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
-    }
     const root = path.dirname(path.dirname(dir));
+    if (!fs.existsSync(metaPath)) return { dir, root, unidentified: 'a torn run record: findings.json with no meta.json' };
     return measurementOf({ dir, root, meta: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath), treeIdentity });
   });
   return {
@@ -243,6 +261,7 @@ module.exports = {
   tally,
   lookupMeasurement,
   renderConsultation,
+  ownedElsewhere,
   findRunDirsDeep,
   collectMeasurements,
 };
