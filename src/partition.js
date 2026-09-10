@@ -34,9 +34,12 @@ const { parseScopeValue } = require('./review');
 //      together may reach that volume again and never exceed it — the 2x ceiling the owner set
 //      (zai-timing-8jk, 2026-09-04), a ceiling and not a target. A loosely coupled change has few seams
 //      and spends little; a tightly coupled one spends to the ceiling and the plan says which seams
-//      went unread. A cut concern's parts are ordinary scopes here: a part reads the sibling it is
-//      coupled to, not every sibling, which is what lets the cut go finer than two (8jk.4 halved with
-//      full eyesight and bought no wall clock; the material a worker sees is what its spawn costs).
+//      went unread. A cut concern's parts read their siblings by construction — the cut made them one
+//      concern, so every sibling file is a candidate at whatever coupling the seams give it, zero
+//      included — ranked with the rest, so a part reads the sibling it is coupled to first and the
+//      others as the budget allows. That is what lets the cut go finer than two (8jk.4 halved with full
+//      eyesight and bought no wall clock; the material a worker sees is what its spawn costs), and what
+//      keeps a concern in a language the seam shapes do not parse read across its cut as before.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
 // `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
@@ -160,11 +163,14 @@ function focusFor(dir, files, reads) {
 }
 
 // Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
-// fills one, and is not cut — this count is the ONE place the cap is read). The read budget no longer
-// bounds it: a part reads its seams, not the whole group, and rule 5 holds every read under the one
-// ceiling. [LAW:one-source-of-truth]
-function partCount(groupChurn) {
-  return Math.ceil(groupChurn / SCOPE_CHURN_CAP);
+// fills one, and is not cut — this count is the ONE place the cap is read), but never more parts than
+// there are lanes left to run them beside the other scopes: a part beyond the runner's width waits for
+// a lane and buys no wall clock, it only pays a spawn's fixed cost. The read budget no longer bounds
+// it: a part reads its seams, not the whole group, and rule 5 holds every read under the one ceiling.
+// `lanesFree` is the runner's lane ceiling less the other scopes (Infinity when no ceiling is handed in).
+// [LAW:one-source-of-truth]
+function partCount(groupChurn, lanesFree) {
+  return Math.max(1, Math.min(Math.ceil(groupChurn / SCOPE_CHURN_CAP), lanesFree));
 }
 
 // A cut of `units` into k contiguous parts of near-equal churn: each unit joins the part its churn's
@@ -186,10 +192,10 @@ function cutInto(units, churnOf, k) {
 // The parts a group becomes: the largest k, from partCount down, whose every part clears the floor; k=1
 // is the group itself, uncut. An empty part has churn 0 and so fails the floor with the rest — the same
 // rule, not a second check. Deterministic: same files, same churn, same cut. [LAW:no-ambient-temporal-coupling]
-function partsOf(units, churnOf) {
+function partsOf(units, churnOf, lanesFree) {
   const unitChurn = (unit) => unit.reduce((sum, f) => sum + churnOf(f), 0);
   const groupChurn = units.reduce((sum, unit) => sum + unitChurn(unit), 0);
-  for (let k = partCount(groupChurn); k > 1; k--) {
+  for (let k = partCount(groupChurn, lanesFree); k > 1; k--) {
     const parts = cutInto(units, unitChurn, k);
     if (parts.every(part => unitChurn(part) >= SCOPE_CHURN_FLOOR)) return parts;
   }
@@ -197,11 +203,15 @@ function partsOf(units, churnOf) {
 }
 
 // Rule 5. The seam reads, spent from one budget. A candidate is a (scope, file) pair where the file is
-// owned elsewhere and the change couples it to something the scope owns: its coupling is the sum of the
-// seam weights between the file and the scope's files. Candidates are taken heaviest first; each costs
-// the file's line count (what a full read opens), and one that no longer fits is passed over for the
-// lighter ones that still do, so the budget is spent, never merely stopped at. Deterministic: ties break
-// by scope then file. [LAW:effects-at-boundaries] pure over the seam table.
+// owned elsewhere and either the change couples it to something the scope owns — its coupling is the
+// sum of the seam weights between the file and the scope's files — or it belongs to a sibling part of
+// the same cut concern (coupling as the seams give it, zero included). Candidates are taken heaviest
+// first; each costs the file's line count (what a full read opens), and one that no longer fits is
+// passed over for the lighter ones that still do, so the budget is spent, never merely stopped at.
+// Deterministic: ties break by scope index then file. [LAW:effects-at-boundaries] pure over the seam table.
+// Scopes are addressed by INDEX throughout: a name is a rendering (two directories can render alike —
+// a directory literally called `top-level` and the root — and multiscope.js uniquifies names later), and
+// keying the spend on one would let two scopes share a reads list. [LAW:one-source-of-truth]
 // The budget is the changed set's own line count: one more read of the whole, the ceiling named above.
 // Returns each scope's reads (in coupling order — the order the worker is told them) and the candidates
 // the budget could not cover, so the plan can say so. [LAW:no-silent-failure]
@@ -211,24 +221,25 @@ function seamReads(owned, seams, linesOf) {
     weight.set(`${a}\0${b}`, w);
     weight.set(`${b}\0${a}`, w);
   }
-  const allFiles = [...owned.values()].flat();
+  const allFiles = owned.flatMap(s => s.files);
   const candidates = [];
-  for (const [scope, files] of owned) {
+  owned.forEach(({ files, concern }, scope) => {
     const own = new Set(files);
+    const sibling = new Set(owned.filter((s, j) => j !== scope && s.concern === concern).flatMap(s => s.files));
     for (const file of allFiles) {
       if (own.has(file)) continue;
       const coupling = files.reduce((sum, f) => sum + (weight.get(`${f}\0${file}`) ?? 0), 0);
-      if (coupling > 0) candidates.push({ scope, file, coupling });
+      if (coupling > 0 || sibling.has(file)) candidates.push({ scope, file, coupling });
     }
-  }
-  candidates.sort((x, y) => y.coupling - x.coupling || (x.scope < y.scope ? -1 : x.scope > y.scope ? 1 : x.file < y.file ? -1 : 1));
+  });
+  candidates.sort((x, y) => y.coupling - x.coupling || x.scope - y.scope || (x.file < y.file ? -1 : 1));
   let remaining = allFiles.reduce((sum, f) => sum + linesOf(f), 0);
-  const reads = new Map([...owned.keys()].map(scope => [scope, []]));
+  const reads = owned.map(() => []);
   const unread = [];
   for (const c of candidates) {
     if (linesOf(c.file) <= remaining) {
       remaining -= linesOf(c.file);
-      reads.get(c.scope).push(c.file);
+      reads[c.scope].push(c.file);
     } else {
       unread.push(c);
     }
@@ -240,13 +251,15 @@ function seamReads(owned, seams, linesOf) {
 // will cover as { filename, churn, lines } (already filtered by EXCLUDE_PATTERNS — a withheld path never
 // reaches here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget
 // is calibrated on; lines is the content measurement measureChangedFiles stamps, what a full read costs)
-// and the change's seams (seamsOf, src/seams.js). Out: the scopes as the workers run them, each minted
+// and the change's seams (seamsOf, src/seams.js), plus the runner's lane ceiling (laneCeilingFromMemory,
+// src/multiscope.js — the one machine fact the cut consults, as a value; absent, no width binds). Out:
+// the scopes as the workers run them, each minted
 // through parseScopeValue so a scope from this producer is the SAME stamped value as one recorded by a
 // scout or read from a pinned plan, plus the orientation line every worker and the posted summary
 // share. [LAW:single-enforcer]
 // [LAW:no-silent-failure] An empty change has no partition; refusing here names the fact rather than
 // letting planRecord refuse an empty scope list two seams later.
-function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {}) {
+function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, laneCeiling = Infinity } = {}) {
   if (changed.length === 0) {
     throw new Error('partitionByDirectory: no changed files to partition — a review with no files has no structure.');
   }
@@ -290,15 +303,17 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {
     if (last && concern.get(last[0]).companion === concern.get(f).companion) last.push(f); else units.push([f]);
     return units;
   }, []);
+  // The lanes a cut may fill: the ceiling less every other group, each of which is one scope.
+  const lanesFree = laneCeiling - (merged.size - 1);
   const owned = [...merged.keys()].sort().flatMap((dir) => {
     const files = [...merged.get(dir)].sort(companionOrder);
     const name = dir === '.' ? ROOT_SCOPE_NAME : dir;
-    const parts = dir === cut ? partsOf(unitsOf(files), churnOf) : [files];
-    return parts.map((own, i) => ({ dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
+    const parts = dir === cut ? partsOf(unitsOf(files), churnOf, lanesFree) : [files];
+    return parts.map((own, i) => ({ dir, concern: dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
   });
-  const { reads, unread, covered } = seamReads(new Map(owned.map(s => [s.name, s.files])), seams, linesOf);
+  const { reads, unread, covered } = seamReads(owned, seams, linesOf);
   const scopes = owned
-    .map(({ dir, name, files }) => ({ name, focus: focusFor(dir, files, reads.get(name)), files, reads: reads.get(name) }))
+    .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i] }))
     .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
   // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
@@ -308,7 +323,7 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {
   const unreadNote = unread.length > 0
     ? ` The read ceiling (one further read of the changed set, ${[...linesByPath.values()].reduce((a, b) => a + b, 0)} lines) covered `
       + `${covered} of ${covered + unread.length} coupled reads; ${unread.length} left unread beyond their owner, heaviest first: `
-      + `${shown.map(c => `${c.file} (for ${c.scope})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
+      + `${shown.map(c => `${c.file} (for ${owned[c.scope].name})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
     : '';
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
     + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.${unreadNote}`;

@@ -19,15 +19,18 @@
 // partition never sees text.
 
 // [LAW:one-source-of-truth] The one reading of "a use": an identifier in the position a call, a member
-// access, a type or a constructor puts it — `Name(`, `.Name`, `Name{`, `&Name`, `*Name`, `Name<` — a word
-// the languages under review agree on (letter or underscore, then word characters) in a shape only code
+// access, a type or a constructor puts it — `Name(`, `.Name`, `Name{`, `&Name`, `*Name` — a word the
+// languages under review agree on (letter or underscore, then word characters) in a shape only code
 // produces. A bare word is NOT a use: prose in a README, a LICENSE, a comment, or a go.sum line mentions
 // `check` and `run` and `Work` freely, and counting those made every changed file couple to every other
 // (the first cut of this module spent the whole read budget on all four frozen cases, docs included).
-// A use matters only when some changed file defines the same name.
+// Nor is an operand: `i < len` is a comparison, not a generic, so `<` is not a use shape (a generic's
+// type is used elsewhere in a shape that is), and `&`/`*` count only at a token's start — `&Conn{` and
+// `*sql.DB`, never `flags&MASK` or `a*height`. A use matters only when some changed file defines the
+// same name.
 const USE_MEMBER = /\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-const USE_CALL = /(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*[({<]/g;
-const USE_TYPE = /[&*]([A-Za-z_][A-Za-z0-9_]*)\b/g;
+const USE_CALL = /(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*[({]/g;
+const USE_TYPE = /(?:^|[\s(,=:[])[&*]([A-Za-z_][A-Za-z0-9_]*)\b/g;
 
 // [LAW:one-type-per-behavior] What DEFINES a symbol, as one table of line shapes with one capture each —
 // the declaration forms of the languages this reviewer meets (Go, JavaScript/TypeScript, Python, Rust,
@@ -86,11 +89,14 @@ function changedSymbolsOf(patch) {
 // in every function) is ambiguous and weighs a fifth per pair. No threshold decides what counts —
 // every live symbol counts, and the read budget (src/partition.js) decides how far down the ranking a
 // review can afford to look. [LAW:dataflow-not-control-flow]
-// A symbol both files define is neither's seam: A's use of it is A's own.
+// A file DEFINES a symbol if its current text does, or its changed lines did: a definition the change
+// DELETED is still that file's, and a caller elsewhere that still uses it is the seam this module most
+// exists to find (a removed or renamed export still used elsewhere) — it weighs 1, never a division
+// by no definer. A symbol both files define is neither's seam: A's use of it is A's own.
 function seamsOf(files) {
-  const defined = new Map(files.map(f => [f.filename, new Set(f.content.symbols.defines)]));
   const used = new Map(files.map(f => [f.filename, new Set(f.content.symbols.uses)]));
   const changed = new Map(files.map(f => [f.filename, changedSymbolsOf(f.patch)]));
+  const defined = new Map(files.map(f => [f.filename, new Set([...f.content.symbols.defines, ...changed.get(f.filename).defines])]));
   const definers = new Map();
   for (const [name, symbols] of defined) {
     for (const s of symbols) definers.set(s, (definers.get(s) ?? 0) + 1);

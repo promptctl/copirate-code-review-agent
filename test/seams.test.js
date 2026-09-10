@@ -42,7 +42,9 @@ describe('symbolsOf — what a text defines and mentions', () => {
     const sum = 'github.com/dolthub/driver v1.2.3 h1:A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6a7b8=';
     assert.deepEqual(symbolsOf(sum).defines, []);
     assert.deepEqual(symbolsOf(sum).uses, ['com']); // member-shaped, harmless: nothing defines it
-    assert.deepEqual(symbolsOf('x := NewConnector(dsn)\nrows.Close()\nc := &Conn{}\nvar p *Rows\nList<Item>').uses, ['Close', 'Conn', 'List', 'NewConnector', 'Rows']);
+    assert.deepEqual(symbolsOf('x := NewConnector(dsn)\nrows.Close()\nc := &Conn{}\nvar p *Rows\nList<Item>').uses, ['Close', 'Conn', 'NewConnector', 'Rows']);
+    // An operand is not a use: a comparison is not a generic, and unspaced arithmetic is not a pointer.
+    assert.deepEqual(symbolsOf('for (let i = 0; i < len; i++) { total += a*height; mask = flags&MASK; }').uses, []);
     assert.deepEqual(symbolsOf(''), { defines: [], uses: [] });
   });
 
@@ -70,6 +72,16 @@ describe('seamsOf — the weighted seams among a changed set', () => {
     const a2 = file('src/a.js', 'function alpha() { return beta(); }', '@@ -1 +1 @@\n context');
     const b2 = file('src/b.js', 'function beta() {}', '@@ -1 +1 @@\n+function beta() {}');
     assert.deepEqual(seamsOf([a2, b2]), [{ a: 'src/a.js', b: 'src/b.js', weight: 1 }]);
+  });
+
+  test('a definition the change DELETED is still its file\'s: a caller that still uses it is a seam of weight 1, never a division by no definer', () => {
+    const b = file('src/b.js', '// helper is gone', '@@ -1 +1 @@\n-function helper() {}\n+// helper is gone');
+    const a = file('src/a.js', 'const x = helper();', '@@ -1 +1 @@\n context');
+    assert.deepEqual(seamsOf([a, b]), [{ a: 'src/a.js', b: 'src/b.js', weight: 1 }]);
+    // ...and a live symbol beside it is not poisoned: the seam carries both.
+    const b2 = file('src/b.js', 'function other() {}', '@@ -1,2 +1,2 @@\n-function helper() {}\n+function other() {}');
+    const a2 = file('src/a.js', 'helper(); other();', '@@ -1 +1 @@\n+other();');
+    assert.deepEqual(seamsOf([a2, b2]), [{ a: 'src/a.js', b: 'src/b.js', weight: 2 }]);
   });
 
   test('two files that share no touched symbol have no seam, and unchanged uses of unchanged definitions are none either', () => {

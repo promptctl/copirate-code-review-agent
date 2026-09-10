@@ -35084,8 +35084,8 @@ function uniquelyNamed(scopes) {
 // scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
 // is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
 // one progress line, exactly as pinnedProposal is.
-function partitionProposal({ changed, seams, log }) {
-  const { scopes, context } = partitionByDirectory(changed, seams);
+function partitionProposal({ changed, seams, laneCeiling, log }) {
+  const { scopes, context } = partitionByDirectory(changed, seams, { laneCeiling });
   log(`partitioned ${changed.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
   return { provenance: 'partition', scopes, context, scoutUsage: null };
 }
@@ -35268,7 +35268,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // [LAW:dataflow-not-control-flow] The one thing that genuinely differs — whether an engine spawn is
   // bought at all — is precisely what choosing a producer means, and it happens here, once.
   const proposal = plan === null
-    ? await material.proposal({ spawn, log })
+    ? await material.proposal({ spawn, log, laneCeiling })
     : pinnedProposal({ plan, changedPaths: material.changedPaths, log });
 
   // [LAW:types-are-the-program] Coverage is a property of the producers, not a check here: a computed
@@ -35492,7 +35492,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:one-source-of-truth] The PR partition is COMPUTED from the changed files and their churn
     // (src/partition.js): no scout spawn, no re-roll, and — because `files` are the post-EXCLUDE_PATTERNS
     // survivors — no withheld path can ever be assigned, so nothing downstream strips one. [LAW:effects-at-boundaries]
-    proposal: ({ log }) => partitionProposal({ changed, seams, log }),
+    // [LAW:dataflow-not-control-flow] The lane ceiling reaches the cut as a value — the one machine fact
+    // the plan consults, so a concern is never cut into more parts than the runner can run beside the
+    // other scopes (rule 4). A pinned plan replays whatever width it was cut at.
+    proposal: ({ log, laneCeiling }) => partitionProposal({ changed, seams, laneCeiling, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
     // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and
@@ -35587,9 +35590,12 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //      together may reach that volume again and never exceed it — the 2x ceiling the owner set
 //      (zai-timing-8jk, 2026-09-04), a ceiling and not a target. A loosely coupled change has few seams
 //      and spends little; a tightly coupled one spends to the ceiling and the plan says which seams
-//      went unread. A cut concern's parts are ordinary scopes here: a part reads the sibling it is
-//      coupled to, not every sibling, which is what lets the cut go finer than two (8jk.4 halved with
-//      full eyesight and bought no wall clock; the material a worker sees is what its spawn costs).
+//      went unread. A cut concern's parts read their siblings by construction — the cut made them one
+//      concern, so every sibling file is a candidate at whatever coupling the seams give it, zero
+//      included — ranked with the rest, so a part reads the sibling it is coupled to first and the
+//      others as the budget allows. That is what lets the cut go finer than two (8jk.4 halved with full
+//      eyesight and bought no wall clock; the material a worker sees is what its spawn costs), and what
+//      keeps a concern in a language the seam shapes do not parse read across its cut as before.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
 // `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
@@ -35713,11 +35719,14 @@ function focusFor(dir, files, reads) {
 }
 
 // Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
-// fills one, and is not cut — this count is the ONE place the cap is read). The read budget no longer
-// bounds it: a part reads its seams, not the whole group, and rule 5 holds every read under the one
-// ceiling. [LAW:one-source-of-truth]
-function partCount(groupChurn) {
-  return Math.ceil(groupChurn / SCOPE_CHURN_CAP);
+// fills one, and is not cut — this count is the ONE place the cap is read), but never more parts than
+// there are lanes left to run them beside the other scopes: a part beyond the runner's width waits for
+// a lane and buys no wall clock, it only pays a spawn's fixed cost. The read budget no longer bounds
+// it: a part reads its seams, not the whole group, and rule 5 holds every read under the one ceiling.
+// `lanesFree` is the runner's lane ceiling less the other scopes (Infinity when no ceiling is handed in).
+// [LAW:one-source-of-truth]
+function partCount(groupChurn, lanesFree) {
+  return Math.max(1, Math.min(Math.ceil(groupChurn / SCOPE_CHURN_CAP), lanesFree));
 }
 
 // A cut of `units` into k contiguous parts of near-equal churn: each unit joins the part its churn's
@@ -35739,10 +35748,10 @@ function cutInto(units, churnOf, k) {
 // The parts a group becomes: the largest k, from partCount down, whose every part clears the floor; k=1
 // is the group itself, uncut. An empty part has churn 0 and so fails the floor with the rest — the same
 // rule, not a second check. Deterministic: same files, same churn, same cut. [LAW:no-ambient-temporal-coupling]
-function partsOf(units, churnOf) {
+function partsOf(units, churnOf, lanesFree) {
   const unitChurn = (unit) => unit.reduce((sum, f) => sum + churnOf(f), 0);
   const groupChurn = units.reduce((sum, unit) => sum + unitChurn(unit), 0);
-  for (let k = partCount(groupChurn); k > 1; k--) {
+  for (let k = partCount(groupChurn, lanesFree); k > 1; k--) {
     const parts = cutInto(units, unitChurn, k);
     if (parts.every(part => unitChurn(part) >= SCOPE_CHURN_FLOOR)) return parts;
   }
@@ -35750,11 +35759,15 @@ function partsOf(units, churnOf) {
 }
 
 // Rule 5. The seam reads, spent from one budget. A candidate is a (scope, file) pair where the file is
-// owned elsewhere and the change couples it to something the scope owns: its coupling is the sum of the
-// seam weights between the file and the scope's files. Candidates are taken heaviest first; each costs
-// the file's line count (what a full read opens), and one that no longer fits is passed over for the
-// lighter ones that still do, so the budget is spent, never merely stopped at. Deterministic: ties break
-// by scope then file. [LAW:effects-at-boundaries] pure over the seam table.
+// owned elsewhere and either the change couples it to something the scope owns — its coupling is the
+// sum of the seam weights between the file and the scope's files — or it belongs to a sibling part of
+// the same cut concern (coupling as the seams give it, zero included). Candidates are taken heaviest
+// first; each costs the file's line count (what a full read opens), and one that no longer fits is
+// passed over for the lighter ones that still do, so the budget is spent, never merely stopped at.
+// Deterministic: ties break by scope index then file. [LAW:effects-at-boundaries] pure over the seam table.
+// Scopes are addressed by INDEX throughout: a name is a rendering (two directories can render alike —
+// a directory literally called `top-level` and the root — and multiscope.js uniquifies names later), and
+// keying the spend on one would let two scopes share a reads list. [LAW:one-source-of-truth]
 // The budget is the changed set's own line count: one more read of the whole, the ceiling named above.
 // Returns each scope's reads (in coupling order — the order the worker is told them) and the candidates
 // the budget could not cover, so the plan can say so. [LAW:no-silent-failure]
@@ -35764,24 +35777,25 @@ function seamReads(owned, seams, linesOf) {
     weight.set(`${a}\0${b}`, w);
     weight.set(`${b}\0${a}`, w);
   }
-  const allFiles = [...owned.values()].flat();
+  const allFiles = owned.flatMap(s => s.files);
   const candidates = [];
-  for (const [scope, files] of owned) {
+  owned.forEach(({ files, concern }, scope) => {
     const own = new Set(files);
+    const sibling = new Set(owned.filter((s, j) => j !== scope && s.concern === concern).flatMap(s => s.files));
     for (const file of allFiles) {
       if (own.has(file)) continue;
       const coupling = files.reduce((sum, f) => sum + (weight.get(`${f}\0${file}`) ?? 0), 0);
-      if (coupling > 0) candidates.push({ scope, file, coupling });
+      if (coupling > 0 || sibling.has(file)) candidates.push({ scope, file, coupling });
     }
-  }
-  candidates.sort((x, y) => y.coupling - x.coupling || (x.scope < y.scope ? -1 : x.scope > y.scope ? 1 : x.file < y.file ? -1 : 1));
+  });
+  candidates.sort((x, y) => y.coupling - x.coupling || x.scope - y.scope || (x.file < y.file ? -1 : 1));
   let remaining = allFiles.reduce((sum, f) => sum + linesOf(f), 0);
-  const reads = new Map([...owned.keys()].map(scope => [scope, []]));
+  const reads = owned.map(() => []);
   const unread = [];
   for (const c of candidates) {
     if (linesOf(c.file) <= remaining) {
       remaining -= linesOf(c.file);
-      reads.get(c.scope).push(c.file);
+      reads[c.scope].push(c.file);
     } else {
       unread.push(c);
     }
@@ -35793,13 +35807,15 @@ function seamReads(owned, seams, linesOf) {
 // will cover as { filename, churn, lines } (already filtered by EXCLUDE_PATTERNS — a withheld path never
 // reaches here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget
 // is calibrated on; lines is the content measurement measureChangedFiles stamps, what a full read costs)
-// and the change's seams (seamsOf, src/seams.js). Out: the scopes as the workers run them, each minted
+// and the change's seams (seamsOf, src/seams.js), plus the runner's lane ceiling (laneCeilingFromMemory,
+// src/multiscope.js — the one machine fact the cut consults, as a value; absent, no width binds). Out:
+// the scopes as the workers run them, each minted
 // through parseScopeValue so a scope from this producer is the SAME stamped value as one recorded by a
 // scout or read from a pinned plan, plus the orientation line every worker and the posted summary
 // share. [LAW:single-enforcer]
 // [LAW:no-silent-failure] An empty change has no partition; refusing here names the fact rather than
 // letting planRecord refuse an empty scope list two seams later.
-function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {}) {
+function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, laneCeiling = Infinity } = {}) {
   if (changed.length === 0) {
     throw new Error('partitionByDirectory: no changed files to partition — a review with no files has no structure.');
   }
@@ -35843,15 +35859,17 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {
     if (last && concern.get(last[0]).companion === concern.get(f).companion) last.push(f); else units.push([f]);
     return units;
   }, []);
+  // The lanes a cut may fill: the ceiling less every other group, each of which is one scope.
+  const lanesFree = laneCeiling - (merged.size - 1);
   const owned = [...merged.keys()].sort().flatMap((dir) => {
     const files = [...merged.get(dir)].sort(companionOrder);
     const name = dir === '.' ? ROOT_SCOPE_NAME : dir;
-    const parts = dir === cut ? partsOf(unitsOf(files), churnOf) : [files];
-    return parts.map((own, i) => ({ dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
+    const parts = dir === cut ? partsOf(unitsOf(files), churnOf, lanesFree) : [files];
+    return parts.map((own, i) => ({ dir, concern: dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
   });
-  const { reads, unread, covered } = seamReads(new Map(owned.map(s => [s.name, s.files])), seams, linesOf);
+  const { reads, unread, covered } = seamReads(owned, seams, linesOf);
   const scopes = owned
-    .map(({ dir, name, files }) => ({ name, focus: focusFor(dir, files, reads.get(name)), files, reads: reads.get(name) }))
+    .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i] }))
     .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
   // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
@@ -35861,7 +35879,7 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {
   const unreadNote = unread.length > 0
     ? ` The read ceiling (one further read of the changed set, ${[...linesByPath.values()].reduce((a, b) => a + b, 0)} lines) covered `
       + `${covered} of ${covered + unread.length} coupled reads; ${unread.length} left unread beyond their owner, heaviest first: `
-      + `${shown.map(c => `${c.file} (for ${c.scope})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
+      + `${shown.map(c => `${c.file} (for ${owned[c.scope].name})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
     : '';
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
     + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.${unreadNote}`;
@@ -38959,15 +38977,18 @@ module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule,
 // partition never sees text.
 
 // [LAW:one-source-of-truth] The one reading of "a use": an identifier in the position a call, a member
-// access, a type or a constructor puts it — `Name(`, `.Name`, `Name{`, `&Name`, `*Name`, `Name<` — a word
-// the languages under review agree on (letter or underscore, then word characters) in a shape only code
+// access, a type or a constructor puts it — `Name(`, `.Name`, `Name{`, `&Name`, `*Name` — a word the
+// languages under review agree on (letter or underscore, then word characters) in a shape only code
 // produces. A bare word is NOT a use: prose in a README, a LICENSE, a comment, or a go.sum line mentions
 // `check` and `run` and `Work` freely, and counting those made every changed file couple to every other
 // (the first cut of this module spent the whole read budget on all four frozen cases, docs included).
-// A use matters only when some changed file defines the same name.
+// Nor is an operand: `i < len` is a comparison, not a generic, so `<` is not a use shape (a generic's
+// type is used elsewhere in a shape that is), and `&`/`*` count only at a token's start — `&Conn{` and
+// `*sql.DB`, never `flags&MASK` or `a*height`. A use matters only when some changed file defines the
+// same name.
 const USE_MEMBER = /\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-const USE_CALL = /(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*[({<]/g;
-const USE_TYPE = /[&*]([A-Za-z_][A-Za-z0-9_]*)\b/g;
+const USE_CALL = /(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*[({]/g;
+const USE_TYPE = /(?:^|[\s(,=:[])[&*]([A-Za-z_][A-Za-z0-9_]*)\b/g;
 
 // [LAW:one-type-per-behavior] What DEFINES a symbol, as one table of line shapes with one capture each —
 // the declaration forms of the languages this reviewer meets (Go, JavaScript/TypeScript, Python, Rust,
@@ -39026,11 +39047,14 @@ function changedSymbolsOf(patch) {
 // in every function) is ambiguous and weighs a fifth per pair. No threshold decides what counts —
 // every live symbol counts, and the read budget (src/partition.js) decides how far down the ranking a
 // review can afford to look. [LAW:dataflow-not-control-flow]
-// A symbol both files define is neither's seam: A's use of it is A's own.
+// A file DEFINES a symbol if its current text does, or its changed lines did: a definition the change
+// DELETED is still that file's, and a caller elsewhere that still uses it is the seam this module most
+// exists to find (a removed or renamed export still used elsewhere) — it weighs 1, never a division
+// by no definer. A symbol both files define is neither's seam: A's use of it is A's own.
 function seamsOf(files) {
-  const defined = new Map(files.map(f => [f.filename, new Set(f.content.symbols.defines)]));
   const used = new Map(files.map(f => [f.filename, new Set(f.content.symbols.uses)]));
   const changed = new Map(files.map(f => [f.filename, changedSymbolsOf(f.patch)]));
+  const defined = new Map(files.map(f => [f.filename, new Set([...f.content.symbols.defines, ...changed.get(f.filename).defines])]));
   const definers = new Map();
   for (const [name, symbols] of defined) {
     for (const s of symbols) definers.set(s, (definers.get(s) ?? 0) + 1);

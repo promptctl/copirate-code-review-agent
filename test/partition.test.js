@@ -194,8 +194,33 @@ describe('partitionByDirectory — the size dimension', () => {
     // Every part clears the floor; the 1526-line go.sum is a part of its own (a single file is never cut).
     for (const part of parts) assert.ok(scopeChurn(part, LINKS_CHURN) >= SCOPE_CHURN_FLOOR, part.name);
     assert.deepEqual(parts.find(p => p.files.length === 1 && p.files[0].endsWith('/go.sum')).files, [`${DRIVER}/go.sum`]);
-    // With no seams handed in, no part reads beyond what it owns: the whole-concern second read is gone.
-    assert.deepEqual(scopes.map(s => s.reads), scopes.map(() => []));
+    // With no seams handed in, a part still reads its siblings — the cut made them one concern — as far as
+    // the budget (one further read of the set, 5387 lines) allows, in name order at coupling zero; the
+    // root, which has no seam and no sibling, reads nothing.
+    assert.deepEqual(scopes[0].reads, []);
+    const budget = Object.values(LINKS_CHURN).reduce((a, b) => a + b, 0);
+    assert.ok(parts.reduce((sum, p) => sum + scopeChurn({ files: p.reads }, LINKS_CHURN), 0) <= budget);
+    assert.ok(parts.some(p => p.reads.length > 0), 'no part read a sibling');
+  });
+
+  test('the cut never makes more parts than the runner has lanes left beside the other scopes', () => {
+    // 5 lanes, one other scope (the root): the driver may fill four. No ceiling handed in: eight, as above.
+    const { scopes } = partitionByDirectory(sized(LINKS_317, LINKS_CHURN), [], { laneCeiling: 5 });
+    assert.deepEqual(scopes.map(s => s.name), [ROOT_SCOPE_NAME, ...[1, 2, 3, 4].map(i => `${DRIVER} ${i}/4`)]);
+    // A ceiling the other scopes already fill leaves the concern whole: one part, never zero.
+    assert.deepEqual(partitionByDirectory(sized(LINKS_317, LINKS_CHURN), [], { laneCeiling: 1 }).scopes.map(s => s.name), [ROOT_SCOPE_NAME, DRIVER]);
+  });
+
+  test('a directory that renders like the root scope is still its own scope with its own reads: the spend is keyed by position, not by name', () => {
+    // A directory literally named `top-level` renders as 'top-level', the root's label; multiscope
+    // uniquifies the names later. Seams: lib/c.js ↔ top-level/x.js only.
+    const churn = { 'README.md': 10, 'LICENSE': 10, 'top-level/x.js': 10, 'top-level/y.js': 10, 'lib/c.js': 10, 'lib/d.js': 10 };
+    const { scopes } = partitionByDirectory(sized(Object.keys(churn), churn), [{ a: 'lib/c.js', b: 'top-level/x.js', weight: 1 }]);
+    assert.deepEqual(scopes.map(s => [s.name, s.files, s.reads]), [
+      [ROOT_SCOPE_NAME, ['LICENSE', 'README.md'], []],
+      ['lib', ['lib/c.js', 'lib/d.js'], ['top-level/x.js']],
+      [ROOT_SCOPE_NAME, ['top-level/x.js', 'top-level/y.js'], ['lib/c.js']],
+    ]);
   });
 
   test("a scope's focus names the files the change couples to it, says the seam is its job, and that a defect seen there is recorded", () => {
@@ -258,10 +283,23 @@ describe('partitionByDirectory — the size dimension', () => {
 
   test('a single-scope change is lopsided against nothing: over the cap it is halved, and the one lane becomes two', () => {
     const { scopes } = partition(sized(['src/a.js', 'src/b.js'], { 'src/a.js': 300, 'src/b.js': 300 }));
+    // The parts are one concern, so each reads the other's file even with no seam detected.
     assert.deepEqual(scopes.map(s => [s.name, s.files, s.reads]), [
-      ['src 1/2', ['src/a.js'], []],
-      ['src 2/2', ['src/b.js'], []],
+      ['src 1/2', ['src/a.js'], ['src/b.js']],
+      ['src 2/2', ['src/b.js'], ['src/a.js']],
     ]);
+  });
+
+  test('a cut concern in a language the seam shapes do not parse still reads across its cut, as far as the budget allows, and a detected seam ranks first', () => {
+    // Four 180-line files (720: two cap-sized parts) beside crumbs; the only seam is a.js ↔ d.js.
+    const churn = { 'src/a.js': 180, 'src/b.js': 180, 'src/c.js': 180, 'src/d.js': 180, 'docs/x.md': 10, 'docs/y.md': 10 };
+    const { scopes } = partitionByDirectory(sized(Object.keys(churn), churn), [{ a: 'src/a.js', b: 'src/d.js', weight: 2 }]);
+    const parts = scopes.filter(s => s.name.startsWith('src'));
+    assert.deepEqual(parts.map(s => [s.name, s.files]), [['src 1/2', ['src/a.js', 'src/b.js']], ['src 2/2', ['src/c.js', 'src/d.js']]]);
+    // 1/2 reads d.js first (the seam), then c.js (a sibling at coupling zero); 2/2 reads a.js (the seam),
+    // then b.js. 720 of a 740-line budget: the cut is covered as it was before seams existed.
+    assert.deepEqual(parts.map(s => s.reads), [['src/d.js', 'src/c.js'], ['src/a.js', 'src/b.js']]);
+    assert.deepEqual(scopes.find(s => s.name === 'docs').reads, []);
   });
 
   test('the cut goes as fine as the cap asks: a part reads its seams, not the whole group, so the read budget no longer bounds the part count', () => {
