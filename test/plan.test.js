@@ -296,6 +296,17 @@ describe('a plan that does not describe this change is refused at zero spend', (
     );
   });
 
+  // Coverage alone is not a partition: a file in two scopes is read and reviewed twice, at double the
+  // cost, by a run that would otherwise score as a valid sample. [LAW:no-silent-failure]
+  test('a plan claiming one file in two scopes is refused — a cover with overlap is not a partition', async () => {
+    const [first, ...rest] = PINNED.scopes;
+    const twice = { ...rest[0], files: [...rest[0].files, first.files[0]] };
+    await assert.rejects(
+      () => passRecording({ pinnedPlan: { ...PINNED, scopes: [first, twice, ...rest.slice(1)] } }),
+      new RegExp(`File\\(s\\) claimed by more than one scope \\(1\\): ${first.files[0].replace(/[./]/g, '\\$&')}`),
+    );
+  });
+
   test('the refusal costs nothing: no engine spawn is made at all', async () => {
     let spawned = 0;
     const adapter = { async produceReview() { spawned++; throw new Error('the pass spawned an engine on a plan it should have refused'); } };

@@ -74,7 +74,7 @@ describe('parseArgs takes --read-set as one of the declared arms, in both flag f
 
 // [LAW:effects-at-boundaries] The plan leaves the parser as a PATH, never a record: reading and parsing
 // the file is IO, and main does it at the run boundary beside every other file this replay opens. null is
-// the absence with a meaning — 'this replay scouts its own partition' — and it is the SAME value
+// the absence with a meaning — 'this replay computes its own partition' — and it is the SAME value
 // runMultiScope's own parameter defaults to, so it flows all the way to the pass untranslated.
 describe('parseArgs takes --plan as the path to a pinned plan', () => {
   test('both flag forms carry the path through unresolved', () => {

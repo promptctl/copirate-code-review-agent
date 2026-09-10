@@ -422,14 +422,17 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // type every line downstream consumes. The check cannot be skipped, because skipping it means having no
 // proposal to hand the workers.
 //
-// [LAW:no-silent-failure] The refusal is EXACT SET EQUALITY against the changed paths, in both
-// directions, and it happens before the first worker at zero model spend. Neither direction may be
-// waved through. A plan omitting a changed file would leave that file read in full by no worker while its plan.json
-// claimed a partition of the whole change, so the pinned replay would be a different review wearing
-// the plan's name. A plan naming a file this diff does
-// not contain is the same error read from the other side: the plan belongs to some other change (a
-// re-frozen case, a different EXCLUDE_PATTERNS), and the paths it names would reach a worker's
-// "read these files in full" line pointing at nothing. Both mean the frozen structure is not this
+// [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
+// exact set equality against the changed paths in both directions, and no path claimed twice — before
+// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
+// changed file would leave that file read in full by no worker while its plan.json claimed a
+// partition of the whole change, so the pinned replay would be a different review wearing the plan's
+// name. A plan naming a file this diff does not contain is the same error read from the other side:
+// the plan belongs to some other change (a re-frozen case, a different EXCLUDE_PATTERNS), and the
+// paths it names would reach a worker's "read these files in full" line pointing at nothing. A plan
+// claiming one file in two scopes (a hand edit, or a scout's plan whose duplicate the deleted
+// reconciliation once warned about) would have two workers read and review the same code, doubling
+// its cost while the run scored as a valid sample. All three mean the frozen structure is not this
 // change's structure, and the whole reason to pin is that the structure is the same.
 //
 // Provenance is stamped 'pinned' HERE regardless of what the file says, because provenance records which
@@ -439,17 +442,20 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // to get wrong. [LAW:one-source-of-truth]
 // [LAW:effects-at-boundaries] Pure but for the one progress line, exactly as its sibling is.
 function pinnedProposal({ plan, changedPaths, log }) {
-  const assigned = new Set(plan.scopes.flatMap(s => s.files));
+  const claimed = plan.scopes.flatMap(s => s.files);
+  const assigned = new Set(claimed);
   const changed = new Set(changedPaths);
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
-  if (omitted.length + foreign.length > 0) {
+  const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
+  if (omitted.length + foreign.length + duplicated.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
+      `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
-      'pin a plan recorded from THIS case, or drop --plan and let the scout partition it.',
+      'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );
   }
   log(`pinned plan: ${plan.scopes.length} scope(s): ${plan.scopes.map(s => s.name).join(', ')}`);
