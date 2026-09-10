@@ -233,8 +233,11 @@ test('compareVerdict refuses a candidate replayed at a different arm than the ba
     c.summary.effort = effort;
     return c;
   };
-  const SWEEPS_ON = { roundCap: 3, sweepCap: 2, reasoningTier: null };
-  const SWEEPS_OFF = { roundCap: 3, sweepCap: 0, reasoningTier: null };
+  // Complete profiles, as parseEffort now hands them over: every axis of the type carries a value, so the
+  // fixture is a record the boundary could actually have produced rather than a partial one only a test
+  // can build. Only sweepCap differs — the arm this case is about. [LAW:parse-dont-validate]
+  const SWEEPS_ON = { roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' };
+  const SWEEPS_OFF = { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' };
   const baseline = frozenBaseline([armed('case-a', SWEEPS_ON), armed('case-b', SWEEPS_ON)]);
   // The case the gate most needs to refuse: a PR that moves DEFAULT_SWEEP_CAP replays the candidate at its
   // own new default, and the recall delta reported against the old floor would be an arm delta wearing a

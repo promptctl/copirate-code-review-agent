@@ -32,7 +32,7 @@ const { execFileSync } = require('child_process');
 // from it rather than copied here. This is the one src require at module load: effort.js has an EMPTY
 // require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
 // cannot bind TRANSCRIPT_DIR before main() redirects RUNNER_TEMP.
-const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS, defaultEffortProfile } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS, defaultEffortProfile, recordEffort } = require('../src/effort');
 // [LAW:one-source-of-truth] The CLI-integer rule's owner; freeze-suite.js imports the same one. Empty
 // require graph, so this stays a pure-helper import under the load-purity rule above.
 const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
@@ -464,10 +464,12 @@ async function main() {
           case: manifest.name, timestamp, run: i, repeats: opts.repeats,
           config: { name: config.name, engine: config.engine, model: config.model, reasoning: config.reasoning ?? null },
           // The effort ACTUALLY passed to the engine, not the flags typed at it — provenance of the arm
-          // this run belongs to, the same way `config` is provenance of the engine it ran on. A run whose
-          // arm is unrecorded (produced before this field existed) is a different value from one recorded
-          // at the default, and the scorer treats it as such. [FRAMING:representation]
-          effort,
+          // this run belongs to, the same way `config` is provenance of the engine it ran on. The profile
+          // and the schema version naming its axis set are written by ONE producer (recordEffort) so the
+          // stamp can never describe a shape the record does not have. [LAW:one-source-of-truth]
+          // [FRAMING:representation] the version is what keeps a future reader from having to guess
+          // whether an axis this record omits was a choice or an era — see src/effort.js's back-fill.
+          ...recordEffort(effort),
           candidate,
           findingCount: review.findings.length,
         },

@@ -127,6 +127,101 @@ function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reas
   return { roundCap, sweepCap, reasoningTier, readSet };
 }
 
+// [LAW:one-source-of-truth] The version of the RECORDED profile, owned next to the type it versions —
+// the discipline eval/baseline.js already applies to the baseline file (copirate-eval-baseline/v2),
+// carried one layer down to the run record where it was missing. It names WHICH AXIS SET the profile
+// above had when a record was written, which is what lets a stored run still be classified years later:
+// the record states the theorem that was true at its writing, so a reader never has to guess whether an
+// absent axis was a choice or an era. Bump it whenever defaultEffortProfile's axes change, and give the
+// outgoing version its row in the back-fill below — the bump and the row are one edit, never two.
+const EFFORT_SCHEMA = 'copirate-effort/v1';
+
+// [LAW:parse-dont-validate] A record carrying no version is NOT versionless: it was written in the era
+// before the version existed, and that era had exactly one axis set. So absence is a VALUE here — it gets
+// a name and a row of its own rather than a fallthrough. This is load-bearing, not tidiness: every run on
+// disk today predates the field, so a table keyed only on versions the records actually carry would
+// classify none of them, which is the entire job.
+const UNVERSIONED_EFFORT_SCHEMA = 'copirate-effort/unversioned';
+
+// [LAW:dataflow-not-control-flow] The back-fill, as a TABLE from schema version to the axes the CODE
+// STRUCTURALLY HAD at that version — values, not an inference each reader re-derives at its own site.
+// [LAW:single-enforcer] one rule, read through completeEffort by every comparison site, replacing the
+// unanswerable "what arm did this run's missing axis run at?" with an answer this tree owns and can cite.
+//   unversioned -> readSet 'assigned': scope-bounded reads shipped in bfcd889 on 2026-07-06, before every
+//     stored run, and the axis did not exist to be set otherwise — the behavior was that arm as a matter
+//     of code, not of guesswork. Retro-editing the stored meta.json files to add the field would falsify
+//     the record; interpreting them through an owned rule is the honest form of the same knowledge.
+//     [LAW:one-source-of-truth] the value is spelled out rather than written as DEFAULT_READ_SET: this
+//     row is a HISTORICAL fact about code that shipped, and if the shipped default ever moves, what those
+//     runs did does not move with it. Binding the two would make the past follow the present.
+//   current -> {}: a record written at the current version carries every axis itself, so there is nothing
+//     to supply — and an axis still missing is a DEFECT, refused loudly by completeEffort rather than
+//     quietly filled.
+const EFFORT_SCHEMA_BACKFILL = {
+  [UNVERSIONED_EFFORT_SCHEMA]: { readSet: 'assigned' },
+  [EFFORT_SCHEMA]: {},
+};
+
+// [LAW:one-source-of-truth] The axis set OF THE TYPE, read off the type itself rather than kept as a
+// second list a new axis would have to remember to join. Adding a field to defaultEffortProfile widens
+// this automatically, which is what turns "added an axis and forgot to record it" from a mistake anyone
+// can make into one nobody can: the completeness check below is stated against this, so the new axis
+// starts being demanded of every record the moment it exists.
+function effortAxes() {
+  return Object.keys(defaultEffortProfile());
+}
+
+// [LAW:one-source-of-truth] The recorded pair, PRODUCED TOGETHER — the profile and the version saying
+// which axis set it was written under. Halves written separately are exactly what drifts, and a record
+// stamped with a version it does not match is worse than one carrying no version at all, so there is one
+// producer and it emits both. Spread into a record: `{ ...recordEffort(effort), case, ... }`.
+// [LAW:effects-at-boundaries] Pure: the caller does the writing.
+function recordEffort(profile) {
+  return { effort: profile, effortSchema: EFFORT_SCHEMA };
+}
+
+// [LAW:parse-dont-validate] The reader of that pair, and the checkpoint this axis was missing: in goes a
+// stored record from whatever era wrote it, out comes a COMPLETE profile — every axis of the current type
+// present — so no comparison site downstream ever meets an axis-shaped void and has to decide what it
+// meant. An axis is supplied only where the table names one for that record's version; an axis the table
+// is silent about passes through exactly as recorded, so a value that genuinely varied is never
+// overwritten by a default.
+// [LAW:no-silent-failure] Two loud refusals, each naming what it saw: a version this tree has no row for
+// (a record from a newer or forked schema, which cannot be interpreted and must not be guessed at), and a
+// record still missing an axis after back-fill — the recorder having fallen behind the type, which is the
+// very defect this function exists to make impossible to ship quietly.
+function completeEffort({ effort, effortSchema }) {
+  const schema = effortSchema ?? UNVERSIONED_EFFORT_SCHEMA;
+  if (!Object.prototype.hasOwnProperty.call(EFFORT_SCHEMA_BACKFILL, schema)) {
+    throw new Error(
+      `Unknown effort schema ${JSON.stringify(schema)}. Known schemas: ${Object.keys(EFFORT_SCHEMA_BACKFILL).join(', ')}.`,
+    );
+  }
+  const completed = { ...effort };
+  for (const [axis, structural] of Object.entries(EFFORT_SCHEMA_BACKFILL[schema])) {
+    // The row supplies the axis for a record that does not carry it, in either spelling absence takes on
+    // the wire: a missing key, or the explicit null a re-read of an already-parsed profile carries. A
+    // recorded reasoningTier of null is untouched, because no row names that axis — the table's silence
+    // is what protects a real value from a back-fill.
+    completed[axis] = completed[axis] ?? structural;
+  }
+  // An axis may be null exactly when its OWN default is null — `reasoningTier`'s null is a real value
+  // ("propose no raise"), while a null anywhere else is absence in its second spelling. The distinction is
+  // read off defaultEffortProfile rather than listed here, so a future nullable axis declares itself.
+  // [LAW:one-source-of-truth] [LAW:types-are-the-program]
+  const nullable = defaultEffortProfile();
+  const missing = effortAxes().filter(
+    axis => completed[axis] === undefined || (completed[axis] === null && nullable[axis] !== null),
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `Effort record at schema ${schema} is missing ${missing.join(', ')}, and no back-fill row supplies ` +
+      `${missing.length === 1 ? 'it' : 'them'}. A record must carry every axis of the profile: ${effortAxes().join(', ')}.`,
+    );
+  }
+  return completed;
+}
+
 // [LAW:parse-dont-validate] Resolve the arm NAME to the projection it selects — the axis's one checkpoint,
 // and the only place its vocabulary is checked. It returns something that could not exist before the check
 // (the projection itself), so a caller holding one holds a proven arm: there is nothing left inland to
@@ -224,6 +319,12 @@ module.exports = {
   DEFAULT_READ_SET,
   READ_SETS,
   TIER_RANK,
+  EFFORT_SCHEMA,
+  UNVERSIONED_EFFORT_SCHEMA,
+  EFFORT_SCHEMA_BACKFILL,
+  effortAxes,
+  recordEffort,
+  completeEffort,
   defaultEffortProfile,
   resolveReasoningTier,
   maxTier,

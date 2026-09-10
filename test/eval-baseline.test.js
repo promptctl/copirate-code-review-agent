@@ -255,7 +255,7 @@ test('buildBaseline computes per-full-run cost only when every run is costed', (
 });
 
 test('buildBaseline records the arm the suite was measured at, and the markdown names it', () => {
-  const arm = { roundCap: 3, sweepCap: 0, reasoningTier: null };
+  const arm = { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' };
   const cases = [
     caseEntry('case-a', { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 }, { effort: arm }),
     caseEntry('case-b', { mean: 1, min: 1, max: 1, n: 2 }, { effort: arm }),
@@ -271,6 +271,33 @@ test('buildBaseline records the arm the suite was measured at, and the markdown 
   });
   assert.equal(legacy.effort, null);
   assert.match(renderBaselineMarkdown(legacy), /unrecorded/);
+});
+
+// [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): the runs already on disk — 40 of them, three
+// axes, no schema version — must become comparable to a new arm THROUGH the back-fill, and buildBaseline
+// must accept the pairing. This is what makes the 'assigned' half of copirate-measurement-2mg.2 a
+// measurement already paid for rather than one to re-buy.
+test('a pre-readSet summary and one that names the arm freeze as ONE arm, and the other arm is still refused', () => {
+  const band = { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 };
+  // As the stored scorecard-summary.json files are written: three axes, no version.
+  const era = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }), 'stored.json').effort;
+  assert.equal(era.readSet, 'assigned', 'the back-fill resolves the era to the arm the code structurally had');
+  // A summary from a run that named its arm: every axis carries a value.
+  const named = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } }), 'fresh.json').effort;
+
+  const paired = buildBaseline({
+    cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: named })],
+    provenance: { sha: 'deadbeef', date: '2026-09-09' },
+  });
+  assert.deepEqual(paired.effort, named);
+  assert.match(renderBaselineMarkdown(paired), /readSet=assigned/);
+
+  // The point of certifying the era is that it now names a SPECIFIC arm — so the other one is refused by
+  // exactly the rule that has always refused a mixed suite. Comparable is not the same as interchangeable.
+  assert.throws(() => buildBaseline({
+    cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: { ...named, readSet: 'changed' } })],
+    provenance: { sha: 'deadbeef', date: '2026-09-09' },
+  }), /freezes one arm, not an average of two/);
 });
 
 test('buildBaseline refuses an inconsistent or empty suite loudly', () => {

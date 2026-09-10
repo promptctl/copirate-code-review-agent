@@ -152,7 +152,7 @@ function parseCaseSummary(raw, label) {
     matcher: json.matcher,
     // The A/B arm this case was scored under, parsed by score.js's own effort boundary so a summary can
     // never mean one thing to the scorer and another to the freezer. [LAW:single-enforcer]
-    effort: parseEffort(json.effort, label),
+    effort: parseEffort(json, label),
     mustFindRecall: parseBand(json.mustFindRecall, `${label}.mustFindRecall`),
     inventoryMustFindRecall: parseBand(json.inventoryMustFindRecall, `${label}.inventoryMustFindRecall`),
     niceToFindRecall: parseBand(json.niceToFindRecall, `${label}.niceToFindRecall`),
@@ -391,7 +391,7 @@ function parseBaseline(raw, label) {
     engine: json.engine ?? null, matcher: json.matcher ?? null, repeats: json.repeats,
     // The arm the gate compares a candidate against — parsed, not defaulted, so a committed baseline
     // carrying a malformed profile is refused here rather than gating as 'unrecorded'.
-    effort: parseEffort(json.effort, label),
+    effort: parseEffort(json, label),
     degradationRule: json.degradationRule ?? null,
     pooledInventoryMustFind: { found: pooled.found, opportunities: pooled.opportunities, rate: pooled.rate ?? null, gateFloor: pooled.gateFloor },
     cases,
