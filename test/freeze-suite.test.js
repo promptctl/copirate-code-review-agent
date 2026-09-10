@@ -1,7 +1,7 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
+const { parseArgs, resolveLanes, selectCaseDirs, suitePin, planJobs, unpinnedPlanSet, runLane, makeLaneGroup, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, laneMemoryShare, laneReplay } = require('../eval/freeze-suite');
 
 // The contract these tests hold is the SCHEDULE: how many replays are still owed, in what order, on
 // which credential, and what the operator is told afterwards. The replay itself belongs to run-case.js
@@ -60,9 +60,12 @@ describe('planJobs', () => {
     { name: 'alpha', dir: 'eval/cases/alpha', completed: 0 },
     { name: 'beta', dir: 'eval/cases/beta', completed: 0 },
   ];
+  // These tests are about the SCHEDULE — which replays are owed and in what order — so they run against
+  // the plan set that pins nothing. What the pin does to a job is the separate describe below.
+  const unpinned = cs => unpinnedPlanSet(cs.map(c => c.name));
 
   test('an untouched suite owes repeats × cases replays', () => {
-    const jobs = planJobs({ cases, repeats: 3 });
+    const jobs = planJobs({ cases, repeats: 3, planSet: unpinned(cases) });
     assert.equal(jobs.length, 6);
     assert.deepEqual(jobs.map(j => j.name), ['alpha', 'beta', 'alpha', 'beta', 'alpha', 'beta']);
     assert.deepEqual(jobs.map(j => j.level), [1, 1, 2, 2, 3, 3]);
@@ -72,31 +75,29 @@ describe('planJobs', () => {
   // The reason the order matters: an interrupted suite must still be freezable. Filling level by level
   // leaves every case at the same depth, which is the one common N baseline.js demands.
   test('the shallowest case is served first, so an interruption leaves an even suite', () => {
-    const jobs = planJobs({
-      cases: [
-        { name: 'alpha', dir: 'a', completed: 4 },
-        { name: 'beta', dir: 'b', completed: 1 },
-      ],
-      repeats: 5,
-    });
+    const cs = [
+      { name: 'alpha', dir: 'a', completed: 4 },
+      { name: 'beta', dir: 'b', completed: 1 },
+    ];
+    const jobs = planJobs({ cases: cs, repeats: 5, planSet: unpinned(cs) });
     assert.deepEqual(jobs.map(j => `${j.name}@${j.level}`), ['beta@2', 'beta@3', 'beta@4', 'alpha@5', 'beta@5']);
   });
 
   test('a case already at target owes nothing, and neither does a finished suite', () => {
-    const jobs = planJobs({
-      cases: [
-        { name: 'alpha', dir: 'a', completed: 5 },
-        { name: 'beta', dir: 'b', completed: 3 },
-      ],
-      repeats: 5,
-    });
+    const cs = [
+      { name: 'alpha', dir: 'a', completed: 5 },
+      { name: 'beta', dir: 'b', completed: 3 },
+    ];
+    const jobs = planJobs({ cases: cs, repeats: 5, planSet: unpinned(cs) });
     assert.deepEqual(jobs.map(j => j.name), ['beta', 'beta']);
-    assert.deepEqual(planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 5 }], repeats: 5 }), []);
+    const done = [{ name: 'alpha', dir: 'a', completed: 5 }];
+    assert.deepEqual(planJobs({ cases: done, repeats: 5, planSet: unpinned(done) }), []);
   });
 
   // Runs beyond the target are not a reason to re-plan — a suite that overshot is already deep enough.
   test('a case past target owes nothing', () => {
-    assert.deepEqual(planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 9 }], repeats: 5 }), []);
+    const cs = [{ name: 'alpha', dir: 'a', completed: 9 }];
+    assert.deepEqual(planJobs({ cases: cs, repeats: 5, planSet: unpinned(cs) }), []);
   });
 });
 
@@ -578,29 +579,29 @@ describe('laneReplay hands the injected replay its share of the host', () => {
       totalMemBytes: 8 * 2 ** 30,
       sweepCap: 0,
       readSet: 'assigned',
-      planPaths: new Map(),
       replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
     });
-    const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
+    // The plan rides on the JOB, stamped by planJobs, which is why the plan set is not threaded here.
+    const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1, plan: [] }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
     assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
     // The suite's own facts — the memory share and the arm every replay runs — are folded in here, so
     // the lane loop never carries either.
-    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0, readSet: 'assigned', planPaths: new Map() }]);
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0, readSet: 'assigned' }]);
   });
 });
 
 describe('replaySpawnSpec puts the lane credential in the pinned provider slot', () => {
-  // planPaths is the SUITE's plan set; an empty map is the un-pinned suite — every case scouts its own
-  // partition — and is what these argv assertions are made against.
-  const spec = (planPaths = new Map()) => replaySpawnSpec({
-    job: { name: 'alpha', dir: '/cases/alpha', level: 1 },
+  // `job.plan` is the zero-or-one plans THIS replicate replays, stamped by planJobs; the empty list is
+  // the un-pinned suite — the case scouts its own partition — and is what these argv assertions are made
+  // against.
+  const spec = (plan = []) => replaySpawnSpec({
+    job: { name: 'alpha', dir: '/cases/alpha', level: 1, plan },
     lane: { name: 'TOKEN_B', value: 'lane-b-credential' },
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
     outRoot: '/out/freeze-abc',
     memoryBudget: 8 * 2 ** 30,
     sweepCap: 0,
     readSet: 'assigned',
-    planPaths,
   });
 
   test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
@@ -615,16 +616,13 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });
 
-  // The pin reaches the child on its OWN argv, keyed by the job's case — the suite's whole contribution to
-  // a pinned replay. An un-pinned suite's argv above must stay byte-identical to what it was before plans
-  // existed, which is why the pin is appended rather than threaded through the existing words.
-  test("a pinned suite forwards THIS case's plan, and only a plan the set actually holds", () => {
-    const pinned = spec(new Map([['alpha', '/plans/alpha.json']]));
-    assert.deepEqual(pinned.args.slice(-2), ['--plan', '/plans/alpha.json']);
+  // The pin reaches the child on its OWN argv, read straight off the job. An un-pinned suite's argv above
+  // must stay byte-identical to what it was before plans existed, which is why the pin is appended rather
+  // than threaded through the existing words.
+  test('a pinned replay forwards the plan its job carries, appended to the un-pinned argv', () => {
+    const pinned = spec(['/plans/alpha/2.json']);
+    assert.deepEqual(pinned.args.slice(-2), ['--plan', '/plans/alpha/2.json']);
     assert.deepEqual(pinned.args.slice(0, -2), spec().args, 'pinning must add words, never change the ones already there');
-    // A set holding some OTHER case's plan does not pin this job with it: a plan partitions one case's
-    // changed files, and forwarding a foreign one would be refused at the child anyway — after the spawn.
-    assert.deepEqual(spec(new Map([['beta', '/plans/beta.json']])).args, spec().args);
   });
 
   test("the lane's value lands in the named slot and overrides an inherited one", () => {
@@ -993,36 +991,120 @@ describe('the CLI records each invocation\'s wall clock without erasing an earli
 });
 
 // [LAW:no-silent-failure] The suite's plan-set gate: it answers the questions that cost nothing to ask now
-// and hours to discover on lane 1 — does every selected case have a plan, and does each one parse — before
-// any credential resolves. A PARTIALLY pinned suite is the failure worth refusing: some cases would replay
-// a frozen structure while the rest re-rolled it, putting the exact variance the pin removes back into the
-// comparison with nothing in the report saying which cases carried it.
+// and hours to discover on lane 1 — does every selected case have plans, are there enough of them for the
+// depth this suite replays, and does each one parse — before any credential resolves. Two failures are
+// worth refusing for the same reason: a PARTIALLY pinned suite (some cases replay a frozen structure while
+// the rest re-roll it) and a SHALLOW one (levels past the last plan fall back to scouting), because each
+// puts the exact variance the pin removes back into the comparison with nothing in the report saying which
+// replicates carried it.
 describe('resolvePlanSet proves the plan set before the suite spends anything', () => {
   const { PLAN_SCHEMA } = require('../src/plan');
-  const writePlan = (dir, name, overrides = {}) => fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
-    planSchema: PLAN_SCHEMA, provenance: 'scout', context: 'ctx',
-    scopes: [{ name: 's', focus: 'f', files: ['a.js'] }], scoutUsage: null, ...overrides,
-  }));
+  const writePlan = (dir, caseName, file, overrides = {}) => {
+    const caseDir = path.join(dir, caseName);
+    fs.mkdirSync(caseDir, { recursive: true });
+    fs.writeFileSync(path.join(caseDir, file), JSON.stringify({
+      planSchema: PLAN_SCHEMA, provenance: 'scout', context: 'ctx',
+      scopes: [{ name: 's', focus: 'f', files: ['a.js'] }], scoutUsage: null, ...overrides,
+    }));
+  };
 
-  test('a complete set resolves to the path per case — the value the spawn reads, already proven', () => {
+  // The value planJobs slices: one ORDERED list per case, every path already proven to parse.
+  test('a complete set resolves to the ordered plans per case, in filename order', () => {
     const dir = tmpTree();
-    writePlan(dir, 'alpha');
-    writePlan(dir, 'beta');
-    assert.deepEqual(resolvePlanSet(dir, ['alpha', 'beta']), new Map([
-      ['alpha', path.join(dir, 'alpha.json')],
-      ['beta', path.join(dir, 'beta.json')],
+    writePlan(dir, 'alpha', 'b-second.json');
+    writePlan(dir, 'alpha', 'a-first.json');
+    writePlan(dir, 'beta', 'only.json');
+    assert.deepEqual(resolvePlanSet(dir, ['alpha', 'beta'], 1), new Map([
+      ['alpha', [path.join(dir, 'alpha', 'a-first.json'), path.join(dir, 'alpha', 'b-second.json')]],
+      ['beta', [path.join(dir, 'beta', 'only.json')]],
     ]));
   });
 
-  test('a selected case with no plan refuses the whole suite, naming the case and the path it looked for', () => {
+  // Non-plan files in a harvested dir (a README, a .DS_Store) are not plans and must not become replicates.
+  test('only .json files count as plans', () => {
     const dir = tmpTree();
-    writePlan(dir, 'alpha');
-    assert.throws(() => resolvePlanSet(dir, ['alpha', 'beta']), /has no plan for case 'beta'.*beta\.json/s);
+    writePlan(dir, 'alpha', 'p1.json');
+    fs.writeFileSync(path.join(dir, 'alpha', 'NOTES.md'), 'harvested from ab-sweep2');
+    assert.deepEqual(resolvePlanSet(dir, ['alpha'], 1), new Map([['alpha', [path.join(dir, 'alpha', 'p1.json')]]]));
+  });
+
+  test('a selected case with no plans refuses the whole suite, naming the case and the dir it looked for', () => {
+    const dir = tmpTree();
+    writePlan(dir, 'alpha', 'p1.json');
+    assert.throws(() => resolvePlanSet(dir, ['alpha', 'beta'], 1), /has no plans for case 'beta'.*beta/s);
+  });
+
+  // The refusal this ticket exists for: -n deeper than the plan set would silently scout the deep levels.
+  test('fewer plans than the suite replays refuses, naming both counts', () => {
+    const dir = tmpTree();
+    writePlan(dir, 'alpha', 'p1.json');
+    writePlan(dir, 'alpha', 'p2.json');
+    assert.throws(() => resolvePlanSet(dir, ['alpha'], 5), /case 'alpha' 2 plan\(s\), but this suite replays 5/);
+  });
+
+  // An empty case dir is the same defect as a missing one, and must not resolve to "pins nothing".
+  test('an empty case directory is refused, not read as an un-pinned case', () => {
+    const dir = tmpTree();
+    fs.mkdirSync(path.join(dir, 'alpha'), { recursive: true });
+    assert.throws(() => resolvePlanSet(dir, ['alpha'], 1), /case 'alpha' 0 plan\(s\)/);
+  });
+
+  // MORE plans than -n is deliberate: the extras are the depth a later resume grows into, against this
+  // same dir, so replicate 4 gets the same structure whether it ran in the first pass or a later one.
+  test('extra plans beyond the depth replayed are kept, not refused', () => {
+    const dir = tmpTree();
+    for (const f of ['p1.json', 'p2.json', 'p3.json']) writePlan(dir, 'alpha', f);
+    assert.equal(resolvePlanSet(dir, ['alpha'], 2).get('alpha').length, 3);
   });
 
   test('a plan that does not parse refuses here, not three hours in at the child', () => {
     const dir = tmpTree();
-    writePlan(dir, 'alpha', { planSchema: 'copirate-plan/v99' });
-    assert.throws(() => resolvePlanSet(dir, ['alpha']), /declares planSchema "copirate-plan\/v99"/);
+    writePlan(dir, 'alpha', 'p1.json', { planSchema: 'copirate-plan/v99' });
+    assert.throws(() => resolvePlanSet(dir, ['alpha'], 1), /declares planSchema "copirate-plan\/v99"/);
+  });
+});
+
+// THE POINT OF copirate-determinism-5od.2sd: replicate r replays plan r, so `-n 5 --plans <dir>` replays
+// five DISTINCT structures per case instead of one structure five times. The pairing survives it — both
+// arms resolve the same dir the same way, so arm A's replicate r and arm B's replicate r share a plan —
+// and eval/paired.js blocks on plan CONTENT, so it needs no knowledge of this mapping at all.
+describe('planJobs stamps each replicate with its own plan', () => {
+  const cases = [{ name: 'alpha', dir: 'a', completed: 0 }, { name: 'beta', dir: 'b', completed: 0 }];
+  const planSet = new Map([['alpha', ['a1', 'a2', 'a3']], ['beta', ['b1', 'b2', 'b3']]]);
+
+  test('level r carries the r-th plan of its own case', () => {
+    const jobs = planJobs({ cases, repeats: 3, planSet });
+    assert.deepEqual(jobs.map(j => `${j.name}@${j.level}:${j.plan}`), [
+      'alpha@1:a1', 'beta@1:b1', 'alpha@2:a2', 'beta@2:b2', 'alpha@3:a3', 'beta@3:b3',
+    ]);
+  });
+
+  // The stamp survives a resume BECAUSE the schedule is level-filling: a case with 2 completed runs is
+  // queued at levels 3..5 and reads plans 3..5 — it does not replay plan 1 under a third structure.
+  test('a resumed case picks up at the plan its next level names', () => {
+    const jobs = planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 2 }], repeats: 3, planSet });
+    assert.deepEqual(jobs.map(j => `${j.level}:${j.plan}`), ['3:a3']);
+  });
+
+  // The un-pinned suite is the same type, not a second shape: every case present, mapping to no plans.
+  test('an un-pinned suite stamps every job with no plan at all', () => {
+    const jobs = planJobs({ cases, repeats: 2, planSet: unpinnedPlanSet(['alpha', 'beta']) });
+    assert.equal(jobs.length, 4);
+    for (const j of jobs) assert.deepEqual(j.plan, []);
+  });
+
+  // THE PROPERTY eval/paired.js DEPENDS ON, and the one that is not obvious: the arms need not be run the
+  // same way. An arm replayed in one clean pass and an arm that crashed after two replays and resumed
+  // still replay the SAME MULTISET of plans per case, because level r names plan r no matter which
+  // invocation queued it. Without that, a resumed arm would be unpairable against the arm it was built to
+  // compare with — discovered at the reducer, after the whole suite had spent. [LAW:no-silent-failure]
+  test('an arm run in one pass and an arm that resumed replay the same plans', () => {
+    const inOnePass = planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 0 }], repeats: 3, planSet });
+    const beforeCrash = planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 0 }], repeats: 3, planSet }).slice(0, 2);
+    const afterResume = planJobs({ cases: [{ name: 'alpha', dir: 'a', completed: 2 }], repeats: 3, planSet });
+    assert.deepEqual(
+      [...beforeCrash, ...afterResume].flatMap(j => j.plan).sort(),
+      inOnePass.flatMap(j => j.plan).sort(),
+    );
   });
 });
