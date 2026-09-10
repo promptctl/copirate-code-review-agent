@@ -38,8 +38,8 @@ const { spawnSync, execFileSync } = require('child_process');
 const {
   parseCaseSummary, parseCaseEngine, buildBaseline, parseBaseline, sameEngine, evaluateGate,
 } = require('./baseline');
-const { matcherLabel, parseExpected, parseMeta, listRunDirs, requireLlmJudgeCredential, describeEffort, misarmedRuns, requireRunCase } = require('./score');
-const { workingTree, treeIdentity } = require('./run-case');
+const { matcherLabel, parseExpected, requireLlmJudgeCredential, describeEffort, misarmedRuns, readPriorRuns } = require('./score');
+const { workingTree, describeTree, foreignRuns } = require('./run-case');
 
 const USAGE = `Gate a candidate (the current working tree) against a frozen eval baseline: replay the golden
 suite N times, score it, and print a DEGRADED / OK / IMPROVED verdict. Non-zero exit on DEGRADED.
@@ -494,37 +494,6 @@ function runCli(scriptPath, args, label) {
   if (res.status !== 0) throw new Error(`${label} exited ${res.status === null ? `on signal ${res.signal}` : `with code ${res.status}`}.`);
 }
 
-// A tree as a phrase, for the refusal below: the reader must see BOTH sides to know which to fix.
-function describeTree(candidate) {
-  if (candidate === null) return 'no recorded identity';
-  return `${candidate.dirty ? 'a dirty tree at ' : ''}commit ${candidate.sha.slice(0, 7)}`;
-}
-
-// [LAW:effects-at-boundaries] Pure: which runs under --out cannot be this candidate's. A run is the
-// candidate's own only when both carry the SAME identity — one clean commit (treeIdentity); a dirty tree
-// on either side has none, so nothing can be proven and everything is foreign. Every foreign run is named
-// with both trees, so the operator knows whether to move the runs or commit the tree.
-function foreignRuns(current, runs) {
-  const identity = treeIdentity(current);
-  return runs
-    .filter(({ candidate }) => identity === null || candidate === null || treeIdentity(candidate) !== identity)
-    .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; the tree under gate is ${describeTree(current)}` }));
-}
-
-// Every completed run already under the candidate root for the gated cases, with the tree that produced
-// it. "Completed" is score.js's own predicate (listRunDirs) — the same census freeze-suite.js will take,
-// so what this accepts is exactly what the replay will count. A run whose record names a different case
-// than the directory it sits in is refused here, before the spend, with the check score.js would make
-// after it. [LAW:one-source-of-truth] [LAW:parse-dont-validate]
-function readPriorRuns(candidateRoot, caseNames) {
-  return caseNames.flatMap(name => listRunDirs(path.join(candidateRoot, name)).map(dir => {
-    const metaPath = path.join(dir, 'meta.json');
-    const meta = parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath);
-    requireRunCase(meta, name, metaPath);
-    return { case: name, dir, candidate: meta.candidate, effort: meta.effort };
-  }));
-}
-
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
@@ -763,5 +732,5 @@ if (require.main === module) {
 module.exports = {
   parseArgs, replayArgs, expectedMatcherLabel, estimateCandidateCostUsd,
   compareVerdict, renderVerdictMarkdown, resolveBaselineJsonPath, computeExpectedOpportunities,
-  foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree,
+  deficitReplays, excessRuns, driftedRuns, producedTree,
 };

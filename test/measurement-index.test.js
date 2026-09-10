@@ -184,17 +184,15 @@ test('only a case with a scheduled replay asks the corpus anything', () => {
   assert.deepEqual(plannedCases(cases, []), []);
 });
 
-// Nothing planned means nothing asked — and asking is what costs a corpus walk and two git subprocesses.
-// A status re-invocation must acquire neither, so the injected effects are proven UNCALLED, not just unused.
-test('a suite with nothing planned reads no corpus and shells out to no git', () => {
+// Nothing planned means nothing asked — and asking is what costs a corpus walk. A status re-invocation
+// must not pay it; the tree snapshot it would compare against is the caller's, and a caller with nothing
+// planned took none (null).
+test('a suite with nothing planned reads no corpus', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
-  let gitCalls = 0;
   const answer = consultCorpus({
     planned: [], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs,
-    workingTree: () => { gitCalls++; return { sha: SHA, dirty: false }; },
+    parseMeta, treeIdentity, listRunDirs, tree: null,
   });
-  assert.equal(gitCalls, 0);
   assert.deepEqual(answer, { notice: null, consultations: [], unidentified: [] });
   fs.rmSync(dir, { recursive: true });
 });
@@ -205,7 +203,7 @@ test('a dirty tree consults nothing and says why', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
   const answer = consultCorpus({
     planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: true }),
+    parseMeta, treeIdentity, listRunDirs, tree: { sha: SHA, dirty: true },
   });
   assert.match(answer.notice, /DIRTY/);
   assert.deepEqual(answer.consultations, []);
@@ -216,7 +214,7 @@ test('a planned case consults the corpus and reports what it holds', () => {
   const dir = writeCorpus({ 'r/case-a/run1': meta() });
   const answer = consultCorpus({
     planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
-    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: false }),
+    parseMeta, treeIdentity, listRunDirs, tree: { sha: SHA, dirty: false },
   });
   assert.match(answer.notice, /1 identified run\(s\) on disk/);
   assert.equal(answer.consultations.length, 1);

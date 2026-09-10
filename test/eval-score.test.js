@@ -8,8 +8,11 @@ const {
   makeLexicalJudge, jaccard, wordSet,
   judgeCacheKey, buildJudgePrompt, parseJudgeResponse, extractText, makeLlmJudge, loadCache,
   requireLlmJudgeCredential, listRunDirs, JUDGE_MODEL,
-  parseEffort, describeEffort, agreedScope, misarmedRuns,
+  parseEffort, describeEffort, agreedScope, misarmedRuns, readPriorRuns,
 } = require('../eval/score');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { EFFORT_SCHEMA } = require('../src/effort');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
@@ -596,6 +599,44 @@ describe('the arm a run was produced under', () => {
     assert.deepEqual(misarmedRuns(on, []), []);
   });
 
+  test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-prior-'));
+    try {
+      const mk = (caseName, run, meta, complete = true) => {
+        const dir = path.join(root, caseName, run);
+        fs.mkdirSync(dir, { recursive: true });
+        if (complete) fs.writeFileSync(path.join(dir, 'findings.json'), '[]\n');
+        fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
+        return dir;
+      };
+      const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } });
+      const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
+      mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
+      mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
+      const prior = readPriorRuns(root, ['case-a', 'case-b']);
+      const misplaced = path.join(root, 'case-b', '2026-01-01T00-00-04-000Z-run1');
+      fs.mkdirSync(misplaced, { recursive: true });
+      fs.writeFileSync(path.join(misplaced, 'findings.json'), '[]\n');
+      fs.writeFileSync(path.join(misplaced, 'meta.json'), JSON.stringify({ case: 'case-a', candidate: { sha: 'abc', dirty: false } }) + '\n');
+      assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
+      fs.rmSync(misplaced, { recursive: true, force: true });
+      assert.deepEqual(prior, [
+        { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } },
+        // The arm rides through beside the tree, and a run recorded before either existed reads as null for
+        // both — the census the arm check below consumes.
+        { case: 'case-a', dir: a2, candidate: null, effort: null },
+      ]);
+      assert.deepEqual(readPriorRuns(path.join(root, 'absent'), ['case-a']), []);
+      // run-case.js writes meta.json first and findings.json last, so a counted run with no meta.json cannot
+      // come from a crash — and skipping it would let a run whose arm and tree cannot be proven pass every
+      // resume check as if it matched.
+      fs.rmSync(path.join(a2, 'meta.json'));
+      assert.throws(() => readPriorRuns(root, ['case-a']), /torn run record/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
     for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: [] }]) {
       assert.throws(() => parseEffort(recorded(bad), 'meta.json'), /'effort' must be/, JSON.stringify(bad));

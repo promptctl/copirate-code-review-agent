@@ -47,6 +47,9 @@ Usage: node eval/freeze-suite.js [options]
 
   -n, --repeats <N>        Target completed runs per case (default: 5 — the standing baseline depth).
   --out <dir>              Output root shared by every case (default: eval/out). Re-runs resume into it.
+                           A root holds one arm at one engine: a resume whose runs were produced at a
+                           different commit, or from a dirty tree, or by this tree while dirty, is
+                           refused by name before any spend — check out that commit and resume clean.
   --cases-dir <dir>        Golden case root (default: eval/cases).
   --cases <a,b,…>          Names of the golden cases to replay (default: every case under --cases-dir).
                            A name no case carries is refused before any spend.
@@ -430,25 +433,6 @@ function unpinnedPlanSet(caseNames) {
   return new Map(caseNames.map(name => [name, []]));
 }
 
-// The arm every run already under --out was produced at. DELIBERATELY separate from censusCases, which
-// only counts: the census runs twice — once before the spend and once after every replay, to report what
-// the scorer will find — and a read that can fail on run CONTENT must never sit in the closing one, where
-// throwing would discard the report and the timing artifact of a suite that has already spent hours.
-// [LAW:decomposition] Two questions asked at two different moments, so two functions; this one is asked
-// once, before anything is spent, where refusing costs nothing.
-function priorRunArms(caseNames, outRoot) {
-  const { listRunDirs, parseMeta } = require('./score');
-  return caseNames.flatMap(name => listRunDirs(path.join(outRoot, name)).map(runDir => {
-    const metaPath = path.join(runDir, 'meta.json');
-    // [LAW:no-silent-failure] run-case.js writes meta.json first and findings.json last (atomically), so a
-    // killed replay leaves a dir listRunDirs never counts. A counted run WITHOUT meta.json therefore means
-    // the record was torn after the fact — refused by name, never skipped, since skipping would let a run
-    // whose arm cannot be proven pass the resume check as if it matched.
-    if (!fs.existsSync(metaPath)) throw new Error(`${runDir} has findings.json but no meta.json — a torn run record. Remove the run dir, or re-run the case.`);
-    return { dir: runDir, effort: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath).effort };
-  }));
-}
-
 function discoverCaseDirs(casesDir) {
   if (!fs.existsSync(casesDir)) throw new Error(`Cases dir not found: ${casesDir}.`);
   const dirs = fs.readdirSync(casesDir, { withFileTypes: true })
@@ -752,13 +736,21 @@ async function main() {
   // The arm THIS invocation replays at: run-case.js builds exactly this from the --sweep-cap forwarded to
   // it, so the profile is read from its owner rather than restated. [LAW:one-source-of-truth]
   const effort = defaultEffortProfile({ sweepCap: opts.sweepCap, readSet: opts.readSet });
+  const caseNames = cases.map(c => c.name);
+  // Every run already under --out, with the arm and tree that produced each, read ONCE for the two resume
+  // refusals below. DELIBERATELY separate from censusCases, which only counts: the census runs again after
+  // every replay to report what the scorer will find, and a read that can fail on run CONTENT must never
+  // sit in that closing pass, where throwing would discard the report and the timing artifact of a suite
+  // that has already spent hours. Read here, before anything is spent, refusing costs nothing.
+  // [LAW:decomposition]
+  const { misarmedRuns, readPriorRuns, parseMeta, listRunDirs } = require('./score');
+  const prior = readPriorRuns(outRoot, caseNames);
   // Resuming an --out under a different --sweep-cap is the likeliest operator slip on the A/B path this
   // command documents (forget the flag while topping up the sweeps-off arm), and the census would happily
   // queue only the deficit at the new arm and mix two arms in one case-out dir. score.js's agreedScope is
   // the backstop, but it fires at scoring — after the whole remaining suite has replayed at full spend.
   // [LAW:no-silent-failure]
-  const { misarmedRuns } = require('./score');
-  const misarmed = misarmedRuns(effort, priorRunArms(cases.map(c => c.name), outRoot));
+  const misarmed = misarmedRuns(effort, prior);
   if (misarmed.length > 0) {
     throw new Error(`--out ${outRoot} holds ${misarmed.length} run(s) produced at a different review effort:\n${misarmed.map(m => `  ${m.dir} ${m.reason}`).join('\n')}\nA case-out dir holds one arm — resume with the arm these runs were produced at (--sweep-cap, --read-set), or give this arm its own --out.`);
   }
@@ -767,7 +759,6 @@ async function main() {
   // resolves a credential, at zero spend. An absent --plans resolves to the plan set that pins nothing,
   // which is the SAME type as a pinned one — every selected case present, mapping to no plans — so the
   // planner below reads one shape either way. [LAW:dataflow-not-control-flow]
-  const caseNames = cases.map(c => c.name);
   const planSet = opts.plans === null ? unpinnedPlanSet(caseNames) : resolvePlanSet(path.resolve(opts.plans), caseNames, opts.repeats);
   const credentialInput = credentialInputFor(pin.provider);
 
@@ -777,21 +768,40 @@ async function main() {
   // must speak before any credential resolves — is now the first thing with something to say. [CLI binding]
   const log = msg => process.stderr.write(`${msg}\n`);
 
+  const { workingTree, treeIdentity, foreignRuns } = require('./run-case');
+  // The tree the planned replays run at, snapshotted ONCE: the resume refusal below and the measurement
+  // consultation after it read this value, and each replay records its own through the same function, so
+  // no two of them can disagree about what "this tree" means. A suite with nothing planned takes
+  // no snapshot — nothing joins the root, so there is no tree to name, and a status re-invocation (this
+  // command's only "where am I?") must not acquire git as a precondition it never had. This is the one
+  // branch, on the plan's own emptiness, the same one lane resolution reads. [LAW:one-source-of-truth]
+  const tree = jobs.length > 0 ? workingTree() : null;
+  // [LAW:no-silent-failure] A resume tops the root up with runs at THIS tree, and score.js pools every run
+  // under a case as one arm — so a run produced at another commit, or one whose tree cannot be proven (dirty
+  // when replayed, or recorded before provenance was kept), would blend two engines into one rate with no
+  // error and no N mismatch, and eval/measurement-index.js would read the root as one measurement it is
+  // not. The arm refusal above catches the same shape on the effort axis; this is the engine axis, refused
+  // by name before any credential resolves. A dirty tree about to replay is refused for the same reason
+  // from the other side: its runs would be unidentifiable, and an arm is not one arm if some of it is
+  // nobody's. Empty when nothing is planned: nothing joins, nothing is foreign.
+  const foreign = tree === null ? [] : foreignRuns(tree, prior);
+  if (foreign.length > 0) {
+    throw new Error(`--out ${outRoot} holds ${foreign.length} run(s) not produced by the tree about to replay:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nA case-out dir holds one engine — check out the commit these runs were produced at (any run's meta.json names it) and resume from a clean tree, or give this tree its own --out.`);
+  }
+
   // [LAW:one-source-of-truth] "Has this already been measured?" asked of the WHOLE corpus rather than of
   // this --out alone. The census above is per-root: it answers "is this dir full?", which on 2026-09-09
   // was YES-it-is-empty while twelve completed runs of the exact arm about to be generated sat one
   // directory over in eval/out/ab-sweep2. The plan is already computed (a pure value), and nothing has
   // been spent — no lane has resolved a credential — so this is the last moment the answer is still free.
   const { consultCorpus, plannedCases, renderConsultation, ownedElsewhere, tally } = require('./measurement-index');
-  const { parseMeta, listRunDirs } = require('./score');
-  const { workingTree, treeIdentity } = require('./run-case');
   // The corpus is anchored at eval/out, this repo's one home for run records — not at --out (which is the
   // dir being FILLED) and not at the CWD (which would make the answer depend on where the operator stood).
-  // `workingTree`/`treeIdentity` come from run-case.js, which records the very same value per run, so both
+  // `tree`/`treeIdentity` come from run-case.js, which records the very same value per run, so both
   // halves of the comparison come from one producer. [LAW:one-source-of-truth]
   const { notice, consultations, unidentified } = consultCorpus({
     planned: plannedCases(cases, jobs), effort, corpusRoot: path.join(__dirname, 'out'),
-    parseMeta, treeIdentity, listRunDirs, workingTree,
+    parseMeta, treeIdentity, listRunDirs, tree,
   });
   // A suite with nothing planned asked nothing and says nothing — the null notice carries that, so there
   // is no branch here. [LAW:dataflow-not-control-flow]
@@ -909,4 +919,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, resolveLanes, priorRunArms, resolvePlanSet, unpinnedPlanSet, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };
+module.exports = { parseArgs, resolveLanes, resolvePlanSet, unpinnedPlanSet, selectCaseDirs, suitePin, planJobs, runLane, makeLaneGroup, shutdownInFlight, runReplay, replaySpawnSpec, laneMemoryShare, laneReplay, superviseSpawn, censusCases, credentialInputFor, renderReport, suiteTiming, suiteTimingPath, readSuiteTiming, formatDuration, outcomeLabel, inFlight, KILL_GRACE_MS };

@@ -381,7 +381,7 @@ describe('resolvePinnedConfig carries a pinned reasoning through the rows that d
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
-const { workingTree, treeIdentity, writeRunRecord } = require('../eval/run-case');
+const { workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord } = require('../eval/run-case');
 
 // Minted through the real producer for the same reason the schedule fixtures are: these tests are the
 // only prose describing what a run dir contains, so a hand-fabricated plan here is a shape a future
@@ -430,6 +430,35 @@ test('workingTree counts tracked modifications as dirty and untracked files as n
 test('treeIdentity: only a clean commit is an identity', () => {
   assert.equal(treeIdentity({ sha: 'abc123', dirty: false }), 'abc123');
   assert.equal(treeIdentity({ sha: 'abc123', dirty: true }), null);
+});
+
+test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
+  const here = { sha: 'aaaaaaa1', dirty: false };
+  const runs = [
+    { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },   // ours
+    { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },   // another commit
+    { dir: 'r3', candidate: { sha: 'aaaaaaa1', dirty: true } },    // same commit, dirty when replayed
+    { dir: 'r4', candidate: null },                                // pre-provenance run
+  ];
+  const foreign = foreignRuns(here, runs);
+  assert.deepEqual(foreign.map(f => f.dir), ['r2', 'r3', 'r4']);
+  assert.match(foreign[0].reason, /replayed on commit bbbbbbb; this tree is commit aaaaaaa/);
+  assert.match(foreign[1].reason, /a dirty tree at commit aaaaaaa/);
+  assert.match(foreign[2].reason, /no recorded identity/);
+});
+
+test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be proven its own', () => {
+  const ours = [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }];
+  const dirty = foreignRuns({ sha: 'aaaaaaa1', dirty: true }, ours);
+  assert.equal(dirty.length, 1);
+  assert.match(dirty[0].reason, /this tree is a dirty tree at commit aaaaaaa/);
+  assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
+});
+
+test('describeTree names a tree the way a refusal must: commit, dirtiness, or the absence of a record', () => {
+  assert.equal(describeTree({ sha: 'aaaaaaa1', dirty: false }), 'commit aaaaaaa');
+  assert.equal(describeTree({ sha: 'aaaaaaa1', dirty: true }), 'a dirty tree at commit aaaaaaa');
+  assert.equal(describeTree(null), 'no recorded identity');
 });
 
 test('writeRunRecord: a counted run dir is a complete one — findings.json lands last, and a record that cannot finish is never counted', () => {

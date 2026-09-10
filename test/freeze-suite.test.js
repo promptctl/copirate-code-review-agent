@@ -322,7 +322,7 @@ describe('runLane', () => {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { censusCases, priorRunArms, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec, resolvePlanSet } = require('../eval/freeze-suite');
+const { censusCases, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec, resolvePlanSet } = require('../eval/freeze-suite');
 // The arm an unflagged replay runs at, from the module that owns the number — a literal here would fail
 // these tests with an unrelated arm-mismatch the day that default moves. [LAW:one-source-of-truth]
 const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET } = require('../src/effort');
@@ -339,40 +339,17 @@ const writeCase = (casesDir, dirName, manifestName) => {
 // A completed run as run-case.js leaves it: findings.json AND the meta.json recording what produced it,
 // written together. `effort` defaults to the arm an unflagged replay runs at, which is what a resume the
 // census must accept looks like.
-const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null, readSet: DEFAULT_READ_SET }) => {
+// `candidate` is the tree that produced the run; a run planted without one is a pre-provenance record.
+const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null, readSet: DEFAULT_READ_SET }, candidate = undefined) => {
   const dir = path.join(outRoot, caseName, runName);
   fs.mkdirSync(dir, { recursive: true });
   if (findings) {
     fs.writeFileSync(path.join(dir, 'findings.json'), '[]');
-    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, effort }));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, effort, candidate }));
   }
 };
 
-describe('priorRunArms reads what arm each existing run was produced at', () => {
-  test('every counted run reports its recorded arm, and a pre-arm run reports none', () => {
-    const root = tmpTree();
-    writeCase(path.join(root, 'cases'), 'delta', 'delta');
-    const outRoot = path.join(root, 'out');
-    const off = { roundCap: 0, sweepCap: 0, reasoningTier: null, readSet: 'assigned' };
-    writeRun(outRoot, 'delta', 'run-1', true, off);
-    writeRun(outRoot, 'delta', 'run-2', true, null);
-    assert.deepEqual(priorRunArms(['delta'], outRoot).map(r => r.effort), [off, null]);
-    // A case with nothing under --out contributes nothing, rather than a run with an unknown arm.
-    assert.deepEqual(priorRunArms(['never-replayed'], outRoot), []);
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  test('a counted run with no meta.json is a torn record, refused by name', () => {
-    const root = tmpTree();
-    const outRoot = path.join(root, 'out');
-    writeRun(outRoot, 'epsilon', 'run-1', true);
-    // run-case.js writes meta.json first and findings.json last, so this shape cannot come from a crash —
-    // and skipping it would let a run whose arm cannot be proven pass the resume check as if it matched.
-    fs.rmSync(path.join(outRoot, 'epsilon', 'run-1', 'meta.json'));
-    assert.throws(() => priorRunArms(['epsilon'], outRoot), /torn run record/);
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
+describe('the census counts, it does not read', () => {
   // The census stays content-blind on purpose: it runs again after every replay, and a read that could
   // throw on run content would discard the report and timing of a suite that has already spent.
   test('the census counts a torn record rather than throwing on it — it must survive the closing pass', () => {
@@ -750,6 +727,80 @@ describe('the CLI refuses a mixed-arm resume before it needs a credential', () =
     assert.match(out, new RegExp(`this invocation replays at roundCap=0 sweepCap=${DEFAULT_SWEEP_CAP} `));
     // Nothing was scheduled: the suite/deficit banner main() prints once lanes resolve never appears.
     assert.doesNotMatch(out, /replay\(s\) to run/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s pre-spend ENGINE guard, through the real CLI — the same claim as the arm guard above, on the
+// other axis a resume can mix. A root holding runs produced at one commit, topped up from another tree,
+// is two engines pooled as one arm; the refusal must sit above lane resolution, so the pinned provider's
+// credential is stripped for the same reason. The CLI runs on THIS checkout, whose commit is never the
+// planted one — and if the checkout is dirty the refusal fires for that reason instead, which is the
+// other half of the rule (the decision itself, both halves, is asserted on foreignRuns in
+// test/run-case.test.js).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI refuses a resume across engine trees before it needs a credential', () => {
+  const { spawnSync } = require('node:child_process');
+  const { providerSpec } = require('../src/provider');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+  const PLANTED = '0123456789abcdef0123456789abcdef01234567';
+
+  test('a run planted at another commit refuses this tree, naming both', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true, undefined, { sha: PLANTED, dirty: false });
+
+    const env = { ...process.env };
+    delete env[providerSpec('deepseek').credentialInput];
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '2', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const out = `${r.stdout}${r.stderr}`;
+
+    assert.notEqual(r.status, 0, out);
+    assert.match(out, /run\(s\) not produced by the tree about to replay/);
+    assert.match(out, /was replayed on commit 0123456; this tree is (a dirty tree at )?commit [0-9a-f]{7}/);
+    assert.doesNotMatch(out, /replay\(s\) to run/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // A pre-provenance run records no tree, so nothing proves what engine produced it; topping it up would
+  // fill the arm with runs nobody can identify — refused the same way.
+  test('a run with no recorded tree cannot be resumed onto either', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true);
+
+    const env = { ...process.env };
+    delete env[providerSpec('deepseek').credentialInput];
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '2', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const out = `${r.stdout}${r.stderr}`;
+
+    assert.notEqual(r.status, 0, out);
+    assert.match(out, /was replayed on no recorded identity/);
+    assert.doesNotMatch(out, /environment variable is unset/);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // Nothing planned takes no snapshot and refuses nothing: a finished root answers "where am I?" from
+  // any checkout.
+  test('a suite already at target N is not refused for the tree it was produced at', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true, undefined, { sha: PLANTED, dirty: false });
+
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = `${r.stdout}${r.stderr}`;
+    assert.equal(r.status, 0, out);
+    assert.match(out, /0 replay\(s\) to run/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

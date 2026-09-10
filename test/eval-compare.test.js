@@ -439,31 +439,7 @@ test('resolveBaselineJsonPath does NOT refuse a shallow clone with an uncommitte
 });
 
 // ── resume or refuse: prior runs under --out against the tree under gate ──────────────────────────────
-const { foreignRuns, readPriorRuns, deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
-
-
-test('foreignRuns keeps the runs replayed on this exact clean commit and names every other by both trees', () => {
-  const here = { sha: 'aaaaaaa1', dirty: false };
-  const runs = [
-    { dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } },   // ours
-    { dir: 'r2', candidate: { sha: 'bbbbbbb2', dirty: false } },   // another commit
-    { dir: 'r3', candidate: { sha: 'aaaaaaa1', dirty: true } },    // same commit, dirty when replayed
-    { dir: 'r4', candidate: null },                                // pre-provenance run
-  ];
-  const foreign = foreignRuns(here, runs);
-  assert.deepEqual(foreign.map(f => f.dir), ['r2', 'r3', 'r4']);
-  assert.match(foreign[0].reason, /replayed on commit bbbbbbb; the tree under gate is commit aaaaaaa/);
-  assert.match(foreign[1].reason, /a dirty tree at commit aaaaaaa/);
-  assert.match(foreign[2].reason, /no recorded identity/);
-});
-
-test('foreignRuns under a dirty tree refuses EVERY prior run — nothing can be proven its own', () => {
-  const ours = [{ dir: 'r1', candidate: { sha: 'aaaaaaa1', dirty: false } }];
-  const dirty = foreignRuns({ sha: 'aaaaaaa1', dirty: true }, ours);
-  assert.equal(dirty.length, 1);
-  assert.match(dirty[0].reason, /the tree under gate is a dirty tree at commit aaaaaaa/);
-  assert.deepEqual(foreignRuns({ sha: 'aaaaaaa1', dirty: true }, []), []);
-});
+const { deficitReplays, excessRuns, driftedRuns, producedTree } = require('../eval/compare');
 
 test('deficitReplays is the census arithmetic: per case, the shortfall to N over the accepted prior runs', () => {
   const prior = [{ case: 'a' }, { case: 'a' }, { case: 'a' }, { case: 'b' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }, { case: 'c' }];
@@ -507,35 +483,3 @@ test('producedTree names the one tree every run records — the verdict\'s prove
   ]), /not produced by one tree:\n {2}r2 recorded commit bbbbbbb; r1 recorded commit aaaaaaa\n {2}r3 recorded no recorded identity/);
 });
 
-test('readPriorRuns reads the census the replay will take — completed runs only, each with its recorded tree', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'compare-prior-'));
-  try {
-    const mk = (caseName, run, meta, complete = true) => {
-      const dir = path.join(root, caseName, run);
-      fs.mkdirSync(dir, { recursive: true });
-      if (complete) fs.writeFileSync(path.join(dir, 'findings.json'), '[]\n');
-      fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
-      return dir;
-    };
-    const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } });
-    const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
-    mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
-    mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
-    const prior = readPriorRuns(root, ['case-a', 'case-b']);
-    const misplaced = path.join(root, 'case-b', '2026-01-01T00-00-04-000Z-run1');
-    fs.mkdirSync(misplaced, { recursive: true });
-    fs.writeFileSync(path.join(misplaced, 'findings.json'), '[]\n');
-    fs.writeFileSync(path.join(misplaced, 'meta.json'), JSON.stringify({ case: 'case-a', candidate: { sha: 'abc', dirty: false } }) + '\n');
-    assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
-    fs.rmSync(misplaced, { recursive: true, force: true });
-    assert.deepEqual(prior, [
-      { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } },
-      // The arm rides through beside the tree, and a run recorded before either existed reads as null for
-      // both — the census the arm check below consumes.
-      { case: 'case-a', dir: a2, candidate: null, effort: null },
-    ]);
-    assert.deepEqual(readPriorRuns(path.join(root, 'absent'), ['case-a']), []);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
