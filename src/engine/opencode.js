@@ -262,6 +262,8 @@ function classifyError(err, text) {
 const opencodeAdapter = makeCliAdapter({
   name: 'opencode',
   timeoutMs: OPENCODE_TIMEOUT_MS,
+  // Undeclared: opencode fronts any provider's models; nothing is withheld and every read is full.
+  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth for config
     // validation in src/config.js. An EMPTY reasoningEfforts set is a deliberate, accurate theorem:

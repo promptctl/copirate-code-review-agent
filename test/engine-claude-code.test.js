@@ -228,7 +228,7 @@ describe('buildCommand — env is an explicit allowlist', () => {
     const allowedKeys = new Set([
       'PATH', 'TMPDIR', 'npm_config_cache', 'HOME',
       'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN',
-      'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'NO_COLOR',
+      'API_TIMEOUT_MS', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY', 'DISABLE_AUTO_COMPACT', 'NO_COLOR',
       'CLAUDE_CODE_EFFORT_LEVEL',
     ]);
     for (const key of Object.keys(env)) {
@@ -268,6 +268,7 @@ describe('buildCommand — the auth variant decides the credential channel, byte
   const CONSTANTS = {
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
 

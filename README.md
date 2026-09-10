@@ -151,6 +151,7 @@ Set `GITHUB_REVIEW_TOKEN` to an approval-capable user or GitHub App token to hav
 
 - The [time budget](#inputs) expired before every scope was reviewed — the unreviewed scopes are named in the summary.
 - A changed file's path cannot be reviewed (it embeds a line separator, so no prompt line can name it and no review comment can anchor to it) — those files are listed under **Changed files NOT reviewed** with the reason.
+- A scope's worker died terminally (an error no retry fixes — a context-window overflow, a crashed CLI) — the summary opens a `⚠️ **Scope worker failed**` line naming the scope, the pass it died on, and the error, and the other scopes' findings are still delivered. Only when every scope fails does the review itself fail.
 
 ## A skipped run says so on the PR
 
@@ -314,6 +315,16 @@ jobs:
 Provider selection and `EXCLUDE_PATTERNS` work as in PR mode. The run is informational and exits 0 regardless of findings.
 
 > **Scale limit:** it's a single agent run, so a broad pass over a very large repo can exceed the agent's context. Pass a `SCOPE` to focus on one subsystem at a time.
+
+## Worker material fits the model's window
+
+**The model's context window is a fact the engine adapter declares, not an input the operator sets.** `claude-code` declares 200,000 tokens; `codex` and `opencode` declare none. Each scope worker's material (the inline diff plus the files it is told to open) is fit to that window before the first request goes out. Tokens are estimated by a two-class rule that deliberately errs high: a hash-dense line (a `go.sum` hash, a base64 blob) costs about one token per character, everything else about one token per 3.5 characters. 70,000 tokens of headroom are held back for the engine's own system prompt and tool schemas (~12k measured) and for a session's working growth (~57k measured). The remainder is the material's budget.
+
+**When it does not fit, the largest hunks are withheld first.** A withheld hunk is not shown inline; findings on that file are still recorded at real line numbers and posted unanchored. Each file then gets exactly one read instruction. `full`: the file fits, open it whole. `targeted`: the file is too large to fit; open only the region around its changed lines with `Read` offset and limit, never the whole file, and skip it if it is a lockfile or generated. `in-diff`: the file is new in this change, so its hunk *is* its complete content; do not read it again. A file that belongs to another scope gets no read at all.
+
+**An overflow now fails loudly instead of quietly reviewing a summary.** The `claude-code` adapter sets `DISABLE_AUTO_COMPACT=1`, so a worker whose prompt exceeds the window dies with `Prompt is too long` and the scope is reported unreviewed (see [The partial exception](#approvals)). The alternative is worse than a gap. On `links-317-dolt-telemetry`, every worker's first request was ~232k tokens against the 200k window: a 362KB prompt whose vendor `go.sum` hunk alone was 152KB of hashes (~165k tokens), and 28 added vendor files whose hunks were their full content, then duplicated by "read in full". Three sessions failed. One "succeeded" because the CLI compacted 232k down to 22k and the worker reviewed a summary of the diff, and nothing on the PR said so. With the fit in place the same two workers land at ~58.5k and ~59.3k tokens.
+
+**A null window withholds nothing and reads everything in full.** `codex` and `opencode` run that same code path with a different value, and Codex's own auto-compaction is left alone because its window is undeclared. A scope is never split for size either: the partition is a pure function of the changed paths, and pinned eval plans replay it verbatim, so the material is fit to the scope rather than the scope re-cut to the material.
 
 ## Multi-engine configuration
 

@@ -167,6 +167,14 @@ function buildCommand({ config, collector, home }) {
     ANTHROPIC_MODEL: config.model,
     API_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
     CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1',
+    // [LAW:no-silent-failure] A worker whose material overruns the window must FAIL, not review a
+    // summary: with auto-compaction on, the CLI silently condensed a 232k-token first request to
+    // 22k and the worker "succeeded" having judged a compaction summary of the diff, not the diff
+    // (links-317-dolt-telemetry, session d54a1478). With it off the same overflow surfaces as the
+    // "Prompt is too long" error assertSucceeded names, and the chain reports the scope unreviewed.
+    // The fit (src/window.js) is what keeps the material inside the window; this is the alarm that
+    // says so when it did not. Present in the pinned CLI (2.1.0) and current releases (2.1.267).
+    DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
 
@@ -211,7 +219,13 @@ function assertSucceeded(stdout) {
     throw new Error(`Claude Code returned invalid JSON.\n\n${formatOutputTail('stdout tail', stdout)}`);
   }
   if (parsed.is_error || parsed.subtype === 'error') {
-    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}`);
+    // The overflow is named as what it is — the worker's material plus its reads exceeded the model's
+    // context window — because the raw "Prompt is too long" reads like a prompt-authoring bug and sent
+    // two investigations toward the instructions before the transcripts showed a 232k first request.
+    const overflow = /prompt is too long/i.test(String(parsed.result ?? ''))
+      ? ' — the worker material (diff + instructions) plus its file reads exceeded the model context window; see contextWindow and the window fit in src/window.js'
+      : '';
+    throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}${overflow}`);
   }
 }
 
@@ -294,6 +308,11 @@ const classifyClaudeError = classifyError;
 const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
+  // [LAW:one-source-of-truth] The window every model this adapter is pointed at reviews inside — the
+  // 200k-token Claude context window, measured on the case that overflowed it (a 232k first request
+  // failing "Prompt is too long"). A model with a larger window gets material fit to 200k, which
+  // withholds early rather than late: the safe direction. Moves with a measurement, never a wish.
+  contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load

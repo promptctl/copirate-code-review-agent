@@ -127,10 +127,15 @@ preflightModule.preflight = async () => ({ ok: true, results: [] });
 // Stand in for the whole scout→workers pass, capturing the material it was handed so the worker
 // prompt this run would have sent can be built from it — the real buildReviewInput, via the real
 // buildPrMaterial, exactly as an engine would receive it.
+// The changed files are measured in the reviewed checkout (GITHUB_WORKSPACE above), which this test
+// does not materialize: the reader is injected as empty content, the same seam the eval replay uses.
+const windowModule = require('../src/window');
+const realMeasure = windowModule.measureChangedFiles;
+windowModule.measureChangedFiles = (files, root) => realMeasure(files, root, () => '');
 multiscope.runMultiScope = async ({ material, chain }) => {
   engineSpawns.push(material);
   return {
-    review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], assessments: [], usage: null },
+    review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], scopeFailures: [], assessments: [], usage: null },
     configUsed: chain[0],
   };
 };

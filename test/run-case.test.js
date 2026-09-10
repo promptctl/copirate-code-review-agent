@@ -292,7 +292,7 @@ const CASE_TOOL_NAMES = {
 
 test("buildCaseMaterial filters the case through production's seam and returns the split", () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   assert.deepEqual(files.map(f => f.filename), ['src/a.js']);
   assert.deepEqual(excluded, { patterns: ['dist/**'], paths: ['dist/index.js'] });
@@ -303,7 +303,7 @@ test("buildCaseMaterial filters the case through production's seam and returns t
 // buildPrMaterial call would leave a replay scoring the reviewer against a prompt production never sends.
 test("buildCaseMaterial threads the exclusion record into the material, so a replay renders production's prompts", () => {
   const { material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
   assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
@@ -311,7 +311,7 @@ test("buildCaseMaterial threads the exclusion record into the material, so a rep
 
 test('buildCaseMaterial with no exclusions reviews every file and says nothing about exclusion', () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree',
+    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
   });
   assert.equal(files.length, 2);
   assert.deepEqual(excluded.paths, []);
@@ -320,7 +320,7 @@ test('buildCaseMaterial with no exclusions reviews every file and says nothing a
 
 test('buildCaseMaterial refuses a case whose patterns exclude everything, rather than replaying it empty', () => {
   assert.throws(
-    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree' }),
+    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '' }),
     /All 2 changed file\(s\) were excluded/,
   );
 });
