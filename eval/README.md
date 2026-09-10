@@ -210,7 +210,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
 #          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
-#          --plan <plan.json> (default: the partition is computed from the changed paths),
+#          --plan <plan.json> (default: the partition is computed from the changed paths and their churn),
 #          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
 ```
 
@@ -344,7 +344,7 @@ the changed file paths and their churn** (`partitionByDirectory` in `src/partiti
 the changed source file with the same stem, every file keys on its directory, a directory group smaller
 than `MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Then
 the size dimension (zai-timing-8jk.4): on a lopsided plan — the largest group at least `LOPSIDED_RATIO`
-(2) times the runner-up — a largest group of `SCOPE_CHURN_CAP` (360) or more changed lines is cut into
+(2) times the runner-up — a largest group of more than `SCOPE_CHURN_CAP` (360) changed lines is cut into
 parts of near-equal churn, each part owning its files and reading every sibling part's in full, so the
 concern is still seen whole by every worker judging a piece of it. The part count is bounded so the
 extra reads never exceed the changed set, a source and the test that names it are never parted, and a

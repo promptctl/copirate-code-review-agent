@@ -243,6 +243,13 @@ describe('partitionByDirectory — the size dimension', () => {
     assert.deepEqual(scopes.map(s => s.reads), [[], [], []]);
   });
 
+  test('the cap is a fit, not a trigger: a lopsided group of exactly SCOPE_CHURN_CAP lines fills one part and stays whole; one line more is halved', () => {
+    const at = { 'src/a.js': 180, 'src/b.js': SCOPE_CHURN_CAP - 180 };
+    assert.deepEqual(partitionByDirectory(sized(['src/a.js', 'src/b.js'], at)).scopes.map(s => [s.name, s.reads]), [['src', []]]);
+    const over = { 'src/a.js': 180, 'src/b.js': SCOPE_CHURN_CAP - 180 + 1 };
+    assert.deepEqual(partitionByDirectory(sized(['src/a.js', 'src/b.js'], over)).scopes.map(s => s.name), ['src 1/2', 'src 2/2']);
+  });
+
   test('a single-scope change is lopsided against nothing: over the cap it is halved, and the one lane becomes two', () => {
     const { scopes } = partitionByDirectory(sized(['src/a.js', 'src/b.js'], { 'src/a.js': 300, 'src/b.js': 300 }));
     assert.deepEqual(scopes.map(s => [s.name, s.files, s.reads]), [

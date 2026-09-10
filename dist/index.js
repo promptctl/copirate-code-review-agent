@@ -35573,7 +35573,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
-//      largest group at or above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
+//      largest group above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
 //      order (a test and the source it names are one unit, never parted). Each part OWNS its files
 //      and READS every sibling part's files in full, so the concern is still seen whole by every worker
 //      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
@@ -35699,9 +35699,10 @@ function focusFor(dir, files, reads) {
     + 'each connection: the dependency points one way, and no single fact is defined or owned on both sides.';
 }
 
-// Rule 4. The part count a group is cut into: enough parts to bring each under the cap, but never more
-// than the read budget allows — each part reads the whole group, so k parts read it k times, and the
-// (k-1) extra reads are held at or below the changed set's own churn. [LAW:one-source-of-truth]
+// Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
+// fills one, and is not cut — this count is the ONE place the cap is read), but never more than the read
+// budget allows — each part reads the whole group, so k parts read it k times, and the (k-1) extra reads
+// are held at or below the changed set's own churn. [LAW:one-source-of-truth]
 function partCount(groupChurn, totalChurn) {
   return Math.min(Math.ceil(groupChurn / SCOPE_CHURN_CAP), 1 + Math.floor(totalChurn / groupChurn));
 }
@@ -35758,15 +35759,16 @@ function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES } = {}) {
   }
   const merged = mergeSmallGroups(groups, minFiles);
 
-  // Rule 4 fires on the ONE largest group, and only on a lopsided plan above the cap. Ties break by name
-  // so the same input always cuts the same group. The other groups are untouched: a balance target every
-  // run chases is exactly what 8jk.3 ruled out — the proxy is noise on even plans.
+  // Rule 4 fires on the ONE largest group, and only on a lopsided plan; whether that group is above the
+  // cap is partCount's call, not a second gate here. Ties break by name so the same input always cuts the
+  // same group. The other groups are untouched: a balance target every run chases is exactly what 8jk.3
+  // ruled out — the proxy is noise on even plans.
   const groupChurn = new Map([...merged].map(([dir, files]) => [dir, files.reduce((sum, f) => sum + churnOf(f), 0)]));
   const byChurn = [...groupChurn.keys()].sort((a, b) => groupChurn.get(b) - groupChurn.get(a) || (a < b ? -1 : 1));
   const [largest, runnerUp] = byChurn;
   const totalChurn = changedPaths.reduce((sum, p) => sum + churnOf(p), 0);
   const lopsided = groupChurn.get(largest) >= LOPSIDED_RATIO * (runnerUp === undefined ? 0 : groupChurn.get(runnerUp));
-  const cut = lopsided && groupChurn.get(largest) >= SCOPE_CHURN_CAP ? largest : null;
+  const cut = lopsided ? largest : null;
 
   // [LAW:one-source-of-truth] A merged-in subdirectory lands at the END of its parent's group, so each
   // group is ordered once here — by companion, the source itself first, then path — and every rendering
