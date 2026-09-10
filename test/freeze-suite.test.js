@@ -740,6 +740,60 @@ describe('the CLI refuses a mixed-arm resume before it needs a credential', () =
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// main()'s measurement consultation, through the real CLI. Like the arm guard above, its POSITION is the
+// claim: it must speak before any credential is looked for, so being told "you already own this" costs
+// nothing. The pinned provider's credential is stripped from the child's env for exactly that reason — a
+// consultation that had slid below lane resolution would never print.
+//
+// The corpus it reads is the repo's own eval/out (this suite's cases live in a temp dir and match nothing
+// in it), so what is pinned here is the ordering, never a hit. The refusal DECISION it feeds is pure and
+// is asserted directly in test/measurement-index.test.js, where a corpus can be built to order.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+describe('the CLI consults the measurement index before it needs a credential', () => {
+  const { spawnSync } = require('node:child_process');
+  const { providerSpec } = require('../src/provider');
+  const cli = path.join(__dirname, '..', 'eval', 'freeze-suite.js');
+
+  test('a suite with replays to plan says what it already owns before any lane resolves', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+
+    const env = { ...process.env };
+    delete env[providerSpec('deepseek').credentialInput];
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const out = `${r.stdout}${r.stderr}`;
+
+    // The consultation printed, and it printed BEFORE the missing-credential refusal that follows it.
+    assert.match(out, /Measurement index:/, out);
+    assert.ok(out.indexOf('Measurement index:') < out.indexOf('environment variable is unset'), out);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // A finished suite plans no jobs, so it has no subject to ask about — the consultation runs over an
+  // empty list and cannot refuse. This is what keeps a status re-invocation, this command's only way to
+  // ask "where am I?", from being blocked by a hit belonging to a case it was never going to replay.
+  test('a suite already at target N asks nothing and still reports its census', () => {
+    const root = tmpTree();
+    const casesDir = path.join(root, 'cases');
+    const outRoot = path.join(root, 'out');
+    writeCase(casesDir, 'good', 'good');
+    writeRun(outRoot, 'good', 'run-1', true);
+
+    const r = spawnSync(process.execPath, [cli, '--cases-dir', casesDir, '--cases', 'good', '-n', '1', '--out', outRoot],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = `${r.stdout}${r.stderr}`;
+
+    assert.equal(r.status, 0, out);
+    assert.match(out, /0 replay\(s\) to run/, out);
+    assert.doesNotMatch(out, /already on disk/, out);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
 describe('suiteTiming', () => {
   const jobs = [
     { name: 'alpha', level: 1, lane: 'TOKEN_A', ok: true, outcome: 'ok', durationMs: 65000, log: 'out/logs/alpha.log' },
