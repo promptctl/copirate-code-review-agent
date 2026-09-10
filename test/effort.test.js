@@ -252,6 +252,17 @@ describe('the recorded effort profile is complete and versioned', () => {
     }
   });
 
+  test('a null is absence for every axis except the one whose own default is null', () => {
+    // An explicit null at the current schema is the second spelling of absence, and it is refused exactly
+    // as an omitted key is — otherwise it renders as a literal `readSet=null`, an arm name no vocabulary
+    // has. The one exception declares itself: reasoningTier's null IS its value.
+    assert.throws(
+      () => completeEffort({ effort: { ...defaultEffortProfile(), readSet: null }, effortSchema: EFFORT_SCHEMA }),
+      /missing readSet/,
+    );
+    assert.equal(completeEffort({ effort: { ...defaultEffortProfile(), reasoningTier: null }, effortSchema: EFFORT_SCHEMA }).reasoningTier, null);
+  });
+
   test('producer and reader agree over the type: a recorded default profile round-trips unchanged', () => {
     const profile = defaultEffortProfile();
     const record = recordEffort(profile);

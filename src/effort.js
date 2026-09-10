@@ -205,7 +205,14 @@ function completeEffort({ effort, effortSchema }) {
     // is what protects a real value from a back-fill.
     completed[axis] = completed[axis] ?? structural;
   }
-  const missing = effortAxes().filter(axis => completed[axis] === undefined);
+  // An axis may be null exactly when its OWN default is null — `reasoningTier`'s null is a real value
+  // ("propose no raise"), while a null anywhere else is absence in its second spelling. The distinction is
+  // read off defaultEffortProfile rather than listed here, so a future nullable axis declares itself.
+  // [LAW:one-source-of-truth] [LAW:types-are-the-program]
+  const nullable = defaultEffortProfile();
+  const missing = effortAxes().filter(
+    axis => completed[axis] === undefined || (completed[axis] === null && nullable[axis] !== null),
+  );
   if (missing.length > 0) {
     throw new Error(
       `Effort record at schema ${schema} is missing ${missing.join(', ')}, and no back-fill row supplies ` +

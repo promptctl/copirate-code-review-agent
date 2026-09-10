@@ -7,7 +7,6 @@ const {
   sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown, DEGRADATION_RULE,
   BASELINE_SCHEMA,
 } = require('../eval/baseline');
-const { EFFORT_SCHEMA } = require('../src/effort');
 
 // [LAW:verifiable-goals] AC: baseline.js reduces the golden cases' scored summaries into one frozen
 // distribution + a degradation rule. These tests exercise the PURE core (arg parse, input parsers, the
@@ -283,11 +282,8 @@ test('a pre-readSet summary and one that names the arm freeze as ONE arm, and th
   // As the stored scorecard-summary.json files are written: three axes, no version.
   const era = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }), 'stored.json').effort;
   assert.equal(era.readSet, 'assigned', 'the back-fill resolves the era to the arm the code structurally had');
-  // As run-case.js writes them now: every axis, stamped with the version naming that axis set.
-  const named = parseCaseSummary(
-    summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' }, effortSchema: EFFORT_SCHEMA }),
-    'fresh.json',
-  ).effort;
+  // A summary from a run that named its arm: every axis carries a value.
+  const named = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } }), 'fresh.json').effort;
 
   const paired = buildBaseline({
     cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: named })],
