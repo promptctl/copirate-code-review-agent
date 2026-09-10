@@ -164,6 +164,25 @@ test('pairs are keyed by (case, plan, finding) across every replicate', () => {
   ]);
 });
 
+test('the README design pairs: an un-pinned scout arm against an arm pinned to its harvested plans', () => {
+  // [LAW:behavior-not-structure] the contract is pairing by partition; the producer that rolled it is
+  // reported, never keyed. Arm A rolled the plan (provenance 'scout'), arm B replayed the harvested file.
+  const a = writeArm(tmpRoot('armA'), {
+    'case-one': [{ provenance: 'scout', found: [1], missed: [2] }, { provenance: 'scout', found: [1, 2], missed: [] }],
+  });
+  const b = writeArm(tmpRoot('armB'), {
+    'case-one': [{ provenance: 'pinned', found: [], missed: [1, 2] }, { provenance: 'pinned', found: [2], missed: [1] }],
+  });
+  const { pairs, blocks } = pairArms(readArm(a, 'A'), readArm(b, 'B'));
+
+  assert.equal(pairs.length, 4);
+  assert.equal(new Set(pairs.map(p => p.planKey)).size, 1);
+  // The block names both producers, so a reader can see the arms were minted differently.
+  assert.deepEqual(blocks.map(bl => ({ case: bl.case, replicates: bl.replicates, provenance: bl.provenance })), [
+    { case: 'case-one', replicates: 2, provenance: 'pinned+scout' },
+  ]);
+});
+
 test('a case replayed against several distinct plans blocks on each of them', () => {
   const runs = [{ plan: PLAN_ONE_SCOPE, found: [1], missed: [] }, { plan: PLAN_TWO_SCOPES, found: [], missed: [1] }];
   const a = writeArm(tmpRoot('armA'), { 'case-one': runs });
