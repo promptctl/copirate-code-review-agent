@@ -43,7 +43,9 @@ Usage: node scripts/local-review.js [options]
                       values live in the file.
   --use <name>        Config name to select from --config (default: the file's 'default').
   --range <expr>      git diff range for the material (default: "HEAD~1 HEAD"). Ignored in repo mode.
-  --diff <file>       Use a unified .diff file instead of computing one from --range.
+  --diff <file>       Use a unified .diff file instead of computing one from --range. The checkout at
+                      --repo must be at that diff's head: the changed files are measured and read from
+                      it, exactly as production reads the PR's checkout.
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
   --mode <pr|repo>    Review mode (default: pr). repo = whole-repo exploration, no diff.
   --scope <text>      Optional free-text scope, repo mode only.
