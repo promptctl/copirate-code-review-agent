@@ -255,7 +255,7 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
                     partition the workers actually ran (each { name, focus, files, reads }; every changed
                     path lands in exactly one scope's files, and reads is what the scope opens in full
-                    beyond its own — the sibling parts of a concern cut for size) and context is the planning text prefixed onto every
+                    beyond its own — the changed files the change couples to it, src/seams.js) and context is the planning text prefixed onto every
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
                     scopes are a pure function of the changed file paths and their churn, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
@@ -345,12 +345,15 @@ the changed source file with the same stem, every file keys on its directory, a 
 than `MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository root never merges. Then
 the size dimension (zai-timing-8jk.4): on a lopsided plan — the largest group at least `LOPSIDED_RATIO`
 (2) times the runner-up — a largest group of more than `SCOPE_CHURN_CAP` (360) changed lines is cut into
-parts of near-equal churn, each part owning its files and reading every sibling part's in full, so the
-concern is still seen whole by every worker judging a piece of it. The part count is bounded so the
-extra reads never exceed the changed set, a source and the test that names it are never parted, and a
-cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. Same diff, same
-structure, every run. Only repo mode still buys its plan from a scout spawn, because there is no diff
-to compute one from.
+as many parts of near-equal churn as the cap fills; a source and the test that names it are never
+parted, and a cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. Then the
+seam reads (zai-timing-8jk.5): every scope reads, beyond the files it owns, the changed files the change
+couples to it (`src/seams.js` — a changed use of a symbol another changed file defines, or a changed
+definition of a symbol another changed file uses, weighted by how many changed files define the symbol),
+heaviest coupling first, from a budget of one further read of the changed set's lines; what the budget
+cannot cover is named in the plan's context. A worker's diff is its eyesight — its own hunks and its
+seams' — and the rest of the change is named to it, not shown. Same diff, same structure, every run.
+Only repo mode still buys its plan from a scout spawn, because there is no diff to compute one from.
 
 It was not always so. The plan used to be re-decided by an LLM scout on every single invocation and
 recorded nowhere durable, and on the frozen case `links-317` identical input gave 1 to 5 scopes, 4 to 28

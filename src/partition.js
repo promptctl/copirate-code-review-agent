@@ -24,13 +24,19 @@ const { parseScopeValue } = require('./review');
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
 //   4. On a LOPSIDED plan — the largest group's churn at least LOPSIDED_RATIO times the runner-up's — a
-//      largest group above SCOPE_CHURN_CAP is cut into parts of near-equal churn, contiguous in companion
-//      order (a test and the source it names are one unit, never parted). Each part OWNS its files
-//      and READS every sibling part's files in full, so the concern is still seen whole by every worker
-//      that judges a piece of it: the seam between parts is covered by construction, not by hope. The
-//      part count is bounded by the read budget (the concern's extra reads never exceed the changed
-//      set — the ceiling zai-timing-8jk.5 names), and a cut that would leave a part under
-//      SCOPE_CHURN_FLOOR is not made: that group is at the floor, and stays one scope.
+//      largest group above SCOPE_CHURN_CAP is cut into as many parts of near-equal churn as the cap
+//      fills, contiguous in companion order (a test and the source it names are one unit, never parted).
+//      A cut that would leave a part under SCOPE_CHURN_FLOOR is not made: that group is at the floor,
+//      and stays one scope.
+//   5. Every scope then READS, beyond the files it owns, the changed files the change couples to them —
+//      its seams (src/seams.js) — heaviest coupling first, until the read budget is spent. The budget is
+//      ONE more read of the changed set: every file is read once by its owner, and the seam reads
+//      together may reach that volume again and never exceed it — the 2x ceiling the owner set
+//      (zai-timing-8jk, 2026-09-04), a ceiling and not a target. A loosely coupled change has few seams
+//      and spends little; a tightly coupled one spends to the ceiling and the plan says which seams
+//      went unread. A cut concern's parts are ordinary scopes here: a part reads the sibling it is
+//      coupled to, not every sibling, which is what lets the cut go finer than two (8jk.4 halved with
+//      full eyesight and bought no wall clock; the material a worker sees is what its spawn costs).
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
 // `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
@@ -71,6 +77,9 @@ const TEST_STEM_SUFFIX = /(\.test|\.spec|_test|-test)$/;
 
 // The label a root-keyed scope carries: '.' is a path, not a name a reader can follow.
 const ROOT_SCOPE_NAME = 'top-level';
+// How many unread seams the plan's context names before counting the rest — presentation, like
+// MAX_EXCLUDED_PATHS_SHOWN (src/diff.js): the count is always stated, the names are a sample.
+const UNREAD_SEAMS_SHOWN = 5;
 
 // [LAW:effects-at-boundaries] Pure path arithmetic. Diff paths are always '/'-separated (git's own form,
 // parseReviewableFiles refuses anything else), so no platform separator is consulted.
@@ -135,15 +144,15 @@ function depthOf(dir) {
 // authored once. It names the files (so the worker knows its assignment even before the read-targets
 // line) and points the worker at the import edges the change crosses — the seam checks are where
 // multi-file defects live. [LAW:one-source-of-truth]
-// `reads` renders as a value: [] (the whole concern is this scope) says nothing; a split part names the
-// sibling parts' files and says what the second read is FOR — the seam, and any defect seen there. A
-// finding in a sibling's file is recorded, never left for the sibling: dedupe merges the overlap.
+// `reads` renders as a value: [] (no seam reaches this scope) says nothing; a non-empty list names the
+// coupled files and says what the second read is FOR — the seam, and any defect seen there. A finding
+// in another scope's file is recorded, never left for its owner: dedupe merges the overlap.
 // [LAW:dataflow-not-control-flow]
 function focusFor(dir, files, reads) {
   const where = dir === '.' ? 'the repository root' : dir;
   const seam = reads.length > 0
-    ? ` This concern is reviewed in parts for size; the rest of it — ${reads.join(', ')} — is owned elsewhere in the plan. `
-      + 'Read those files in full too: the seam between your files and theirs is yours to check, and a defect you '
+    ? ` The change couples these files to yours — ${reads.join(', ')} — and other scopes own them. `
+      + 'Read them in full too: the seam between your files and theirs is yours to check, and a defect you '
       + 'notice in one of them is recorded, never left for the worker that owns it.'
     : '';
   return `Review the changes to ${files.join(', ')} in ${where}.${seam} Also read the files they import and check `
@@ -151,11 +160,11 @@ function focusFor(dir, files, reads) {
 }
 
 // Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
-// fills one, and is not cut — this count is the ONE place the cap is read), but never more than the read
-// budget allows — each part reads the whole group, so k parts read it k times, and the (k-1) extra reads
-// are held at or below the changed set's own churn. [LAW:one-source-of-truth]
-function partCount(groupChurn, totalChurn) {
-  return Math.min(Math.ceil(groupChurn / SCOPE_CHURN_CAP), 1 + Math.floor(totalChurn / groupChurn));
+// fills one, and is not cut — this count is the ONE place the cap is read). The read budget no longer
+// bounds it: a part reads its seams, not the whole group, and rule 5 holds every read under the one
+// ceiling. [LAW:one-source-of-truth]
+function partCount(groupChurn) {
+  return Math.ceil(groupChurn / SCOPE_CHURN_CAP);
 }
 
 // A cut of `units` into k contiguous parts of near-equal churn: each unit joins the part its churn's
@@ -177,30 +186,74 @@ function cutInto(units, churnOf, k) {
 // The parts a group becomes: the largest k, from partCount down, whose every part clears the floor; k=1
 // is the group itself, uncut. An empty part has churn 0 and so fails the floor with the rest — the same
 // rule, not a second check. Deterministic: same files, same churn, same cut. [LAW:no-ambient-temporal-coupling]
-function partsOf(units, churnOf, totalChurn) {
+function partsOf(units, churnOf) {
   const unitChurn = (unit) => unit.reduce((sum, f) => sum + churnOf(f), 0);
   const groupChurn = units.reduce((sum, unit) => sum + unitChurn(unit), 0);
-  for (let k = partCount(groupChurn, totalChurn); k > 1; k--) {
+  for (let k = partCount(groupChurn); k > 1; k--) {
     const parts = cutInto(units, unitChurn, k);
     if (parts.every(part => unitChurn(part) >= SCOPE_CHURN_FLOOR)) return parts;
   }
   return [units.flat()];
 }
 
+// Rule 5. The seam reads, spent from one budget. A candidate is a (scope, file) pair where the file is
+// owned elsewhere and the change couples it to something the scope owns: its coupling is the sum of the
+// seam weights between the file and the scope's files. Candidates are taken heaviest first; each costs
+// the file's line count (what a full read opens), and one that no longer fits is passed over for the
+// lighter ones that still do, so the budget is spent, never merely stopped at. Deterministic: ties break
+// by scope then file. [LAW:effects-at-boundaries] pure over the seam table.
+// The budget is the changed set's own line count: one more read of the whole, the ceiling named above.
+// Returns each scope's reads (in coupling order — the order the worker is told them) and the candidates
+// the budget could not cover, so the plan can say so. [LAW:no-silent-failure]
+function seamReads(owned, seams, linesOf) {
+  const weight = new Map();
+  for (const { a, b, weight: w } of seams) {
+    weight.set(`${a}\0${b}`, w);
+    weight.set(`${b}\0${a}`, w);
+  }
+  const allFiles = [...owned.values()].flat();
+  const candidates = [];
+  for (const [scope, files] of owned) {
+    const own = new Set(files);
+    for (const file of allFiles) {
+      if (own.has(file)) continue;
+      const coupling = files.reduce((sum, f) => sum + (weight.get(`${f}\0${file}`) ?? 0), 0);
+      if (coupling > 0) candidates.push({ scope, file, coupling });
+    }
+  }
+  candidates.sort((x, y) => y.coupling - x.coupling || (x.scope < y.scope ? -1 : x.scope > y.scope ? 1 : x.file < y.file ? -1 : 1));
+  let remaining = allFiles.reduce((sum, f) => sum + linesOf(f), 0);
+  const reads = new Map([...owned.keys()].map(scope => [scope, []]));
+  const unread = [];
+  for (const c of candidates) {
+    if (linesOf(c.file) <= remaining) {
+      remaining -= linesOf(c.file);
+      reads.get(c.scope).push(c.file);
+    } else {
+      unread.push(c);
+    }
+  }
+  return { reads, unread, covered: candidates.length - unread.length };
+}
+
 // [LAW:parse-dont-validate] The one producer of a PR review's partition. In: the changed files a review
-// will cover as { filename, churn } (already filtered by EXCLUDE_PATTERNS — a withheld path never reaches
-// here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget is
-// calibrated on). Out: the scopes as the workers run them, each minted through parseScopeValue so a scope
-// from this producer is the SAME stamped value as one recorded by a scout or read from a pinned plan,
-// plus the orientation line every worker and the posted summary share. [LAW:single-enforcer]
+// will cover as { filename, churn, lines } (already filtered by EXCLUDE_PATTERNS — a withheld path never
+// reaches here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget
+// is calibrated on; lines is the content measurement measureChangedFiles stamps, what a full read costs)
+// and the change's seams (seamsOf, src/seams.js). Out: the scopes as the workers run them, each minted
+// through parseScopeValue so a scope from this producer is the SAME stamped value as one recorded by a
+// scout or read from a pinned plan, plus the orientation line every worker and the posted summary
+// share. [LAW:single-enforcer]
 // [LAW:no-silent-failure] An empty change has no partition; refusing here names the fact rather than
 // letting planRecord refuse an empty scope list two seams later.
-function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES } = {}) {
+function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES } = {}) {
   if (changed.length === 0) {
     throw new Error('partitionByDirectory: no changed files to partition — a review with no files has no structure.');
   }
   const churnByPath = new Map(changed.map(f => [f.filename, f.churn]));
   const churnOf = (p) => churnByPath.get(p);
+  const linesByPath = new Map(changed.map(f => [f.filename, f.lines]));
+  const linesOf = (p) => linesByPath.get(p);
   const changedPaths = [...churnByPath.keys()].sort();
   const concern = concernOf(changedPaths);
   const groups = new Map();
@@ -217,7 +270,6 @@ function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES } = {}) {
   const groupChurn = new Map([...merged].map(([dir, files]) => [dir, files.reduce((sum, f) => sum + churnOf(f), 0)]));
   const byChurn = [...groupChurn.keys()].sort((a, b) => groupChurn.get(b) - groupChurn.get(a) || (a < b ? -1 : 1));
   const [largest, runnerUp] = byChurn;
-  const totalChurn = changedPaths.reduce((sum, p) => sum + churnOf(p), 0);
   const lopsided = groupChurn.get(largest) >= LOPSIDED_RATIO * (runnerUp === undefined ? 0 : groupChurn.get(runnerUp));
   const cut = lopsided ? largest : null;
 
@@ -238,18 +290,28 @@ function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES } = {}) {
     if (last && concern.get(last[0]).companion === concern.get(f).companion) last.push(f); else units.push([f]);
     return units;
   }, []);
-  const scopes = [...merged.keys()].sort().flatMap((dir) => {
+  const owned = [...merged.keys()].sort().flatMap((dir) => {
     const files = [...merged.get(dir)].sort(companionOrder);
     const name = dir === '.' ? ROOT_SCOPE_NAME : dir;
-    const parts = dir === cut ? partsOf(unitsOf(files), churnOf, totalChurn) : [files];
-    return parts.map((own, i) => {
-      const reads = parts.flatMap((part, j) => (j === i ? [] : part));
-      return { name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, focus: focusFor(dir, own, reads), files: own, reads };
-    });
-  }).map((scope, index) => parseScopeValue(scope, index));
+    const parts = dir === cut ? partsOf(unitsOf(files), churnOf) : [files];
+    return parts.map((own, i) => ({ dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
+  });
+  const { reads, unread, covered } = seamReads(new Map(owned.map(s => [s.name, s.files])), seams, linesOf);
+  const scopes = owned
+    .map(({ dir, name, files }) => ({ name, focus: focusFor(dir, files, reads.get(name)), files, reads: reads.get(name) }))
+    .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
+  // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
+  // cross-file defect on it has no second reader — and it is said in the one line every worker and the
+  // posted summary read, never left to be inferred from a shorter reads list. Full coverage says nothing.
+  const shown = unread.slice(0, UNREAD_SEAMS_SHOWN);
+  const unreadNote = unread.length > 0
+    ? ` The read ceiling (one further read of the changed set, ${[...linesByPath.values()].reduce((a, b) => a + b, 0)} lines) covered `
+      + `${covered} of ${covered + unread.length} coupled reads; ${unread.length} left unread beyond their owner, heaviest first: `
+      + `${shown.map(c => `${c.file} (for ${c.scope})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
+    : '';
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
-    + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.`;
+    + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.${unreadNote}`;
   return { scopes, context };
 }
 

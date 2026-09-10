@@ -23,6 +23,7 @@ const {
 const { defaultEffortProfile, DEFAULT_READ_SET } = require('../src/effort');
 const { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput } = require('../src/prompt');
 const { partitionByDirectory } = require('../src/partition');
+const { seamsOf } = require('../src/seams');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { fileChurn } = require('../src/diff');
 const { TransientError } = require('../src/failover');
@@ -858,7 +859,7 @@ describe('buildPrMaterial', () => {
       { filename: 'README.md', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+3' },
     ]);
     const proposal = buildPrMaterial({ files, maxDiffChars: 0, reviewedRepoRoot: REPO_ROOT }).proposal({ log: () => {} });
-    const expected = partitionByDirectory(files.map(f => ({ filename: f.filename, churn: fileChurn(f) })));
+    const expected = partitionByDirectory(files.map(f => ({ filename: f.filename, churn: fileChurn(f), lines: f.content.lines })), seamsOf(files));
     assert.deepEqual(proposal, { provenance: 'partition', scopes: expected.scopes, context: expected.context, scoutUsage: null });
   });
 
@@ -872,14 +873,17 @@ describe('buildPrMaterial', () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, { assigned: ['src/usage.js', 'src/report.js'], read: ['src/usage.js', 'src/report.js'] });
     assert.match(prompt, /Read the complete content of THESE files/);
     assert.match(prompt, /src\/usage\.js, src\/report\.js/);
-    assert.match(prompt, /Another scope's worker reads the other changed files/);
+    // the rest of the change is NAMED, not shown: its hunk is another worker's grid
+    assert.match(prompt, /The other changed files in this pull request — src\/a\.js — are owned and read by other scopes' workers, so their diffs are not shown here/);
+    assert.match(prompt, /### src\/usage\.js \(modified\)/);
+    assert.doesNotMatch(prompt, /### src\/a\.js \(modified\)/);
     // roaming is bounded: prefer Grep for imports, don't pre-read the tree
     assert.match(prompt, /prefer Grep/);
     assert.match(prompt, /Do not pre-read the tree/);
     // depth beyond the assigned files reaches a caller elsewhere via its call sites (copirate-review-loop-5pw.2)
     assert.match(prompt, /a caller elsewhere/);
     assert.match(prompt, /call sites/);
-    // the whole diff is still shown (report-anywhere + anchor validity preserved)
+    // the eyesight's diff is shown on the LINE grid (report-anywhere within it + anchor validity preserved)
     assert.match(prompt, /```diff/);
   });
 
@@ -1964,7 +1968,9 @@ describe('buildReviewInput window fit', () => {
     const prompt = buildReviewInput({ files: big, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/old.js'], window: 200_000 }).prompt;
     assert.match(prompt, /do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: src\/old\.js \(lines 10-12, 41 of 9000\)\./);
     assert.doesNotMatch(prompt, /this scope reads in full:/);
-    assert.match(prompt, /Another scope's worker reads the other changed files/);
+    // the one changed file IS the eyesight, so there is no "other changed files" sentence to render
+    assert.doesNotMatch(prompt, /other changed files in this pull request/);
+    assert.match(prompt, /Do not pre-read the tree/);
   });
 
   test('the rendered prompt never exceeds window − headroom, however many files the note and read lists must name', () => {
@@ -2001,22 +2007,36 @@ describe('buildReviewInput window fit', () => {
     assert.match(prompt, /src\/top\.js \(lines 1 of 9000\)/);
   });
 
-  test("a withheld file outside this worker's read set is another scope's: consult only when a finding needs it; a removed one has nothing to read", () => {
+  test("a file outside this worker's read set is off its grid entirely — named as another scope's, never shown or withheld; a removed one in its read set has nothing to read", () => {
     const files = stamp([
       { filename: 'go.sum', status: 'added', patch: `@@ -0,0 +1,1500 @@\n${hashes}` },
       { filename: 'src/gone.js', status: 'removed', patch: '@@ -1,2 +0,0 @@\n-a\n-b' },
       { filename: 'src/mine.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' },
     ]);
-    const prompt = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/mine.js'], window: 100_000 }).prompt;
-    assert.match(prompt, new RegExp(`> - ${REPO_ROOT}/go\\.sum — another scope's worker owns it — consult it only when a finding of yours needs it`));
-    assert.doesNotMatch(prompt, new RegExp(`> - ${REPO_ROOT}/src/gone\\.js`)); // its hunk (deletions only) is shown, so it is on the grid
+    const prompt = buildReviewInput({ files, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT, readFiles: ['src/mine.js', 'src/gone.js'], window: 100_000 }).prompt;
+    // go.sum is another scope's: not on the grid, not in the withheld note, and the worker is told so by name.
+    assert.doesNotMatch(prompt, /### go\.sum/);
+    assert.doesNotMatch(prompt, /could not be shown/); // nothing on THIS grid needed withholding once go.sum left it
+    assert.match(prompt, /The other changed files in this pull request — go\.sum — are owned and read by other scopes' workers/);
+    assert.match(prompt, /### src\/gone\.js \(removed\)/); // its hunk (deletions only) is shown, so it is on the grid
+    assert.match(prompt, /### src\/mine\.js \(modified\)/);
+  });
+
+  test("a worker's grid holds only its eyesight: with the whole read set it is the whole diff, and narrowing the set narrows the grid", () => {
+    const whole = build({ readFiles: ['go.sum', 'src/new.js', 'src/old.js'] });
+    for (const f of ['go.sum', 'src/new.js', 'src/old.js']) assert.match(whole, new RegExp(`### ${f.replace(/[./]/g, '\\$&')} \\(`));
+    assert.doesNotMatch(whole, /other changed files in this pull request/);
+    const narrow = build({ readFiles: ['src/old.js'] });
+    assert.match(narrow, /### src\/old\.js \(modified\)/);
+    assert.doesNotMatch(narrow, /### go\.sum|### src\/new\.js/);
+    assert.match(narrow, /The other changed files in this pull request — go\.sum, src\/new\.js — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change\. Do NOT read them in full/);
   });
 
   test("the 'changed' arm (empty readFiles) keeps its wording and still exempts added+shown files from a re-read", () => {
     const prompt = build({ readFiles: [] });
     assert.match(prompt, /Read the complete content of every changed file that contains code/);
     assert.match(prompt, /do NOT Read them again, review them from the diff: go\.sum, src\/new\.js\./);
-    assert.doesNotMatch(prompt, /Another scope's worker/);
+    assert.doesNotMatch(prompt, /other changed files in this pull request/);
   });
 
   test('an unmeasured changed set is refused at the material boundary, before any worker prompt', () => {

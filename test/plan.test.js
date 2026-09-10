@@ -6,6 +6,7 @@ const { fileChurn } = require('../src/diff');
 const { PLAN_SCHEMA, PLAN_PROVENANCES, PLAN_FIELDS, planRecord, parsePlanRecord } = require('../src/plan');
 const { buildPrMaterial, runMultiScopePass } = require('../src/multiscope');
 const { partitionByDirectory } = require('../src/partition');
+const { seamsOf } = require('../src/seams');
 
 // The plan is the review's STRUCTURE, and until this artifact existed it was recoverable only by parsing
 // worker transcripts — which is why a variable carrying a 26-point recall spread on a frozen case could
@@ -162,12 +163,12 @@ describe('the recorded plan is the partition the workers actually ran', () => {
     assert.deepEqual(first.phases, first.phases.map(() => 'worker'), 'a PR pass bought a partition it could compute');
     assert.deepEqual(second.plan, first.plan);
     assert.deepEqual(second.handed.map(h => h.prompt), first.handed.map(h => h.prompt));
-    assert.deepEqual(first.plan.scopes, partitionByDirectory(FILES.map(f => ({ filename: f.filename, churn: fileChurn(f) }))).scopes);
+    assert.deepEqual(first.plan.scopes, partitionByDirectory(FILES.map(f => ({ filename: f.filename, churn: fileChurn(f), lines: f.content.lines })), seamsOf(FILES)).scopes);
   });
 
   test('the context the plan records is the one prefixed onto every worker focus', async () => {
     const { handed, plan } = await passRecording();
-    assert.equal(plan.context, partitionByDirectory(FILES.map(f => ({ filename: f.filename, churn: fileChurn(f) }))).context);
+    assert.equal(plan.context, partitionByDirectory(FILES.map(f => ({ filename: f.filename, churn: fileChurn(f), lines: f.content.lines })), seamsOf(FILES)).context);
     // Not byte-recoverable from summary.txt (composeSummary embeds it in composed prose), which is why
     // the plan carries it: a pinned replay reconstructs workerFocusText from THIS.
     for (const h of handed) assert.ok(h.focusText.includes(plan.context), 'a worker saw a context the plan does not record');
