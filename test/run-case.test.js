@@ -72,6 +72,26 @@ describe('parseArgs takes --read-set as one of the declared arms, in both flag f
   });
 });
 
+// [LAW:effects-at-boundaries] The plan leaves the parser as a PATH, never a record: reading and parsing
+// the file is IO, and main does it at the run boundary beside every other file this replay opens. null is
+// the absence with a meaning — 'this replay scouts its own partition' — and it is the SAME value
+// runMultiScope's own parameter defaults to, so it flows all the way to the pass untranslated.
+describe('parseArgs takes --plan as the path to a pinned plan', () => {
+  test('both flag forms carry the path through unresolved', () => {
+    assert.equal(parseArgs(['foo', '--plan', 'eval/out/c/run1/plan.json']).plan, 'eval/out/c/run1/plan.json');
+    assert.equal(parseArgs(['foo', '--plan=plan.json']).plan, 'plan.json');
+  });
+
+  test('unset is the null the engine already means by it — no pinned/unpinned mode to set', () => {
+    assert.equal(parseArgs(['foo']).plan, null);
+  });
+
+  test('a missing value is refused here, not discovered as a file named --out', () => {
+    assert.throws(() => parseArgs(['foo', '--plan']), /--plan requires a value/);
+    assert.throws(() => parseArgs(['foo', '--plan', '--out', 'x']), /--plan requires a value, but got what looks like another flag/);
+  });
+});
+
 test('parseArgs supports -n alias, --flag=value, and --help', () => {
   const o = parseArgs(['eval/cases/foo', '-n', '3', '--out=tmp/out']);
   assert.equal(o.repeats, 3);

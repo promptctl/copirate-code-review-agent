@@ -321,7 +321,7 @@ describe('runLane', () => {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { censusCases, priorRunArms, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec } = require('../eval/freeze-suite');
+const { censusCases, priorRunArms, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec, resolvePlanSet } = require('../eval/freeze-suite');
 // The arm an unflagged replay runs at, from the module that owns the number — a literal here would fail
 // these tests with an unrelated arm-mismatch the day that default moves. [LAW:one-source-of-truth]
 const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET } = require('../src/effort');
@@ -578,18 +578,21 @@ describe('laneReplay hands the injected replay its share of the host', () => {
       totalMemBytes: 8 * 2 ** 30,
       sweepCap: 0,
       readSet: 'assigned',
+      planPaths: new Map(),
       replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
     });
     const call = { job: { name: 'alpha', dir: '/cases/alpha', level: 1 }, lane: { name: 'A', value: 'a' }, credentialInput: 'X', outRoot: '/out', logPath: '/out-logs/a.log', timeoutMinutes: 5 };
     assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
     // The suite's own facts — the memory share and the arm every replay runs — are folded in here, so
     // the lane loop never carries either.
-    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0, readSet: 'assigned' }]);
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0, readSet: 'assigned', planPaths: new Map() }]);
   });
 });
 
 describe('replaySpawnSpec puts the lane credential in the pinned provider slot', () => {
-  const spec = () => replaySpawnSpec({
+  // planPaths is the SUITE's plan set; an empty map is the un-pinned suite — every case scouts its own
+  // partition — and is what these argv assertions are made against.
+  const spec = (planPaths = new Map()) => replaySpawnSpec({
     job: { name: 'alpha', dir: '/cases/alpha', level: 1 },
     lane: { name: 'TOKEN_B', value: 'lane-b-credential' },
     credentialInput: 'CLAUDE_CODE_OAUTH_TOKEN',
@@ -597,6 +600,7 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     memoryBudget: 8 * 2 ** 30,
     sweepCap: 0,
     readSet: 'assigned',
+    planPaths,
   });
 
   test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
@@ -609,6 +613,18 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30), '--sweep-cap', '0', '--read-set', 'assigned']);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
+  });
+
+  // The pin reaches the child on its OWN argv, keyed by the job's case — the suite's whole contribution to
+  // a pinned replay. An un-pinned suite's argv above must stay byte-identical to what it was before plans
+  // existed, which is why the pin is appended rather than threaded through the existing words.
+  test("a pinned suite forwards THIS case's plan, and only a plan the set actually holds", () => {
+    const pinned = spec(new Map([['alpha', '/plans/alpha.json']]));
+    assert.deepEqual(pinned.args.slice(-2), ['--plan', '/plans/alpha.json']);
+    assert.deepEqual(pinned.args.slice(0, -2), spec().args, 'pinning must add words, never change the ones already there');
+    // A set holding some OTHER case's plan does not pin this job with it: a plan partitions one case's
+    // changed files, and forwarding a foreign one would be refused at the child anyway — after the spawn.
+    assert.deepEqual(spec(new Map([['beta', '/plans/beta.json']])).args, spec().args);
   });
 
   test("the lane's value lands in the named slot and overrides an inherited one", () => {
@@ -973,5 +989,40 @@ describe('the CLI records each invocation\'s wall clock without erasing an earli
       fs.chmodSync(outRoot, 0o755);
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// [LAW:no-silent-failure] The suite's plan-set gate: it answers the questions that cost nothing to ask now
+// and hours to discover on lane 1 — does every selected case have a plan, and does each one parse — before
+// any credential resolves. A PARTIALLY pinned suite is the failure worth refusing: some cases would replay
+// a frozen structure while the rest re-rolled it, putting the exact variance the pin removes back into the
+// comparison with nothing in the report saying which cases carried it.
+describe('resolvePlanSet proves the plan set before the suite spends anything', () => {
+  const { PLAN_SCHEMA } = require('../src/plan');
+  const writePlan = (dir, name, overrides = {}) => fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({
+    planSchema: PLAN_SCHEMA, provenance: 'scout', context: 'ctx',
+    scopes: [{ name: 's', focus: 'f', files: ['a.js'] }], scoutUsage: null, ...overrides,
+  }));
+
+  test('a complete set resolves to the path per case — the value the spawn reads, already proven', () => {
+    const dir = tmpTree();
+    writePlan(dir, 'alpha');
+    writePlan(dir, 'beta');
+    assert.deepEqual(resolvePlanSet(dir, ['alpha', 'beta']), new Map([
+      ['alpha', path.join(dir, 'alpha.json')],
+      ['beta', path.join(dir, 'beta.json')],
+    ]));
+  });
+
+  test('a selected case with no plan refuses the whole suite, naming the case and the path it looked for', () => {
+    const dir = tmpTree();
+    writePlan(dir, 'alpha');
+    assert.throws(() => resolvePlanSet(dir, ['alpha', 'beta']), /has no plan for case 'beta'.*beta\.json/s);
+  });
+
+  test('a plan that does not parse refuses here, not three hours in at the child', () => {
+    const dir = tmpTree();
+    writePlan(dir, 'alpha', { planSchema: 'copirate-plan/v99' });
+    assert.throws(() => resolvePlanSet(dir, ['alpha']), /declares planSchema "copirate-plan\/v99"/);
   });
 });
