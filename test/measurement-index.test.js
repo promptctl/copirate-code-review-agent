@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { measurementFields, measurementKey, differingFields, measurementOf, lookupMeasurement, renderConsultation, ownedElsewhere, collectMeasurements } = require('../eval/measurement-index');
+const { measurementFields, measurementKey, differingFields, measurementOf, lookupMeasurement, renderConsultation, ownedElsewhere, plannedCases, consultCorpus, collectMeasurements } = require('../eval/measurement-index');
 const { parseMeta, listRunDirs } = require('../eval/score');
 const { treeIdentity } = require('../eval/run-case');
 const { defaultEffortProfile, EFFORT_SCHEMA } = require('../src/effort');
@@ -160,6 +160,81 @@ test('only a hit outside the root being filled is something already owned', () =
   assert.deepEqual(ownedElsewhere(consultation([{ root: here }]), here), []);
   assert.deepEqual(ownedElsewhere([], here), []);
   assert.deepEqual(ownedElsewhere(consultation([{ root: '/out/elsewhere' }, { root: here }]), here), [{ root: '/out/elsewhere' }]);
+});
+
+// The minimum-distance tier is what keeps a large corpus's miss list readable. Every other test builds a
+// single tier, so a flipped comparison here would ship green.
+test('only the closest tier of misses is reported, not every same-case miss', () => {
+  const dir = writeCorpus({
+    'r/case-a/one-off': meta({ sha: OTHER_SHA }),                                             // differs in sha alone
+    'r/case-a/two-off': meta({ sha: OTHER_SHA, effort: defaultEffortProfile({ readSet: 'changed' }) }),  // sha AND arm
+  });
+  const miss = lookupMeasurement(collect(dir), measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile() }));
+  assert.deepEqual(miss.nearest.map(n => n.differing), [['sha']]);
+  assert.deepEqual(miss.nearest.map(n => path.basename(n.dir)), ['one-off']);
+  fs.rmSync(dir, { recursive: true });
+});
+
+// The derivation that carried a regression once: a case already at target N contributes no subject, so its
+// hit in an unrelated root cannot refuse another case's still-pending replays.
+test('only a case with a scheduled replay asks the corpus anything', () => {
+  const cases = [{ name: 'complete' }, { name: 'short' }];
+  const jobs = [{ name: 'short', level: 1 }, { name: 'short', level: 2 }];
+  assert.deepEqual(plannedCases(cases, jobs).map(c => c.name), ['short']);
+  assert.deepEqual(plannedCases(cases, []), []);
+});
+
+// Nothing planned means nothing asked — and asking is what costs a corpus walk and two git subprocesses.
+// A status re-invocation must acquire neither, so the injected effects are proven UNCALLED, not just unused.
+test('a suite with nothing planned reads no corpus and shells out to no git', () => {
+  const dir = writeCorpus({ 'r/case-a/run1': meta() });
+  let gitCalls = 0;
+  const answer = consultCorpus({
+    planned: [], effort: defaultEffortProfile(), corpusRoot: dir,
+    parseMeta, treeIdentity, listRunDirs,
+    workingTree: () => { gitCalls++; return { sha: SHA, dirty: false }; },
+  });
+  assert.equal(gitCalls, 0);
+  assert.deepEqual(answer, { notice: null, consultations: [], unidentified: [] });
+  fs.rmSync(dir, { recursive: true });
+});
+
+// A dirty tree names no reproducible content, so no stored run can be proven a replay of it. The notice
+// says so rather than leaving the silence to be read as "nothing found".
+test('a dirty tree consults nothing and says why', () => {
+  const dir = writeCorpus({ 'r/case-a/run1': meta() });
+  const answer = consultCorpus({
+    planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
+    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: true }),
+  });
+  assert.match(answer.notice, /DIRTY/);
+  assert.deepEqual(answer.consultations, []);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('a planned case consults the corpus and reports what it holds', () => {
+  const dir = writeCorpus({ 'r/case-a/run1': meta() });
+  const answer = consultCorpus({
+    planned: [{ name: 'case-a' }], effort: defaultEffortProfile(), corpusRoot: dir,
+    parseMeta, treeIdentity, listRunDirs, workingTree: () => ({ sha: SHA, dirty: false }),
+  });
+  assert.match(answer.notice, /1 identified run\(s\) on disk/);
+  assert.equal(answer.consultations.length, 1);
+  assert.equal(answer.consultations[0].hits.length, 1);
+  fs.rmSync(dir, { recursive: true });
+});
+
+// Same fact as a missing meta.json — a run whose identity cannot be read — and the same reason it must not
+// abort: one unreadable record anywhere would block every invocation for every --out. The likely cause is
+// an effortSchema written by a branch that has already bumped the version.
+test('a record that cannot be parsed is reported by name, not thrown', () => {
+  const dir = writeCorpus({ 'r/case-a/whole': meta(), 'r/case-a/truncated': null, 'r/case-a/future': meta({ schema: 'copirate-effort/v99' }) });
+  fs.writeFileSync(path.join(dir, 'r/case-a/truncated', 'meta.json'), '{ "case": "case-a"');
+  const corpus = collect(dir);
+  assert.equal(corpus.measurements.length, 1);
+  assert.deepEqual(corpus.unidentified.map(u => path.basename(u.dir)).sort(), ['future', 'truncated']);
+  assert.match(corpus.unidentified.find(u => u.dir.endsWith('future')).unidentified, /Unknown effort schema/);
+  fs.rmSync(dir, { recursive: true });
 });
 
 test('an absent corpus is an empty corpus, not a crash', () => {

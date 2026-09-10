@@ -687,33 +687,22 @@ async function main() {
   // was YES-it-is-empty while twelve completed runs of the exact arm about to be generated sat one
   // directory over in eval/out/ab-sweep2. The plan is already computed (a pure value), and nothing has
   // been spent — no lane has resolved a credential — so this is the last moment the answer is still free.
-  const { collectMeasurements, lookupMeasurement, measurementFields, renderConsultation, ownedElsewhere, tally } = require('./measurement-index');
+  const { consultCorpus, plannedCases, renderConsultation, ownedElsewhere, tally } = require('./measurement-index');
   const { parseMeta, listRunDirs } = require('./score');
   const { workingTree, treeIdentity } = require('./run-case');
   // The corpus is anchored at eval/out, this repo's one home for run records — not at --out (which is the
   // dir being FILLED) and not at the CWD (which would make the answer depend on where the operator stood).
-  const corpus = collectMeasurements({ corpusRoot: path.join(__dirname, 'out'), parseMeta, treeIdentity, listRunDirs });
-  // Which code this suite would measure. run-case.js records exactly this per run, so the two halves of
-  // the comparison come from one producer. A dirty tree resolves to null — it names no reproducible
-  // content, so nothing on disk can be PROVEN to be a replay of it (run-case.js's treeIdentity).
-  const candidateSha = treeIdentity(workingTree());
-  // The subjects are read off the PLAN, never off the selected cases: the question is "am I about to
-  // re-buy something?", so only a case with a replay scheduled can ask it. A case already at target N in
-  // this --out is not about to be scheduled, and letting its hit in an unrelated root refuse the command
-  // would kill another case's legitimate, non-duplicated work.
-  // [LAW:one-source-of-truth] derived from `jobs` rather than by re-testing `c.completed < opts.repeats`,
-  // which would be a second copy of planJobs' scheduling rule, free to drift from it.
-  // [LAW:dataflow-not-control-flow] this is also what carries the two cases that used to need branches: a
-  // finished suite plans no jobs and a dirty tree names no identity, and BOTH arrive as an empty subject
-  // list. The consultation, the render and the refusal all still run, over nothing, and report nothing.
-  const planned = new Set(jobs.map(job => job.name));
-  const subjects = candidateSha === null ? [] : cases.filter(c => planned.has(c.name)).map(c => measurementFields({ caseName: c.name, sha: candidateSha, effort }));
-  const consultations = subjects.map(wanted => lookupMeasurement(corpus, wanted));
-  log(candidateSha === null
-    ? `Measurement index: candidate tree is DIRTY, so its runs match no stored measurement — index not consulted.`
-    : `Measurement index: ${corpus.measurements.length} identified run(s) on disk; asking what this suite already owns…`);
-  const consulted = renderConsultation({ consultations, unidentified: corpus.unidentified });
-  consulted.split('\n').filter(line => line !== '').forEach(line => log(line));
+  // `workingTree`/`treeIdentity` come from run-case.js, which records the very same value per run, so both
+  // halves of the comparison come from one producer. [LAW:one-source-of-truth]
+  const { notice, consultations, unidentified } = consultCorpus({
+    planned: plannedCases(cases, jobs), effort, corpusRoot: path.join(__dirname, 'out'),
+    parseMeta, treeIdentity, listRunDirs, workingTree,
+  });
+  // A suite with nothing planned asked nothing and says nothing — the null notice carries that, so there
+  // is no branch here. [LAW:dataflow-not-control-flow]
+  [notice, ...renderConsultation({ consultations, unidentified }).split('\n')]
+    .filter(line => line !== null && line !== '')
+    .forEach(line => log(line));
 
   // [LAW:no-silent-failure] The index REPORTS a reusable measurement; it must never substitute one. So a
   // hit outside this --out stops the line at the point of spend rather than quietly filling a smaller

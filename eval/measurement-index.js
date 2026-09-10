@@ -40,6 +40,15 @@ const { effortAxes } = require('../src/effort');
 // be counted as a match — but only a run sharing the SUBJECT can be NEAR: "you measured this case, at an
 // older sha" is a difference an operator acts on, while a run of another case is not close to this one
 // at any distance, it simply answers something else.
+//
+// KNOWN LIMIT, stated here because it is a constraint on the golden set that this file cannot enforce:
+// the subject is the case's NAME, never a fingerprint of the case's own content (its diff and tree). So
+// editing a golden case in place — same name, revised assets — is UNSUPPORTED: runs measuring the old
+// content stay indistinguishable from runs measuring the new, and a hit would cite a measurement of a
+// different task. Rename the case instead; the name is its identity. Closing this properly means
+// run-case.js RECORDING a case fingerprint before anything can key on one — keying first would make every
+// run already on disk unmatchable, which is the value this index exists to recover. Record, then key;
+// the same sequencing src/effort.js used for `effortSchema`.
 const SUBJECT_FIELD = 'case';
 const CONDITION_FIELDS = ['sha', ...effortAxes()];
 
@@ -179,6 +188,21 @@ function renderConsultation({ consultations, unidentified }) {
   return lines.join('\n');
 }
 
+// [LAW:effects-at-boundaries] Pure. The cases a consultation asks about: exactly those with a replay
+// scheduled. "Am I about to re-buy something?" is a question only work about to be scheduled can ask, so a
+// case already at target N in this --out contributes no subject — and its hit in some unrelated root can
+// never refuse another case's still-pending work.
+//
+// [LAW:one-source-of-truth] derived from `jobs`, the plan itself, rather than by re-testing planJobs'
+// scheduling rule (`completed < repeats`) — a second copy of that rule would be free to drift from it.
+// Exported and pure because this derivation is where a regression already occurred once: inline in main()
+// it was reachable only by spawning the CLI against whatever run dirs sat on the developer's disk.
+// [LAW:verifiable-goals]
+function plannedCases(cases, jobs) {
+  const planned = new Set(jobs.map(job => job.name));
+  return cases.filter(c => planned.has(c.name));
+}
+
 // [LAW:effects-at-boundaries] Pure. The refusal DECISION as a value: the hits that live outside the root
 // this suite is filling. A hit inside `outRoot` is not a duplicate at all — it is this suite's own census,
 // which planJobs has already counted and will not re-buy.
@@ -243,11 +267,56 @@ function collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs 
     const metaPath = path.join(dir, 'meta.json');
     const root = path.dirname(path.dirname(dir));
     if (!fs.existsSync(metaPath)) return { dir, root, unidentified: 'a torn run record: findings.json with no meta.json' };
-    return measurementOf({ dir, root, meta: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath), treeIdentity });
+    // A record whose CONTENT cannot be read is the same fact as one whose file is missing: a run whose
+    // identity is unavailable. Truncated JSON, a malformed candidate, or — the likely one — an
+    // `effortSchema` this tree has no back-fill row for, which is a record written on a branch that has
+    // already bumped the version. Left to propagate, any one of them would abort every invocation for
+    // every --out, which is the unscoped blast radius the missing-file case above exists to avoid; the
+    // reason travels with the row, so the record is still named and still explained.
+    try {
+      return measurementOf({ dir, root, meta: parseMeta(fs.readFileSync(metaPath, 'utf8'), metaPath), treeIdentity });
+    } catch (e) {
+      return { dir, root, unidentified: `its record could not be read: ${e.message}` };
+    }
   });
   return {
     measurements: records.filter(r => r.fields !== undefined),
     unidentified: records.filter(r => r.fields === undefined),
+  };
+}
+
+// The corpus's whole answer for one invocation: what it holds about each case about to be replayed, and
+// the one line naming what was asked. This is the seam that keeps the COST of asking proportional to the
+// question — every input is acquired only where a subject exists to need it.
+//
+// [LAW:dataflow-not-control-flow] Nothing is skipped; emptiness flows. No planned case means no tree
+// identity to resolve, which means no subject, which means no corpus to walk — each step's empty value is
+// what makes the next one free, and all three arrive at the same empty answer by the same path.
+//
+// That matters because acquiring these inputs is not free and not local: `workingTree` shells out to git
+// twice, and the walk parses every meta.json in an ever-growing corpus. A status re-invocation — this
+// command's ONLY resume and its only status check — must not pay either, nor acquire git as a
+// precondition it never had. freeze-suite gates lane resolution on precisely this reasoning; this is the
+// same rule applied to the same kind of precondition. [LAW:one-source-of-truth]
+//
+// A DIRTY tree is the second empty: it names no reproducible content, so nothing on disk can be proven to
+// be a replay of it, and a lookup performed anyway would miss on sha for every case and report a
+// difference the operator cannot act on. The notice says so rather than leaving the silence to be read as
+// "nothing found". [LAW:no-silent-failure]
+function consultCorpus({ planned, effort, corpusRoot, parseMeta, treeIdentity, listRunDirs, workingTree }) {
+  const sha = planned.length === 0 ? null : treeIdentity(workingTree());
+  const subjects = sha === null ? [] : planned.map(c => measurementFields({ caseName: c.name, sha, effort }));
+  const corpus = subjects.length === 0 ? { measurements: [], unidentified: [] } : collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs });
+  return {
+    // Three answers to "what was asked?", each read off the values above rather than off a flag: nothing
+    // planned says nothing at all, since a suite with no work owes no account of what it did not ask.
+    notice: planned.length === 0
+      ? null
+      : sha === null
+        ? 'Measurement index: candidate tree is DIRTY, so its runs match no stored measurement — index not consulted.'
+        : `Measurement index: ${corpus.measurements.length} identified run(s) on disk; asking what this suite already owns…`,
+    consultations: subjects.map(wanted => lookupMeasurement(corpus, wanted)),
+    unidentified: corpus.unidentified,
   };
 }
 
@@ -262,6 +331,8 @@ module.exports = {
   lookupMeasurement,
   renderConsultation,
   ownedElsewhere,
+  plannedCases,
+  consultCorpus,
   findRunDirsDeep,
   collectMeasurements,
 };
