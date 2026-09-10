@@ -35482,11 +35482,13 @@ function partitionByDirectory(changedPaths, { minFiles = MIN_SCOPE_FILES } = {})
     groups.set(dir, [...(groups.get(dir) ?? []), p]);
   }
   const merged = mergeSmallGroups(groups, minFiles);
-  const scopes = [...merged.keys()].sort().map((dir, index) => parseScopeValue({
-    name: dir === '.' ? ROOT_SCOPE_NAME : dir,
-    focus: focusFor(dir, merged.get(dir)),
-    files: [...merged.get(dir)].sort(),
-  }, index));
+  // [LAW:one-source-of-truth] A merged-in subdirectory lands at the END of its parent's group, so the
+  // list is sorted once here and both renderings of the assignment — the focus prose and the files
+  // field — read from that one ordering.
+  const scopes = [...merged.keys()].sort().map((dir, index) => {
+    const files = [...merged.get(dir)].sort();
+    return parseScopeValue({ name: dir === '.' ? ROOT_SCOPE_NAME : dir, focus: focusFor(dir, files), files }, index);
+  });
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
     + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.`;
