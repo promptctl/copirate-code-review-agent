@@ -258,9 +258,9 @@ function findRunDirsDeep(dir, listRunDirs) {
 //
 // It does NOT abort. The scan is the whole corpus by design, so throwing would let one stray dir in an
 // experiment root nobody touches hard-block every future invocation for every --out — a blast radius the
-// strict rule never had. The strict rule keeps its own enforcer where it bites: freeze-suite's
-// `priorRunArms` still refuses a torn record in the root being WRITTEN. [LAW:single-enforcer] the index
-// reports on the corpus; priorRunArms enforces on the target.
+// strict rule never had. The strict rule keeps its own enforcer where it bites: score.js's
+// `readPriorRuns`, which freeze-suite's resume reads, still refuses a torn record in the root being
+// WRITTEN. [LAW:single-enforcer] the index reports on the corpus; readPriorRuns enforces on the target.
 function collectMeasurements({ corpusRoot, parseMeta, treeIdentity, listRunDirs }) {
   const runDirs = fs.existsSync(corpusRoot) ? findRunDirsDeep(corpusRoot, listRunDirs) : [];
   const records = runDirs.map(dir => {

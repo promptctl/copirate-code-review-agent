@@ -141,8 +141,8 @@ test('only runs of the same case can be near; another case is not a near miss', 
 // A torn record is a run whose identity cannot be read, which is what `unidentified` means — so it takes a
 // row in that vocabulary and is reported by name. It must NOT abort: the scan is the whole corpus, so a
 // throw would let one stray dir in an experiment root nobody touches block every future invocation for
-// every --out. The strict rule keeps its own enforcer in freeze-suite's priorRunArms, on the root being
-// WRITTEN, where the blast radius is the operator's own target.
+// every --out. The strict rule keeps its own enforcer in score.js's readPriorRuns, which the resume reads
+// on the root being WRITTEN, where the blast radius is the operator's own target.
 test('a torn run record is reported by name, and does not abort the corpus around it', () => {
   const dir = writeCorpus({ 'a/case-a/torn': null, 'a/case-a/whole': meta() });
   const corpus = collect(dir);
