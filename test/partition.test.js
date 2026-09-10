@@ -107,6 +107,23 @@ describe('partitionByDirectory — the theorem every output satisfies', () => {
     });
   });
 
+  test('a bare-stem file in a test directory names no source: it keys on its own directory, not a same-named coincidence', () => {
+    const { scopes } = partitionByDirectory(['src/config.js', 'src/app.js', 'test/config.js', 'test/app.test.js']);
+    assert.deepEqual(byName(scopes), {
+      src: ['src/app.js', 'src/config.js', 'test/app.test.js'],
+      [ROOT_SCOPE_NAME]: ['test/config.js'],
+    });
+  });
+
+  test('a test directory anywhere in the path marks a test: a nested __tests__ file is never a source a suffixed test can name', () => {
+    // Without the nested recognition, __tests__/button.js would be the "source" that button.test.js names,
+    // and the real src/ui/button.js would be left unnamed.
+    const { scopes } = partitionByDirectory(['src/ui/button.js', 'src/ui/__tests__/button.js', 'e2e/button.test.js', 'src/ui/theme.js']);
+    assert.deepEqual(byName(scopes), {
+      'src/ui': ['e2e/button.test.js', 'src/ui/__tests__/button.js', 'src/ui/button.js', 'src/ui/theme.js'],
+    });
+  });
+
   test('minFiles is the width lever: at 1 nothing merges, at a large value everything is one root scope', () => {
     assert.equal(partitionByDirectory(CC_CANDYBAR_150, { minFiles: 1 }).scopes.length, 6);
     assert.deepEqual(byName(partitionByDirectory(CC_CANDYBAR_150, { minFiles: 100 }).scopes), {

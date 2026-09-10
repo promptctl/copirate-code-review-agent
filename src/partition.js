@@ -16,9 +16,10 @@ const { parseScopeValue } = require('./review');
 // [LAW:no-ambient-temporal-coupling] nothing here reads a clock, a model, or a file.
 //
 // The rule, in the order it applies:
-//   1. A test file joins the concern of the changed source file it names (test/foo.test.js -> the changed
-//      foo.js), when exactly one such source is in the change. A test that names no changed source, or an
-//      ambiguous one, keys on its own directory like any other file.
+//   1. A test file whose stem carries a test suffix joins the concern of the changed source it names
+//      (test/foo.test.js -> the changed foo.js), when exactly one such source is in the change. A test
+//      that names no changed source, an ambiguous one, or nothing at all (test/helpers.js: a test by
+//      directory, naming no source) keys on its own directory like any other file.
 //   2. Every file keys on its directory ('.' for the repository root).
 //   3. A directory group smaller than MIN_SCOPE_FILES merges into its parent directory's group, deepest
 //      first, until every group is at least that size or sits at the root. The root never merges.
@@ -30,8 +31,11 @@ const { parseScopeValue } = require('./review');
 // measure it with the eval harness before moving it, and record the move (zai-tuning-pf0).
 const MIN_SCOPE_FILES = 2;
 
-// Test files are recognised by where they live or what they are called — both conventions are common,
-// and either alone misses half of real repositories.
+// Test files are recognised by where they live (a test directory ANYWHERE in the path — Jest's
+// src/x/__tests__/, a monorepo's packages/foo/test/) or what they are called — both conventions are
+// common, and either alone misses half of real repositories. Recognition decides only that a file is
+// never a SOURCE; naming a source is the suffix's job alone, because a bare stem in a test directory
+// (test/config.js beside src/config.js) shares a name by coincidence, not by convention.
 const TEST_DIRS = new Set(['test', 'tests', '__tests__', 'spec', 'specs']);
 const TEST_STEM_SUFFIX = /(\.test|\.spec|_test|-test)$/;
 
@@ -54,12 +58,12 @@ function stemOf(p) {
   return dot <= 0 ? base : base.slice(0, dot);
 }
 function isTestPath(p) {
-  return TEST_DIRS.has(p.split('/')[0]) || TEST_STEM_SUFFIX.test(stemOf(p));
+  return p.split('/').slice(0, -1).some(seg => TEST_DIRS.has(seg)) || TEST_STEM_SUFFIX.test(stemOf(p));
 }
 
-// Rule 1 as a table: the concern directory each path keys on. A test path keys on the directory of the ONE
-// changed source whose stem it names; every other path keys on its own directory. Built once so the
-// grouping below is a plain fold over values. [LAW:dataflow-not-control-flow]
+// Rule 1 as a table: the concern directory each path keys on. A suffixed test path keys on the directory
+// of the ONE changed source whose stem it names; every other path keys on its own directory. Built once
+// so the grouping below is a plain fold over values. [LAW:dataflow-not-control-flow]
 function concernDirOf(changedPaths) {
   const sourcesByStem = new Map();
   for (const p of changedPaths) {
@@ -68,7 +72,8 @@ function concernDirOf(changedPaths) {
     sourcesByStem.set(stem, sourcesByStem.has(stem) ? null : p); // null marks an ambiguous stem
   }
   return new Map(changedPaths.map(p => {
-    const named = isTestPath(p) ? sourcesByStem.get(stemOf(p).replace(TEST_STEM_SUFFIX, '')) : null;
+    const stem = stemOf(p);
+    const named = TEST_STEM_SUFFIX.test(stem) ? sourcesByStem.get(stem.replace(TEST_STEM_SUFFIX, '')) : null;
     return [p, dirnameOf(named ?? p)];
   }));
 }
