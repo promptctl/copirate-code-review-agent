@@ -5,7 +5,7 @@ const os = require('os');
 const { parseRetryAfterMs, classifyTransient } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = require('./run');
 const { makeCliAdapter } = require('./cli');
-const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = require('../usage');
+const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -237,17 +237,37 @@ function assertSucceeded(stdout) {
 function extractUsage(stdout, config, startedAt) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
-  const u = env.usage;
-  // [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a
-  // rename into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the
-  // discounted cached rate; fresh input and cache WRITES both bill at the full input rate, which is
-  // what puts them in one class together.
-  const tokens = {
+  const tokens = tokensOfAnthropicUsage(env.usage);
+  return { tokens, cost: costFromEnvelope(env, config, tokens, startedAt) };
+}
+
+// [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a rename
+// into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the discounted
+// cached rate; fresh input and cache WRITES both bill at the full input rate, which is what puts them in
+// one class together. [LAW:one-source-of-truth] The result envelope and the live meter below read usage
+// through this one conversion, so the cap and the footer count the same classes.
+function tokensOfAnthropicUsage(u) {
+  return {
     inputCacheMiss: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
     inputCacheHit: u.cache_read_input_tokens ?? 0,
     output: u.output_tokens ?? 0,
   };
-  return { tokens, cost: costFromEnvelope(env, config, tokens, startedAt) };
+}
+
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds
+// it every stdout line). stream-json emits an `assistant` event per content block, each repeating its
+// API message's usage, so the spawn's running total is the LATEST usage per message id, summed. Checked
+// against a real subscription transcript: the input classes sum exactly to the result envelope, while
+// output streams as a partial snapshot (64 live vs 10,126 in the envelope) — the envelope settles it.
+function meterUsage() {
+  const byMessage = new Map();
+  return line => {
+    let event;
+    try { event = JSON.parse(line); } catch { return null; }
+    if (event?.type !== 'assistant' || !event.message?.usage) return null;
+    byMessage.set(event.message.id, tokensOfAnthropicUsage(event.message.usage));
+    return [...byMessage.values()].reduce(addTokens, emptyTokens());
+  };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
@@ -326,6 +346,7 @@ const claudeCodeAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -340,5 +361,6 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
   parseResultEnvelope,
 };

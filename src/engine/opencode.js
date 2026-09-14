@@ -222,16 +222,7 @@ function extractUsage(stdout) {
     const { tokens, cost } = event.part;
     if (tokens) {
       sawTokens = true;
-      const cache = tokens.cache || {};
-      // [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes
-      // (src/usage.js). Cache READS are the discounted class; fresh input and cache WRITES are both
-      // billed at the full input rate, so they share the miss class. Reasoning tokens are generated
-      // output, so they join the visible output rather than any input class.
-      total = addTokens(total, {
-        inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
-        inputCacheHit: cache.read ?? 0,
-        output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
-      });
+      total = addTokens(total, tokensOfStep(tokens));
     }
     if (Number.isFinite(cost)) {
       // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
@@ -245,6 +236,34 @@ function extractUsage(stdout) {
     ? { basis: 'dollars', usd }
     : { basis: 'unpriced', reason: 'not-reported' };
   return { tokens: total, cost };
+}
+
+// [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes (src/usage.js).
+// Cache READS are the discounted class; fresh input and cache WRITES are both billed at the full input
+// rate, so they share the miss class. Reasoning tokens are generated output, so they join the visible
+// output rather than any input class. [LAW:one-source-of-truth] extractUsage and the live meter below
+// both convert through here, so the cap and the footer count the same classes.
+function tokensOfStep(tokens) {
+  const cache = tokens.cache || {};
+  return {
+    inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
+    inputCacheHit: cache.read ?? 0,
+    output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
+  };
+}
+
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds
+// it every stdout line). Each step_finish carries that step's own counts, seen once, so the running
+// total is their sum — the same fold extractUsage makes over the retained stream.
+function meterUsage() {
+  let total = emptyTokens();
+  return line => {
+    let event;
+    try { event = JSON.parse(line); } catch { return null; }
+    if (event?.type !== 'step_finish' || !event.part?.tokens) return null;
+    total = addTokens(total, tokensOfStep(event.part.tokens));
+    return total;
+  };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
@@ -283,6 +302,7 @@ const opencodeAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -298,4 +318,5 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
 };

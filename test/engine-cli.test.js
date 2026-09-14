@@ -24,6 +24,7 @@ function specThatRecords(onExtract) {
       args: ['-e', 'require("fs").writeFileSync(process.env.RECORDS, JSON.stringify({type:"finish",summary:"done"})+"\\n")'],
       env: { RECORDS: collector.recordsPath },
     }),
+    meterUsage: () => () => null,
     session: promptOnStdin,
     assertSucceeded: () => {},
     classifyError: err => err,

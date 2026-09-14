@@ -275,6 +275,22 @@ function tokensOfRequest(u) {
 // no card for a request) and telling them apart is the price table's job, not the adapter's.
 // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
 // ever be billed to a subscription and this adapter has no notional arm to reach.
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds it
+// every stdout line). Each thread/tokenUsage/updated is one model request's usage, seen once, so the
+// running total is their sum through the same parse and conversion extractUsage applies to the session
+// record. [LAW:one-source-of-truth] A malformed notification throws here exactly as it does in the
+// session; runEngine turns a meter throw into a loud stop of the spawn.
+function meterUsage() {
+  let total = emptyTokens();
+  return line => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return null; }
+    if (msg?.method !== 'thread/tokenUsage/updated') return null;
+    total = addTokens(total, tokensOfRequest(requestUsageOf(msg.params)));
+    return total;
+  };
+}
+
 function extractUsage({ requests }, config, startedAt) {
   if (requests.length === 0) return null;
   const perRequest = requests.map(tokensOfRequest);
@@ -315,6 +331,7 @@ const codexAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior —
@@ -329,4 +346,5 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
 };

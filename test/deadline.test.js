@@ -2,8 +2,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { DeadlineExceededError, parseTimeBudgetMinutes, mintDeadline, remainingMs } = require('../src/deadline');
-const { isRetryableSpawnError, TransientError } = require('../src/failover');
+const { parseTimeBudgetMinutes, mintDeadline, remainingMs } = require('../src/deadline');
 
 // ── the time-budget input, parsed strictly (mirrors parseMaxRounds) ───────────────────────────────
 describe('parseTimeBudgetMinutes', () => {
@@ -43,16 +42,6 @@ describe('mintDeadline / remainingMs', () => {
   });
 });
 
-// ── the deadline kill's place in the error vocabulary ─────────────────────────────────────────────
-describe('DeadlineExceededError retry policy', () => {
-  test('is not retryable in place — a fresh spawn cannot fit in a spent budget', () => {
-    assert.equal(isRetryableSpawnError(new DeadlineExceededError('x')), false);
-  });
-  test('is not transient — config-level failover must not restart the pass at the deadline', () => {
-    assert.equal(new DeadlineExceededError('x') instanceof TransientError, false);
-  });
-});
-
 // ── the overflow hole in the digits regex (zai-timing-sn1 review round 2) ─────────────────────────
 describe('parseTimeBudgetMinutes — overflow safety', () => {
   test('a digit string past the safe-integer range is rejected, never a silently-disabled budget', () => {
@@ -69,11 +58,6 @@ describe('parseTimeBudgetMinutes — derived-product safety', () => {
     // 1e14 is a safe integer, but * 60_000 is ~6e18 — past MAX_SAFE_INTEGER, minting an imprecise
     // never-arriving deadline that silently disables the budget.
     assert.throws(() => parseTimeBudgetMinutes('100000000000000'), /TIME_BUDGET_MINUTES must be a non-negative integer/);
-  });
-  test('the error type serializes distinguishably', () => {
-    const e = new DeadlineExceededError('budget spent');
-    assert.equal(e.name, 'DeadlineExceededError');
-    assert.match(String(e), /^DeadlineExceededError: budget spent/);
   });
 });
 

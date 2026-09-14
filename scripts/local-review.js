@@ -29,6 +29,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { summarizeSession } = require('./session-stats');
+const { parseMaxReviewTokens, mintTokenCap } = require('../src/token-cap');
 
 const USAGE = `Run a faithful local review (real engine, real collector, no GitHub) and report which
 diff files the engine read and what it read in the repo.
@@ -51,16 +52,19 @@ Usage: node scripts/local-review.js [options]
   --scope <text>      Optional free-text scope, repo mode only.
   --model <id>        Override the provider's default model.
   --base-url <url>    Override the provider's endpoint base URL (api-key providers only).
+  --max-tokens <n>    The review's hard token cap, exactly as the MAX_REVIEW_TOKENS input sets it in
+                      production (default: 0 = no cap).
   --help              Show this help.
 `;
 
 // [LAW:effects-at-boundaries] Pure arg parse: flags map to a plain options value; no IO, no defaults
 // that touch the world. `--flag value` and `--flag=value` both supported.
 function parseArgs(argv) {
-  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '' };
-  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'model', 'base-url', 'config', 'use']);
-  // The options that pick between two sources via truthiness downstream — see the rejection below.
-  const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider']);
+  const opts = { provider: 'auto', range: 'HEAD~1 HEAD', repo: process.cwd(), mode: 'pr', scope: '', maxTokens: '0' };
+  const known = new Set(['provider', 'range', 'diff', 'repo', 'mode', 'scope', 'model', 'base-url', 'config', 'use', 'max-tokens']);
+  // The options that pick between two sources via truthiness downstream — see the rejection below —
+  // plus --max-tokens, whose empty value is an unset shell variable that must not read as "no cap".
+  const NON_EMPTY_OPTIONS = new Set(['config', 'use', 'diff', 'base-url', 'model', 'provider', 'max-tokens']);
   const written = new Set(); // flag names the caller actually typed, for exclusivity checks below
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -80,8 +84,11 @@ function parseArgs(argv) {
     // (scope, repo, range, mode) empty either equals the default or already fails loudly.
     if (value === '' && NON_EMPTY_OPTIONS.has(name)) throw new Error(`Option --${name} requires a non-empty value.`);
     written.add(name);
-    opts[name === 'base-url' ? 'baseUrl' : name] = value;
+    opts[{ 'base-url': 'baseUrl', 'max-tokens': 'maxTokens' }[name] ?? name] = value;
   }
+  // [LAW:parse-dont-validate] Parsed here, at the arg boundary, by the same parser production's input
+  // goes through — so a typo fails before any engine spawns, and main receives a number.
+  opts.maxTokens = parseMaxReviewTokens(opts.maxTokens);
   // [LAW:no-silent-failure] --config and the preset flags are two sources for the same facts
   // (provider, model, endpoint). Accepting both and letting one win would leave the operator
   // believing the loser took effect — reject the combination outright. [LAW:one-source-of-truth]
@@ -300,6 +307,8 @@ async function main() {
     // [LAW:one-source-of-truth] The same start instant formatReport's total counts from, so the
     // live running totals and the report's figure share one clock.
     startedAt,
+    // The run's one token cap, minted here at the local run's boundary exactly as run.js mints it.
+    tokenCap: mintTokenCap(opts.maxTokens),
   });
 
   const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, diffDir, totalMs: Date.now() - startedAt });

@@ -21,7 +21,9 @@ const { renderTimingBreakdown, passLabel } = require('./schedule');
 const { renderRepoReport } = require('./report');
 const registry = require('./engine/registry');
 const { loadConfig, peekConfigNames } = require('./config');
-const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = require('./deadline');
+const { parseTimeBudgetMinutes, mintDeadline } = require('./deadline');
+const { BOUNDS } = require('./bounds');
+const { parseMaxReviewTokens, mintTokenCap } = require('./token-cap');
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
@@ -192,24 +194,31 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
-// the review's coverage data plus the one remedy sentence (BUDGET_REMEDY, src/deadline.js) — never
+// the review's coverage data plus the one remedy sentence (BOUNDS, src/bounds.js) — never
 // re-authored per sink, so the operator remedy cannot drift between modes or from the error
 // messages that share it. [LAW:no-silent-failure] the budget biting is operator news, not just
 // review-body prose: the warning makes a curtailed review visible in the run's annotations.
 function warnBudgetExhausted(review) {
-  if (!review.budgetExhausted) return;
+  const byCause = unreviewedByCause(review);
+  // [LAW:dataflow-not-control-flow] One warning per ceiling the run reached — none when it reached none —
+  // each naming its own gap and its own remedy.
+  for (const bound of review.exhaustedBounds) {
+    warnBoundReached(review, bound, byCause[bound]);
+  }
+}
+
+function warnBoundReached(review, bound, stopped) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
   // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
   // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
-  const { budget } = unreviewedByCause(review);
-  const state = budget.length > 0
-    ? `${budget.length} scope(s) went unreviewed (${budget.map(unreviewedName).join(', ')})`
+  const state = stopped.length > 0
+    ? `${stopped.length} scope(s) went unreviewed (${stopped.map(unreviewedName).join(', ')})`
     : review.unreviewedScopes.length === 0
       ? 'every scope was reviewed, but convergence sweeps were cut short'
       : 'convergence sweeps were cut short';
-  core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
+  core.warning(`Review ${BOUNDS[bound].reached}: ${state}. The collected findings were still delivered. ${BOUNDS[bound].remedy}`);
 }
 
 // [LAW:one-source-of-truth] The sibling warning for the other way coverage falls short: a scope worker
@@ -421,7 +430,7 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -763,7 +772,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
   });
   warnBudgetExhausted(review);
   warnScopeFailures(review);
@@ -814,7 +823,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
 // `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
 // at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now()) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -838,7 +847,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
   });
   warnBudgetExhausted(review);
   warnScopeFailures(review);
@@ -897,12 +906,16 @@ async function run() {
   // The run's start instant is the SAME mint the deadline spends from — one clock read, two
   // consumers (the budget's horizon, the timing footer's total) — never a second Date.now()
   // that could disagree with it. [LAW:one-source-of-truth] (zai-timing-31d.6)
+  // The token cap is minted at the same boundary and shares the parses' failure path: one cap for the
+  // whole run, threaded into whichever mode runs and shared by every config a failover reaches.
   const startedAt = Date.now();
   let roundCap;
   let deadline;
+  let tokenCap;
   try {
     roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
     deadline = mintDeadline(startedAt, parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
+    tokenCap = mintTokenCap(parseMaxReviewTokens(core.getInput('MAX_REVIEW_TOKENS')));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -910,9 +923,9 @@ async function run() {
   const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }

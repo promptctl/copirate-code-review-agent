@@ -515,7 +515,7 @@ describe('submitReview — every finding blocks', () => {
 describe('submitReview — partial coverage (unreviewedScopes)', () => {
   test('clean-but-partial posts as COMMENT with the partial verdict, never Approved — even with an approve-capable token', async () => {
     const octokit = fakeOctokit();
-    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [{ name: 'store', cause: 'budget', kept: 0 }, { name: 'docs', cause: 'budget', kept: 0 }], unreviewableFiles: [] };
+    const review = { summary: 'S.', findings: [], unanchored: [], unreviewedScopes: [{ name: 'store', cause: 'time', kept: 0 }, { name: 'docs', cause: 'time', kept: 0 }], unreviewableFiles: [] };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];
     assert.equal(arg.event, 'COMMENT');
@@ -529,7 +529,7 @@ describe('submitReview — partial coverage (unreviewedScopes)', () => {
       summary: 'S.',
       findings: [{ path: 'a.js', line: 1, body: 'bug', severity: 5 }],
       unanchored: [],
-      unreviewedScopes: [{ name: 'docs', cause: 'budget', kept: 0 }], unreviewableFiles: [],
+      unreviewedScopes: [{ name: 'docs', cause: 'time', kept: 0 }], unreviewableFiles: [],
     };
     await submitReview(octokit, 'o', 'r', 1, 'sha', 'Reviewer', review, true, gitHubTransport([], []));
     const arg = octokit.calls[0];

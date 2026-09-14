@@ -1,7 +1,9 @@
 'use strict';
 const os = require('os');
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, TransientError } = require('./failover');
-const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('./deadline');
+const { remainingMs } = require('./deadline');
+const { BOUNDS, BudgetExhaustedError } = require('./bounds');
+const { mintTokenCap } = require('./token-cap');
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
@@ -138,10 +140,11 @@ function sumSpan(spans) {
 // read like a clean bill. The scout summary standing above it describes the CHANGE and never the
 // review, so it cannot soften that report into one.
 function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
-  const { unreviewed, scopeFailures, sweeps, budgetExhausted } = coverage;
+  const { unreviewed, scopeFailures, sweeps, exhaustedBounds } = coverage;
   const unreviewedNames = new Set(unreviewed.map(u => u.name));
   const reviewed = scopes.filter(s => !unreviewedNames.has(s.name));
-  const { budget: budgetUnreviewed, failure: failedUnreviewed } = unreviewedByCause({ unreviewedScopes: unreviewed });
+  const byCause = unreviewedByCause({ unreviewedScopes: unreviewed });
+  const failedUnreviewed = byCause.failure;
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
   // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
   // there is no absent-summary state for this sink to represent. Neither can break this line-structured
@@ -157,14 +160,18 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
       ? `cut short by ${s.curtailed.map(c => CURTAILMENT_BY[c]).join(' and ')} after ${s.added} new finding(s).`
       : s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
   }
-  if (budgetExhausted) {
-    lines.push(budgetUnreviewed.length > 0
-      ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + notReviewedClause(budgetUnreviewed)
+  // [LAW:dataflow-not-control-flow] One line per ceiling the run reached, in BOUNDS order — none when it
+  // reached none — each naming the scopes THAT bound stopped, so a run the deadline and the token cap
+  // both bit says which scope each one took.
+  for (const bound of exhaustedBounds) {
+    const stopped = byCause[bound];
+    lines.push(stopped.length > 0
+      ? `${BOUNDS[bound].title} — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
+        + notReviewedClause(stopped)
       // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
-      // not the budget's share of it: a scope whose worker died is named on the failure line below, and
-      // this line must not contradict it.
-      : `⏳ **Time budget exhausted** — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
+      // not this bound's share of it: a scope whose worker died, or that the other bound stopped, is named
+      // on its own line, and this line must not contradict it.
+      : `${BOUNDS[bound].title} — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
         + 'late-round findings may be missing.');
   }
   // [LAW:no-silent-failure] A worker that died terminally is named with what killed it, at the pass it
@@ -191,14 +198,17 @@ function notReviewedClause(entries) {
 }
 
 // [LAW:types-are-the-program] Why a pass did not run to completion — the vocabulary `curtailed` speaks
-// at every depth. 'budget': the wall-clock budget refused or killed it (planned degradation, owned by
-// the deadline). 'failure': the worker died on an error no retry fixes — a context-window overflow, a
-// crashed CLI — and the error rides along so the caller can rethrow it when NOTHING was reviewed.
-// A TransientError is neither: failover owns it, and the chain lets it propagate.
-const CURTAILMENT_CAUSES = ['budget', 'failure'];
+// at every depth. A BOUND ('time', 'tokens' — src/bounds.js): the run reached that ceiling, which refused
+// or killed the pass (planned degradation, owned by the deadline or the token cap). 'failure': the worker
+// died on an error no retry fixes — a context-window overflow, a crashed CLI — and the error rides along
+// so the caller can rethrow it when NOTHING was reviewed. A TransientError is neither: failover owns it,
+// and the chain lets it propagate. [LAW:one-source-of-truth] The bounds are read from BOUNDS, so a
+// ceiling added there is a cause here with no edit.
+const BOUND_CAUSES = Object.keys(BOUNDS);
+const CURTAILMENT_CAUSES = [...BOUND_CAUSES, 'failure'];
 // The one prose rendering of each cause, shared by the sweep line and the pass log.
-const CURTAILMENT_BY = { budget: 'the time budget', failure: 'a worker failure' };
-const FULL_COVERAGE = Object.freeze({ unreviewed: [], scopeFailures: [], sweeps: [], budgetExhausted: false });
+const CURTAILMENT_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, `the ${BOUNDS[b].label}`])), failure: 'a worker failure' };
+const FULL_COVERAGE = Object.freeze({ unreviewed: [], scopeFailures: [], sweeps: [], exhaustedBounds: [] });
 
 // [LAW:one-source-of-truth] The memory one engine lane reserves. Every lane is a full engine CLI
 // process (claude-code, codex, opencode) holding its own context — observed in the low hundreds of MB
@@ -268,13 +278,15 @@ function sweepsByDepth(chains) {
 //                   message stamped single-line here (firstLine) so the line-structured summary and
 //                   the operator warning can carry it as-is;
 //   sweeps        — sweepsByDepth over the chains' sweep passes;
-//   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
+//   exhaustedBounds — the bounds that bit at any depth, in BOUNDS order: a scope one refused, or a
+//                   sweep it cut; [] when the run reached no ceiling.
 // [LAW:one-source-of-truth] The review record carries the unreviewed set as the coverage entries
 // themselves ({ name, cause, kept }) — the verdict reads its length, and every sink that must attribute
 // a gap correctly splits it by the cause each entry carries, here, ONCE: a scope unreviewed because
-// its worker died at the review of record is the failure's, and the rest are the budget's.
+// its worker died at the review of record is the failure's, and the rest belong to the bound that stopped
+// them. Every cause is a key, so a sink reads its own list without guarding for one that is absent.
 function unreviewedByCause({ unreviewedScopes }) {
-  return { failure: unreviewedScopes.filter(u => u.cause === 'failure'), budget: unreviewedScopes.filter(u => u.cause === 'budget') };
+  return Object.fromEntries(CURTAILMENT_CAUSES.map(c => [c, unreviewedScopes.filter(u => u.cause === c)]));
 }
 
 function coverageOf(scopes, outcomes) {
@@ -285,8 +297,8 @@ function coverageOf(scopes, outcomes) {
   const scopeFailures = scopes.flatMap((s, i) => outcomes[i].passes.flatMap((p, pass) =>
     (p.curtailed && p.curtailed.cause === 'failure' ? [{ scope: s.name, pass, message: firstLine(p.curtailed.error.message) }] : [])));
   const sweeps = sweepsByDepth(outcomes.map(o => o.passes.slice(1)));
-  const budgetExhausted = unreviewed.some(u => u.cause === 'budget') || sweeps.some(s => s.curtailed.includes('budget'));
-  return { unreviewed, scopeFailures, sweeps, budgetExhausted };
+  const exhaustedBounds = BOUND_CAUSES.filter(b => unreviewed.some(u => u.cause === b) || sweeps.some(s => s.curtailed.includes(b)));
+  return { unreviewed, scopeFailures, sweeps, exhaustedBounds };
 }
 
 // [LAW:dataflow-not-control-flow] A fixed-width pool of lanes that is FAIL-LOUD: the first error
@@ -324,15 +336,15 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // where passes[0] is the review of record and passes[k] is sweep k. `added` is what the pass put in
 // the ledger — a completed pass's new findings, or the findings a curtailed pass's dead worker had
 // recorded before it stopped (kept, never discarded). `curtailed` is false for a pass that ran, or
-// the cause that stopped it — { cause: 'budget' } or { cause: 'failure', error } (see
+// the cause that stopped it — { cause: 'time' | 'tokens' } or { cause: 'failure', error } (see
 // CURTAILMENT_CAUSES) — one fact at every depth: at pass 0 it is the coverage gap the summary and the
 // verdict carry (the scope was not reviewed); at a sweep it merely ends the chain (pass 0's judgment
 // stands). The list is exactly the passes that RAN plus at most one curtailed entry, so a caller reads
 // the chain's depth off its length. [LAW:types-are-the-program]
 //
 // [LAW:single-enforcer] A pass's fate is decided in exactly ONE place — attemptPass — identically
-// before and around every pass: the budget refuses a pass before spawning when nothing remains, and a
-// spawn the deadline kills mid-flight settles the same way (DeadlineExceededError); a worker that
+// before and around every pass: a bound (the deadline, the token cap) refuses a pass before spawning once
+// it is reached, and a spawn a bound kills mid-flight settles the same way (BudgetExhaustedError); a worker that
 // dies on any error failover does not own (a context-window overflow, a crashed CLI — anything but a
 // TransientError) settles as a failure. Both are absorbed HERE so sibling chains' earned results are
 // never discarded by a fail-loud rethrow (zai-engine-ydc: one overflowing worker used to void every
@@ -341,7 +353,7 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // attempts on it, and config-level failover is the owner of what happens next. [LAW:dataflow-not-control-flow]
 // The killed spawn's burned time is not this chain's concern: the spawn seam recorded it (err.span)
 // before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, tokenCap, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
@@ -359,14 +371,15 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   // way and the pass entry's `added` is what THIS pass put in the ledger — for a curtailed pass, the
   // findings kept from its dead worker. [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
   const attemptPass = async (pass) => {
-    if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'budget' } };
+    if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'time' } };
+    if (tokenCap.exhausted()) return { ...NOTHING_RECORDED, curtailed: { cause: 'tokens' } };
     try {
       const { findings, assessments } = await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
       return { findings, assessments, curtailed: false };
     } catch (e) {
       if (e instanceof TransientError) throw e;
       const { findings, assessments } = e.recorded;
-      return { findings, assessments, curtailed: e instanceof DeadlineExceededError ? { cause: 'budget' } : { cause: 'failure', error: e } };
+      return { findings, assessments, curtailed: e instanceof BudgetExhaustedError ? { cause: e.bound } : { cause: 'failure', error: e } };
     }
   };
   const passes = [];
@@ -394,8 +407,8 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 }
 
 // [LAW:one-source-of-truth] The two log renderings of a curtailment, keyed by cause: the pass line's
-// reason and the chain line's suffix ('review curtailed' is the budget's established wording).
-const CHAIN_LABEL_BY = { budget: ' curtailed', failure: ' failed' };
+// reason and the chain line's suffix ('review curtailed' is a bound's established wording).
+const CHAIN_LABEL_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, ' curtailed'])), failure: ' failed' };
 // What a pass that never spawned recorded: the empty records, in the spawn seam's own shape.
 const NOTHING_RECORDED = Object.freeze({ findings: [], assessments: [] });
 // [LAW:one-source-of-truth] The ONE phrase for findings salvaged from a curtailed pass, rendered by the
@@ -410,7 +423,7 @@ function unreviewedName({ name, kept }) {
   return `${name}${keptNote(kept)}`;
 }
 function curtailmentLogText(curtailed) {
-  return curtailed.cause === 'budget' ? 'time budget exhausted' : `worker failed: ${firstLine(curtailed.error.message)}`;
+  return curtailed.cause === 'failure' ? `worker failed: ${firstLine(curtailed.error.message)}` : BOUNDS[curtailed.cause].reached;
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -575,13 +588,13 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
-// data (unreviewedScopes, budgetExhausted). [LAW:no-ambient-temporal-coupling] the deadline is a
+// data (unreviewedScopes, exhaustedBounds). [LAW:no-ambient-temporal-coupling] the deadline is a
 // value minted once at the run boundary, never a clock read scattered through callers.
 // `startedAt` (epoch ms, null = unknown) is the run's start instant from that SAME mint — the live
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -618,7 +631,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
-        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
+        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap }),
         {
           sleepFn,
           // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
@@ -699,7 +712,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, tokenCap, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
   // A scope whose pass 0 did not complete is a COVERAGE gap, carried as data to the summary and the
@@ -712,13 +725,15 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // A pass whose every worker died but left findings behind delivers them instead: the review has
   // something to say, and it never approves, since every scope is unreviewed.
   if (coverage.unreviewed.length === scopes.length && coverage.unreviewed.every(u => u.kept === 0)) {
-    const failed = scopes.map((s, i) => outcomes[i].passes[0].curtailed).find(c => c.cause === 'failure');
+    const stops = scopes.map((s, i) => outcomes[i].passes[0].curtailed);
+    const failed = stops.find(c => c.cause === 'failure');
     if (failed) throw failed.error;
-    throw new DeadlineExceededError(
-      `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
+    const bound = stops[0].cause;
+    throw new BudgetExhaustedError(bound,
+      `The review's ${BOUNDS[bound].label} was reached before any scope completed — no review to deliver. ${BOUNDS[bound].remedy}`,
     );
   }
-  const { sweeps, unreviewed, scopeFailures, budgetExhausted } = coverage;
+  const { sweeps, unreviewed, scopeFailures, exhaustedBounds } = coverage;
   for (const [i, s] of sweeps.entries()) {
     const pass = i + 1;
     log(`convergence sweep ${pass}: ${s.added} new finding(s)${s.curtailed.length > 0 ? ` — cut short (${s.curtailed.map(c => SWEEP_LOG_BY[c]).join(', ')})` : s.added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
@@ -772,18 +787,18 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview) — whatever took them,
     // since a scope a worker died on is exactly as unreviewed as one the budget refused — and run.js
-    // warns when the budget bit (budgetExhausted) and when a worker failed (scopeFailures, every
+    // warns when a bound bit (exhaustedBounds) and when a worker failed (scopeFailures, every
     // failed pass at any depth with its message), naming each unreviewed scope with the cause and
     // kept count its entry carries. The summary text above derives from these same values, never the
-    // other way around. All three are their defaults ([]/false/[]) on every run nothing went wrong in.
+    // other way around. All three are their defaults ([]/[]/[]) on every run nothing went wrong in.
     unreviewedScopes: unreviewed,
-    budgetExhausted,
+    exhaustedBounds,
     scopeFailures,
   };
 }
 
 // The sweep log's cause wording, keyed like CURTAILMENT_BY. [LAW:one-source-of-truth]
-const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
+const SWEEP_LOG_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, BOUNDS[b].label])), failure: 'worker failure' };
 
 // The engine seam both modes call. Wraps the multi-scope pass in failover.produceReview so the whole
 // pass retries/advances per config. produceReview supplies (config, buildPromptFor, anchors); the
@@ -802,7 +817,10 @@ const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
 // that produces it (os.totalmem) sits HERE, at the seam's default, never inside the pass: the pass
 // takes a number, so a test hands it one and the production callers hand it nothing. It is not on the
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+// [LAW:one-source-of-truth] `tokenCap` is the run's one token cap, and every config the chain fails over to
+// spends from it: failover restarts the pass, never the count. A caller that sets no cap gets an uncapped
+// one — the same code path with a limit that is never reached.
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
@@ -813,7 +831,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test

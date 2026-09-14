@@ -3,7 +3,10 @@ const { spawn } = require('child_process');
 const readline = require('readline');
 const core = require('@actions/core');
 const { emitTranscript } = require('../debug');
-const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = require('../deadline');
+const { remainingMs } = require('../deadline');
+const { BOUNDS, BudgetExhaustedError } = require('../bounds');
+const { mintTokenCap } = require('../token-cap');
+const { totalTokens } = require('../usage');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
@@ -122,20 +125,35 @@ function promptOnStdin(io, prompt) {
 // and this is the ONE place it bounds a spawn's lifetime: the effective timeout is the smaller of
 // the adapter's own sanity cap and the time remaining. The two bounds mean different things and
 // throw different types [LAW:types-are-the-program] — the adapter cap firing is an engine failure
-// (plain Error, as before), the deadline firing is planned degradation (DeadlineExceededError, which
-// the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass). A deadline
-// already in the past refuses to spawn at all — the one enforcer of "no engine starts past the
-// budget", so callers never race a doomed spawn.
-function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null) {
+// (plain Error, as before), the deadline firing is planned degradation (BudgetExhaustedError('time'),
+// which the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass).
+//
+// [LAW:single-enforcer] `spend` is this spawn's handle on the review's token cap (src/token-cap.js), and
+// this is the one place the cap watches a spawn LIVE: every stdout line goes through the adapter's
+// meterUsage, the running total is observed, and when any lane brings the run to the cap the handle
+// orders this spawn stopped (BudgetExhaustedError('tokens'), absorbed exactly as the deadline is). A meter
+// that throws stops the spawn loudly as an engine failure: a cap that cannot count must not let spend
+// through. The adapter seam settles the handle with the engine's authoritative total afterwards.
+//
+// A deadline already in the past, or a cap already spent, refuses to spawn at all — the one enforcer of
+// "no engine starts past a bound", so callers never race a doomed spawn.
+function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null, spend = mintTokenCap(0).open()) {
   return new Promise((resolve, reject) => {
     const remaining = remainingMs(deadline, Date.now());
     if (remaining <= 0) {
-      reject(new DeadlineExceededError(
-        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BUDGET_REMEDY}`,
+      reject(new BudgetExhaustedError('time',
+        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BOUNDS.time.remedy}`,
       ));
       return;
     }
+    if (spend.exhausted()) {
+      reject(spend.refused(`${adapter.name} spawn`));
+      return;
+    }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
+    // The spawn's usage meter is built BEFORE the child exists: a spec that cannot supply one fails
+    // here, with nothing spawned to orphan, rather than inside the executor after the engine is running.
+    const meter = adapter.meterUsage();
     const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
     // <= : at the exact tie both bounds fire at the same instant, and the deadline reading wins —
     // it is true (the budget did expire then) and it is the safe side (absorbed upstream as an
@@ -231,14 +249,24 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // finally deletes the engine's temp HOME — only when nothing is left alive to write into it.
     // The escalation timer must OUTLIVE finish-from-timeout (there is none anymore) and is cleared
     // in finish, i.e. when close/error actually settles: a SIGTERM that worked needs no SIGKILL.
-    let timedOut = false;
+    //
+    // [LAW:dataflow-not-control-flow] Every way a spawn is stopped — the timeout (the deadline or the
+    // adapter's own cap), the token cap, a meter that cannot count — orders the stop through stopWith,
+    // and `stopped` holds the error the stop settles with. The first order wins; a later one, or one
+    // arriving after the spawn settled, changes nothing. So the close handler never asks which bound
+    // fired: it settles with the value.
+    let stopped = null;
     let escalation = null;
     const killGraceMs = adapter.killGraceMs ?? 2_000;
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    const stopWith = reason => {
+      if (stopped || settled) return;
+      stopped = reason;
       killTree('SIGTERM');
       escalation = setTimeout(() => killTree('SIGKILL'), killGraceMs);
-    }, timeoutMs);
+    };
+    const timeout = setTimeout(() => stopWith(deadlineBound
+      ? new BudgetExhaustedError('time', `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BOUNDS.time.remedy}`)
+      : new Error(`${adapter.name} review timed out.`)), timeoutMs);
 
     // [LAW:no-silent-failure] A verbose-but-complete review must finish and be parsed, not be
     // aborted for tripping a byte ceiling — that turned every substantial review into a crash.
@@ -272,6 +300,21 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       lines: readline.createInterface({ input: child.stdout, crlfDelay: Infinity }),
       closed,
     };
+    // [LAW:single-enforcer] The token cap watches the spawn here, off the same live line stream the
+    // session reads, so every usage event counts the moment the engine emits it — never clipped by the
+    // retention window. The handle orders the stop when any lane brings the run to the cap; a meter
+    // that throws (a usage payload this adapter cannot read) stops the spawn as the loud engine failure
+    // it is, instead of an exception inside a stream callback or a spawn the cap silently stops counting.
+    io.lines.on('line', line => {
+      if (stopped) return;
+      try {
+        const tokens = meter(line);
+        if (tokens) spend.observe(totalTokens(tokens));
+      } catch (err) {
+        stopWith(new Error(`${adapter.name} usage could not be metered, so the token cap cannot count this spawn: ${err.message}`));
+      }
+    });
+    spend.onExhausted(() => stopWith(spend.killed(`${adapter.name} spawn`)));
     const session = Promise.resolve().then(() => adapter.session(io, prompt));
     // A session that fails mid-conversation closes stdin, so a server that exits on EOF (codex
     // app-server does) exits on its own; one that does not is still bounded by the timeout. The
@@ -284,11 +327,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
 
     child.on('close', code => {
       closedResolve(stdout);
-      // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
-      // to classify: which bound fired decides the type — the deadline kill is the budget working
-      // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
-      // that outlived any sane review and stays the loud failure it always was.
-      if (timedOut) {
+      // [LAW:types-are-the-program] A close after a stop is the STOP settling, not an engine exit to
+      // classify: the reason stopWith recorded is the type — a bound reached is the budget working as
+      // designed (absorbed upstream as an unreviewed scope); the adapter-cap kill and a meter that could
+      // not count are engine failures and stay loud.
+      if (stopped) {
         finish(() => {
           // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
           // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
@@ -296,11 +339,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // early close cancels the pending escalation, and outlive the settle into the cleanup —
           // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
           killTree('SIGKILL');
-          fail(deadlineBound
-            ? new DeadlineExceededError(
-              `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
-            )
-            : new Error(`${adapter.name} review timed out.`));
+          fail(stopped);
         });
         return;
       }

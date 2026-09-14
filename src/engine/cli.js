@@ -5,6 +5,8 @@ const path = require('path');
 const core = require('@actions/core');
 const { createReviewCollector, readCollectedReview, readRecordedFindings } = require('../collector');
 const { runEngine } = require('./run');
+const { mintTokenCap } = require('../token-cap');
+const { totalTokens } = require('../usage');
 
 // [LAW:no-silent-failure] Scratch-dir cleanup must never OUTRANK the review: these are throwaway
 // dirs under the runner's ephemeral tmp, and a removal failure is a few leaked megabytes on a VM
@@ -71,8 +73,15 @@ function makeCliAdapter(spec) {
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
     // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
     // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
-    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
+    // `tokenCap` is the run's one token cap (src/token-cap.js). This seam opens the spawn's handle
+    // before anything that can fail, hands it to runEngine to watch the stream, and settles it in the
+    // finally with the engine's authoritative total — 0 when the spawn reported none, which keeps
+    // what the live meter observed — so no outcome of a spawn leaves its tokens uncounted.
+    // [LAW:no-silent-failure]
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null, tokenCap = mintTokenCap(0) }) {
       const collector = createReviewCollector();
+      const spend = tokenCap.open();
+      let reportedTokens = 0;
       try {
         // Built inside the stamped try: a prompt that fails to build (a window fit that cannot fit,
         // a file read that fails) is a worker death like any other, and must carry the (empty)
@@ -92,7 +101,7 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline, spend);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
@@ -100,6 +109,7 @@ function makeCliAdapter(spec) {
             // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
             try {
               const raw = spec.extractUsage(output, config, new Date(span.from));
+              reportedTokens = raw ? totalTokens(raw.tokens) : 0;
               // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
               // together when it reported nothing; span is the HOST's clock and is always present —
               // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
@@ -133,6 +143,7 @@ function makeCliAdapter(spec) {
         err.recorded = readRecordedFindings(collector.recordsPath);
         throw err;
       } finally {
+        spend.settle(reportedTokens);
         removeQuietly(collector.dir, 'collector dir');
       }
     },
