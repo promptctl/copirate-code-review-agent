@@ -3,7 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const core = require('@actions/core');
-const { createReviewCollector, readCollectedReview } = require('../collector');
+const { createReviewCollector, readCollectedReview, readRecordedFindings } = require('../collector');
 const { runEngine } = require('./run');
 
 // [LAW:no-silent-failure] Scratch-dir cleanup must never OUTRANK the review: these are throwaway
@@ -35,7 +35,9 @@ function removeQuietly(dir, label) {
 // go.mod-owning worker) `assessments`. This is a REQUIRED part of the contract, not optional: the
 // multi-scope aggregator accesses `r.findings`/`r.assessments` with no fallback, so an adapter that omits a
 // field fails loud rather than silently degrading (e.g. every bump rendering "unassessed"). A new engine —
-// including a direct-API one that never touches this factory — must return all five. [LAW:composability]
+// including a direct-API one that never touches this factory — must return all five. An error thrown out of produceReview carries
+// `recorded` ({ findings, assessments }: what the worker drove through the collector before it died)
+// and, once the spawn ran, `span`. [LAW:composability]
 // The whole MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview)
 // is a PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
 // mechanics. [LAW:carrying-cost]
@@ -122,6 +124,17 @@ function makeCliAdapter(spec) {
         } finally {
           removeQuietly(cwd, 'scratch cwd');
         }
+      } catch (err) {
+        // [LAW:no-silent-failure] The other half of the span invariant: no outcome of a spawn that ran
+        // loses what it RECORDED. A worker drives the collector as it goes — every request_change is
+        // on disk the instant it is made — so a worker that then dies (a context-window overflow, a
+        // crashed CLI, a deadline kill, a forgotten finish_review) has left findings behind that are
+        // as true as any a finished worker returns. They ride out on the error, read here, before
+        // the collector's directory is removed below; the chain that absorbs the death delivers
+        // them. Any error at all is stamped, so downstream holds a value and never asks whether
+        // this one happened to carry it. [LAW:parse-dont-validate]
+        err.recorded = readRecordedFindings(collector.recordsPath);
+        throw err;
       } finally {
         removeQuietly(collector.dir, 'collector dir');
       }
