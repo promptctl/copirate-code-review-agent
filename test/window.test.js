@@ -111,12 +111,13 @@ describe('measureChangedFiles', () => {
     { filename: 'src/a.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' },
     { filename: 'src/gone.js', status: 'removed' },
   ];
-  test('stamps tokens and lines from the injected reader, at the path under the reviewed root; a removed file measures 0', () => {
+  test('stamps tokens, lines and symbols from the injected reader, at the path under the reviewed root; a removed file measures 0', () => {
     const seen = [];
     const out = measureChangedFiles(files, '/repo', (p) => { seen.push(p); return 'line one\nline two\n'; });
     assert.deepEqual(seen, ['/repo/src/a.js']);
-    assert.deepEqual(out[0].content, { tokens: estimateTokens('line one\nline two\n'), lines: 2 }); // the trailing newline ends line two
-    assert.deepEqual(out[1].content, { tokens: 0, lines: 0 });
+    // the trailing newline ends line two; the symbols are the seam material (src/seams.js) stamped by the same read
+    assert.deepEqual(out[0].content, { tokens: estimateTokens('line one\nline two\n'), lines: 2, symbols: { defines: [], uses: [] } });
+    assert.deepEqual(out[1].content, { tokens: 0, lines: 0, symbols: { defines: [], uses: [] } });
     assert.equal(out[0].patch, files[0].patch); // the record is extended, never replaced
   });
   test('a file with no trailing newline keeps its last line, and an empty file has none', () => {

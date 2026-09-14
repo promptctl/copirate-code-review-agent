@@ -1,6 +1,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const { symbolsOf } = require('./seams');
 
 // [FRAMING:representation] The model's context window is a hard wall, and until this module nothing
 // in the engine represented it: a worker's material was "the whole diff plus every assigned file read
@@ -66,7 +67,7 @@ const WORKER_HEADROOM_TOKENS = 70_000;
 //   'full'     — open the whole file (it fits alongside the diff);
 //   'targeted' — too large to fit whole: read only around its hunks, by offset and limit;
 //   'in-diff'  — the file is new in this change and its hunk is shown, so the diff IS its full content;
-//   'none'     — not this worker's to open (another scope's file, or a deleted file with no head content).
+//   'none'     — not this worker's to open (a file outside its read set, or a deleted file with no head content).
 // A file's `hunk` is 'shown' (inline, on the LINE grid) or 'withheld' (no inline diff — findings on it
 // are recorded at real line numbers and posted unanchored).
 const READ_KINDS = ['full', 'targeted', 'in-diff', 'none'];
@@ -126,7 +127,9 @@ function fitWorkerMaterial({ window, fixedTokens, files, readSet }) {
 
 // [LAW:effects-at-boundaries] The ONE effect this module owns: measure each changed file's content as
 // it stands in the reviewed checkout — the tree the worker's Read tool will open — and stamp the
-// measurement onto the record. [LAW:parse-dont-validate] `content` is the stamp: buildPrMaterial and
+// measurement onto the record: its size (tokens, lines — what a full read costs the window) and its
+// symbols (what it defines and mentions — what the seams between changed files are derived from,
+// src/seams.js). One read, every measurement; the text itself travels no further. [LAW:parse-dont-validate] `content` is the stamp: buildPrMaterial and
 // buildReviewInput require it on every file, so an unmeasured changed set cannot reach a worker prompt.
 // A removed file has no head content (nothing to read); every other status is read from the checkout.
 // [LAW:no-silent-failure] A listed file missing from the checkout is refused with the path and root
@@ -143,7 +146,7 @@ function lineCount(text) {
 
 function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) => fs.readFileSync(absPath, 'utf8')) {
   return files.map(f => {
-    if (f.status === 'removed') return { ...f, content: { tokens: 0, lines: 0 } };
+    if (f.status === 'removed') return { ...f, content: { tokens: 0, lines: 0, symbols: symbolsOf('') } };
     const absPath = path.join(reviewedRepoRoot, f.filename);
     let text;
     try {
@@ -151,7 +154,7 @@ function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) =>
     } catch (e) {
       throw new Error(`The reviewed checkout at ${reviewedRepoRoot} has no readable ${f.filename} (listed as ${f.status} in this change): ${e.message}. The review reads changed files from that checkout, so it must be at the change's head.`);
     }
-    return { ...f, content: { tokens: estimateTokens(text), lines: lineCount(text) } };
+    return { ...f, content: { tokens: estimateTokens(text), lines: lineCount(text), symbols: symbolsOf(text) } };
   });
 }
 
