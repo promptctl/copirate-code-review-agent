@@ -141,14 +141,15 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
   const { unreviewed, scopeFailures, sweeps, budgetExhausted } = coverage;
   const unreviewedNames = new Set(unreviewed.map(u => u.name));
   const reviewed = scopes.filter(s => !unreviewedNames.has(s.name));
-  const budgetUnreviewed = unreviewed.filter(u => u.cause === 'budget').map(u => u.name);
-  const failedUnreviewed = unreviewed.filter(u => u.cause === 'failure').map(u => u.name);
+  const { budget: budgetUnreviewed, failure: failedUnreviewed } = unreviewedByCause({ unreviewedScopes: unreviewed });
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
   // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
   // there is no absent-summary state for this sink to represent. Neither can break this line-structured
   // summary. This sink previously flattened the name and NOT the summary — the exact shape of bug that
   // call-site discipline produces, and the reason the rule moved to the boundary.
-  const lines = [scoutSummary, '', `Reviewed ${reviewed.length} scope(s): ${reviewed.map(s => s.name).join(', ')}.`];
+  // "Reviewed 0 scope(s)" is a real line now: a pass whose every worker died still delivers what
+  // they recorded, and the summary must say no scope was reviewed rather than list nothing after a colon.
+  const lines = [scoutSummary, '', `Reviewed ${reviewed.length} scope(s)${reviewed.length > 0 ? `: ${reviewed.map(s => s.name).join(', ')}` : ''}.`];
   for (const [i, s] of sweeps.entries()) {
     // [FRAMING:representation] A curtailed sweep must never render as convergence: "added nothing
     // because it was killed" and "searched and found nothing" are different facts.
@@ -159,7 +160,7 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
   if (budgetExhausted) {
     lines.push(budgetUnreviewed.length > 0
       ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + `NOT reviewed: ${budgetUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
+        + notReviewedClause(budgetUnreviewed)
       // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
       // not the budget's share of it: a scope whose worker died is named on the failure line below, and
       // this line must not contradict it.
@@ -172,10 +173,21 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
   if (scopeFailures.length > 0) {
     lines.push(`⚠️ **Scope worker failed** — ${scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ')}. `
       + (failedUnreviewed.length > 0
-        ? `NOT reviewed: ${failedUnreviewed.join(', ')}. The findings above cover only the reviewed scopes.`
+        ? notReviewedClause(failedUnreviewed)
         : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.'));
   }
   return lines.join('\n');
+}
+
+// [LAW:one-source-of-truth] The one rendering of a NOT-reviewed list and of what the findings above
+// then cover — the budget line and the failure line both end in it, so neither can claim the findings
+// cover "only the reviewed scopes" on a review that also carries what an unreviewed scope's worker
+// recorded before it died. [FRAMING:representation]
+function notReviewedClause(entries) {
+  const kept = entries.reduce((sum, u) => sum + u.kept, 0);
+  return `NOT reviewed: ${entries.map(unreviewedName).join(', ')}. The findings above cover ${kept > 0
+    ? 'the reviewed scopes, plus what the unreviewed scopes\' workers recorded before they stopped'
+    : 'only the reviewed scopes'}.`;
 }
 
 // [LAW:types-are-the-program] Why a pass did not run to completion — the vocabulary `curtailed` speaks
@@ -249,25 +261,26 @@ function sweepsByDepth(chains) {
 // [LAW:effects-at-boundaries] Pure: the pass's COVERAGE record, folded ONCE from the chains' outcomes
 // — the one derivation the summary renders from and the return value carries, so the posted prose and
 // the sink's data cannot disagree about which scope went unreviewed or why. [LAW:one-source-of-truth]
-//   unreviewed    — [{ name, cause }] for every scope whose pass 0 did not complete (the coverage gap);
+//   unreviewed    — [{ name, cause, kept }] for every scope whose pass 0 did not complete (the coverage
+//                   gap), `kept` being the findings its dead worker recorded before it stopped — pass 0's
+//                   `added`, the ledger's own count, so the summary cannot claim more than was merged;
 //   scopeFailures — [{ scope, pass, message }] for every pass at any depth a worker died on, the
 //                   message stamped single-line here (firstLine) so the line-structured summary and
 //                   the operator warning can carry it as-is;
 //   sweeps        — sweepsByDepth over the chains' sweep passes;
 //   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
-// [LAW:one-source-of-truth] The review record carries the unreviewed set as names (unreviewedScopes —
-// the verdict's input) and the failures as a record (scopeFailures); the split of the names by cause is
-// derived here, ONCE, for every sink that must attribute a gap correctly: a scope unreviewed because its
-// worker died at the review of record is the failure's, and only the rest are the budget's.
-function unreviewedByCause({ unreviewedScopes, scopeFailures }) {
-  const failure = scopeFailures.filter(f => f.pass === 0).map(f => f.scope);
-  return { failure, budget: unreviewedScopes.filter(name => !failure.includes(name)) };
+// [LAW:one-source-of-truth] The review record carries the unreviewed set as the coverage entries
+// themselves ({ name, cause, kept }) — the verdict reads its length, and every sink that must attribute
+// a gap correctly splits it by the cause each entry carries, here, ONCE: a scope unreviewed because
+// its worker died at the review of record is the failure's, and the rest are the budget's.
+function unreviewedByCause({ unreviewedScopes }) {
+  return { failure: unreviewedScopes.filter(u => u.cause === 'failure'), budget: unreviewedScopes.filter(u => u.cause === 'budget') };
 }
 
 function coverageOf(scopes, outcomes) {
   const unreviewed = scopes.flatMap((s, i) => {
-    const c = outcomes[i].passes[0].curtailed;
-    return c ? [{ name: s.name, cause: c.cause }] : [];
+    const { curtailed, added } = outcomes[i].passes[0];
+    return curtailed ? [{ name: s.name, cause: curtailed.cause, kept: added }] : [];
   });
   const scopeFailures = scopes.flatMap((s, i) => outcomes[i].passes.flatMap((p, pass) =>
     (p.curtailed && p.curtailed.cause === 'failure' ? [{ scope: s.name, pass, message: firstLine(p.curtailed.error.message) }] : [])));
@@ -308,8 +321,10 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // recorded so far — its own and its siblings' — stopping the moment a sweep adds nothing.
 // [LAW:composability] It returns one OUTCOME per scope:
 //   { passes: [{ added, curtailed }], assessments }
-// where passes[0] is the review of record and passes[k] is sweep k. `curtailed` is false for a pass
-// that ran, or the cause that stopped it — { cause: 'budget' } or { cause: 'failure', error } (see
+// where passes[0] is the review of record and passes[k] is sweep k. `added` is what the pass put in
+// the ledger — a completed pass's new findings, or the findings a curtailed pass's dead worker had
+// recorded before it stopped (kept, never discarded). `curtailed` is false for a pass that ran, or
+// the cause that stopped it — { cause: 'budget' } or { cause: 'failure', error } (see
 // CURTAILMENT_CAUSES) — one fact at every depth: at pass 0 it is the coverage gap the summary and the
 // verdict carry (the scope was not reviewed); at a sweep it merely ends the chain (pass 0's judgment
 // stands). The list is exactly the passes that RAN plus at most one curtailed entry, so a caller reads
@@ -333,33 +348,41 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   // the ledger as it stands the instant it starts. The pass index is the domain's own discriminator
   // (review of record vs sweep), so this is the one branch the chain has. [LAW:dataflow-not-control-flow]
   const seedFor = (pass) => (pass === 0 ? [] : ledger.findings);
-  // attemptPass settles to one of two shapes: { result } (the worker's records) or { curtailed }
-  // (why it did not run to completion). [LAW:types-are-the-program]
+  // attemptPass settles to ONE shape whatever happened: { findings, assessments, curtailed } — the
+  // records this pass produced, and false or the cause that stopped it. A pass that ran to completion
+  // returns the worker's records; a spawn that died returns what the worker RECORDED before it died
+  // (err.recorded — stamped by the spawn seam on every error out of produceReview, read bare here:
+  // an adapter that omits it crashes loud, exactly as one omitting `assessments` does), and a pass
+  // the budget refused before spawning returns nothing, because nothing ran. A finding the worker
+  // drove through the collector is a fact about the code the instant it was recorded; the worker's
+  // death afterwards does not unsay it, so the loop below merges every attempt's records the same
+  // way and the pass entry's `added` is what THIS pass put in the ledger — for a curtailed pass, the
+  // findings kept from its dead worker. [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
   const attemptPass = async (pass) => {
-    if (remainingMs(deadline, now()) <= 0) return { curtailed: { cause: 'budget' } };
+    if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'budget' } };
     try {
-      return { result: await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings: seedFor(pass), pass }) };
+      const { findings, assessments } = await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings: seedFor(pass), pass });
+      return { findings, assessments, curtailed: false };
     } catch (e) {
-      if (e instanceof DeadlineExceededError) return { curtailed: { cause: 'budget' } };
       if (e instanceof TransientError) throw e;
-      return { curtailed: { cause: 'failure', error: e } };
+      const { findings, assessments } = e.recorded;
+      return { findings, assessments, curtailed: e instanceof DeadlineExceededError ? { cause: 'budget' } : { cause: 'failure', error: e } };
     }
   };
   const passes = [];
   const assessments = [];
   for (let pass = 0; pass <= sweepCap; pass++) {
     const attempt = await attemptPass(pass);
-    if (attempt.curtailed) {
-      log(`${sweepLabelPrefix(pass)}scope '${scope.name}' not reviewed — ${curtailmentLogText(attempt.curtailed)}`);
-      passes.push({ added: 0, curtailed: attempt.curtailed });
-      break;
-    }
-    const { result } = attempt;
-    assessments.push(...result.assessments);
-    const added = ledger.merge(result.findings);
-    passes.push({ added, curtailed: false });
-    if (pass > 0) log(`sweep ${pass} scope '${scope.name}': ${added} new finding(s)`);
-    if (added === 0) break;
+    assessments.push(...attempt.assessments);
+    const added = ledger.merge(attempt.findings);
+    passes.push({ added, curtailed: attempt.curtailed });
+    // The pass line: a curtailed pass says why, and what its dead worker left behind; a sweep that
+    // ran says what it added. The review of record that ran says nothing here — the worker's own
+    // 'done' line already did. [LAW:dataflow-not-control-flow] the index and the curtailment are the
+    // domain's discriminators; this is rendering, not policy.
+    if (attempt.curtailed) log(`${sweepLabelPrefix(pass)}scope '${scope.name}' not reviewed — ${curtailmentLogText(attempt.curtailed)}${keptNote(added)}`);
+    else if (pass > 0) log(`sweep ${pass} scope '${scope.name}': ${added} new finding(s)`);
+    if (attempt.curtailed || added === 0) break;
   }
   // The closing line names the passes as they happened — 'review, sweep 1', or 'review curtailed' for
   // a scope the budget refused before it was ever reviewed — read straight off the passes value, so
@@ -373,6 +396,19 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 // [LAW:one-source-of-truth] The two log renderings of a curtailment, keyed by cause: the pass line's
 // reason and the chain line's suffix ('review curtailed' is the budget's established wording).
 const CHAIN_LABEL_BY = { budget: ' curtailed', failure: ' failed' };
+// What a pass that never spawned recorded: the empty records, in the spawn seam's own shape.
+const NOTHING_RECORDED = Object.freeze({ findings: [], assessments: [] });
+// [LAW:one-source-of-truth] The ONE phrase for findings salvaged from a curtailed pass, rendered by the
+// pass log, the summary's NOT-reviewed lists and the run warnings alike — so every surface that names
+// an unreviewed scope says the same thing about what it kept. Nothing kept renders nothing: the
+// established wording for a scope that left nothing behind is unchanged, and this is rendering.
+function keptNote(kept) {
+  return kept > 0 ? ` (${kept} recorded finding(s) kept)` : '';
+}
+// An unreviewed scope as the summary and the warnings name it: its name, and what it kept.
+function unreviewedName({ name, kept }) {
+  return `${name}${keptNote(kept)}`;
+}
 function curtailmentLogText(curtailed) {
   return curtailed.cause === 'budget' ? 'time budget exhausted' : `worker failed: ${firstLine(curtailed.error.message)}`;
 }
@@ -701,11 +737,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // A scope whose pass 0 did not complete is a COVERAGE gap, carried as data to the summary and the
   // verdict; a curtailed sweep merely bounds convergence — pass 0's judgments of record stand.
   const coverage = coverageOf(scopes, outcomes);
-  // [LAW:no-silent-failure] NO scope completed: there is no review to deliver, and "delivering" an
-  // empty one would approve a change nobody looked at. Fail fast with the real cause — the first
-  // worker's own error when one died, so an overflow or a crash is diagnosed as itself and never as
-  // a budget the run did not spend; otherwise the budget, with the knob named.
-  if (coverage.unreviewed.length === scopes.length) {
+  // [LAW:no-silent-failure] NO scope completed and NOTHING was kept: there is no review to deliver,
+  // and "delivering" an empty one would approve a change nobody looked at. Fail fast with the real
+  // cause — the first worker's own error when one died, so an overflow or a crash is diagnosed as
+  // itself and never as a budget the run did not spend; otherwise the budget, with the knob named.
+  // A pass whose every worker died but left findings behind delivers them instead: the review has
+  // something to say, and it never approves, since every scope is unreviewed.
+  if (coverage.unreviewed.length === scopes.length && coverage.unreviewed.every(u => u.kept === 0)) {
     const failed = scopes.map((s, i) => outcomes[i].passes[0].curtailed).find(c => c.cause === 'failure');
     if (failed) throw failed.error;
     throw new DeadlineExceededError(
@@ -764,13 +802,13 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
       scoutUsage: proposal.scoutUsage,
     }),
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
-    // approval when unreviewedScopes is non-empty (transport.submitReview) — the NAMES, whatever took
-    // them, since a scope a worker died on is exactly as unreviewed as one the budget refused — and
-    // run.js warns when the budget bit (budgetExhausted) and when a worker failed (scopeFailures,
-    // every failed pass at any depth with its message). The summary text above derives from these
-    // same values, never the other way around. All three are their defaults ([]/false/[]) on every
-    // run nothing went wrong in.
-    unreviewedScopes: unreviewed.map(u => u.name),
+    // approval when unreviewedScopes is non-empty (transport.submitReview) — whatever took them,
+    // since a scope a worker died on is exactly as unreviewed as one the budget refused — and run.js
+    // warns when the budget bit (budgetExhausted) and when a worker failed (scopeFailures, every
+    // failed pass at any depth with its message), naming each unreviewed scope with the cause and
+    // kept count its entry carries. The summary text above derives from these same values, never the
+    // other way around. All three are their defaults ([]/false/[]) on every run nothing went wrong in.
+    unreviewedScopes: unreviewed,
     budgetExhausted,
     scopeFailures,
   };
@@ -903,6 +941,7 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
 
 module.exports = {
   unreviewedByCause,
+  unreviewedName,
   workerFocusText,
   sumUsage,
   composeSummary,

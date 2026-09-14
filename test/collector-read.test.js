@@ -9,7 +9,7 @@ const os = require('os');
 const path = require('path');
 const core = require('@actions/core');
 
-const { readCollectedReview } = require('../src/collector');
+const { readCollectedReview, readRecordedFindings } = require('../src/collector');
 const { ProtocolError } = require('../src/failover');
 
 // Every temp dir writeRecords creates, torn down in afterEach so the suite leaves no residue in a
@@ -109,5 +109,36 @@ describe('readCollectedReview — dependency assessments', () => {
       finish('done'),
     ]);
     assert.throws(() => readCollectedReview(p), /invalid verdict/);
+  });
+});
+
+// zai-worker-death-nt0: the salvage read. A worker drives the collector as it goes, so a worker that
+// dies (overflow, crash, deadline kill, forgotten finish) has left records behind; this reader returns
+// them with NO finish gate — absence of a finish is the death the caller already holds as its error.
+describe('readRecordedFindings — what a worker recorded, whether or not it lived to finish', () => {
+  it('returns the findings and assessments of a records file with no finish, parsed as the finish gate would parse them', () => {
+    const p = writeRecords([
+      { type: 'assessment', assessment: { module: 'github.com/a/b', impact: 'adds retries', affected: false, verdict: 'safe' } },
+      { type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug one', severity: 4 } },
+      { type: 'request_change', finding: { path: 'b.js', line: 9, body: 'bug two', severity: 3 } },
+    ]);
+    const recorded = readRecordedFindings(p);
+    assert.deepEqual(recorded.findings.map(f => [f.path, f.line, f.body, f.severity]), [['a.js', 3, 'bug one', 4], ['b.js', 9, 'bug two', 3]]);
+    assert.deepEqual(recorded.assessments.map(a => a.module), ['github.com/a/b']);
+    assert.equal(warnings.length, 0);
+  });
+
+  it('a finished review reads the same records the finish gate does', () => {
+    const p = writeRecords([{ type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug', severity: 4 } }, finish('done')]);
+    assert.deepEqual(readRecordedFindings(p).findings, readCollectedReview(p).findings);
+  });
+
+  it('no records file at all is the empty salvage — a worker that never drove the collector recorded nothing', () => {
+    assert.deepEqual(readRecordedFindings(path.join(os.tmpdir(), 'collector-read-never-written', 'records.jsonl')), { findings: [], assessments: [] });
+  });
+
+  it('an empty records file is the empty salvage too, never a throw', () => {
+    const p = writeRecords([]);
+    assert.deepEqual(readRecordedFindings(p), { findings: [], assessments: [] });
   });
 });

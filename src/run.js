@@ -10,7 +10,7 @@ const { showableFiles } = require('./prompt');
 const { measureChangedFiles } = require('./window');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
-const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause } = require('./multiscope');
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = require('./multiscope');
 const { defaultEffortProfile } = require('./effort');
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = require('./budget');
 const { assessDifficulty } = require('./difficulty');
@@ -206,7 +206,7 @@ function warnBudgetExhausted(review) {
   // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
   const { budget } = unreviewedByCause(review);
   const state = budget.length > 0
-    ? `${budget.length} scope(s) went unreviewed (${budget.join(', ')})`
+    ? `${budget.length} scope(s) went unreviewed (${budget.map(unreviewedName).join(', ')})`
     : review.unreviewedScopes.length === 0
       ? 'every scope was reviewed, but convergence sweeps were cut short'
       : 'convergence sweeps were cut short';
@@ -223,9 +223,11 @@ function warnScopeFailures(review) {
   // The same two facts the summary's failure line states: a death at the review of record is a coverage
   // gap and names the scope; a death in a sweep leaves pass 0's judgment standing.
   const failed = review.scopeFailures.map(f => `'${f.scope}' at ${passLabel(f.pass)}: ${f.message}`).join('; ');
+  // Each unreviewed scope is named as the summary names it — with what its dead worker recorded
+  // before it stopped, which the review delivers rather than discards. [LAW:one-source-of-truth]
   const { failure } = unreviewedByCause(review);
   const coverage = failure.length > 0
-    ? `NOT reviewed: ${failure.join(', ')}. The other scopes' findings were still delivered.`
+    ? `NOT reviewed: ${failure.map(unreviewedName).join(', ')}. The other scopes' findings were still delivered.`
     : 'Every scope was reviewed; the failed sweep may have left late-round findings missing.';
   core.warning(`${review.scopeFailures.length} scope worker(s) failed — ${failed}. ${coverage}`);
 }

@@ -95,3 +95,48 @@ describe('makeCliAdapter — the spawn start instant (zai-cost-truth-p5o.1)', ()
     );
   });
 });
+
+// zai-worker-death-nt0: every error out of produceReview carries what the worker RECORDED before it
+// died, read before the collector's directory is torn down. Exercised through a REAL child that drives
+// the collector's file and then dies — the whole seam, not a stub of it. [LAW:behavior-not-structure]
+describe('makeCliAdapter — a dead spawn\'s recorded findings ride out on its error', () => {
+  const RECORD = JSON.stringify({ type: 'request_change', finding: { path: 'a.js', line: 3, body: 'bug one', severity: 4 } });
+  function specThatRecordsThenDies(script) {
+    return {
+      ...specThatRecords(() => null),
+      buildCommand: ({ collector }) => ({
+        command: process.execPath,
+        args: ['-e', script],
+        env: { RECORDS: collector.recordsPath, RECORD },
+      }),
+    };
+  }
+  const produce = (adapter) => adapter.produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null });
+
+  test('a worker that records a finding and then crashes: the error carries the finding', async () => {
+    const adapter = makeCliAdapter(specThatRecordsThenDies('require("fs").writeFileSync(process.env.RECORDS, process.env.RECORD+"\\n"); process.exit(3)'));
+    await assert.rejects(produce(adapter), (err) => {
+      assert.match(err.message, /exited with status 3/);
+      assert.deepEqual(err.recorded.findings.map(f => [f.path, f.line, f.body, f.severity]), [['a.js', 3, 'bug one', 4]]);
+      assert.deepEqual(err.recorded.assessments, []);
+      return true;
+    });
+  });
+
+  test('a worker that records a finding and exits without finishing: the ProtocolError carries the finding', async () => {
+    const adapter = makeCliAdapter(specThatRecordsThenDies('require("fs").writeFileSync(process.env.RECORDS, process.env.RECORD+"\\n")'));
+    await assert.rejects(produce(adapter), (err) => {
+      assert.match(err.message, /did not call finish_review/);
+      assert.equal(err.recorded.findings.length, 1);
+      return true;
+    });
+  });
+
+  test('a worker that dies having recorded nothing carries the empty salvage — a value, never an absent field', async () => {
+    const adapter = makeCliAdapter(specThatRecordsThenDies('process.exit(2)'));
+    await assert.rejects(produce(adapter), (err) => {
+      assert.deepEqual(err.recorded, { findings: [], assessments: [] });
+      return true;
+    });
+  });
+});
