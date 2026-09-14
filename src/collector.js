@@ -31,18 +31,51 @@ function createReviewCollector() {
   return { dir, recordsPath, mcpConfigPath };
 }
 
-function readCollectedReview(recordsPath) {
-  if (!fs.existsSync(recordsPath)) {
-    // [LAW:no-silent-failure] No records file at all is the zero-record extreme of a protocol slip: the
-    // engine terminated without ever driving the collector. Typed as ProtocolError so the retry seam
-    // re-spawns it in place rather than the plain Error that killed the whole multi-scope pass.
-    throw new ProtocolError('The review engine did not call the review collector tools.');
-  }
-
-  const records = fs.readFileSync(recordsPath, 'utf8')
+// [LAW:one-source-of-truth] The ONE reader of the collector's file: every record the worker drove
+// through the MCP server, in the order it recorded them, or [] when the engine never drove the
+// collector at all (no file). Both readers below derive from it — what a finished review asserts about
+// these records (a finish) is a separate question from what the records ARE.
+function readRecords(recordsPath) {
+  if (!fs.existsSync(recordsPath)) return [];
+  return fs.readFileSync(recordsPath, 'utf8')
     .split('\n')
     .filter(line => line.trim().length > 0)
     .map(line => JSON.parse(line));
+}
+
+// [LAW:one-source-of-truth] The findings and dependency assessments among a record list, parsed once
+// here for both readers. Typed and schema-validated exactly as the collector server validated them
+// when it wrote them, so a record that reached the file parses by construction.
+function recordedFindings(records) {
+  return {
+    findings: records
+      .filter(record => record.type === 'request_change')
+      .map((record, index) => parseFindingValue(record.finding, index)),
+    // [LAW:dataflow-not-control-flow] Only the go.mod-owning worker records any; every other spawn's
+    // list is empty by construction, never a branch.
+    assessments: records
+      .filter(record => record.type === 'assessment')
+      .map((record, index) => parseAssessmentValue(record.assessment, index)),
+  };
+}
+
+// What a worker RECORDED, whether or not it lived to finish — the salvage read for a spawn that died
+// (a context-window overflow, a crashed CLI, a deadline kill). A finding the worker recorded is a fact
+// about the code the moment it is written; the worker's death afterwards does not unsay it. No finish
+// gate here: absence of a finish is the death the caller already holds as its error, and an empty
+// list is exactly what a worker that recorded nothing before dying produced. [LAW:parse-dont-validate]
+function readRecordedFindings(recordsPath) {
+  return recordedFindings(readRecords(recordsPath));
+}
+
+function readCollectedReview(recordsPath) {
+  const records = readRecords(recordsPath);
+  // [LAW:no-silent-failure] No records at all is the zero-record extreme of a protocol slip: the
+  // engine terminated without ever driving the collector. Typed as ProtocolError so the retry seam
+  // re-spawns it in place rather than the plain Error that killed the whole multi-scope pass.
+  if (records.length === 0) {
+    throw new ProtocolError('The review engine did not call the review collector tools.');
+  }
   const finishes = records.filter(record => record.type === 'finish');
   // [LAW:no-silent-failure] Zero finishes is the most common weak-model slip (the model forgot the gate),
   // not a code bug — typed as ProtocolError so retryTransientSpawn re-spawns instead of discarding every
@@ -57,9 +90,7 @@ function readCollectedReview(recordsPath) {
     core.warning(`The review engine called finish_review ${finishes.length} times; using the last one.`);
   }
   const finish = finishes[finishes.length - 1];
-  const findings = records
-    .filter(record => record.type === 'request_change')
-    .map((record, index) => parseFindingValue(record.finding, index));
+  const { findings, assessments } = recordedFindings(records);
   // [LAW:dataflow-not-control-flow] One reader, two record kinds: a worker run produces findings (no
   // scopes), a scout run produces scopes (no findings) — both flow through the same collector and the
   // same exactly-one-finish gate. Scopes are typed, schema-validated records exactly like findings,
@@ -67,13 +98,6 @@ function readCollectedReview(recordsPath) {
   const scopes = records
     .filter(record => record.type === 'scope')
     .map((record, index) => parseScopeValue(record.scope, index));
-  // [LAW:dataflow-not-control-flow] A third record kind through the same one reader: a worker that reviewed
-  // a resolved go.mod bump records per-module dependency assessments; every other spawn produces none, so
-  // this is an empty list by construction, never a branch. Typed and schema-validated exactly like findings
-  // and scopes. [FRAMING:representation]
-  const assessments = records
-    .filter(record => record.type === 'assessment')
-    .map((record, index) => parseAssessmentValue(record.assessment, index));
   const review = parseReviewValue({
     summary: finish.summary,
     findings,
@@ -94,4 +118,4 @@ if (require.main === module && process.argv.includes(COLLECTOR_SERVER_ARG)) {
   require('./collector-server').runReviewCollectorServer();
 }
 
-module.exports = { COLLECTOR_SERVER_ARG, createReviewCollector, readCollectedReview };
+module.exports = { COLLECTOR_SERVER_ARG, createReviewCollector, readCollectedReview, readRecordedFindings };
