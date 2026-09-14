@@ -51,45 +51,103 @@ const DEFINITION_SHAPES = [
   /^\s+(?:(?:static|async|public|private|protected|readonly|override)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*(?::[^{;]*)?\{\s*$/,
 ];
 const BLOCK_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
-// Go's grouped declarations — `var (` / `const (` / `type (` … `)` — define one name per indented line
-// (`ErrNoRows = errors.New(…)`, `timeout time.Duration`). Only inside such a group is an indented name
-// a definition: an indented `err = f()` in a function body is a reassignment of a local, and reading it
-// as a definition made every file that reassigns `err`, `count` or `result` a definer of that name.
-const GROUP_OPEN = /^(?:var|const|type)\s*\(\s*$/;
-const GROUP_CLOSE = /^\)/;
-const GROUP_MEMBER = /^\s+([A-Za-z_]\w*)\b/;
+// [LAW:one-type-per-behavior] A declaration BLOCK: a line that opens a body whose members, at exactly one
+// indent, are definitions — and only there. An indented `name = value` elsewhere is a reassigned local
+// (`err = f()`, `    result = g()`), and reading it as a definition made every file that reassigns
+// `err`, `count` or `result` a definer of that name. Two blocks, one table:
+//   - Go's grouped declaration, `var (` / `const (` / `type (` at column 0 (a trailing comment allowed).
+//     gofmt indents a group inside a function body, whose members are locals, so the column-0 anchor is
+//     what excludes it; and gofmt puts every member at one tab, so a wrapped value (`\t\tTimeout: 30,`
+//     inside `\tdefaults = Config{`) is a continuation, never a member.
+//   - A class body: JavaScript/TypeScript `class X … {`, Python `class X…:`, Kotlin. Its member indent is
+//     whatever the first line after the opener uses, so a method body, one indent deeper, is not a member.
+// A block closes at the first non-blank line indented no deeper than its opener: Go's `)`, a JavaScript
+// class's `}`, a Python dedent.
+const BLOCKS = [
+  { opener: /^(?:var|const|type)\s*\(\s*(?:\/\/.*)?$/, member: /^([A-Za-z_]\w*)\b/, indent: '\t' },
+  {
+    opener: /^\s*(?:export\s+(?:default\s+)?)?(?:(?:abstract|data|sealed|open)\s+)*class\s+[A-Za-z_]\w*[^;{}]*[{:]\s*$/,
+    member: /^(?:(?:static|public|private|protected|readonly|declare|override)\s+)*([A-Za-z_]\w*)\s*[?!]?\s*(?::|=(?!=))/,
+    indent: null,
+  },
+];
+// The value a scan reads between a hunk's section heading and the hunk itself: the two are not adjacent,
+// so a block the heading opens cannot learn its member indent from what follows. [LAW:dataflow-not-control-flow]
+const GAP = null;
 
-// [LAW:effects-at-boundaries] Pure: the symbols a text defines and the symbols it uses, each once.
-// Returned as sorted arrays so the stamp is a plain, comparable, serialisable value.
-function symbolsOf(text) {
-  const defines = new Set();
-  const uses = new Set();
-  let inGroup = false;
-  for (const line of text.split('\n')) {
+// [LAW:effects-at-boundaries] Pure: the symbols each line defines and uses, in order, as one pass that
+// carries the open blocks from line to line. An entry is a line of text, or GAP. A block's memberIndent is
+// the indent its members use — null until the first line after its opener sets it, false once a GAP has
+// made it unknowable (no line is a member of such a block).
+function scanLines(lines) {
+  const open = [];
+  return lines.map((line) => {
+    const symbols = { defines: [], uses: [] };
+    if (line === GAP) {
+      for (const block of open) block.memberIndent ??= false;
+      return symbols;
+    }
+    if (line.trim() === '') return symbols;
+    const indent = /^\s*/.exec(line)[0];
+    while (open.length > 0 && indent.length <= open[open.length - 1].openerIndent) open.pop();
     for (const shape of DEFINITION_SHAPES) {
       const m = shape.exec(line);
-      if (m && !BLOCK_KEYWORDS.has(m[1])) defines.add(m[1]);
+      if (m && !BLOCK_KEYWORDS.has(m[1])) symbols.defines.push(m[1]);
     }
-    if (GROUP_OPEN.test(line)) inGroup = true;
-    else if (GROUP_CLOSE.test(line)) inGroup = false;
-    else if (inGroup) {
-      const m = GROUP_MEMBER.exec(line);
-      if (m) defines.add(m[1]);
+    const inside = open[open.length - 1];
+    if (inside) {
+      inside.memberIndent ??= indent;
+      const m = indent === inside.memberIndent && inside.kind.member.exec(line.slice(indent.length));
+      if (m) symbols.defines.push(m[1]);
     }
+    const kind = BLOCKS.find(b => b.opener.test(line));
+    if (kind) open.push({ kind, openerIndent: indent.length, memberIndent: kind.indent });
     for (const shape of [USE_CALL, USE_MEMBER, USE_TYPE]) {
-      for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) uses.add(m[1]);
+      for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) symbols.uses.push(m[1]);
     }
-  }
+    return symbols;
+  });
+}
+
+// The symbols a set of scanned lines carries, each once, as sorted arrays so the stamp is a plain,
+// comparable, serialisable value.
+function foldSymbols(scanned) {
+  const defines = new Set(scanned.flatMap(s => s.defines));
+  const uses = new Set(scanned.flatMap(s => s.uses));
   return { defines: [...defines].sort(), uses: [...uses].sort() };
 }
 
+// [LAW:effects-at-boundaries] Pure: the symbols a text defines and the symbols it uses, each once.
+function symbolsOf(text) {
+  return foldSymbols(scanLines(text.split('\n')));
+}
+
 // [LAW:one-source-of-truth] The changed lines of a patch are the lines fileChurn (src/diff.js) counts —
-// a `+` or `-` at column 0 — read here as text rather than tallied. A file with no patch (binary, or
-// too large for the host to render) changed nothing this module can see.
+// a `+` or `-` at column 0. A changed line's meaning depends on the block around it, which a spliced list
+// of changed lines no longer has (a member added to an unchanged `var (` group loses its opener; a
+// replaced opener whose `)` is context leaks its group over every later hunk). So each hunk is scanned
+// on its own, one side at a time — the old side (context and `-` lines) and the new side (context and
+// `+` lines) — with the block its section heading names (git writes the nearest preceding unindented
+// line after the `@@ … @@`, which for a line deep in a Go group is the `var (` itself) standing before a
+// GAP; and only the changed lines' symbols are kept. A file with no patch (binary, or too large for the
+// host to render) changed nothing this module can see.
 function changedSymbolsOf(patch) {
-  if (!patch) return symbolsOf('');
-  const changed = patch.split('\n').filter(line => line[0] === '+' || line[0] === '-').map(line => line.slice(1));
-  return symbolsOf(changed.join('\n'));
+  const hunks = [{ heading: GAP, old: [], new: [] }];
+  for (const line of (patch ?? '').split('\n')) {
+    const header = /^@@[^@]*@@ ?(.*)$/.exec(line);
+    if (header) {
+      hunks.push({ heading: header[1], old: [], new: [] });
+      continue;
+    }
+    const hunk = hunks[hunks.length - 1];
+    const entry = { text: line.slice(1), changed: line[0] !== ' ' };
+    if (line[0] === ' ' || line[0] === '-') hunk.old.push(entry);
+    if (line[0] === ' ' || line[0] === '+') hunk.new.push(entry);
+  }
+  return foldSymbols(hunks.flatMap(({ heading, old, new: added }) => [old, added].flatMap((side) => {
+    const scanned = scanLines([heading, GAP, ...side.map(e => e.text)]).slice(2);
+    return scanned.filter((_, i) => side[i].changed);
+  })));
 }
 
 // [LAW:effects-at-boundaries] Pure: the seams among a changed set, as weighted unordered pairs.

@@ -230,7 +230,7 @@ describe('partitionByDirectory — the size dimension', () => {
     assert.deepEqual(src.reads, ['lib/c.js']);
     assert.match(src.focus, new RegExp(`^Review the changes to src/a\\.js, src/b\\.js in src\\.`));
     assert.match(src.focus, /The change couples these files to yours — lib\/c\.js — and other scopes own them\./);
-    assert.match(src.focus, /Read those files in full too: the seam between your files and theirs is yours to check, and a defect you notice in one of them is recorded, never left for the worker that owns it\./);
+    assert.match(src.focus, /Read those files in full too: how your files and theirs fit together is yours to check, and a defect you notice in one of them is recorded, never left for the worker that owns it\./);
     assert.doesNotMatch(src.focus, /reviewed in parts for size/);
     assert.match(src.focus, /Also read the files they import and check each connection/);
     // The seam is unordered: lib reads src/a.js by the same seam, and its focus says so.
@@ -313,7 +313,7 @@ describe('partitionByDirectory — the size dimension', () => {
     assert.equal(scopes.length, 9);
     assert.deepEqual(scopes.map(s => s.reads.length), [1, 1, 1, 1, 1, 1, 1, 1, 1]);
     assert.deepEqual(scopes.map(s => s.reads[0]), ['src/b.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js', 'src/a.js']);
-    assert.match(context, /covered 9 of 72 coupled reads; 63 left unread beyond their owner/);
+    assert.match(context, /covered 9 of 72 second reads; 63 left unread beyond their owner \(0 on a detected seam\)/);
   });
 
   test('the cut goes as fine as the cap asks: a part reads its seams, not the whole group, so the read budget no longer bounds the part count', () => {
@@ -387,7 +387,7 @@ describe('partitionByDirectory — the seam reads', () => {
     assert.equal(spent, 400);
     // a↔b weighs 5, a↔c 4, then a↔d, b↔c 3, b↔d 2, c↔d 1: the eight reads are the heaviest eight candidates.
     assert.deepEqual(readsOf(scopes), { a: ['b/x.js', 'c/x.js', 'd/x.js'], b: ['a/x.js', 'c/x.js'], c: ['a/x.js', 'b/x.js'], d: ['a/x.js'] });
-    assert.match(context, /The read ceiling \(one further read of the changed set, 400 lines\) covered 8 of 12 coupled reads; 4 left unread beyond their owner, heaviest first: d\/x\.js \(for b\), b\/x\.js \(for d\), d\/x\.js \(for c\), c\/x\.js \(for d\)\.$/);
+    assert.match(context, /The read ceiling \(one further read of the changed set, 400 lines\) covered 8 of 12 second reads; 4 left unread beyond their owner \(4 on a detected seam\), heaviest first: d\/x\.js \(for b\), b\/x\.js \(for d\), d\/x\.js \(for c\), c\/x\.js \(for d\)\.$/);
   });
 
   test('a read that no longer fits is passed over for a lighter one that does: the budget is spent, not stopped at', () => {
@@ -401,7 +401,7 @@ describe('partitionByDirectory — the seam reads', () => {
     ];
     const { scopes, context } = partitionByDirectory(sized(Object.keys(lines), lines), seams);
     assert.deepEqual(readsOf(scopes), { doc: [], lib: ['src/b.js', 'src/a.js', 'doc/x.md'], src: ['lib/big.js', 'lib/small.js'] });
-    assert.match(context, /covered 5 of 6 coupled reads; 1 left unread beyond their owner, heaviest first: lib\/big\.js \(for doc\)\.$/);
+    assert.match(context, /covered 5 of 6 second reads; 1 left unread beyond their owner \(1 on a detected seam\), heaviest first: lib\/big\.js \(for doc\)\.$/);
   });
 
   test('a scope never reads a file it owns, whatever the seams say, and reads are listed in coupling order', () => {

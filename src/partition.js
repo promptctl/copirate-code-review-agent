@@ -167,7 +167,7 @@ function focusFor(dir, files, reads) {
       ? ` This concern is reviewed in parts for size; the rest of it that you also read — ${siblings.join(', ')} — is owned by sibling parts.`
       : '')
     + (reads.length > 0
-      ? ' Read those files in full too: the seam between your files and theirs is yours to check, and a defect you '
+      ? ' Read those files in full too: how your files and theirs fit together is yours to check, and a defect you '
         + 'notice in one of them is recorded, never left for the worker that owns it.'
       : '');
   return `Review the changes to ${files.join(', ')} in ${where}.${seam} Also read the files they import and check `
@@ -338,13 +338,16 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, lane
     .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i].map(r => r.file) }))
     .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
-  // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
-  // cross-file defect on it has no second reader — and it is said in the one line every worker and the
-  // posted summary read, never left to be inferred from a shorter reads list. Full coverage says nothing.
+  // [LAW:no-silent-failure] A second read the budget could not cover is a coverage fact about THIS plan —
+  // a cross-file defect there has no second reader — and it is said in the one line every worker and the
+  // posted summary read, never left to be inferred from a shorter reads list. A candidate is a detected
+  // seam or a sibling part of a cut concern at no detected coupling, and the line says how many of the
+  // unread are the former, so a lost seam is not diluted by a many-part cut's siblings. Full coverage says nothing.
   const shown = unread.slice(0, UNREAD_SEAMS_SHOWN);
   const unreadNote = unread.length > 0
     ? ` The read ceiling (one further read of the changed set, ${[...linesByPath.values()].reduce((a, b) => a + b, 0)} lines) covered `
-      + `${covered} of ${covered + unread.length} coupled reads; ${unread.length} left unread beyond their owner, heaviest first: `
+      + `${covered} of ${covered + unread.length} second reads; ${unread.length} left unread beyond their owner `
+      + `(${unread.filter(c => c.coupling > 0).length} on a detected seam), heaviest first: `
       + `${shown.map(c => `${c.file} (for ${owned[c.scope].name})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
     : '';
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `

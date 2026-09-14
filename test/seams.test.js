@@ -28,17 +28,30 @@ describe('symbolsOf — what a text defines and mentions', () => {
       'export async function fetchAll() {}', 'export interface Scope {}', 'export type Plan = {};',
       '  if (x) {', '  for (const y of z) {', '  } catch (e) {',
     ].join('\n');
-    assert.deepEqual(symbolsOf(js).defines, ['Ledger', 'Plan', 'SCHEMA', 'Scope', 'fetchAll', 'flush', 'merge', 'parsePlan', 'planRecord']);
+    assert.deepEqual(symbolsOf(js).defines, ['Ledger', 'Plan', 'SCHEMA', 'Scope', 'count', 'fetchAll', 'flush', 'merge', 'parsePlan', 'planRecord']);
   });
 
   test('Python, Rust and shell declaration forms', () => {
     const text = ['def score(run):', 'class Judge:', '    threshold = 0.5', 'pub fn render(x: u8) {}', 'pub(crate) struct Case {}', 'freeze_case() {', '}', 'function verify_tasks {'].join('\n');
-    assert.deepEqual(symbolsOf(text).defines, ['Case', 'Judge', 'freeze_case', 'render', 'score', 'verify_tasks']);
+    assert.deepEqual(symbolsOf(text).defines, ['Case', 'Judge', 'freeze_case', 'render', 'score', 'threshold', 'verify_tasks']);
   });
 
-  test('an indented assignment defines a name only inside a Go grouped declaration: a reassigned local is not a definition', () => {
-    const go = ['func f() error {', '\terr = g()', '\tcount = 0', '\treturn err', '}', 'var (', '\tErrNoRows = errors.New("x")', '\ttimeout time.Duration', ')', 'const (', '\tA = iota', '\tB', ')'].join('\n');
+  test('an indented assignment defines a name only as a member of a declaration block: a reassigned local is not a definition', () => {
+    const go = ['func f() error {', '\terr = g()', '\tcount = 0', '\treturn err', '}', 'var (', '\tErrNoRows = errors.New("x")', '\ttimeout time.Duration', ')', 'const ( // modes', '\tA = iota', '\tB', ')'].join('\n');
     assert.deepEqual(symbolsOf(go).defines, ['A', 'B', 'ErrNoRows', 'f', 'timeout']);
+    // A class body's members are definitions; its methods' locals, one indent deeper, are not.
+    const py = ['class Judge:', '    threshold: float = 0.5', '    def score(self, run):', '        result = run.total', '        return result'].join('\n');
+    assert.deepEqual(symbolsOf(py).defines, ['Judge', 'score', 'threshold']);
+    const ts = ['export class Ledger {', '  private count: number;', '  limit = 10;', '  merge(findings) {', '    total = findings.length;', '  }', '}', 'total = 0;'].join('\n');
+    assert.deepEqual(symbolsOf(ts).defines, ['Ledger', 'count', 'limit', 'merge']);
+  });
+
+  test('a Go group member sits at one tab: a wrapped value is not a member, and a group inside a function holds locals', () => {
+    const go = [
+      'var (', '\tdefaults = Config{', '\t\tTimeout: 30 * time.Second,', '\t\tretry(3),', '\t}', ')',
+      'func run() {', '\tvar (', '\t\tresult = 1', '\t\terr error', '\t)', '}',
+    ].join('\n');
+    assert.deepEqual(symbolsOf(go).defines, ['defaults', 'run']);
   });
 
   test('a use is call-shaped: a bare word in prose or a hash line is neither a definition nor a use', () => {
@@ -64,6 +77,26 @@ describe('changedSymbolsOf — the symbols on the changed lines of a patch', () 
     assert.deepEqual(changedSymbolsOf(patch), { defines: ['fresh', 'old'], uses: ['fresh', 'helper', 'old'] });
     assert.deepEqual(changedSymbolsOf(undefined), { defines: [], uses: [] });
   });
+
+  test('a changed member of a Go group is a definition when the hunk holds the opener, or its section heading names it', () => {
+    const inHunk = '@@ -1,4 +1,5 @@\n var (\n \tErrA = errors.New("a")\n+\tErrB = errors.New("b")\n )';
+    assert.deepEqual(changedSymbolsOf(inHunk), { defines: ['ErrB'], uses: ['New'] });
+    const deep = '@@ -40,6 +40,6 @@ var (\n \tErrY = errors.New("y")\n-\tErrZ = errors.New("z")\n+\tErrZ = errors.New("zz")\n \tErrW = errors.New("w")';
+    assert.deepEqual(changedSymbolsOf(deep).defines, ['ErrZ']);
+  });
+
+  test('a block never outlives its hunk: an opener whose close is out of view does not make later hunks\' locals definitions', () => {
+    const patch = [
+      '@@ -1,3 +1,3 @@', '-var (', '+const (', ' \tA = 1',
+      '@@ -30,4 +30,4 @@ func f() error {', '-\terr = g()', '+\terr = h()', '-\tcount = 1', '+\tcount = 2',
+    ].join('\n');
+    assert.deepEqual(changedSymbolsOf(patch).defines, []);
+  });
+
+  test('a class named only by the section heading has an unknown member indent: a method local deep in its body is not a member', () => {
+    const patch = '@@ -20,6 +20,6 @@ class Judge:\n         total = 0\n-        result = 1\n+        result = 2';
+    assert.deepEqual(changedSymbolsOf(patch).defines, []);
+  });
 });
 
 describe('seamsOf — the weighted seams among a changed set', () => {
@@ -87,6 +120,12 @@ describe('seamsOf — the weighted seams among a changed set', () => {
     const b2 = file('src/b.js', 'function other() {}', '@@ -1,2 +1,2 @@\n-function helper() {}\n+function other() {}');
     const a2 = file('src/a.js', 'helper(); other();', '@@ -1 +1 @@\n+other();');
     assert.deepEqual(seamsOf([a2, b2]), [{ a: 'src/a.js', b: 'src/b.js', weight: 2 }]);
+  });
+
+  test('a changed Go group member deep in its group is a seam to a file that uses it, through the hunk\'s section heading', () => {
+    const errs = file('errs.go', 'var (\n\tErrNoRows = errors.New("no rows")\n)', '@@ -12,5 +12,5 @@ var (\n-\tErrNoRows = errors.New("none")\n+\tErrNoRows = errors.New("no rows")');
+    const rows = file('rows.go', 'func (r *Rows) Next() error { return driver.ErrNoRows }', '@@ -1 +1 @@\n context');
+    assert.deepEqual(seamsOf([errs, rows]), [{ a: 'errs.go', b: 'rows.go', weight: 1 }]);
   });
 
   test('two files that share no touched symbol have no seam, and unchanged uses of unchanged definitions are none either', () => {
