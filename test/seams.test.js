@@ -69,6 +69,12 @@ describe('symbolsOf — what a text defines and mentions', () => {
   test('a comparison is not a definition, and a block keyword with parentheses is not a method', () => {
     assert.deepEqual(symbolsOf('  if (a == b) {\n  while (x) {\n  ok == 1').defines, []);
   });
+
+  test('a control keyword is never a symbol: a class body\'s else: is not a member, and } else { is not a use', () => {
+    const py = ['class Loader:', '    try:', '        import fast', '    except ImportError:', '        fast = None', '    else:', '        ready = True', '    finally:', '        done = 1'].join('\n');
+    assert.deepEqual(symbolsOf(py).defines, ['Loader']);
+    assert.deepEqual(symbolsOf('if (a) { x(); } else { y(); }\ntry { z(); } finally { w(); }\ndo { v(); } while (u);').uses, ['v', 'w', 'x', 'y', 'z']);
+  });
 });
 
 describe('changedSymbolsOf — the symbols on the changed lines of a patch', () => {

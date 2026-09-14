@@ -39117,7 +39117,9 @@ const DEFINITION_SHAPES = [
   // with parentheses (if, for, while, switch, catch) are the shapes this rule must NOT read as methods.
   /^\s+(?:(?:static|async|public|private|protected|readonly|override)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*(?::[^{;]*)?\{\s*$/,
 ];
-const BLOCK_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
+// The control keywords a definition or use shape can capture — `if (`, `} else {`, `try {`, a Python class
+// body's `else:` — are never symbols. Every name a line yields passes this one filter. [LAW:single-enforcer]
+const BLOCK_KEYWORDS = new Set(['if', 'else', 'for', 'do', 'while', 'switch', 'try', 'catch', 'finally', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
 // [LAW:one-type-per-behavior] A declaration BLOCK: a line that opens a body whose members, at exactly one
 // indent, are definitions — and only there. An indented `name = value` elsewhere is a reassigned local
 // (`err = f()`, `    result = g()`), and reading it as a definition made every file that reassigns
@@ -39149,30 +39151,33 @@ const GAP = null;
 function scanLines(lines) {
   const open = [];
   return lines.map((line) => {
-    const symbols = { defines: [], uses: [] };
+    const none = { defines: [], uses: [] };
     if (line === GAP) {
       for (const block of open) block.memberIndent ??= false;
-      return symbols;
+      return none;
     }
-    if (line.trim() === '') return symbols;
+    if (line.trim() === '') return none;
+    const defines = [];
+    const uses = [];
     const indent = /^\s*/.exec(line)[0];
     while (open.length > 0 && indent.length <= open[open.length - 1].openerIndent) open.pop();
     for (const shape of DEFINITION_SHAPES) {
       const m = shape.exec(line);
-      if (m && !BLOCK_KEYWORDS.has(m[1])) symbols.defines.push(m[1]);
+      if (m) defines.push(m[1]);
     }
     const inside = open[open.length - 1];
     if (inside) {
       inside.memberIndent ??= indent;
       const m = indent === inside.memberIndent && inside.kind.member.exec(line.slice(indent.length));
-      if (m) symbols.defines.push(m[1]);
+      if (m) defines.push(m[1]);
     }
     const kind = BLOCKS.find(b => b.opener.test(line));
     if (kind) open.push({ kind, openerIndent: indent.length, memberIndent: kind.indent });
     for (const shape of [USE_CALL, USE_MEMBER, USE_TYPE]) {
-      for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) symbols.uses.push(m[1]);
+      for (const m of line.matchAll(shape)) uses.push(m[1]);
     }
-    return symbols;
+    const symbol = (name) => !BLOCK_KEYWORDS.has(name);
+    return { defines: defines.filter(symbol), uses: uses.filter(symbol) };
   });
 }
 
