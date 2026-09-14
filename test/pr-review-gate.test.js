@@ -20,6 +20,8 @@
 // Read at require time by @actions/github (context.repo) and src/run.js (REVIEWED_REPO_ROOT).
 process.env.GITHUB_REPOSITORY = 'acme/widget';
 process.env.GITHUB_WORKSPACE = '/home/runner/work/widget/widget';
+// The runner always provides it; run.js writes the change's diff files under it.
+process.env.RUNNER_TEMP = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'pr-review-gate-'));
 // core.getInput reads INPUT_*; every unset input is '' and takes its own off-value, so the budget
 // gradient, difficulty scaling, dependency diff and config file are all off — simple mode.
 Object.assign(process.env, {

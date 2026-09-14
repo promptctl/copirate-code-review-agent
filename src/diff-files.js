@@ -1,6 +1,5 @@
 'use strict';
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { annotatePatchWithLines } = require('./diff');
 
@@ -10,7 +9,9 @@ const { annotatePatchWithLines } = require('./diff');
 // puts the change where those tools reach. A file with no patch (binary, or too large for the host to
 // render) has no diff file, and the prompt names it.
 // [LAW:no-silent-failure] A changed path that resolves outside the directory is refused, never written.
-function writeDiffFiles(files, dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-diffs-'))) {
+// The caller names the directory: the diffs hold the change's code, so they belong under a directory the
+// caller already deletes, never an orphan temp dir that outlives the run.
+function writeDiffFiles(files, dir) {
   const root = path.resolve(dir);
   fs.mkdirSync(root, { recursive: true });
   for (const f of files.filter(file => file.patch)) {

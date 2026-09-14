@@ -374,7 +374,7 @@ function loadDiffFiles(diffPath) {
 // from the `excluded` returned here.
 // [LAW:one-source-of-truth] The diff files are written by the same writer run.js uses (writeDiffFiles), from
 // the same filtered files the anchors come from, so a replay's workers read exactly what a live review's do.
-function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot }) {
+function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot, diffDir }) {
   const { filterFiles } = require('../src/diff');
   const { buildPrMaterial } = require('../src/multiscope');
   const { writeDiffFiles } = require('../src/diff-files');
@@ -384,7 +384,7 @@ function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot }) {
   if (files.length === 0) {
     throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
   }
-  return { files, excluded, material: buildPrMaterial({ files, diffDir: writeDiffFiles(files), reviewedRepoRoot, excluded }) };
+  return { files, excluded, material: buildPrMaterial({ files, diffDir: writeDiffFiles(files, diffDir), reviewedRepoRoot, excluded }) };
 }
 
 // [LAW:no-ambient-temporal-coupling] Drain the engine's frozen TRANSCRIPT_DIR into this run's dir, then
@@ -459,6 +459,8 @@ async function main() {
     const allFiles = loadDiffFiles(manifest.diffPath);
     const { files, excluded, material } = buildCaseMaterial({
       allFiles, excludePatterns: manifest.excludePatterns, reviewedRepoRoot: treeTemp,
+      // Beside the transcripts, never inside the reviewed tree, and removed with stagingTemp below.
+      diffDir: path.join(stagingTemp, 'diffs'),
     });
     if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
 

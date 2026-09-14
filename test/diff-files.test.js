@@ -26,12 +26,6 @@ describe('writeDiffFiles — the change as files a worker reads', () => {
     assert.deepEqual(fs.readdirSync(dir), []);
   });
 
-  test('with no directory given, it writes to a fresh temp directory and returns its path', () => {
-    const dir = writeDiffFiles([{ filename: 'a.js', status: 'modified', patch: '@@ -1 +1 @@\n+x' }]);
-    assert.ok(dir.startsWith(fs.realpathSync(os.tmpdir())) || dir.startsWith(os.tmpdir()), dir);
-    assert.ok(fs.existsSync(path.join(dir, 'a.js.diff')));
-  });
-
   test('a changed path that resolves outside the directory is refused, and nothing is written for it', () => {
     const root = scratch();
     const dir = path.join(root, 'diffs');

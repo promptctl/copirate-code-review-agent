@@ -732,7 +732,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
   // retry timing; the whole plan→workers pass is one attempt per config.
   const anchors = buildReviewAnchors(filteredFiles);
-  const diffDir = writeDiffFiles(filteredFiles);
+  // Under RUNNER_TEMP, which the runner deletes at the end of the job, so the PR's code never outlives it.
+  const diffDir = writeDiffFiles(filteredFiles, fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'review-diffs-')));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
