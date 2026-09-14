@@ -227,29 +227,46 @@ describe('warnBudgetExhausted', () => {
     return warnings;
   }
   test('a coverage gap names the unreviewed scopes', () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: [{ name: 'store', cause: 'budget', kept: 0 }, { name: 'docs', cause: 'budget', kept: 0 }], scopeFailures: [] });
+    const w = captured({ exhaustedBounds: ['time'], unreviewedScopes: [{ name: 'store', cause: 'time', kept: 0 }, { name: 'docs', cause: 'time', kept: 0 }], scopeFailures: [] });
     assert.equal(w.length, 1);
     assert.match(w[0], /2 scope\(s\) went unreviewed \(store, docs\)/);
     assert.match(w[0], /TIME_BUDGET_MINUTES/);
   });
   test('curtailed-only says every scope was reviewed — never a contradictory zero-unreviewed line', () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: [], scopeFailures: [] });
+    const w = captured({ exhaustedBounds: ['time'], unreviewedScopes: [], scopeFailures: [] });
     assert.equal(w.length, 1);
     assert.match(w[0], /every scope was reviewed, but convergence sweeps were cut short/);
     assert.doesNotMatch(w[0], /0 scope\(s\)/);
   });
   test("a scope unreviewed because its worker died is not the budget's to name, and coverage is not claimed", () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: [{ name: 'store', cause: 'failure', kept: 0 }], scopeFailures: [{ scope: 'store', pass: 0, message: 'boom' }] });
+    const w = captured({ exhaustedBounds: ['time'], unreviewedScopes: [{ name: 'store', cause: 'failure', kept: 0 }], scopeFailures: [{ scope: 'store', pass: 0, message: 'boom' }] });
     assert.equal(w.length, 1);
     assert.match(w[0], /Review time budget exhausted: convergence sweeps were cut short\./);
     assert.doesNotMatch(w[0], /every scope was reviewed|store/);
   });
   test("a budget-killed scope's kept findings are named with it", () => {
-    const w = captured({ budgetExhausted: true, unreviewedScopes: [{ name: 'store', cause: 'budget', kept: 2 }], scopeFailures: [] });
+    const w = captured({ exhaustedBounds: ['time'], unreviewedScopes: [{ name: 'store', cause: 'time', kept: 2 }], scopeFailures: [] });
     assert.match(w[0], /1 scope\(s\) went unreviewed \(store \(2 recorded finding\(s\) kept\)\)/);
   });
-  test('a budget that never bit warns nothing', () => {
-    assert.deepEqual(captured({ budgetExhausted: false, unreviewedScopes: [], scopeFailures: [] }), []);
+  test('a run that reached no bound warns nothing', () => {
+    assert.deepEqual(captured({ exhaustedBounds: [], unreviewedScopes: [], scopeFailures: [] }), []);
+  });
+  test('the token cap names its own knob and the scopes it stopped', () => {
+    const w = captured({ exhaustedBounds: ['tokens'], unreviewedScopes: [{ name: 'store', cause: 'tokens', kept: 1 }], scopeFailures: [] });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /^Review token cap reached: 1 scope\(s\) went unreviewed \(store \(1 recorded finding\(s\) kept\)\)/);
+    assert.match(w[0], /MAX_REVIEW_TOKENS/);
+    assert.doesNotMatch(w[0], /TIME_BUDGET_MINUTES/);
+  });
+  test('a run both bounds bit warns once per bound, each naming only the scopes it stopped', () => {
+    const w = captured({
+      exhaustedBounds: ['time', 'tokens'],
+      unreviewedScopes: [{ name: 'store', cause: 'time', kept: 0 }, { name: 'docs', cause: 'tokens', kept: 0 }],
+      scopeFailures: [],
+    });
+    assert.equal(w.length, 2);
+    assert.match(w[0], /^Review time budget exhausted: 1 scope\(s\) went unreviewed \(store\).*TIME_BUDGET_MINUTES/);
+    assert.match(w[1], /^Review token cap reached: 1 scope\(s\) went unreviewed \(docs\).*MAX_REVIEW_TOKENS/);
   });
 });
 

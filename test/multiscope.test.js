@@ -26,11 +26,13 @@ const { partitionByDirectory } = require('../src/partition');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { fileChurn } = require('../src/diff');
 const { TransientError } = require('../src/failover');
-const { DeadlineExceededError } = require('../src/deadline');
+const { BudgetExhaustedError } = require('../src/bounds');
+const { mintTokenCap } = require('../src/token-cap');
 
 // The spawn seam's stamp (src/engine/cli.js): every error out of produceReview carries what the worker
-// RECORDED before it died. A fake spawn dies the same way, so the chain reads a value it is owed.
-const died = (err, recorded = { findings: [], assessments: [] }) => Object.assign(err, { recorded });
+// RECORDED before it died, and what the spawn spent (its usage record, null when nothing ran). A fake
+// spawn dies the same way, so the chain reads values it is owed.
+const died = (err, recorded = { findings: [], assessments: [] }, usage = null) => Object.assign(err, { recorded, usage });
 // An unreviewed scope as the coverage record names it: name, cause, and what its dead worker kept.
 const gap = (name, cause, kept = 0) => ({ name, cause, kept });
 const { totalInputTokens } = require('../src/usage');
@@ -382,9 +384,9 @@ describe('sweepsByDepth', () => {
     const chains = [
       [{ added: 2, curtailed: false }, { added: 0, curtailed: false }], // converged at sweep 2
       [{ added: 0, curtailed: false }],                                  // converged at sweep 1
-      [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'budget' } }],   // the budget took its sweep 2
+      [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'time' } }],   // the budget took its sweep 2
     ];
-    assert.deepEqual(sweepsByDepth(chains), [{ added: 3, curtailed: [] }, { added: 0, curtailed: ['budget'] }]);
+    assert.deepEqual(sweepsByDepth(chains), [{ added: 3, curtailed: [] }, { added: 0, curtailed: ['time'] }]);
   });
   test('no sweeps anywhere folds to [] — the value the summary renders as nothing', () => {
     assert.deepEqual(sweepsByDepth([[], []]), []);
@@ -399,7 +401,7 @@ describe('runScopeChain', () => {
   const bug = (body) => ({ path: 'a.js', line: 1, body, severity: 3 });
   const chainArgs = (spawn, extra = {}) => ({
     scope, context: '', material, spawn, log: () => {}, ledger: findingsLedger(), sweepCap: 3,
-    deadline: null, now: Date.now, runningTotal: () => 'elapsed unclocked (no budget)', ...extra,
+    deadline: null, tokenCap: mintTokenCap(0), now: Date.now, runningTotal: () => 'elapsed unclocked (no budget)', ...extra,
   });
   // A fake spawn seam: findingsFor(pass, prompt) answers this scope's pass-th spawn.
   const spawnOf = (findingsFor) => {
@@ -447,21 +449,21 @@ describe('runScopeChain', () => {
     let spawned = 0;
     const spawn = async () => { spawned++; };
     const out = await runScopeChain(chainArgs(spawn, { deadline: 100, now: () => 200 }));
-    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'budget' } }]);
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'time' } }]);
     assert.equal(spawned, 0);
   });
 
   test('a deadline kill at pass 0 settles the same way as a refusal', async () => {
-    const spawn = async () => { throw died(new DeadlineExceededError('killed')); };
+    const spawn = async () => { throw died(new BudgetExhaustedError('time', 'killed')); };
     const out = await runScopeChain(chainArgs(spawn, { deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'budget' } }]);
+    assert.deepEqual(out.passes, [{ added: 0, curtailed: { cause: 'time' } }]);
   });
 
   test("the budget taking a SWEEP curtails the chain; pass 0's judgment stands", async () => {
-    const spawn = spawnOf((pass) => { if (pass > 0) throw died(new DeadlineExceededError('killed in the sweep')); return [bug('one')]; });
+    const spawn = spawnOf((pass) => { if (pass > 0) throw died(new BudgetExhaustedError('time', 'killed in the sweep')); return [bug('one')]; });
     const ledger = findingsLedger();
     const out = await runScopeChain(chainArgs(spawn, { ledger, deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'budget' } }]);
+    assert.deepEqual(out.passes, [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'time' } }]);
     assert.deepEqual(ledger.findings.map(f => f.body), ['one']);
   });
 
@@ -515,11 +517,11 @@ describe('runScopeChain', () => {
   });
 
   test('a deadline kill at pass 0 keeps what the worker recorded, under the budget cause', async () => {
-    const spawn = async () => { throw died(new DeadlineExceededError('killed'), { findings: [bug('one')], assessments: [] }); };
+    const spawn = async () => { throw died(new BudgetExhaustedError('time', 'killed'), { findings: [bug('one')], assessments: [] }); };
     const ledger = findingsLedger();
     const logs = [];
     const out = await runScopeChain(chainArgs(spawn, { ledger, deadline: Date.now() + 3_600_000, log: (m) => logs.push(m) }));
-    assert.deepEqual(out.passes, [{ added: 1, curtailed: { cause: 'budget' } }]);
+    assert.deepEqual(out.passes, [{ added: 1, curtailed: { cause: 'time' } }]);
     assert.deepEqual(ledger.findings.map(f => f.body), ['one']);
     assert.ok(logs.includes("scope 'a' not reviewed — time budget exhausted (1 recorded finding(s) kept)"), JSON.stringify(logs));
   });
@@ -1358,10 +1360,11 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   const config = { engine: 'fake', name: 'c1' };
 
   function makeRegistry({ workerBehavior }) {
-    const calls = { scout: 0, workers: {}, deadlines: [] };
+    const calls = { scout: 0, workers: {}, deadlines: [], tokenCaps: [] };
     const adapter = {
-      async produceReview({ buildPromptFor, deadline }) {
+      async produceReview({ buildPromptFor, deadline, tokenCap }) {
         calls.deadlines.push(deadline);
+        calls.tokenCaps.push(tokenCap);
         const prompt = buildPromptFor({});
         if (prompt === 'SCOUT') {
           calls.scout++;
@@ -1388,15 +1391,15 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   test("a deadline-killed pass-0 worker yields a PARTIAL review: siblings' findings delivered, the gap carried as data, no in-place retry", async () => {
     const { registry, calls } = makeRegistry({
       workerBehavior: ({ scope }) => {
-        if (scope.name === 'b') throw died(new DeadlineExceededError('killed at the deadline'));
+        if (scope.name === 'b') throw died(new BudgetExhaustedError('time', 'killed at the deadline'));
         return okResult(scope);
       },
     });
     const logs = [];
     const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000, log: m => logs.push(m) }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
-    assert.deepEqual(review.unreviewedScopes, [gap('b', 'budget')]);
-    assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'time')]);
+    assert.deepEqual(review.exhaustedBounds, ['time']);
     assert.equal(calls.workers.b, 1); // a spent budget is not retried in place
     assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
     assert.match(review.summary, /Time budget exhausted.*2 of 3 scope\(s\).*NOT reviewed: b/);
@@ -1409,21 +1412,17 @@ describe('runMultiScopePass — wall-clock time budget', () => {
   });
 
   // The killed spawn's burned wall clock reaches the pass total (zai-timing-31d.4): the span rides
-  // the DeadlineExceededError out of the worker pool as a span-only usage and widens the envelope.
+  // the BudgetExhaustedError out of the worker pool as a span-only usage and widens the envelope.
   test("a deadline-killed worker's span still widens the pass usage envelope", async () => {
     const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
     const { registry } = makeRegistry({
       workerBehavior: ({ scope }) => {
-        if (scope.name === 'b') {
-          const err = new DeadlineExceededError('killed at the deadline');
-          err.span = span;
-          throw died(err);
-        }
+        if (scope.name === 'b') throw died(new BudgetExhaustedError('time', 'killed at the deadline'), undefined, { span });
         return okResult(scope);
       },
     });
     const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(review.unreviewedScopes, [gap('b', 'budget')]);
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'time')]);
     // Every reviewed spawn reported usage:null here, so the killed spawn's span IS the envelope.
     assert.deepEqual(review.usage.span, span);
     assert.equal(review.usage.tokens, null);
@@ -1431,25 +1430,25 @@ describe('runMultiScopePass — wall-clock time budget', () => {
 
   test('the budget expiring before ANY scope completes fails fast, naming the knob', async () => {
     const { registry } = makeRegistry({
-      workerBehavior: () => { throw died(new DeadlineExceededError('killed')); },
+      workerBehavior: () => { throw died(new BudgetExhaustedError('time', 'killed')); },
     });
     await assert.rejects(
       runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 })),
-      (err) => err instanceof DeadlineExceededError && /before any scope completed/.test(err.message) && /TIME_BUDGET_MINUTES/.test(err.message),
+      (err) => err instanceof BudgetExhaustedError && /before any scope completed/.test(err.message) && /TIME_BUDGET_MINUTES/.test(err.message),
     );
   });
 
   test('deadline-killed SWEEP workers curtail convergence without touching pass-0 coverage', async () => {
     const { registry } = makeRegistry({
       workerBehavior: ({ scope, sweep }) => {
-        if (sweep) throw died(new DeadlineExceededError('killed in the sweep'));
+        if (sweep) throw died(new BudgetExhaustedError('time', 'killed in the sweep'));
         return okResult(scope);
       },
     });
     const review = await runMultiScopePass(passArgs(registry, { sweepCap: 2, deadline: Date.now() + 3_600_000 }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
     assert.deepEqual(review.unreviewedScopes, []); // pass 0's judgments of record stand
-    assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.exhaustedBounds, ['time']);
     assert.match(review.summary, /every scope was reviewed, but convergence sweeps were cut short/);
   });
 
@@ -1467,7 +1466,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     };
     const review = await runMultiScopePass(passArgs(registry, { sweepCap: 2, deadline: 100, now: () => clock, log }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'b.js', 'c.js']);
-    assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.exhaustedBounds, ['time']);
     assert.deepEqual(review.unreviewedScopes, []);
     assert.equal(Object.values(calls.workers).reduce((a, b) => a + b, 0), SCOPES.length); // pass 0 only — no sweep spawned
     for (const s of SCOPES) assert.ok(logs.includes(`sweep 1 scope '${s.name}' not reviewed — time budget exhausted`), JSON.stringify(logs));
@@ -1487,8 +1486,84 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     const { registry } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
     const review = await runMultiScopePass(passArgs(registry));
     assert.deepEqual(review.unreviewedScopes, []);
-    assert.equal(review.budgetExhausted, false);
+    assert.deepEqual(review.exhaustedBounds, []);
     assert.doesNotMatch(review.summary, /Time budget/);
+  });
+
+  // ── the token cap takes the same degradation path, under its own name (zai-token-cap-zya) ─────────
+  test("a pass-0 worker the token cap stops yields a PARTIAL review naming the cap, not the time budget", async () => {
+    const { registry, calls } = makeRegistry({
+      workerBehavior: ({ scope }) => {
+        if (scope.name === 'b') throw died(new BudgetExhaustedError('tokens', 'killed at the cap'));
+        return okResult(scope);
+      },
+    });
+    const logs = [];
+    const review = await runMultiScopePass(passArgs(registry, { log: m => logs.push(m) }));
+    assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'tokens')]);
+    assert.deepEqual(review.exhaustedBounds, ['tokens']);
+    assert.equal(calls.workers.b, 1); // a spent cap is not retried in place
+    assert.match(review.summary, /🪙 \*\*Token cap reached\*\* — 2 of 3 scope\(s\) were reviewed; NOT reviewed: b\./);
+    assert.doesNotMatch(review.summary, /Time budget/);
+    assert.ok(logs.includes("scope 'b' not reviewed — token cap reached"), JSON.stringify(logs));
+  });
+
+  test('when no scope completed and both bounds stopped scopes, the failure names both knobs', async () => {
+    const { registry } = makeRegistry({
+      workerBehavior: ({ scope }) => {
+        throw died(new BudgetExhaustedError(scope.name === 'a' ? 'time' : 'tokens', 'stopped'));
+      },
+    });
+    await assert.rejects(
+      runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 })),
+      (e) => e instanceof BudgetExhaustedError && e.bound === 'time'
+        && /time budget and token cap were reached before any scope completed/.test(e.message)
+        && /TIME_BUDGET_MINUTES/.test(e.message) && /MAX_REVIEW_TOKENS/.test(e.message),
+    );
+  });
+
+  test('a spent cap refuses every pass before a worker spawns, and the run fails naming MAX_REVIEW_TOKENS', async () => {
+    const { registry, calls } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
+    const tokenCap = mintTokenCap(100);
+    const spent = tokenCap.open();
+    spent.observe(100);
+    spent.settle(100);
+    await assert.rejects(
+      runMultiScopePass(passArgs(registry, { tokenCap })),
+      (e) => e instanceof BudgetExhaustedError && e.bound === 'tokens'
+        && /token cap was reached before any scope completed — no review to deliver\. Raise MAX_REVIEW_TOKENS/.test(e.message),
+    );
+    assert.deepEqual(calls.workers, {}, 'no worker spawned against a spent cap');
+  });
+
+  test("every spawn of the pass is handed the run's one cap", async () => {
+    const { registry, calls } = makeRegistry({ workerBehavior: ({ scope }) => okResult(scope) });
+    const tokenCap = mintTokenCap(1_000_000);
+    await runMultiScopePass(passArgs(registry, { tokenCap }));
+    assert.ok(calls.tokenCaps.length >= SCOPES.length);
+    assert.ok(calls.tokenCaps.every(c => c === tokenCap));
+  });
+
+  test('failover to the next config spends from the same cap — a restart never resets the count', async () => {
+    const caps = [];
+    const adapter = {
+      async produceReview({ config: used, buildPromptFor, tokenCap }) {
+        caps.push({ config: used.name, tokenCap });
+        if (used.name === 'c1') throw new TransientError('rate-limited');
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: null };
+        return okResult(SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`)));
+      },
+    };
+    const tokenCap = mintTokenCap(1_000_000);
+    const { configUsed } = await runMultiScope({
+      chain: [{ engine: 'fake', name: 'c1' }, { engine: 'fake', name: 'c2' }],
+      material, registry: { get: () => adapter }, instructionsPath: 'x', log: () => {}, sleepFn: async () => {}, tokenCap,
+    });
+    assert.equal(configUsed.name, 'c2');
+    assert.ok(caps.some(c => c.config === 'c1') && caps.some(c => c.config === 'c2'), JSON.stringify(caps.map(c => c.config)));
+    assert.ok(caps.every(c => c.tokenCap === tokenCap));
   });
 });
 
@@ -1598,7 +1673,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
         if (scope.name === 'b' && !sweep && !blipped) {
           blipped = true;
           const err = new TransientError('API Error: terminated');
-          err.span = span(30, 45); // the failed attempt burned 15 minutes, ending past every success
+          err.usage = { span: span(30, 45) }; // the failed attempt burned 15 minutes, ending past every success
           throw err;
         }
         return null;
@@ -1618,24 +1693,43 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     const registry = makeRegistry({
       workerBehavior: ({ scope, sweep }) => {
         if (scope.name === 'b' && !sweep) {
-          const err = new DeadlineExceededError('killed at the deadline');
-          err.span = span(10, 50); // burned 40 minutes before the kill — the latest instant in the pass
-          throw died(err);
+          // burned 40 minutes before the kill — the latest instant in the pass
+          throw died(new BudgetExhaustedError('time', 'killed at the deadline'), undefined, { span: span(10, 50) });
         }
         return null;
       },
     });
     const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(review.unreviewedScopes, [gap('b', 'budget')]);
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'time')]);
     const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
     assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage: { span: span(10, 50) } }]);
     assert.equal(review.usage.span.to, at(50));
   });
 
+  // zai-token-cap-zya: a spawn the cap killed spent real tokens, and the pass total is the figure an
+  // operator sizes MAX_REVIEW_TOKENS by — so the killed spawn's metered tokens reach it, and its
+  // unreported cost marks the pass's cost unpriced instead of vanishing from a dollar total.
+  test("a cap-killed scope's metered tokens reach the pass total, and its unreported cost is not silently dropped", async () => {
+    const usage ={ tokens: { inputCacheMiss: 1_000, inputCacheHit: 4_000, output: 0 }, cost: { basis: 'unpriced', reason: 'not-reported' }, span: span(10, 50) };
+    const registry = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (scope.name === 'b' && !sweep) throw died(new BudgetExhaustedError('tokens', 'killed at the cap'), undefined, usage);
+        return null;
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry));
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'tokens')]);
+    const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
+    assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage }]);
+    // Every completed spawn here reported a span and no tokens, so the pass's tokens ARE the killed spawn's.
+    assert.deepEqual(review.usage.tokens, usage.tokens);
+    assert.equal(review.usage.cost.basis, 'unpriced');
+  });
+
   test('a spawn the deadline gate refused outright (nothing ran) records a usage-less failure', async () => {
     const registry = makeRegistry({
       workerBehavior: ({ scope, sweep }) => {
-        if (scope.name === 'b' && !sweep) throw died(new DeadlineExceededError('spawn refused: budget exhausted'));
+        if (scope.name === 'b' && !sweep) throw died(new BudgetExhaustedError('time', 'spawn refused: budget exhausted'));
         return null;
       },
     });
@@ -1683,7 +1777,7 @@ describe('the pass stamps unique scope names', () => {
     const summary = composeSummary(
       'Splits the sync path in two.',
       [{ name: 'sync', focus: 'f1', files: [] }, { name: 'sync (2)', focus: 'f2', files: [] }],
-      { unreviewed: [{ name: 'sync (2)', cause: 'budget' }], scopeFailures: [], sweeps: [], budgetExhausted: true },
+      { unreviewed: [{ name: 'sync (2)', cause: 'time' }], scopeFailures: [], sweeps: [], exhaustedBounds: ['time'] },
     );
     assert.match(summary, /Reviewed 1 scope\(s\): sync\./);
     assert.match(summary, /1 of 2 scope\(s\) were reviewed; NOT reviewed: sync \(2\)/);
@@ -1823,7 +1917,7 @@ describe('runMultiScopePass — phase timings stream to the run log live', () =>
 // The precedent is the deadline: a scope the budget took is absorbed as data, never as a fail-loud
 // rethrow that discards sibling findings. A worker whose spawn fails on an error no retry fixes — a
 // context-window overflow ("Prompt is too long"), a crashed CLI — now settles the same way, with its
-// cause and message carried as data (scopeFailures) beside the budget's (budgetExhausted).
+// cause and message carried as data (scopeFailures) beside the bounds' (exhaustedBounds).
 describe('runMultiScopePass — a terminally failed scope worker', () => {
   const SCOPES = [
     { name: 'a', focus: 'fa', files: [] },
@@ -1862,7 +1956,7 @@ describe('runMultiScopePass — a terminally failed scope worker', () => {
     const review = await runMultiScopePass(passArgs(registry, { log: m => logs.push(m) }));
     assert.deepEqual(review.findings.map(f => f.path).sort(), ['a.js', 'c.js']);
     assert.deepEqual(review.unreviewedScopes, [gap('b', 'failure')]);
-    assert.equal(review.budgetExhausted, false); // nothing here is the budget's doing
+    assert.deepEqual(review.exhaustedBounds, []); // nothing here is the budget's doing
     assert.deepEqual(review.scopeFailures, [{ scope: 'b', pass: 0, message: overflow().message }]);
     assert.equal(calls.workers.b, 1); // a terminal failure is not retried in place
     assert.match(review.summary, /Reviewed 2 scope\(s\): a, c\./);
@@ -1875,7 +1969,7 @@ describe('runMultiScopePass — a terminally failed scope worker', () => {
 
   test('every worker failing rethrows the first failure itself — never a budget error the run did not spend', async () => {
     const { registry } = makeRegistry(() => { throw overflow(); });
-    await assert.rejects(runMultiScopePass(passArgs(registry)), (e) => !(e instanceof DeadlineExceededError) && /Prompt is too long/.test(e.message));
+    await assert.rejects(runMultiScopePass(passArgs(registry)), (e) => !(e instanceof BudgetExhaustedError) && /Prompt is too long/.test(e.message));
   });
 
   test('a TransientError still propagates out of the pass — failover owns it', async () => {
@@ -1895,13 +1989,13 @@ describe('runMultiScopePass — a terminally failed scope worker', () => {
 
   test('a budget-taken scope and a failed scope are both unreviewed, each under its own cause', async () => {
     const { registry } = makeRegistry(({ scope }) => {
-      if (scope.name === 'b') throw died(new DeadlineExceededError('killed'));
+      if (scope.name === 'b') throw died(new BudgetExhaustedError('time', 'killed'));
       if (scope.name === 'c') throw overflow();
       return okResult(scope);
     });
     const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
-    assert.deepEqual(review.unreviewedScopes, [gap('b', 'budget'), gap('c', 'failure')]);
-    assert.equal(review.budgetExhausted, true);
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'time'), gap('c', 'failure')]);
+    assert.deepEqual(review.exhaustedBounds, ['time']);
     assert.deepEqual(review.scopeFailures.map(f => f.scope), ['c']);
     assert.match(review.summary, /Reviewed 1 scope\(s\): a\./);
     assert.match(review.summary, /Time budget exhausted\*\* — 1 of 3 scope\(s\) were reviewed; NOT reviewed: b\./);
@@ -1946,21 +2040,21 @@ describe('coverageOf — the one fold of the chains\' outcomes into the pass\'s 
   test('unreviewed names pass-0 curtailments with their cause; scopeFailures every failed pass, single-line; sweeps by depth; the budget bit', () => {
     const outcomes = [
       { passes: [{ added: 1, curtailed: false }, { added: 0, curtailed: { cause: 'failure', error: boom } }] },
-      { passes: [{ added: 0, curtailed: { cause: 'budget' } }] },
+      { passes: [{ added: 0, curtailed: { cause: 'time' } }] },
       { passes: [{ added: 2, curtailed: false }, { added: 1, curtailed: false }] },
     ];
     assert.deepEqual(coverageOf(scopes, outcomes), {
-      unreviewed: [gap('b', 'budget')],
+      unreviewed: [gap('b', 'time')],
       scopeFailures: [{ scope: 'a', pass: 1, message: 'line one' }],
       sweeps: [{ added: 1, curtailed: ['failure'] }],
-      budgetExhausted: true,
+      exhaustedBounds: ['time'],
     });
   });
   test('nothing curtailed folds to the empty coverage record', () => {
-    assert.deepEqual(coverageOf(scopes, scopes.map(() => ({ passes: [{ added: 0, curtailed: false }] }))), { unreviewed: [], scopeFailures: [], sweeps: [], budgetExhausted: false });
+    assert.deepEqual(coverageOf(scopes, scopes.map(() => ({ passes: [{ added: 0, curtailed: false }] }))), { unreviewed: [], scopeFailures: [], sweeps: [], exhaustedBounds: [] });
   });
   test('CURTAILMENT_CAUSES is the closed vocabulary, in fold order', () => {
-    assert.deepEqual(CURTAILMENT_CAUSES, ['budget', 'failure']);
+    assert.deepEqual(CURTAILMENT_CAUSES, ['time', 'tokens', 'failure']);
   });
 });
 
@@ -1970,8 +2064,8 @@ describe('composeSummary with a failed scope and a budget-cut sweep', () => {
     const summary = composeSummary('ctx', scopes, {
       unreviewed: [gap('a', 'failure')],
       scopeFailures: [{ scope: 'a', pass: 0, message: 'boom' }],
-      sweeps: [{ added: 0, curtailed: ['budget'] }],
-      budgetExhausted: true,
+      sweeps: [{ added: 0, curtailed: ['time'] }],
+      exhaustedBounds: ['time'],
     });
     assert.match(summary, /⏳ \*\*Time budget exhausted\*\* — convergence sweeps were cut short; late-round findings may be missing\./);
     assert.doesNotMatch(summary, /every scope was reviewed/);

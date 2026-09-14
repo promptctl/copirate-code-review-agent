@@ -10,28 +10,8 @@
 // with a full pocket of findings. [LAW:one-source-of-truth] the deadline is minted exactly once;
 // nothing downstream re-reads the input or re-decides the budget.
 
-// [LAW:types-are-the-program] "The time budget expired" is a distinct fact from "this engine hung
-// past its own sanity cap" — the first is planned degradation the scheduler absorbs scope-by-scope,
-// the second is an engine failure that reds the attempt. Two meanings, two types: the deadline kill
-// carries this class so the worker pool can absorb it as "scope unreviewed" without touching the
-// fail-loud path that protects sibling findings. It is NOT retryable and NOT transient by
-// construction: retryTransientSpawn passes it through (isRetryableSpawnError is false) and
-// produceReview's `instanceof TransientError` gate rethrows it immediately — no failover restart
-// can fit in a budget that has already run out.
-class DeadlineExceededError extends Error {
-  constructor(message) {
-    super(message);
-    // The whole point of the type is being distinguishable — including in serialized form:
-    // without this, err.name/String(err) report a generic "Error" and every log or triage
-    // surface collapses planned degradation back into an engine failure.
-    this.name = 'DeadlineExceededError';
-  }
-}
-
-// [LAW:one-source-of-truth] The operator remedy, stated once: every deadline-exhaustion message —
-// the spawn refusal, the mid-spawn kill, the nothing-completed failure — names the same two knobs
-// the same way, so the fix is never phrased three drifting ways.
-const BUDGET_REMEDY = 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeout-minutes above it) or split the change.';
+// Reaching the deadline is planned degradation, carried as BudgetExhaustedError('time') with the remedy
+// BOUNDS.time names (src/bounds.js), the same type and wording path the token cap uses.
 
 // [LAW:no-silent-failure] Parse the budget strictly, mirroring parseMaxRounds: a typo like "25m"
 // or "twenty" must red the run, never silently disable the budget (the failure mode that would
@@ -79,4 +59,4 @@ function remainingMs(deadline, nowMs) {
   return deadline === null || deadline === undefined ? Infinity : deadline - nowMs;
 }
 
-module.exports = { DeadlineExceededError, BUDGET_REMEDY, parseTimeBudgetMinutes, mintDeadline, remainingMs };
+module.exports = { parseTimeBudgetMinutes, mintDeadline, remainingMs };

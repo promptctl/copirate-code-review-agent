@@ -31422,9 +31422,9 @@ const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed:';
 // [LAW:one-type-per-behavior] ONE notice mechanism serves every path that exits 0 without reviewing;
 // the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
-// a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a time budget that
-// expires before any scope completes, is deliberately NOT here: it already throws DeadlineExceededError
-// and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+// a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a bound (the time
+// budget or the token cap) reached before any scope completes, is deliberately NOT here: it already
+// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already and needs no notice.
 //
 // [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
 // list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
@@ -33208,6 +33208,12 @@ function addTokens(a, b) {
   };
 }
 
+// Every token the record holds, in the footer's own units (input, cached input included, plus output) — the
+// quantity the token cap (src/token-cap.js) counts, so an operator sizes the cap by reading the footer.
+function totalTokens(tokens) {
+  return totalInputTokens(tokens) + tokens.output;
+}
+
 // [LAW:single-enforcer] ONE spelling of "a clock value is a real Date or it is an error", shared by
 // both readers of one below — the rate lookup above and the freshness check further down. `what` is
 // the caller's own sentence rather than a generic message, because the two failures need different
@@ -34279,6 +34285,7 @@ module.exports = {
   spawnFromTokens,
   spawnFromRequest,
   totalInputTokens,
+  totalTokens,
   emptyTokens,
   addTokens,
   renderCostLine,

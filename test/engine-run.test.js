@@ -65,6 +65,7 @@ function makeAdapter({ emitTerminal }) {
       env: { PATH: process.env.PATH },
     }),
     // Mirror the real adapters: completion is judged by the presence of the terminal event.
+    meterUsage: () => () => null,
     session: promptOnStdin,
     assertSucceeded: stdout => {
       const completed = stdout.split('\n').some(line => {
@@ -99,6 +100,7 @@ describe('runEngine with an oversized engine stream', () => {
         args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -133,6 +135,7 @@ describe('runEngine session transcript', () => {
         args: ['-e', `process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');`],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -164,6 +167,7 @@ describe('runEngine session transcript', () => {
         args: ['-e', `process.stderr.write('BOOM-STDERR'); process.exit(1);`],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -183,10 +187,10 @@ describe('runEngine session transcript', () => {
 
 // ── the wall-clock deadline at the spawn boundary (zai-timing-sn1) ────────────────────────────────
 // The deadline and the adapter's own cap are DIFFERENT bounds with different types: the deadline
-// firing is the time budget's planned degradation (DeadlineExceededError, absorbed upstream as an
+// firing is the time budget's planned degradation (BudgetExhaustedError, absorbed upstream as an
 // unreviewed scope); the adapter cap firing stays the loud engine failure it always was.
 describe('runEngine under a wall-clock deadline', () => {
-  const { DeadlineExceededError } = require('../src/deadline.js');
+  const { BudgetExhaustedError } = require('../src/bounds.js');
 
   test('a deadline already in the past refuses to spawn at all', async () => {
     let built = false;
@@ -194,13 +198,14 @@ describe('runEngine under a wall-clock deadline', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => { built = true; return { command: process.execPath, args: ['-e', ''], env: { PATH: process.env.PATH } }; },
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() - 1),
-      (err) => err instanceof DeadlineExceededError && /TIME_BUDGET_MINUTES/.test(err.message),
+      (err) => err instanceof BudgetExhaustedError && /TIME_BUDGET_MINUTES/.test(err.message),
     );
     assert.equal(built, false, 'no command is built for a spawn that can never run');
   });
@@ -214,13 +219,14 @@ describe('runEngine under a wall-clock deadline', () => {
         args: ['-e', 'setTimeout(() => {}, 10000);'], // outlives the deadline
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 300),
-      (err) => err instanceof DeadlineExceededError && /ran out mid-spawn/.test(err.message),
+      (err) => err instanceof BudgetExhaustedError && /ran out mid-spawn/.test(err.message),
     );
   });
 
@@ -233,13 +239,14 @@ describe('runEngine under a wall-clock deadline', () => {
         args: ['-e', 'setTimeout(() => {}, 10000);'],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 3_600_000),
-      (err) => !(err instanceof DeadlineExceededError) && /review timed out/.test(err.message),
+      (err) => !(err instanceof BudgetExhaustedError) && /review timed out/.test(err.message),
     );
   });
 });
@@ -251,7 +258,7 @@ describe('runEngine under a wall-clock deadline', () => {
 // orphan. The kill signals the process GROUP and settles only on 'close' — when the tree has
 // actually exited and released the pipes.
 describe('runEngine kill semantics', () => {
-  const { DeadlineExceededError } = require('../src/deadline.js');
+  const { BudgetExhaustedError } = require('../src/bounds.js');
   const fs = require('fs');
   const os = require('os');
   const pathmod = require('path');
@@ -267,13 +274,14 @@ describe('runEngine kill semantics', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 500),
-      DeadlineExceededError,
+      BudgetExhaustedError,
     );
     // The settle happens on 'close', i.e. after the group signal — the grandchild must already be
     // dead (or die within the SIGKILL grace at most; poll briefly to absorb signal delivery time).
@@ -303,6 +311,7 @@ describe('runEngine kill semantics', () => {
         args: ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 30000);'],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -310,7 +319,7 @@ describe('runEngine kill semantics', () => {
     const started = Date.now();
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 300),
-      DeadlineExceededError,
+      BudgetExhaustedError,
     );
     // deadline (~300ms) + grace (300ms) + SIGKILL delivery — well under 5s, never the 30s the
     // SIGTERM-ignoring engine wanted.
@@ -329,7 +338,7 @@ describe('runEngine kill semantics', () => {
 
 // ── round 6: the two orphan holes the group-kill left open ────────────────────────────────────────
 describe('runEngine orphan reaping', () => {
-  const { DeadlineExceededError } = require('../src/deadline.js');
+  const { BudgetExhaustedError } = require('../src/bounds.js');
   const { reapLiveEngineGroups } = require('../src/engine/run.js');
   const fs = require('fs');
   const os = require('os');
@@ -361,13 +370,14 @@ describe('runEngine orphan reaping', () => {
       timeoutMs: 30_000,
       killGraceMs: 10_000, // the escalation timer alone would fire far too late to explain a dead straggler
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(
       runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 500),
-      DeadlineExceededError,
+      BudgetExhaustedError,
     );
     const gpid = parseInt(fs.readFileSync(pidFile, 'utf8'), 10);
     fs.rmSync(pidFile, { force: true });
@@ -383,6 +393,7 @@ describe('runEngine orphan reaping', () => {
         args: ['-e', 'setTimeout(() => {}, 30000);'],
         env: { PATH: process.env.PATH },
       }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -399,7 +410,7 @@ describe('runEngine orphan reaping', () => {
 // that FAILED after burning real time still reports what it burned. Success carries it on the
 // resolved value; every post-spawn rejection carries it as err.span. [LAW:no-silent-failure]
 describe('runEngine spawn duration', () => {
-  const { DeadlineExceededError } = require('../src/deadline.js');
+  const { BudgetExhaustedError } = require('../src/bounds.js');
 
   const durationOf = span => Date.parse(span.to) - Date.parse(span.from);
 
@@ -408,6 +419,7 @@ describe('runEngine spawn duration', () => {
       name: 'fake',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', script], env: { PATH: process.env.PATH } }),
+      meterUsage: () => () => null,
       session: promptOnStdin,
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -443,7 +455,7 @@ describe('runEngine spawn duration', () => {
     await assert.rejects(
       runEngine(sleeperAdapter('setTimeout(() => {}, 30000);'), {}, 'p', '/tmp', {}, process.cwd(), Date.now() + 400),
       err => {
-        assert.ok(err instanceof DeadlineExceededError);
+        assert.ok(err instanceof BudgetExhaustedError);
         assert.ok(err.span, 'the killed spawn carries its span');
         // The kill fires at ~400ms; the settle waits for the tree to exit, so the duration can only exceed it.
         assert.ok(durationOf(err.span) >= 350, `duration ${durationOf(err.span)}ms covers the budget it consumed`);
@@ -455,7 +467,7 @@ describe('runEngine spawn duration', () => {
   test('a spawn refused before it starts carries no span — nothing ran, so there is nothing to time', async () => {
     await assert.rejects(
       runEngine(sleeperAdapter(''), {}, 'p', '/tmp', {}, process.cwd(), Date.now() - 1),
-      err => err instanceof DeadlineExceededError && err.span === undefined,
+      err => err instanceof BudgetExhaustedError && err.span === undefined,
     );
   });
 });
@@ -478,6 +490,7 @@ describe('runEngine session seam', () => {
       name: 'fake-server',
       timeoutMs: 30_000,
       buildCommand: echoChild,
+      meterUsage: () => () => null,
       session: async (io, prompt) => {
         const reply = new Promise(resolve => io.lines.once('line', resolve));
         io.write(prompt + '\n');
@@ -498,6 +511,7 @@ describe('runEngine session seam', () => {
       name: 'fake-server',
       timeoutMs: 30_000,
       buildCommand: echoChild,
+      meterUsage: () => () => null,
       session: async () => { throw new Error('thread/start failed: no such model'); },
       assertSucceeded: () => {},
       classifyError: err => err,
@@ -510,6 +524,7 @@ describe('runEngine session seam', () => {
       name: 'fake-server',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', 'process.exit(0)'], env: { PATH: process.env.PATH } }),
+      meterUsage: () => () => null,
       session: async io => {
         const never = new Promise(() => {});
         return Promise.race([never, io.closed.then(() => { throw new Error('engine exited before completing'); })]);
@@ -525,10 +540,110 @@ describe('runEngine session seam', () => {
       name: 'fake-server',
       timeoutMs: 30_000,
       buildCommand: () => ({ command: process.execPath, args: ['-e', 'process.exit(0)'], env: { PATH: process.env.PATH } }),
+      meterUsage: () => () => null,
       session: () => new Promise(() => {}),
       assertSucceeded: () => {},
       classifyError: err => err,
     };
     await assert.rejects(runEngine(spec, {}, 'hello', '/tmp', {}, process.cwd()), /fake-server session did not settle when the engine exited/);
+  });
+});
+
+// ── the token cap at the spawn boundary (zai-token-cap-zya) ───────────────────────────────────────
+// The cap watches a spawn LIVE: every stdout line goes through the adapter's meter, and when the run's
+// spend reaches the cap — from this spawn or any other lane — the spawn is killed with the tokens bound.
+describe('runEngine under a token cap', () => {
+  const { BudgetExhaustedError } = require('../src/bounds.js');
+  const { mintTokenCap } = require('../src/token-cap.js');
+
+  // A child that prints the given usage readings, one JSON line each, then idles far past any test.
+  const usageAdapter = ({ readings = [], idleMs = 10_000, exitAfter = false, meter } = {}) => ({
+    name: 'fake',
+    timeoutMs: 30_000,
+    buildCommand: () => ({
+      command: process.execPath,
+      args: ['-e', `for (const used of ${JSON.stringify(readings)}) console.log(JSON.stringify({ used })); ${exitAfter ? '' : `setTimeout(() => {}, ${idleMs});`}`],
+      env: { PATH: process.env.PATH },
+    }),
+    meterUsage: meter ?? (() => line => {
+      const { used } = JSON.parse(line);
+      return { inputCacheMiss: used, inputCacheHit: 0, output: 0 };
+    }),
+    session: promptOnStdin,
+    assertSucceeded: () => {},
+    classifyError: err => err,
+  });
+
+  test('a spent cap refuses to spawn at all', async () => {
+    const cap = mintTokenCap(100);
+    const spent = cap.open();
+    spent.observe(100);
+    let built = false;
+    const adapter = { ...usageAdapter(), buildCommand: () => { built = true; return { command: process.execPath, args: ['-e', ''], env: {} }; } };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), null, cap.open()),
+      (err) => err instanceof BudgetExhaustedError && err.bound === 'tokens' && /MAX_REVIEW_TOKENS/.test(err.message),
+    );
+    assert.equal(built, false, 'no command is built for a spawn the cap can never admit');
+  });
+
+  test('usage reaching the cap mid-spawn kills the spawn with the tokens bound, long before it would exit', async () => {
+    const cap = mintTokenCap(100);
+    const started = Date.now();
+    await assert.rejects(
+      runEngine(usageAdapter({ readings: [40, 150] }), {}, 'p', '/tmp', {}, process.cwd(), null, cap.open()),
+      (err) => err instanceof BudgetExhaustedError && err.bound === 'tokens' && /reached mid-spawn \(150 of 100 tokens\)/.test(err.message),
+    );
+    assert.ok(Date.now() - started < 8_000, 'the idle child was killed, not waited out');
+  });
+
+  test('another lane reaching the cap kills this spawn too, though it reported nothing', async () => {
+    const cap = mintTokenCap(100);
+    const silent = runEngine(usageAdapter({ readings: [] }), {}, 'p', '/tmp', {}, process.cwd(), null, cap.open());
+    const loud = runEngine(usageAdapter({ readings: [120] }), {}, 'p', '/tmp', {}, process.cwd(), null, cap.open());
+    const isTokens = (err) => err instanceof BudgetExhaustedError && err.bound === 'tokens';
+    await Promise.all([assert.rejects(silent, isTokens), assert.rejects(loud, isTokens)]);
+  });
+
+  test('a meter that cannot read a usage line stops the spawn loudly, as an engine failure and not a bound', async () => {
+    const cap = mintTokenCap(1_000_000);
+    const meter = () => () => { throw new Error('unreadable usage payload'); };
+    await assert.rejects(
+      runEngine(usageAdapter({ readings: [1], meter }), {}, 'p', '/tmp', {}, process.cwd(), null, cap.open()),
+      (err) => !(err instanceof BudgetExhaustedError) && /could not be metered.*unreadable usage payload/.test(err.message),
+    );
+  });
+
+  // A killed spawn has no engine report, so what it spent leaves on the error as the meter's last
+  // reading — including usage the engine emits inside the kill's grace, which was spent all the same.
+  test('a killed spawn carries its metered tokens, counting usage emitted after the stop was ordered', async () => {
+    const cap = mintTokenCap(100);
+    const adapter = {
+      ...usageAdapter(),
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'process.on("SIGTERM", () => { console.log(JSON.stringify({ used: 180 })); process.exit(0); }); console.log(JSON.stringify({ used: 150 })); setTimeout(() => {}, 10000);'],
+        env: { PATH: process.env.PATH },
+      }),
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), null, cap.open()),
+      (err) => {
+        assert.ok(err instanceof BudgetExhaustedError && err.bound === 'tokens', err.message);
+        assert.deepEqual(err.metered, { inputCacheMiss: 180, inputCacheHit: 0, output: 0 });
+        return true;
+      },
+    );
+    assert.match(cap.describe(), /^180 of 100 tokens$/);
+  });
+
+  test('a spawn under the cap completes, and its tokens count before it settles', async () => {
+    const cap = mintTokenCap(1_000);
+    const spend = cap.open();
+    const { metered } = await runEngine(usageAdapter({ readings: [40, 70], exitAfter: true }), {}, 'p', '/tmp', {}, process.cwd(), null, spend);
+    assert.deepEqual(metered, { inputCacheMiss: 70, inputCacheHit: 0, output: 0 });
+    assert.match(cap.describe(), /^70 of 1,000 tokens$/);
+    spend.settle(90);
+    assert.match(cap.describe(), /^90 of 1,000 tokens$/);
   });
 });

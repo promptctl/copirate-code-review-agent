@@ -24,6 +24,8 @@ function specThatRecords(onExtract) {
       args: ['-e', 'require("fs").writeFileSync(process.env.RECORDS, JSON.stringify({type:"finish",summary:"done"})+"\\n")'],
       env: { RECORDS: collector.recordsPath },
     }),
+    meterUsage: () => () => null,
+    priceMetered: (tokens) => ({ basis: 'dollars', usd: (tokens.inputCacheMiss + tokens.inputCacheHit) / 1000 }),
     session: promptOnStdin,
     assertSucceeded: () => {},
     classifyError: err => err,
@@ -93,6 +95,63 @@ describe('makeCliAdapter — the spawn start instant (zai-cost-truth-p5o.1)', ()
         return true;
       },
     );
+  });
+});
+
+// zai-token-cap-zya: every error out of produceReview carries what the spawn SPENT, so a spawn the cap
+// killed is in the footer's total exactly as it is in the cap's. [LAW:one-source-of-truth]
+describe('makeCliAdapter — a dead spawn\'s spend rides out on its error', () => {
+  const { mintTokenCap } = require('../src/token-cap');
+  const meteredSpec = {
+    ...specThatRecords(() => { throw new Error('a killed spawn is never asked for its report'); }),
+    buildCommand: () => ({
+      command: process.execPath,
+      args: ['-e', 'console.log(JSON.stringify({ used: 150 })); setTimeout(() => {}, 10000);'],
+      env: { PATH: process.env.PATH },
+    }),
+    meterUsage: () => line => ({ inputCacheMiss: 100, inputCacheHit: JSON.parse(line).used - 100, output: 0 }),
+  };
+  const produce = (tokenCap) => makeCliAdapter(meteredSpec).produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null, tokenCap });
+
+  test('a spawn the cap killed carries its metered tokens, priced by the engine, with its span', async () => {
+    const tokenCap = mintTokenCap(120);
+    await assert.rejects(produce(tokenCap), (err) => {
+      assert.equal(err.bound, 'tokens');
+      assert.deepEqual(err.usage.tokens, { inputCacheMiss: 100, inputCacheHit: 50, output: 0 });
+      assert.deepEqual(err.usage.cost, { basis: 'dollars', usd: 0.15 });
+      assert.ok(Date.parse(err.usage.span.to) >= Date.parse(err.usage.span.from));
+      return true;
+    });
+    assert.match(tokenCap.describe(), /^150 of 120 tokens$/, 'the footer record and the cap charge the same spend');
+  });
+
+  test('a spawn whose engine reported usage before a later step failed keeps the report, not the meter', async () => {
+    const report = { tokens: { inputCacheMiss: 7, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0.5 } };
+    const adapter = makeCliAdapter({
+      ...meteredSpec,
+      extractUsage: () => report,
+      // prints usage and exits cleanly without ever recording finish_review
+      buildCommand: () => ({ command: process.execPath, args: ['-e', 'console.log(JSON.stringify({ used: 150 }))'], env: { PATH: process.env.PATH } }),
+    });
+    await assert.rejects(
+      adapter.produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null, tokenCap: mintTokenCap(0) }),
+      (err) => {
+        assert.deepEqual(err.usage.tokens, report.tokens);
+        assert.deepEqual(err.usage.cost, report.cost);
+        assert.ok(err.usage.span, 'the report is stamped with the spawn span');
+        return true;
+      },
+    );
+  });
+
+  test('a spawn refused before it ran carries a null usage — nothing was spent', async () => {
+    const tokenCap = mintTokenCap(1);
+    tokenCap.open().observe(1);
+    await assert.rejects(produce(tokenCap), (err) => {
+      assert.equal(err.bound, 'tokens');
+      assert.equal(err.usage, null);
+      return true;
+    });
   });
 });
 

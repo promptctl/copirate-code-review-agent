@@ -5,6 +5,8 @@ const path = require('path');
 const core = require('@actions/core');
 const { createReviewCollector, readCollectedReview, readRecordedFindings } = require('../collector');
 const { runEngine } = require('./run');
+const { mintTokenCap } = require('../token-cap');
+const { totalTokens } = require('../usage');
 
 // [LAW:no-silent-failure] Scratch-dir cleanup must never OUTRANK the review: these are throwaway
 // dirs under the runner's ephemeral tmp, and a removal failure is a few leaked megabytes on a VM
@@ -20,6 +22,14 @@ function removeQuietly(dir, label) {
   } catch (e) {
     core.warning(`Could not remove the engine's ${label} (${dir}) — left for the runner to reap: ${e.message}`);
   }
+}
+
+// The usage record of a spawn that died with no engine report: null when it never ran; its span alone when
+// it ran but metered nothing; otherwise the tokens its live meter read — what the cap charged — priced by
+// the engine's own priceMetered, the resolution its report would have made. [LAW:dataflow-not-control-flow]
+function usageOfDeadSpawn(spec, config, { span, metered }) {
+  if (!span) return null;
+  return metered ? { tokens: metered, cost: spec.priceMetered(metered, config, new Date(span.from)), span } : { span };
 }
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
@@ -71,8 +81,15 @@ function makeCliAdapter(spec) {
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
     // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
     // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
-    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
+    // `tokenCap` is the run's one token cap (src/token-cap.js). This seam opens the spawn's handle
+    // before anything that can fail, hands it to runEngine to watch the stream, and settles it in the
+    // finally with the engine's authoritative total — 0 when the spawn reported none, which keeps
+    // what the live meter observed — so no outcome of a spawn leaves its tokens uncounted.
+    // [LAW:no-silent-failure]
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null, tokenCap = mintTokenCap(0) }) {
       const collector = createReviewCollector();
+      const spend = tokenCap.open();
+      let reported = null;
       try {
         // Built inside the stamped try: a prompt that fails to build (a window fit that cannot fit,
         // a file read that fails) is a worker death like any other, and must carry the (empty)
@@ -92,20 +109,20 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            const { output, span, metered } = await runEngine(spec, config, prompt, home, collector, cwd, deadline, spend);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
             // The throw carries the span out, matching the invariant runEngine's own rejections
             // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
             try {
-              const raw = spec.extractUsage(output, config, new Date(span.from));
+              reported = spec.extractUsage(output, config, new Date(span.from));
               // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
               // together when it reported nothing; span is the HOST's clock and is always present —
               // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
               // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
               // tokens, dollars, and seconds.
-              const usage = { ...(raw ?? {}), span };
+              const usage = { ...(reported ?? {}), span };
               const review = readCollectedReview(collector.recordsPath);
               // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
               // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
@@ -113,6 +130,7 @@ function makeCliAdapter(spec) {
               return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
             } catch (err) {
               err.span = span;
+              err.metered = metered;
               throw err;
             }
           } finally {
@@ -131,8 +149,15 @@ function makeCliAdapter(spec) {
         // them. Any error at all is stamped, so downstream holds a value and never asks whether
         // this one happened to carry it. [LAW:parse-dont-validate]
         err.recorded = readRecordedFindings(collector.recordsPath);
+        // The same half for what the spawn SPENT. An engine that reported before a later step failed keeps
+        // its report. A spawn that died with none — the cap's kill is the common case — is recorded from the
+        // live meter's last reading, the tokens the cap already charged, so the footer and the cap count one
+        // spend, and the engine prices them as it would have priced its report. A failure before the spawn
+        // ran (no span) spent nothing.
+        err.usage = reported ? { ...reported, span: err.span } : usageOfDeadSpawn(spec, config, err);
         throw err;
       } finally {
+        spend.settle(reported ? totalTokens(reported.tokens) : 0);
         removeQuietly(collector.dir, 'collector dir');
       }
     },

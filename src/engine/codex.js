@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const core = require('@actions/core');
 const { TransientError, classifyTransient } = require('../failover');
-const { priceFromTable, spawnFromRequest, sumCost, emptyTokens, addTokens } = require('../usage');
+const { priceFromTable, spawnFromRequest, spawnFromTokens, sumCost, emptyTokens, addTokens } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 const { createJsonRpcClient } = require('./jsonrpc');
 const { resolveReasoningTier } = require('../effort');
@@ -275,6 +275,30 @@ function tokensOfRequest(u) {
 // no card for a request) and telling them apart is the price table's job, not the adapter's.
 // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
 // ever be billed to a subscription and this adapter has no notional arm to reach.
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds it
+// every stdout line). Each thread/tokenUsage/updated is one model request's usage, seen once, so the
+// running total is their sum through the same parse and conversion extractUsage applies to the session
+// record. [LAW:one-source-of-truth] A malformed notification throws here exactly as it does in the
+// session; runEngine turns a meter throw into a loud stop of the spawn.
+function meterUsage() {
+  let total = emptyTokens();
+  return line => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return null; }
+    if (msg?.method !== 'thread/tokenUsage/updated') return null;
+    total = addTokens(total, tokensOfRequest(requestUsageOf(msg.params)));
+    return total;
+  };
+}
+
+// [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died with no session
+// report, through the same price table extractUsage uses. The metered total no longer says how its requests
+// split, so it is priced as one spawn from its tokens — which proves each request's context only as an upper
+// bound, and stays unpriced (with the table's own reason) wherever that bound crosses a context tier.
+function priceMetered(tokens, config, startedAt) {
+  return priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
+}
+
 function extractUsage({ requests }, config, startedAt) {
   if (requests.length === 0) return null;
   const perRequest = requests.map(tokensOfRequest);
@@ -315,6 +339,8 @@ const codexAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior —
@@ -329,4 +355,6 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 };

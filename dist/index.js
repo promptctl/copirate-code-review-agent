@@ -29922,6 +29922,62 @@ function wrappy (fn, cb) {
 
 /***/ }),
 
+/***/ 3752:
+/***/ ((module) => {
+
+"use strict";
+
+
+// [FRAMING:parts-and-seams] The ceilings one review run can reach. The time budget (src/deadline.js) and
+// the token cap (src/token-cap.js) measure different things and are enforced where each is observed, but
+// reaching either one means the same thing to everything downstream: planned degradation. The run stops
+// starting work, delivers what it collected, and names what it did not reach. So a bound is a VALUE in
+// this map, never a second mechanism. [LAW:one-type-per-behavior]
+//
+// [LAW:one-source-of-truth] Each bound's words are stated once: `label` names it inside a sentence,
+// `reached` is the phrase for a scope it stopped, `title` heads its summary line, and `remedy` names the
+// operator's knobs. Every message that reports a bound (the spawn refusal, the mid-spawn kill, the
+// nothing-completed failure, the summary, the run warning) reads them from here, so a remedy is never
+// phrased two drifting ways.
+const BOUNDS = Object.freeze({
+  time: Object.freeze({
+    label: 'time budget',
+    reached: 'time budget exhausted',
+    title: '⏳ **Time budget exhausted**',
+    remedy: 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeout-minutes above it) or split the change.',
+  }),
+  tokens: Object.freeze({
+    label: 'token cap',
+    reached: 'token cap reached',
+    title: '🪙 **Token cap reached**',
+    remedy: 'Raise MAX_REVIEW_TOKENS or split the change.',
+  }),
+});
+
+// [LAW:types-are-the-program] "A bound was reached" is a distinct fact from "the engine failed": the first
+// is planned degradation the scheduler absorbs scope by scope, the second is a worker death. The error
+// carries WHICH bound, so the pass records it as the scope's cause and every rendering names the right
+// ceiling. It is NOT retryable and NOT transient by construction: retryTransientSpawn passes it through
+// and produceReview's `instanceof TransientError` gate rethrows it immediately. No retry fits in a budget
+// that has already run out, and failing over to the next config would spend past a cap the whole run shares.
+// [LAW:parse-dont-validate] The constructor is the one checkpoint for `bound`: an unknown one throws here,
+// so no consumer downstream ever looks a bound up and finds nothing.
+class BudgetExhaustedError extends Error {
+  constructor(bound, message) {
+    if (!Object.hasOwn(BOUNDS, bound)) throw new Error(`BudgetExhaustedError: unknown bound ${JSON.stringify(bound)}`);
+    super(message);
+    // Distinguishable in serialized form too: without the name, err.name/String(err) report a generic
+    // "Error" and every log or triage surface collapses planned degradation back into an engine failure.
+    this.name = 'BudgetExhaustedError';
+    this.bound = bound;
+  }
+}
+
+module.exports = { BOUNDS, BudgetExhaustedError };
+
+
+/***/ }),
+
 /***/ 5120:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -30824,28 +30880,8 @@ module.exports = { loadConfig, validateFile, resolveChain, resolveSecrets, peekC
 // with a full pocket of findings. [LAW:one-source-of-truth] the deadline is minted exactly once;
 // nothing downstream re-reads the input or re-decides the budget.
 
-// [LAW:types-are-the-program] "The time budget expired" is a distinct fact from "this engine hung
-// past its own sanity cap" — the first is planned degradation the scheduler absorbs scope-by-scope,
-// the second is an engine failure that reds the attempt. Two meanings, two types: the deadline kill
-// carries this class so the worker pool can absorb it as "scope unreviewed" without touching the
-// fail-loud path that protects sibling findings. It is NOT retryable and NOT transient by
-// construction: retryTransientSpawn passes it through (isRetryableSpawnError is false) and
-// produceReview's `instanceof TransientError` gate rethrows it immediately — no failover restart
-// can fit in a budget that has already run out.
-class DeadlineExceededError extends Error {
-  constructor(message) {
-    super(message);
-    // The whole point of the type is being distinguishable — including in serialized form:
-    // without this, err.name/String(err) report a generic "Error" and every log or triage
-    // surface collapses planned degradation back into an engine failure.
-    this.name = 'DeadlineExceededError';
-  }
-}
-
-// [LAW:one-source-of-truth] The operator remedy, stated once: every deadline-exhaustion message —
-// the spawn refusal, the mid-spawn kill, the nothing-completed failure — names the same two knobs
-// the same way, so the fix is never phrased three drifting ways.
-const BUDGET_REMEDY = 'Raise TIME_BUDGET_MINUTES (and the workflow job\'s timeout-minutes above it) or split the change.';
+// Reaching the deadline is planned degradation, carried as BudgetExhaustedError('time') with the remedy
+// BOUNDS.time names (src/bounds.js), the same type and wording path the token cap uses.
 
 // [LAW:no-silent-failure] Parse the budget strictly, mirroring parseMaxRounds: a typo like "25m"
 // or "twenty" must red the run, never silently disable the budget (the failure mode that would
@@ -30893,7 +30929,7 @@ function remainingMs(deadline, nowMs) {
   return deadline === null || deadline === undefined ? Infinity : deadline - nowMs;
 }
 
-module.exports = { DeadlineExceededError, BUDGET_REMEDY, parseTimeBudgetMinutes, mintDeadline, remainingMs };
+module.exports = { parseTimeBudgetMinutes, mintDeadline, remainingMs };
 
 
 /***/ }),
@@ -32389,7 +32425,7 @@ const os = __nccwpck_require__(857);
 const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
-const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens } = __nccwpck_require__(9614);
+const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -32621,17 +32657,37 @@ function assertSucceeded(stdout) {
 function extractUsage(stdout, config, startedAt) {
   const env = parseResultEnvelope(stdout);
   if (!env || !env.usage) return null;
-  const u = env.usage;
-  // [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a
-  // rename into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the
-  // discounted cached rate; fresh input and cache WRITES both bill at the full input rate, which is
-  // what puts them in one class together.
-  const tokens = {
+  const tokens = tokensOfAnthropicUsage(env.usage);
+  return { tokens, cost: costFromEnvelope(env, config, tokens, startedAt) };
+}
+
+// [LAW:parse-dont-validate] Anthropic's three input buckets are already disjoint, so this is a rename
+// into THE TOKEN RECORD (src/usage.js) rather than a subtraction: cache READS bill at the discounted
+// cached rate; fresh input and cache WRITES both bill at the full input rate, which is what puts them in
+// one class together. [LAW:one-source-of-truth] The result envelope and the live meter below read usage
+// through this one conversion, so the cap and the footer count the same classes.
+function tokensOfAnthropicUsage(u) {
+  return {
     inputCacheMiss: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
     inputCacheHit: u.cache_read_input_tokens ?? 0,
     output: u.output_tokens ?? 0,
   };
-  return { tokens, cost: costFromEnvelope(env, config, tokens, startedAt) };
+}
+
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds
+// it every stdout line). stream-json emits an `assistant` event per content block, each repeating its
+// API message's usage, so the spawn's running total is the LATEST usage per message id, summed. Checked
+// against a real subscription transcript: the input classes sum exactly to the result envelope, while
+// output streams as a partial snapshot (64 live vs 10,126 in the envelope) — the envelope settles it.
+function meterUsage() {
+  const byMessage = new Map();
+  return line => {
+    let event;
+    try { event = JSON.parse(line); } catch { return null; }
+    if (event?.type !== 'assistant' || !event.message?.usage) return null;
+    byMessage.set(event.message.id, tokensOfAnthropicUsage(event.message.usage));
+    return [...byMessage.values()].reduce(addTokens, emptyTokens());
+  };
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
@@ -32672,6 +32728,14 @@ function costFromEnvelope(env, config, buckets, startedAt) {
   return priceFromTable(spawnFromTokens(startedAt, buckets), config.model);
 }
 
+// [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died before its
+// result envelope: costFromEnvelope's own resolution, handed no envelope. A table-priced endpoint (z.ai,
+// DeepSeek) prices them exactly as a report would be priced; a subscription's list price and a genuine
+// Anthropic endpoint's figure exist only in the envelope, so they resolve as unreported.
+function priceMetered(tokens, config, startedAt) {
+  return costFromEnvelope({}, config, tokens, startedAt);
+}
+
 // [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
 // once in src/failover.js (classifyTransient); this adapter contributes only its genuinely
 // engine-specific bit — the Anthropic-compatible CLI echoes the Retry-After header, so it passes
@@ -32710,6 +32774,8 @@ const claudeCodeAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -32724,6 +32790,8 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
   parseResultEnvelope,
 };
 
@@ -32741,6 +32809,8 @@ const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
 const { createReviewCollector, readCollectedReview, readRecordedFindings } = __nccwpck_require__(7290);
 const { runEngine } = __nccwpck_require__(8861);
+const { mintTokenCap } = __nccwpck_require__(7889);
+const { totalTokens } = __nccwpck_require__(9614);
 
 // [LAW:no-silent-failure] Scratch-dir cleanup must never OUTRANK the review: these are throwaway
 // dirs under the runner's ephemeral tmp, and a removal failure is a few leaked megabytes on a VM
@@ -32756,6 +32826,14 @@ function removeQuietly(dir, label) {
   } catch (e) {
     core.warning(`Could not remove the engine's ${label} (${dir}) — left for the runner to reap: ${e.message}`);
   }
+}
+
+// The usage record of a spawn that died with no engine report: null when it never ran; its span alone when
+// it ran but metered nothing; otherwise the tokens its live meter read — what the cap charged — priced by
+// the engine's own priceMetered, the resolution its report would have made. [LAW:dataflow-not-control-flow]
+function usageOfDeadSpawn(spec, config, { span, metered }) {
+  if (!span) return null;
+  return metered ? { tokens: metered, cost: spec.priceMetered(metered, config, new Date(span.from)), span } : { span };
 }
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
@@ -32807,8 +32885,15 @@ function makeCliAdapter(spec) {
     // so cleanup runs even when the engine throws. [LAW:no-silent-failure]
     // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
     // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
-    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
+    // `tokenCap` is the run's one token cap (src/token-cap.js). This seam opens the spawn's handle
+    // before anything that can fail, hands it to runEngine to watch the stream, and settles it in the
+    // finally with the engine's authoritative total — 0 when the spawn reported none, which keeps
+    // what the live meter observed — so no outcome of a spawn leaves its tokens uncounted.
+    // [LAW:no-silent-failure]
+    async produceReview({ config, buildPromptFor, instructionsPath, deadline = null, tokenCap = mintTokenCap(0) }) {
       const collector = createReviewCollector();
+      const spend = tokenCap.open();
+      let reported = null;
       try {
         // Built inside the stamped try: a prompt that fails to build (a window fit that cannot fit,
         // a file read that fails) is a worker death like any other, and must carry the (empty)
@@ -32828,20 +32913,20 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline);
+            const { output, span, metered } = await runEngine(spec, config, prompt, home, collector, cwd, deadline, spend);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
             // The throw carries the span out, matching the invariant runEngine's own rejections
             // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
             try {
-              const raw = spec.extractUsage(output, config, new Date(span.from));
+              reported = spec.extractUsage(output, config, new Date(span.from));
               // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
               // together when it reported nothing; span is the HOST's clock and is always present —
               // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
               // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
               // tokens, dollars, and seconds.
-              const usage = { ...(raw ?? {}), span };
+              const usage = { ...(reported ?? {}), span };
               const review = readCollectedReview(collector.recordsPath);
               // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
               // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
@@ -32849,6 +32934,7 @@ function makeCliAdapter(spec) {
               return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
             } catch (err) {
               err.span = span;
+              err.metered = metered;
               throw err;
             }
           } finally {
@@ -32867,8 +32953,15 @@ function makeCliAdapter(spec) {
         // them. Any error at all is stamped, so downstream holds a value and never asks whether
         // this one happened to carry it. [LAW:parse-dont-validate]
         err.recorded = readRecordedFindings(collector.recordsPath);
+        // The same half for what the spawn SPENT. An engine that reported before a later step failed keeps
+        // its report. A spawn that died with none — the cap's kill is the common case — is recorded from the
+        // live meter's last reading, the tokens the cap already charged, so the footer and the cap count one
+        // spend, and the engine prices them as it would have priced its report. A failure before the spawn
+        // ran (no span) spent nothing.
+        err.usage = reported ? { ...reported, span: err.span } : usageOfDeadSpawn(spec, config, err);
         throw err;
       } finally {
+        spend.settle(reported ? totalTokens(reported.tokens) : 0);
         removeQuietly(collector.dir, 'collector dir');
       }
     },
@@ -32890,7 +32983,7 @@ const path = __nccwpck_require__(6928);
 const os = __nccwpck_require__(857);
 const core = __nccwpck_require__(7484);
 const { TransientError, classifyTransient } = __nccwpck_require__(2887);
-const { priceFromTable, spawnFromRequest, sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
+const { priceFromTable, spawnFromRequest, spawnFromTokens, sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { makeCliAdapter } = __nccwpck_require__(2890);
 const { createJsonRpcClient } = __nccwpck_require__(1129);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
@@ -33161,6 +33254,30 @@ function tokensOfRequest(u) {
 // no card for a request) and telling them apart is the price table's job, not the adapter's.
 // The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
 // ever be billed to a subscription and this adapter has no notional arm to reach.
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds it
+// every stdout line). Each thread/tokenUsage/updated is one model request's usage, seen once, so the
+// running total is their sum through the same parse and conversion extractUsage applies to the session
+// record. [LAW:one-source-of-truth] A malformed notification throws here exactly as it does in the
+// session; runEngine turns a meter throw into a loud stop of the spawn.
+function meterUsage() {
+  let total = emptyTokens();
+  return line => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return null; }
+    if (msg?.method !== 'thread/tokenUsage/updated') return null;
+    total = addTokens(total, tokensOfRequest(requestUsageOf(msg.params)));
+    return total;
+  };
+}
+
+// [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died with no session
+// report, through the same price table extractUsage uses. The metered total no longer says how its requests
+// split, so it is priced as one spawn from its tokens — which proves each request's context only as an upper
+// bound, and stays unpriced (with the table's own reason) wherever that bound crosses a context tier.
+function priceMetered(tokens, config, startedAt) {
+  return priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
+}
+
 function extractUsage({ requests }, config, startedAt) {
   if (requests.length === 0) return null;
   const perRequest = requests.map(tokensOfRequest);
@@ -33201,6 +33318,8 @@ const codexAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior —
@@ -33215,6 +33334,8 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 };
 
 
@@ -33530,16 +33651,7 @@ function extractUsage(stdout) {
     const { tokens, cost } = event.part;
     if (tokens) {
       sawTokens = true;
-      const cache = tokens.cache || {};
-      // [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes
-      // (src/usage.js). Cache READS are the discounted class; fresh input and cache WRITES are both
-      // billed at the full input rate, so they share the miss class. Reasoning tokens are generated
-      // output, so they join the visible output rather than any input class.
-      total = addTokens(total, {
-        inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
-        inputCacheHit: cache.read ?? 0,
-        output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
-      });
+      total = addTokens(total, tokensOfStep(tokens));
     }
     if (Number.isFinite(cost)) {
       // [LAW:types-are-the-program] finite, not typeof==='number' (which accepts NaN) — a NaN self-
@@ -33553,6 +33665,41 @@ function extractUsage(stdout) {
     ? { basis: 'dollars', usd }
     : { basis: 'unpriced', reason: 'not-reported' };
   return { tokens: total, cost };
+}
+
+// [LAW:parse-dont-validate] OpenCode's step counts → THE TOKEN RECORD's disjoint classes (src/usage.js).
+// Cache READS are the discounted class; fresh input and cache WRITES are both billed at the full input
+// rate, so they share the miss class. Reasoning tokens are generated output, so they join the visible
+// output rather than any input class. [LAW:one-source-of-truth] extractUsage and the live meter below
+// both convert through here, so the cap and the footer count the same classes.
+function tokensOfStep(tokens) {
+  const cache = tokens.cache || {};
+  return {
+    inputCacheMiss: (tokens.input ?? 0) + (cache.write ?? 0),
+    inputCacheHit: cache.read ?? 0,
+    output: (tokens.output ?? 0) + (tokens.reasoning ?? 0),
+  };
+}
+
+// [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds
+// it every stdout line). Each step_finish carries that step's own counts, seen once, so the running
+// total is their sum — the same fold extractUsage makes over the retained stream.
+function meterUsage() {
+  let total = emptyTokens();
+  return line => {
+    let event;
+    try { event = JSON.parse(line); } catch { return null; }
+    if (event?.type !== 'step_finish' || !event.part?.tokens) return null;
+    total = addTokens(total, tokensOfStep(event.part.tokens));
+    return total;
+  };
+}
+
+// OpenCode's dollars are its own per-step estimate, carried on the step events and summed by extractUsage;
+// no local table prices the tokens a live meter read, so a spawn that died with no report leaves its
+// metered tokens unpriced rather than inventing a figure. [LAW:no-silent-failure]
+function priceMetered() {
+  return { basis: 'unpriced', reason: 'not-reported' };
 }
 
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
@@ -33591,6 +33738,8 @@ const opencodeAdapter = makeCliAdapter({
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -33606,6 +33755,8 @@ module.exports = {
   assertSucceeded,
   classifyError,
   extractUsage,
+  meterUsage,
+  priceMetered,
 };
 
 
@@ -33650,7 +33801,10 @@ const { spawn } = __nccwpck_require__(5317);
 const readline = __nccwpck_require__(3785);
 const core = __nccwpck_require__(7484);
 const { emitTranscript } = __nccwpck_require__(9806);
-const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
+const { remainingMs } = __nccwpck_require__(6757);
+const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
+const { mintTokenCap } = __nccwpck_require__(7889);
+const { totalTokens } = __nccwpck_require__(9614);
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
@@ -33769,20 +33923,35 @@ function promptOnStdin(io, prompt) {
 // and this is the ONE place it bounds a spawn's lifetime: the effective timeout is the smaller of
 // the adapter's own sanity cap and the time remaining. The two bounds mean different things and
 // throw different types [LAW:types-are-the-program] — the adapter cap firing is an engine failure
-// (plain Error, as before), the deadline firing is planned degradation (DeadlineExceededError, which
-// the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass). A deadline
-// already in the past refuses to spawn at all — the one enforcer of "no engine starts past the
-// budget", so callers never race a doomed spawn.
-function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null) {
+// (plain Error, as before), the deadline firing is planned degradation (BudgetExhaustedError('time'),
+// which the scope-worker pool absorbs as "scope unreviewed" instead of failing the pass).
+//
+// [LAW:single-enforcer] `spend` is this spawn's handle on the review's token cap (src/token-cap.js), and
+// this is the one place the cap watches a spawn LIVE: every stdout line goes through the adapter's
+// meterUsage, the running total is observed, and when any lane brings the run to the cap the handle
+// orders this spawn stopped (BudgetExhaustedError('tokens'), absorbed exactly as the deadline is). A meter
+// that throws stops the spawn loudly as an engine failure: a cap that cannot count must not let spend
+// through. The adapter seam settles the handle with the engine's authoritative total afterwards.
+//
+// A deadline already in the past, or a cap already spent, refuses to spawn at all — the one enforcer of
+// "no engine starts past a bound", so callers never race a doomed spawn.
+function runEngine(adapter, config, prompt, home, collector, cwd, deadline = null, spend = mintTokenCap(0).open()) {
   return new Promise((resolve, reject) => {
     const remaining = remainingMs(deadline, Date.now());
     if (remaining <= 0) {
-      reject(new DeadlineExceededError(
-        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BUDGET_REMEDY}`,
+      reject(new BudgetExhaustedError('time',
+        `${adapter.name} spawn refused: the review's time budget is exhausted. ${BOUNDS.time.remedy}`,
       ));
       return;
     }
+    if (spend.exhausted()) {
+      reject(spend.refused(`${adapter.name} spawn`));
+      return;
+    }
     const { command, args, env } = adapter.buildCommand({ config, collector, home });
+    // The spawn's usage meter is built BEFORE the child exists: a spec that cannot supply one fails
+    // here, with nothing spawned to orphan, rather than inside the executor after the engine is running.
+    const meter = adapter.meterUsage();
     const adapterCapMs = adapter.timeoutMs ?? 3_000_000;
     // <= : at the exact tie both bounds fire at the same instant, and the deadline reading wins —
     // it is true (the budget did expire then) and it is the safe side (absorbed upstream as an
@@ -33867,6 +34036,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // retryTransientSpawn reads only the attempt it settles on.
     const fail = err => {
       err.span = span;
+      err.metered = metered;
       reject(err);
     };
 
@@ -33878,14 +34048,24 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // finally deletes the engine's temp HOME — only when nothing is left alive to write into it.
     // The escalation timer must OUTLIVE finish-from-timeout (there is none anymore) and is cleared
     // in finish, i.e. when close/error actually settles: a SIGTERM that worked needs no SIGKILL.
-    let timedOut = false;
+    //
+    // [LAW:dataflow-not-control-flow] Every way a spawn is stopped — the timeout (the deadline or the
+    // adapter's own cap), the token cap, a meter that cannot count — orders the stop through stopWith,
+    // and `stopped` holds the error the stop settles with. The first order wins; a later one, or one
+    // arriving after the spawn settled, changes nothing. So the close handler never asks which bound
+    // fired: it settles with the value.
+    let stopped = null;
     let escalation = null;
     const killGraceMs = adapter.killGraceMs ?? 2_000;
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    const stopWith = reason => {
+      if (stopped || settled) return;
+      stopped = reason;
       killTree('SIGTERM');
       escalation = setTimeout(() => killTree('SIGKILL'), killGraceMs);
-    }, timeoutMs);
+    };
+    const timeout = setTimeout(() => stopWith(deadlineBound
+      ? new BudgetExhaustedError('time', `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BOUNDS.time.remedy}`)
+      : new Error(`${adapter.name} review timed out.`)), timeoutMs);
 
     // [LAW:no-silent-failure] A verbose-but-complete review must finish and be parsed, not be
     // aborted for tripping a byte ceiling — that turned every substantial review into a crash.
@@ -33919,6 +34099,27 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
       lines: readline.createInterface({ input: child.stdout, crlfDelay: Infinity }),
       closed,
     };
+    // [LAW:single-enforcer] The token cap watches the spawn here, off the same live line stream the
+    // session reads, so every usage event counts the moment the engine emits it — never clipped by the
+    // retention window, and still counted after a stop is ordered, since a request finishing inside the
+    // kill's grace was spent all the same. The handle orders the stop when any lane brings the run to the
+    // cap; a meter that throws (a usage payload this adapter cannot read) stops the spawn as the loud
+    // engine failure it is, instead of an exception inside a stream callback or a spawn the cap silently
+    // stops counting. `metered` is the latest reading, and it leaves with the span on every settle — a
+    // killed spawn has no engine report, so this reading is the only record of what it spent.
+    let metered = null;
+    io.lines.on('line', line => {
+      try {
+        const tokens = meter(line);
+        if (tokens) {
+          metered = tokens;
+          spend.observe(totalTokens(tokens));
+        }
+      } catch (err) {
+        stopWith(new Error(`${adapter.name} usage could not be metered, so the token cap cannot count this spawn: ${err.message}`));
+      }
+    });
+    spend.onExhausted(() => stopWith(spend.killed(`${adapter.name} spawn`)));
     const session = Promise.resolve().then(() => adapter.session(io, prompt));
     // A session that fails mid-conversation closes stdin, so a server that exits on EOF (codex
     // app-server does) exits on its own; one that does not is still bounded by the timeout. The
@@ -33931,11 +34132,11 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
 
     child.on('close', code => {
       closedResolve(stdout);
-      // [LAW:types-are-the-program] A close after a kill is the KILL settling, not an engine exit
-      // to classify: which bound fired decides the type — the deadline kill is the budget working
-      // as designed (absorbed upstream as an unreviewed scope); the adapter-cap kill is an engine
-      // that outlived any sane review and stays the loud failure it always was.
-      if (timedOut) {
+      // [LAW:types-are-the-program] A close after a stop is the STOP settling, not an engine exit to
+      // classify: the reason stopWith recorded is the type — a bound reached is the budget working as
+      // designed (absorbed upstream as an unreviewed scope); the adapter-cap kill and a meter that could
+      // not count are engine failures and stay loud.
+      if (stopped) {
         finish(() => {
           // One unconditional SIGKILL sweep before settling: 'close' proves the direct child and
           // every PIPE HOLDER are gone — not the whole group. A pipe-less grandchild that ignored
@@ -33943,11 +34144,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
           // early close cancels the pending escalation, and outlive the settle into the cleanup —
           // the ENOTEMPTY/credit-burn hole again. Idempotent: ESRCH is the goal state.
           killTree('SIGKILL');
-          fail(deadlineBound
-            ? new DeadlineExceededError(
-              `${adapter.name} spawn killed: the review's time budget ran out mid-spawn. ${BUDGET_REMEDY}`,
-            )
-            : new Error(`${adapter.name} review timed out.`));
+          fail(stopped);
         });
         return;
       }
@@ -33995,7 +34192,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             // [LAW:dataflow-not-control-flow] The session's output is the engine's output value; the
             // caller derives usage/cost from it via the adapter's extractUsage. Findings still flow
             // out-of-band through the MCP collector — the output carries only usage.
-            resolve({ output, span });
+            resolve({ output, span, metered });
           } catch (err) {
             fail(adapter.classifyError(err, stdout));
           }
@@ -34541,7 +34738,9 @@ module.exports = {
 
 const os = __nccwpck_require__(857);
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, TransientError } = __nccwpck_require__(2887);
-const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
+const { remainingMs } = __nccwpck_require__(6757);
+const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
+const { mintTokenCap } = __nccwpck_require__(7889);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
@@ -34678,10 +34877,11 @@ function sumSpan(spans) {
 // read like a clean bill. The scout summary standing above it describes the CHANGE and never the
 // review, so it cannot soften that report into one.
 function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
-  const { unreviewed, scopeFailures, sweeps, budgetExhausted } = coverage;
+  const { unreviewed, scopeFailures, sweeps, exhaustedBounds } = coverage;
   const unreviewedNames = new Set(unreviewed.map(u => u.name));
   const reviewed = scopes.filter(s => !unreviewedNames.has(s.name));
-  const { budget: budgetUnreviewed, failure: failedUnreviewed } = unreviewedByCause({ unreviewedScopes: unreviewed });
+  const byCause = unreviewedByCause({ unreviewedScopes: unreviewed });
+  const failedUnreviewed = byCause.failure;
   // [LAW:parse-dont-validate] Nothing is flattened here. A scope's name comes stamped single-line from
   // parseScopeValue and the scout's summary from parseReviewValue — which also refuses an empty one, so
   // there is no absent-summary state for this sink to represent. Neither can break this line-structured
@@ -34697,14 +34897,18 @@ function composeSummary(scoutSummary, scopes, coverage = FULL_COVERAGE) {
       ? `cut short by ${s.curtailed.map(c => CURTAILMENT_BY[c]).join(' and ')} after ${s.added} new finding(s).`
       : s.added === 0 ? 'nothing new; the review converged.' : `${s.added} new finding(s).`}`);
   }
-  if (budgetExhausted) {
-    lines.push(budgetUnreviewed.length > 0
-      ? `⏳ **Time budget exhausted** — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
-        + notReviewedClause(budgetUnreviewed)
+  // [LAW:dataflow-not-control-flow] One line per ceiling the run reached, in BOUNDS order — none when it
+  // reached none — each naming the scopes THAT bound stopped, so a run the deadline and the token cap
+  // both bit says which scope each one took.
+  for (const bound of exhaustedBounds) {
+    const stopped = byCause[bound];
+    lines.push(stopped.length > 0
+      ? `${BOUNDS[bound].title} — ${reviewed.length} of ${scopes.length} scope(s) were reviewed; `
+        + notReviewedClause(stopped)
       // [FRAMING:representation] "every scope was reviewed" is a claim about the WHOLE unreviewed set,
-      // not the budget's share of it: a scope whose worker died is named on the failure line below, and
-      // this line must not contradict it.
-      : `⏳ **Time budget exhausted** — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
+      // not this bound's share of it: a scope whose worker died, or that the other bound stopped, is named
+      // on its own line, and this line must not contradict it.
+      : `${BOUNDS[bound].title} — ${unreviewed.length === 0 ? 'every scope was reviewed, but ' : ''}convergence sweeps were cut short; `
         + 'late-round findings may be missing.');
   }
   // [LAW:no-silent-failure] A worker that died terminally is named with what killed it, at the pass it
@@ -34731,14 +34935,17 @@ function notReviewedClause(entries) {
 }
 
 // [LAW:types-are-the-program] Why a pass did not run to completion — the vocabulary `curtailed` speaks
-// at every depth. 'budget': the wall-clock budget refused or killed it (planned degradation, owned by
-// the deadline). 'failure': the worker died on an error no retry fixes — a context-window overflow, a
-// crashed CLI — and the error rides along so the caller can rethrow it when NOTHING was reviewed.
-// A TransientError is neither: failover owns it, and the chain lets it propagate.
-const CURTAILMENT_CAUSES = ['budget', 'failure'];
+// at every depth. A BOUND ('time', 'tokens' — src/bounds.js): the run reached that ceiling, which refused
+// or killed the pass (planned degradation, owned by the deadline or the token cap). 'failure': the worker
+// died on an error no retry fixes — a context-window overflow, a crashed CLI — and the error rides along
+// so the caller can rethrow it when NOTHING was reviewed. A TransientError is neither: failover owns it,
+// and the chain lets it propagate. [LAW:one-source-of-truth] The bounds are read from BOUNDS, so a
+// ceiling added there is a cause here with no edit.
+const BOUND_CAUSES = Object.keys(BOUNDS);
+const CURTAILMENT_CAUSES = [...BOUND_CAUSES, 'failure'];
 // The one prose rendering of each cause, shared by the sweep line and the pass log.
-const CURTAILMENT_BY = { budget: 'the time budget', failure: 'a worker failure' };
-const FULL_COVERAGE = Object.freeze({ unreviewed: [], scopeFailures: [], sweeps: [], budgetExhausted: false });
+const CURTAILMENT_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, `the ${BOUNDS[b].label}`])), failure: 'a worker failure' };
+const FULL_COVERAGE = Object.freeze({ unreviewed: [], scopeFailures: [], sweeps: [], exhaustedBounds: [] });
 
 // [LAW:one-source-of-truth] The memory one engine lane reserves. Every lane is a full engine CLI
 // process (claude-code, codex, opencode) holding its own context — observed in the low hundreds of MB
@@ -34808,13 +35015,15 @@ function sweepsByDepth(chains) {
 //                   message stamped single-line here (firstLine) so the line-structured summary and
 //                   the operator warning can carry it as-is;
 //   sweeps        — sweepsByDepth over the chains' sweep passes;
-//   budgetExhausted — the budget bit at any depth: a scope it refused, or a sweep it cut.
+//   exhaustedBounds — the bounds that bit at any depth, in BOUNDS order: a scope one refused, or a
+//                   sweep it cut; [] when the run reached no ceiling.
 // [LAW:one-source-of-truth] The review record carries the unreviewed set as the coverage entries
 // themselves ({ name, cause, kept }) — the verdict reads its length, and every sink that must attribute
 // a gap correctly splits it by the cause each entry carries, here, ONCE: a scope unreviewed because
-// its worker died at the review of record is the failure's, and the rest are the budget's.
+// its worker died at the review of record is the failure's, and the rest belong to the bound that stopped
+// them. Every cause is a key, so a sink reads its own list without guarding for one that is absent.
 function unreviewedByCause({ unreviewedScopes }) {
-  return { failure: unreviewedScopes.filter(u => u.cause === 'failure'), budget: unreviewedScopes.filter(u => u.cause === 'budget') };
+  return Object.fromEntries(CURTAILMENT_CAUSES.map(c => [c, unreviewedScopes.filter(u => u.cause === c)]));
 }
 
 function coverageOf(scopes, outcomes) {
@@ -34825,8 +35034,8 @@ function coverageOf(scopes, outcomes) {
   const scopeFailures = scopes.flatMap((s, i) => outcomes[i].passes.flatMap((p, pass) =>
     (p.curtailed && p.curtailed.cause === 'failure' ? [{ scope: s.name, pass, message: firstLine(p.curtailed.error.message) }] : [])));
   const sweeps = sweepsByDepth(outcomes.map(o => o.passes.slice(1)));
-  const budgetExhausted = unreviewed.some(u => u.cause === 'budget') || sweeps.some(s => s.curtailed.includes('budget'));
-  return { unreviewed, scopeFailures, sweeps, budgetExhausted };
+  const exhaustedBounds = BOUND_CAUSES.filter(b => unreviewed.some(u => u.cause === b) || sweeps.some(s => s.curtailed.includes(b)));
+  return { unreviewed, scopeFailures, sweeps, exhaustedBounds };
 }
 
 // [LAW:dataflow-not-control-flow] A fixed-width pool of lanes that is FAIL-LOUD: the first error
@@ -34864,15 +35073,15 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // where passes[0] is the review of record and passes[k] is sweep k. `added` is what the pass put in
 // the ledger — a completed pass's new findings, or the findings a curtailed pass's dead worker had
 // recorded before it stopped (kept, never discarded). `curtailed` is false for a pass that ran, or
-// the cause that stopped it — { cause: 'budget' } or { cause: 'failure', error } (see
+// the cause that stopped it — { cause: 'time' | 'tokens' } or { cause: 'failure', error } (see
 // CURTAILMENT_CAUSES) — one fact at every depth: at pass 0 it is the coverage gap the summary and the
 // verdict carry (the scope was not reviewed); at a sweep it merely ends the chain (pass 0's judgment
 // stands). The list is exactly the passes that RAN plus at most one curtailed entry, so a caller reads
 // the chain's depth off its length. [LAW:types-are-the-program]
 //
 // [LAW:single-enforcer] A pass's fate is decided in exactly ONE place — attemptPass — identically
-// before and around every pass: the budget refuses a pass before spawning when nothing remains, and a
-// spawn the deadline kills mid-flight settles the same way (DeadlineExceededError); a worker that
+// before and around every pass: a bound (the deadline, the token cap) refuses a pass before spawning once
+// it is reached, and a spawn a bound kills mid-flight settles the same way (BudgetExhaustedError); a worker that
 // dies on any error failover does not own (a context-window overflow, a crashed CLI — anything but a
 // TransientError) settles as a failure. Both are absorbed HERE so sibling chains' earned results are
 // never discarded by a fail-loud rethrow (zai-engine-ydc: one overflowing worker used to void every
@@ -34881,7 +35090,7 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // attempts on it, and config-level failover is the owner of what happens next. [LAW:dataflow-not-control-flow]
 // The killed spawn's burned time is not this chain's concern: the spawn seam recorded it (err.span)
 // before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, tokenCap, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
@@ -34899,14 +35108,15 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   // way and the pass entry's `added` is what THIS pass put in the ledger — for a curtailed pass, the
   // findings kept from its dead worker. [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
   const attemptPass = async (pass) => {
-    if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'budget' } };
+    if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'time' } };
+    if (tokenCap.exhausted()) return { ...NOTHING_RECORDED, curtailed: { cause: 'tokens' } };
     try {
       const { findings, assessments } = await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
       return { findings, assessments, curtailed: false };
     } catch (e) {
       if (e instanceof TransientError) throw e;
       const { findings, assessments } = e.recorded;
-      return { findings, assessments, curtailed: e instanceof DeadlineExceededError ? { cause: 'budget' } : { cause: 'failure', error: e } };
+      return { findings, assessments, curtailed: e instanceof BudgetExhaustedError ? { cause: e.bound } : { cause: 'failure', error: e } };
     }
   };
   const passes = [];
@@ -34934,8 +35144,8 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
 }
 
 // [LAW:one-source-of-truth] The two log renderings of a curtailment, keyed by cause: the pass line's
-// reason and the chain line's suffix ('review curtailed' is the budget's established wording).
-const CHAIN_LABEL_BY = { budget: ' curtailed', failure: ' failed' };
+// reason and the chain line's suffix ('review curtailed' is a bound's established wording).
+const CHAIN_LABEL_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, ' curtailed'])), failure: ' failed' };
 // What a pass that never spawned recorded: the empty records, in the spawn seam's own shape.
 const NOTHING_RECORDED = Object.freeze({ findings: [], assessments: [] });
 // [LAW:one-source-of-truth] The ONE phrase for findings salvaged from a curtailed pass, rendered by the
@@ -34950,7 +35160,7 @@ function unreviewedName({ name, kept }) {
   return `${name}${keptNote(kept)}`;
 }
 function curtailmentLogText(curtailed) {
-  return curtailed.cause === 'budget' ? 'time budget exhausted' : `worker failed: ${firstLine(curtailed.error.message)}`;
+  return curtailed.cause === 'failure' ? `worker failed: ${firstLine(curtailed.error.message)}` : BOUNDS[curtailed.cause].reached;
 }
 
 // One scope worker: a single review spawn on this config, focused on one scope. [LAW:composability]
@@ -35115,13 +35325,13 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
-// data (unreviewedScopes, budgetExhausted). [LAW:no-ambient-temporal-coupling] the deadline is a
+// data (unreviewedScopes, exhaustedBounds). [LAW:no-ambient-temporal-coupling] the deadline is a
 // value minted once at the run boundary, never a clock read scattered through callers.
 // `startedAt` (epoch ms, null = unknown) is the run's start instant from that SAME mint — the live
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -35154,11 +35364,10 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
   const spawnRecords = [];
-  const spanOnlyUsage = (err) => (err.span ? { span: err.span } : null);
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
-        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline }),
+        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap }),
         {
           sleepFn,
           // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
@@ -35167,10 +35376,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
           deadline,
           now,
           onRetry: ({ attempt, limit, delay, err }) => {
-            // [LAW:no-silent-failure] A retried attempt burned real time; it appears as its own
-            // record (span-only — a failed spawn reports no tokens) rather than vanishing into
-            // the retry loop. err.span is absent when the failure predated the spawn: nothing ran.
-            spawnRecords.push(spawnRecord(tag, 'retried', spanOnlyUsage(err)));
+            // [LAW:no-silent-failure] A retried attempt burned real time and tokens; it appears as
+            // its own record rather than vanishing into the retry loop. err.usage is the dead spawn's
+            // record, stamped by the adapter seam: its span and metered tokens, or null when the
+            // failure predated the spawn and nothing ran.
+            spawnRecords.push(spawnRecord(tag, 'retried', err.usage));
             log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`);
           },
         },
@@ -35180,7 +35390,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     } catch (err) {
       // The settling failure's burned time is recorded BEFORE the error escapes — a deadline-killed
       // worker is absorbed as 'unreviewed' by the pool downstream, but its record is already here.
-      spawnRecords.push(spawnRecord(tag, 'failed', spanOnlyUsage(err)));
+      spawnRecords.push(spawnRecord(tag, 'failed', err.usage));
       throw err;
     }
   };
@@ -35239,7 +35449,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, tokenCap, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
   // A scope whose pass 0 did not complete is a COVERAGE gap, carried as data to the summary and the
@@ -35252,13 +35462,17 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // A pass whose every worker died but left findings behind delivers them instead: the review has
   // something to say, and it never approves, since every scope is unreviewed.
   if (coverage.unreviewed.length === scopes.length && coverage.unreviewed.every(u => u.kept === 0)) {
-    const failed = scopes.map((s, i) => outcomes[i].passes[0].curtailed).find(c => c.cause === 'failure');
+    const stops = scopes.map((s, i) => outcomes[i].passes[0].curtailed);
+    const failed = stops.find(c => c.cause === 'failure');
     if (failed) throw failed.error;
-    throw new DeadlineExceededError(
-      `The review's time budget expired before any scope completed — no review to deliver. ${BUDGET_REMEDY}`,
+    // Every bound that stopped a scope is named with its remedy — one scope refused by the clock and the
+    // rest by the cap is a run whose operator must raise both. The error's type carries the first.
+    const { exhaustedBounds } = coverage;
+    throw new BudgetExhaustedError(exhaustedBounds[0],
+      `The review's ${exhaustedBounds.map(b => BOUNDS[b].label).join(' and ')} ${exhaustedBounds.length > 1 ? 'were' : 'was'} reached before any scope completed — no review to deliver. ${exhaustedBounds.map(b => BOUNDS[b].remedy).join(' ')}`,
     );
   }
-  const { sweeps, unreviewed, scopeFailures, budgetExhausted } = coverage;
+  const { sweeps, unreviewed, scopeFailures, exhaustedBounds } = coverage;
   for (const [i, s] of sweeps.entries()) {
     const pass = i + 1;
     log(`convergence sweep ${pass}: ${s.added} new finding(s)${s.curtailed.length > 0 ? ` — cut short (${s.curtailed.map(c => SWEEP_LOG_BY[c]).join(', ')})` : s.added === 0 ? ' — converged' : pass === sweepCap ? ' — sweep cap reached' : ''}`);
@@ -35312,18 +35526,18 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // [LAW:one-source-of-truth] The coverage gap as DATA, for the sinks: the PR sink withholds
     // approval when unreviewedScopes is non-empty (transport.submitReview) — whatever took them,
     // since a scope a worker died on is exactly as unreviewed as one the budget refused — and run.js
-    // warns when the budget bit (budgetExhausted) and when a worker failed (scopeFailures, every
+    // warns when a bound bit (exhaustedBounds) and when a worker failed (scopeFailures, every
     // failed pass at any depth with its message), naming each unreviewed scope with the cause and
     // kept count its entry carries. The summary text above derives from these same values, never the
-    // other way around. All three are their defaults ([]/false/[]) on every run nothing went wrong in.
+    // other way around. All three are their defaults ([]/[]/[]) on every run nothing went wrong in.
     unreviewedScopes: unreviewed,
-    budgetExhausted,
+    exhaustedBounds,
     scopeFailures,
   };
 }
 
 // The sweep log's cause wording, keyed like CURTAILMENT_BY. [LAW:one-source-of-truth]
-const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
+const SWEEP_LOG_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, BOUNDS[b].label])), failure: 'worker failure' };
 
 // The engine seam both modes call. Wraps the multi-scope pass in failover.produceReview so the whole
 // pass retries/advances per config. produceReview supplies (config, buildPromptFor, anchors); the
@@ -35342,7 +35556,10 @@ const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
 // that produces it (os.totalmem) sits HERE, at the seam's default, never inside the pass: the pass
 // takes a number, so a test hands it one and the production callers hand it nothing. It is not on the
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
+// [LAW:one-source-of-truth] `tokenCap` is the run's one token cap, and every config the chain fails over to
+// spends from it: failover restarts the pass, never the count. A caller that sets no cap gets an uncapped
+// one — the same code path with a limit that is never reached.
+function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
@@ -35353,7 +35570,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -37344,7 +37561,9 @@ const { renderTimingBreakdown, passLabel } = __nccwpck_require__(7932);
 const { renderRepoReport } = __nccwpck_require__(8959);
 const registry = __nccwpck_require__(25);
 const { loadConfig, peekConfigNames } = __nccwpck_require__(1283);
-const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = __nccwpck_require__(6757);
+const { parseTimeBudgetMinutes, mintDeadline } = __nccwpck_require__(6757);
+const { BOUNDS } = __nccwpck_require__(3752);
+const { parseMaxReviewTokens, mintTokenCap } = __nccwpck_require__(7889);
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
@@ -37515,24 +37734,31 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
-// the review's coverage data plus the one remedy sentence (BUDGET_REMEDY, src/deadline.js) — never
+// the review's coverage data plus the one remedy sentence (BOUNDS, src/bounds.js) — never
 // re-authored per sink, so the operator remedy cannot drift between modes or from the error
 // messages that share it. [LAW:no-silent-failure] the budget biting is operator news, not just
 // review-body prose: the warning makes a curtailed review visible in the run's annotations.
 function warnBudgetExhausted(review) {
-  if (!review.budgetExhausted) return;
+  const byCause = unreviewedByCause(review);
+  // [LAW:dataflow-not-control-flow] One warning per ceiling the run reached — none when it reached none —
+  // each naming its own gap and its own remedy.
+  for (const bound of review.exhaustedBounds) {
+    warnBoundReached(review, bound, byCause[bound]);
+  }
+}
+
+function warnBoundReached(review, bound, stopped) {
   // The same two budget states composeSummary distinguishes, distinguished here too: a coverage
   // gap names the unreviewed scopes; curtailed-only means every scope WAS reviewed and only the
   // convergence sweeps were cut short — "0 scope(s) went unreviewed" would contradict itself.
   // Only the budget's own gap is attributed to it: a scope whose worker died is warnScopeFailures' to
   // name, and "every scope was reviewed" is claimed only when nothing at all went unreviewed.
-  const { budget } = unreviewedByCause(review);
-  const state = budget.length > 0
-    ? `${budget.length} scope(s) went unreviewed (${budget.map(unreviewedName).join(', ')})`
+  const state = stopped.length > 0
+    ? `${stopped.length} scope(s) went unreviewed (${stopped.map(unreviewedName).join(', ')})`
     : review.unreviewedScopes.length === 0
       ? 'every scope was reviewed, but convergence sweeps were cut short'
       : 'convergence sweeps were cut short';
-  core.warning(`Review time budget exhausted: ${state}. The collected findings were still delivered. ${BUDGET_REMEDY}`);
+  core.warning(`Review ${BOUNDS[bound].reached}: ${state}. The collected findings were still delivered. ${BOUNDS[bound].remedy}`);
 }
 
 // [LAW:one-source-of-truth] The sibling warning for the other way coverage falls short: a scope worker
@@ -37744,7 +37970,7 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -38086,7 +38312,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
   });
   warnBudgetExhausted(review);
   warnScopeFailures(review);
@@ -38137,7 +38363,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
 // `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
 // at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now()) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -38161,7 +38387,7 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
   const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, startedAt,
+    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
   });
   warnBudgetExhausted(review);
   warnScopeFailures(review);
@@ -38220,12 +38446,16 @@ async function run() {
   // The run's start instant is the SAME mint the deadline spends from — one clock read, two
   // consumers (the budget's horizon, the timing footer's total) — never a second Date.now()
   // that could disagree with it. [LAW:one-source-of-truth] (zai-timing-31d.6)
+  // The token cap is minted at the same boundary and shares the parses' failure path: one cap for the
+  // whole run, threaded into whichever mode runs and shared by every config a failover reaches.
   const startedAt = Date.now();
   let roundCap;
   let deadline;
+  let tokenCap;
   try {
     roundCap = parseMaxRounds(core.getInput('MAX_REVIEW_ROUNDS'));
     deadline = mintDeadline(startedAt, parseTimeBudgetMinutes(core.getInput('TIME_BUDGET_MINUTES')));
+    tokenCap = mintTokenCap(parseMaxReviewTokens(core.getInput('MAX_REVIEW_TOKENS')));
   } catch (e) {
     core.setFailed(e.message);
     return;
@@ -38233,9 +38463,9 @@ async function run() {
   const effort = defaultEffortProfile({ roundCap });
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
@@ -38647,6 +38877,109 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 /***/ }),
 
+/***/ 7889:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
+
+// [FRAMING:parts-and-seams] The review's token cap: a hard ceiling on the tokens one run may spend, counted
+// in the review footer's own units (input, cached input included, plus output) so an operator sizes it by
+// reading the footer. Unlike the deadline, spend is not known in advance — it accrues while engines run, in
+// several lanes at once — so the cap is OWNED mutable state rather than a minted value: one owner, created
+// once at the run boundary and shared by every spawn of the run (the scout, every worker, every sweep,
+// every retry, and every config a failover restarts the pass on). [LAW:no-shared-mutable-globals]
+
+// [LAW:no-silent-failure] Parse strictly, mirroring parseTimeBudgetMinutes: a typo like "10M" or "ten
+// million" must red the run, never silently disable the cap it exists to enforce. The domain is a
+// non-negative integer of tokens; 0 = no cap, matching the 0-sentinel of TIME_BUDGET_MINUTES and
+// MAX_REVIEW_ROUNDS. Empty (an explicitly cleared input) is no cap; unset gets action.yml's default.
+function parseMaxReviewTokens(raw) {
+  const s = String(raw).trim();
+  if (s === '') return 0;
+  const tokens = Number(s);
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(tokens)) {
+    throw new Error(`MAX_REVIEW_TOKENS must be a non-negative integer of tokens (0 = no cap); got "${raw}".`);
+  }
+  return tokens;
+}
+
+// The cap's state and the one API that changes it. `limit` 0 reads as Infinity, so an uncapped run takes
+// the same code path with a value that is never reached. [LAW:dataflow-not-control-flow]
+//
+// What the run has SPENT is the settled spawns' totals plus every in-flight spawn's live estimate, so a
+// spawn's tokens count from the first usage event its engine emits, not from when it exits. Each spawn
+// opens a handle:
+//   observe(total) — the spawn's running total so far, fed live from the engine's stream (runEngine);
+//   onExhausted(fn) — how to stop this spawn when the cap is reached, by any lane (runEngine);
+//   settle(total)   — the engine's authoritative total once the spawn is over (the adapter seam).
+// settle charges max(live, authoritative), because both undercount in different ways: claude-code's live
+// output count is a partial snapshot, and opencode's authoritative sum loses a clipped stream's head. A
+// spawn that died with no report settles with 0 and keeps what was observed. [FRAMING:representation]
+//
+// [LAW:single-enforcer] Exhaustion is decided here, in one place: when spend reaches the limit, EVERY
+// open spawn's onExhausted fires, once, so the cap stops all lanes and not only the spawn that crossed
+// it. The overshoot is what the in-flight spawns reported in their last usage events — at most one
+// model request per running spawn — plus whatever a live meter cannot see: claude-code's streamed output
+// count on a subscription is a partial snapshot, so a spawn killed there is charged its input in full and
+// its output only as far as the stream showed. Output is a small share of the footer's units, where the
+// cached input every request re-sends dominates.
+function mintTokenCap(limit) {
+  const ceiling = limit > 0 ? limit : Infinity;
+  let committed = 0;
+  const live = new Map();
+  const watchers = new Map();
+  const spent = () => committed + [...live.values()].reduce((sum, n) => sum + n, 0);
+  const exhausted = () => spent() >= ceiling;
+  const fireIfExhausted = () => {
+    if (!exhausted()) return;
+    const stops = [...watchers.values()];
+    watchers.clear();
+    for (const stop of stops) stop();
+  };
+  const describe = () => `${spent().toLocaleString('en-US')} of ${ceiling.toLocaleString('en-US')} tokens`;
+  // [LAW:single-enforcer] The one wording of each way the cap stops work — a spawn refused before it
+  // starts, a spawn killed mid-flight — so the remedy is named the same way wherever the cap bites, and
+  // the figure is read at the instant the stop is ordered.
+  const refused = (what) => new BudgetExhaustedError('tokens', `${what} refused: the review's token cap is spent (${describe()}). ${BOUNDS.tokens.remedy}`);
+  const killed = (what) => new BudgetExhaustedError('tokens', `${what} killed: the review's token cap was reached mid-spawn (${describe()}). ${BOUNDS.tokens.remedy}`);
+  return {
+    exhausted,
+    describe,
+    refused,
+    open() {
+      const key = Symbol('spawn');
+      live.set(key, 0);
+      return {
+        exhausted,
+        refused,
+        killed,
+        observe(total) {
+          live.set(key, Math.max(live.get(key), total));
+          fireIfExhausted();
+        },
+        onExhausted(stop) {
+          watchers.set(key, stop);
+          fireIfExhausted();
+        },
+        settle(total) {
+          committed += Math.max(live.get(key), total);
+          live.delete(key);
+          watchers.delete(key);
+          fireIfExhausted();
+        },
+      };
+    },
+  };
+}
+
+module.exports = { parseMaxReviewTokens, mintTokenCap };
+
+
+/***/ }),
+
 /***/ 7228:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -38678,9 +39011,9 @@ const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed:';
 // [LAW:one-type-per-behavior] ONE notice mechanism serves every path that exits 0 without reviewing;
 // the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
-// a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a time budget that
-// expires before any scope completes, is deliberately NOT here: it already throws DeadlineExceededError
-// and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+// a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a bound (the time
+// budget or the token cap) reached before any scope completes, is deliberately NOT here: it already
+// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already and needs no notice.
 //
 // [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
 // list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
@@ -40464,6 +40797,12 @@ function addTokens(a, b) {
   };
 }
 
+// Every token the record holds, in the footer's own units (input, cached input included, plus output) — the
+// quantity the token cap (src/token-cap.js) counts, so an operator sizes the cap by reading the footer.
+function totalTokens(tokens) {
+  return totalInputTokens(tokens) + tokens.output;
+}
+
 // [LAW:single-enforcer] ONE spelling of "a clock value is a real Date or it is an error", shared by
 // both readers of one below — the rate lookup above and the freshness check further down. `what` is
 // the caller's own sentence rather than a generic message, because the two failures need different
@@ -41535,6 +41874,7 @@ module.exports = {
   spawnFromTokens,
   spawnFromRequest,
   totalInputTokens,
+  totalTokens,
   emptyTokens,
   addTokens,
   renderCostLine,
@@ -52097,7 +52437,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.67.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.68.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

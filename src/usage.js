@@ -347,6 +347,12 @@ function addTokens(a, b) {
   };
 }
 
+// Every token the record holds, in the footer's own units (input, cached input included, plus output) — the
+// quantity the token cap (src/token-cap.js) counts, so an operator sizes the cap by reading the footer.
+function totalTokens(tokens) {
+  return totalInputTokens(tokens) + tokens.output;
+}
+
 // [LAW:single-enforcer] ONE spelling of "a clock value is a real Date or it is an error", shared by
 // both readers of one below — the rate lookup above and the freshness check further down. `what` is
 // the caller's own sentence rather than a generic message, because the two failures need different
@@ -1418,6 +1424,7 @@ module.exports = {
   spawnFromTokens,
   spawnFromRequest,
   totalInputTokens,
+  totalTokens,
   emptyTokens,
   addTokens,
   renderCostLine,

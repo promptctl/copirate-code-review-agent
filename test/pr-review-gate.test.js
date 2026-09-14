@@ -132,7 +132,7 @@ preflightModule.preflight = async () => ({ ok: true, results: [] });
 multiscope.runMultiScope = async ({ material, chain }) => {
   engineSpawns.push(material);
   return {
-    review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], scopeFailures: [], assessments: [], usage: null },
+    review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], scopeFailures: [], exhaustedBounds: [], assessments: [], usage: null },
     configUsed: chain[0],
   };
 };
