@@ -238,6 +238,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // retryTransientSpawn reads only the attempt it settles on.
     const fail = err => {
       err.span = span;
+      err.metered = metered;
       reject(err);
     };
 
@@ -302,14 +303,20 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     };
     // [LAW:single-enforcer] The token cap watches the spawn here, off the same live line stream the
     // session reads, so every usage event counts the moment the engine emits it — never clipped by the
-    // retention window. The handle orders the stop when any lane brings the run to the cap; a meter
-    // that throws (a usage payload this adapter cannot read) stops the spawn as the loud engine failure
-    // it is, instead of an exception inside a stream callback or a spawn the cap silently stops counting.
+    // retention window, and still counted after a stop is ordered, since a request finishing inside the
+    // kill's grace was spent all the same. The handle orders the stop when any lane brings the run to the
+    // cap; a meter that throws (a usage payload this adapter cannot read) stops the spawn as the loud
+    // engine failure it is, instead of an exception inside a stream callback or a spawn the cap silently
+    // stops counting. `metered` is the latest reading, and it leaves with the span on every settle — a
+    // killed spawn has no engine report, so this reading is the only record of what it spent.
+    let metered = null;
     io.lines.on('line', line => {
-      if (stopped) return;
       try {
         const tokens = meter(line);
-        if (tokens) spend.observe(totalTokens(tokens));
+        if (tokens) {
+          metered = tokens;
+          spend.observe(totalTokens(tokens));
+        }
       } catch (err) {
         stopWith(new Error(`${adapter.name} usage could not be metered, so the token cap cannot count this spawn: ${err.message}`));
       }
@@ -387,7 +394,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             // [LAW:dataflow-not-control-flow] The session's output is the engine's output value; the
             // caller derives usage/cost from it via the adapter's extractUsage. Findings still flow
             // out-of-band through the MCP collector — the output carries only usage.
-            resolve({ output, span });
+            resolve({ output, span, metered });
           } catch (err) {
             fail(adapter.classifyError(err, stdout));
           }

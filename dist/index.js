@@ -32818,6 +32818,13 @@ function removeQuietly(dir, label) {
   }
 }
 
+// The usage record of a spawn that died: null when it never ran; its span alone when it ran but metered
+// nothing; otherwise its metered tokens, whose cost no engine reported. [LAW:dataflow-not-control-flow]
+function usageOfDeadSpawn({ span, metered }) {
+  if (!span) return null;
+  return metered ? { tokens: metered, cost: { basis: 'unpriced', reason: 'not-reported' }, span } : { span };
+}
+
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
 // subprocess that returns findings out-of-band through the MCP collector. They differ only in
 // their spawn primitives (the spec: materializeHome/buildCommand/session/assertSucceeded/
@@ -32895,7 +32902,7 @@ function makeCliAdapter(spec) {
             // say which one lied. Time is a pricing input (DeepSeek's peak/off-peak windows), so
             // this spawn is priced at the tier it actually ran in; extractUsage stays a pure
             // function of the engine's output and the instant it was given. [LAW:effects-at-boundaries]
-            const { output, span } = await runEngine(spec, config, prompt, home, collector, cwd, deadline, spend);
+            const { output, span, metered } = await runEngine(spec, config, prompt, home, collector, cwd, deadline, spend);
             // [LAW:no-silent-failure] From here the spawn HAS run and its span is known, so any
             // failure past this point — a throwing extractUsage, a ProtocolError from an engine
             // that never called finish_review — still burned real wall clock and provider cost.
@@ -32917,6 +32924,7 @@ function makeCliAdapter(spec) {
               return { summary: review.summary, findings: review.findings, scopes: review.scopes, assessments: review.assessments, usage };
             } catch (err) {
               err.span = span;
+              err.metered = metered;
               throw err;
             }
           } finally {
@@ -32935,6 +32943,12 @@ function makeCliAdapter(spec) {
         // them. Any error at all is stamped, so downstream holds a value and never asks whether
         // this one happened to carry it. [LAW:parse-dont-validate]
         err.recorded = readRecordedFindings(collector.recordsPath);
+        // The same half for what the spawn SPENT. A spawn that died has no engine report — the cap's
+        // kill is the common case — so its record is the live meter's last reading: the tokens the cap
+        // already charged, so the footer and the cap count one spend. Its cost is unpriced, because no
+        // engine reported the figure, and one unpriced spawn marks the pass's cost unpriced rather than
+        // letting a dollar total silently omit it. A failure before the spawn ran (no span) spent nothing.
+        err.usage = usageOfDeadSpawn(err);
         throw err;
       } finally {
         spend.settle(reportedTokens);
@@ -33993,6 +34007,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     // retryTransientSpawn reads only the attempt it settles on.
     const fail = err => {
       err.span = span;
+      err.metered = metered;
       reject(err);
     };
 
@@ -34057,14 +34072,20 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
     };
     // [LAW:single-enforcer] The token cap watches the spawn here, off the same live line stream the
     // session reads, so every usage event counts the moment the engine emits it — never clipped by the
-    // retention window. The handle orders the stop when any lane brings the run to the cap; a meter
-    // that throws (a usage payload this adapter cannot read) stops the spawn as the loud engine failure
-    // it is, instead of an exception inside a stream callback or a spawn the cap silently stops counting.
+    // retention window, and still counted after a stop is ordered, since a request finishing inside the
+    // kill's grace was spent all the same. The handle orders the stop when any lane brings the run to the
+    // cap; a meter that throws (a usage payload this adapter cannot read) stops the spawn as the loud
+    // engine failure it is, instead of an exception inside a stream callback or a spawn the cap silently
+    // stops counting. `metered` is the latest reading, and it leaves with the span on every settle — a
+    // killed spawn has no engine report, so this reading is the only record of what it spent.
+    let metered = null;
     io.lines.on('line', line => {
-      if (stopped) return;
       try {
         const tokens = meter(line);
-        if (tokens) spend.observe(totalTokens(tokens));
+        if (tokens) {
+          metered = tokens;
+          spend.observe(totalTokens(tokens));
+        }
       } catch (err) {
         stopWith(new Error(`${adapter.name} usage could not be metered, so the token cap cannot count this spawn: ${err.message}`));
       }
@@ -34142,7 +34163,7 @@ function runEngine(adapter, config, prompt, home, collector, cwd, deadline = nul
             // [LAW:dataflow-not-control-flow] The session's output is the engine's output value; the
             // caller derives usage/cost from it via the adapter's extractUsage. Findings still flow
             // out-of-band through the MCP collector — the output carries only usage.
-            resolve({ output, span });
+            resolve({ output, span, metered });
           } catch (err) {
             fail(adapter.classifyError(err, stdout));
           }
@@ -35314,7 +35335,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
   const spawnRecords = [];
-  const spanOnlyUsage = (err) => (err.span ? { span: err.span } : null);
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
@@ -35327,10 +35347,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
           deadline,
           now,
           onRetry: ({ attempt, limit, delay, err }) => {
-            // [LAW:no-silent-failure] A retried attempt burned real time; it appears as its own
-            // record (span-only — a failed spawn reports no tokens) rather than vanishing into
-            // the retry loop. err.span is absent when the failure predated the spawn: nothing ran.
-            spawnRecords.push(spawnRecord(tag, 'retried', spanOnlyUsage(err)));
+            // [LAW:no-silent-failure] A retried attempt burned real time and tokens; it appears as
+            // its own record rather than vanishing into the retry loop. err.usage is the dead spawn's
+            // record, stamped by the adapter seam: its span and metered tokens, or null when the
+            // failure predated the spawn and nothing ran.
+            spawnRecords.push(spawnRecord(tag, 'retried', err.usage));
             log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`);
           },
         },
@@ -35340,7 +35361,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     } catch (err) {
       // The settling failure's burned time is recorded BEFORE the error escapes — a deadline-killed
       // worker is absorbed as 'unreviewed' by the pool downstream, but its record is already here.
-      spawnRecords.push(spawnRecord(tag, 'failed', spanOnlyUsage(err)));
+      spawnRecords.push(spawnRecord(tag, 'failed', err.usage));
       throw err;
     }
   };
@@ -35415,9 +35436,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     const stops = scopes.map((s, i) => outcomes[i].passes[0].curtailed);
     const failed = stops.find(c => c.cause === 'failure');
     if (failed) throw failed.error;
-    const bound = stops[0].cause;
-    throw new BudgetExhaustedError(bound,
-      `The review's ${BOUNDS[bound].label} was reached before any scope completed — no review to deliver. ${BOUNDS[bound].remedy}`,
+    // Every bound that stopped a scope is named with its remedy — one scope refused by the clock and the
+    // rest by the cap is a run whose operator must raise both. The error's type carries the first.
+    const { exhaustedBounds } = coverage;
+    throw new BudgetExhaustedError(exhaustedBounds[0],
+      `The review's ${exhaustedBounds.map(b => BOUNDS[b].label).join(' and ')} ${exhaustedBounds.length > 1 ? 'were' : 'was'} reached before any scope completed — no review to deliver. ${exhaustedBounds.map(b => BOUNDS[b].remedy).join(' ')}`,
     );
   }
   const { sweeps, unreviewed, scopeFailures, exhaustedBounds } = coverage;
@@ -38870,7 +38893,10 @@ function parseMaxReviewTokens(raw) {
 // [LAW:single-enforcer] Exhaustion is decided here, in one place: when spend reaches the limit, EVERY
 // open spawn's onExhausted fires, once, so the cap stops all lanes and not only the spawn that crossed
 // it. The overshoot is what the in-flight spawns reported in their last usage events — at most one
-// model request per running spawn.
+// model request per running spawn — plus whatever a live meter cannot see: claude-code's streamed output
+// count on a subscription is a partial snapshot, so a spawn killed there is charged its input in full and
+// its output only as far as the stream showed. Output is a small share of the footer's units, where the
+// cached input every request re-sends dominates.
 function mintTokenCap(limit) {
   const ceiling = limit > 0 ? limit : Infinity;
   let committed = 0;

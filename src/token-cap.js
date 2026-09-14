@@ -39,7 +39,10 @@ function parseMaxReviewTokens(raw) {
 // [LAW:single-enforcer] Exhaustion is decided here, in one place: when spend reaches the limit, EVERY
 // open spawn's onExhausted fires, once, so the cap stops all lanes and not only the spawn that crossed
 // it. The overshoot is what the in-flight spawns reported in their last usage events — at most one
-// model request per running spawn.
+// model request per running spawn — plus whatever a live meter cannot see: claude-code's streamed output
+// count on a subscription is a partial snapshot, so a spawn killed there is charged its input in full and
+// its output only as far as the stream showed. Output is a small share of the footer's units, where the
+// cached input every request re-sends dominates.
 function mintTokenCap(limit) {
   const ceiling = limit > 0 ? limit : Infinity;
   let committed = 0;

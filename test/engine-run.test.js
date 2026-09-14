@@ -614,10 +614,34 @@ describe('runEngine under a token cap', () => {
     );
   });
 
+  // A killed spawn has no engine report, so what it spent leaves on the error as the meter's last
+  // reading — including usage the engine emits inside the kill's grace, which was spent all the same.
+  test('a killed spawn carries its metered tokens, counting usage emitted after the stop was ordered', async () => {
+    const cap = mintTokenCap(100);
+    const adapter = {
+      ...usageAdapter(),
+      buildCommand: () => ({
+        command: process.execPath,
+        args: ['-e', 'process.on("SIGTERM", () => { console.log(JSON.stringify({ used: 180 })); process.exit(0); }); console.log(JSON.stringify({ used: 150 })); setTimeout(() => {}, 10000);'],
+        env: { PATH: process.env.PATH },
+      }),
+    };
+    await assert.rejects(
+      runEngine(adapter, {}, 'p', '/tmp', {}, process.cwd(), null, cap.open()),
+      (err) => {
+        assert.ok(err instanceof BudgetExhaustedError && err.bound === 'tokens', err.message);
+        assert.deepEqual(err.metered, { inputCacheMiss: 180, inputCacheHit: 0, output: 0 });
+        return true;
+      },
+    );
+    assert.match(cap.describe(), /^180 of 100 tokens$/);
+  });
+
   test('a spawn under the cap completes, and its tokens count before it settles', async () => {
     const cap = mintTokenCap(1_000);
     const spend = cap.open();
-    await runEngine(usageAdapter({ readings: [40, 70], exitAfter: true }), {}, 'p', '/tmp', {}, process.cwd(), null, spend);
+    const { metered } = await runEngine(usageAdapter({ readings: [40, 70], exitAfter: true }), {}, 'p', '/tmp', {}, process.cwd(), null, spend);
+    assert.deepEqual(metered, { inputCacheMiss: 70, inputCacheHit: 0, output: 0 });
     assert.match(cap.describe(), /^70 of 1,000 tokens$/);
     spend.settle(90);
     assert.match(cap.describe(), /^90 of 1,000 tokens$/);

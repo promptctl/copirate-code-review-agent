@@ -30,8 +30,9 @@ const { BudgetExhaustedError } = require('../src/bounds');
 const { mintTokenCap } = require('../src/token-cap');
 
 // The spawn seam's stamp (src/engine/cli.js): every error out of produceReview carries what the worker
-// RECORDED before it died. A fake spawn dies the same way, so the chain reads a value it is owed.
-const died = (err, recorded = { findings: [], assessments: [] }) => Object.assign(err, { recorded });
+// RECORDED before it died, and what the spawn spent (its usage record, null when nothing ran). A fake
+// spawn dies the same way, so the chain reads values it is owed.
+const died = (err, recorded = { findings: [], assessments: [] }, usage = null) => Object.assign(err, { recorded, usage });
 // An unreviewed scope as the coverage record names it: name, cause, and what its dead worker kept.
 const gap = (name, cause, kept = 0) => ({ name, cause, kept });
 const { totalInputTokens } = require('../src/usage');
@@ -1416,11 +1417,7 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     const span = { from: '2026-08-22T03:30:00.000Z', to: '2026-08-22T03:35:00.000Z' };
     const { registry } = makeRegistry({
       workerBehavior: ({ scope }) => {
-        if (scope.name === 'b') {
-          const err = new BudgetExhaustedError('time', 'killed at the deadline');
-          err.span = span;
-          throw died(err);
-        }
+        if (scope.name === 'b') throw died(new BudgetExhaustedError('time', 'killed at the deadline'), undefined, { span });
         return okResult(scope);
       },
     });
@@ -1510,6 +1507,20 @@ describe('runMultiScopePass — wall-clock time budget', () => {
     assert.match(review.summary, /🪙 \*\*Token cap reached\*\* — 2 of 3 scope\(s\) were reviewed; NOT reviewed: b\./);
     assert.doesNotMatch(review.summary, /Time budget/);
     assert.ok(logs.includes("scope 'b' not reviewed — token cap reached"), JSON.stringify(logs));
+  });
+
+  test('when no scope completed and both bounds stopped scopes, the failure names both knobs', async () => {
+    const { registry } = makeRegistry({
+      workerBehavior: ({ scope }) => {
+        throw died(new BudgetExhaustedError(scope.name === 'a' ? 'time' : 'tokens', 'stopped'));
+      },
+    });
+    await assert.rejects(
+      runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 })),
+      (e) => e instanceof BudgetExhaustedError && e.bound === 'time'
+        && /time budget and token cap were reached before any scope completed/.test(e.message)
+        && /TIME_BUDGET_MINUTES/.test(e.message) && /MAX_REVIEW_TOKENS/.test(e.message),
+    );
   });
 
   test('a spent cap refuses every pass before a worker spawns, and the run fails naming MAX_REVIEW_TOKENS', async () => {
@@ -1662,7 +1673,7 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
         if (scope.name === 'b' && !sweep && !blipped) {
           blipped = true;
           const err = new TransientError('API Error: terminated');
-          err.span = span(30, 45); // the failed attempt burned 15 minutes, ending past every success
+          err.usage = { span: span(30, 45) }; // the failed attempt burned 15 minutes, ending past every success
           throw err;
         }
         return null;
@@ -1682,9 +1693,8 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     const registry = makeRegistry({
       workerBehavior: ({ scope, sweep }) => {
         if (scope.name === 'b' && !sweep) {
-          const err = new BudgetExhaustedError('time', 'killed at the deadline');
-          err.span = span(10, 50); // burned 40 minutes before the kill — the latest instant in the pass
-          throw died(err);
+          // burned 40 minutes before the kill — the latest instant in the pass
+          throw died(new BudgetExhaustedError('time', 'killed at the deadline'), undefined, { span: span(10, 50) });
         }
         return null;
       },
@@ -1694,6 +1704,26 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
     assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage: { span: span(10, 50) } }]);
     assert.equal(review.usage.span.to, at(50));
+  });
+
+  // zai-token-cap-zya: a spawn the cap killed spent real tokens, and the pass total is the figure an
+  // operator sizes MAX_REVIEW_TOKENS by — so the killed spawn's metered tokens reach it, and its
+  // unreported cost marks the pass's cost unpriced instead of vanishing from a dollar total.
+  test("a cap-killed scope's metered tokens reach the pass total, and its unreported cost is not silently dropped", async () => {
+    const usage ={ tokens: { inputCacheMiss: 1_000, inputCacheHit: 4_000, output: 0 }, cost: { basis: 'unpriced', reason: 'not-reported' }, span: span(10, 50) };
+    const registry = makeRegistry({
+      workerBehavior: ({ scope, sweep }) => {
+        if (scope.name === 'b' && !sweep) throw died(new BudgetExhaustedError('tokens', 'killed at the cap'), undefined, usage);
+        return null;
+      },
+    });
+    const review = await runMultiScopePass(passArgs(registry));
+    assert.deepEqual(review.unreviewedScopes, [gap('b', 'tokens')]);
+    const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
+    assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage }]);
+    // Every completed spawn here reported a span and no tokens, so the pass's tokens ARE the killed spawn's.
+    assert.deepEqual(review.usage.tokens, usage.tokens);
+    assert.equal(review.usage.cost.basis, 'unpriced');
   });
 
   test('a spawn the deadline gate refused outright (nothing ran) records a usage-less failure', async () => {

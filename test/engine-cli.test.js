@@ -97,6 +97,44 @@ describe('makeCliAdapter — the spawn start instant (zai-cost-truth-p5o.1)', ()
   });
 });
 
+// zai-token-cap-zya: every error out of produceReview carries what the spawn SPENT, so a spawn the cap
+// killed is in the footer's total exactly as it is in the cap's. [LAW:one-source-of-truth]
+describe('makeCliAdapter — a dead spawn\'s spend rides out on its error', () => {
+  const { mintTokenCap } = require('../src/token-cap');
+  const meteredSpec = {
+    ...specThatRecords(() => { throw new Error('a killed spawn is never asked for its report'); }),
+    buildCommand: () => ({
+      command: process.execPath,
+      args: ['-e', 'console.log(JSON.stringify({ used: 150 })); setTimeout(() => {}, 10000);'],
+      env: { PATH: process.env.PATH },
+    }),
+    meterUsage: () => line => ({ inputCacheMiss: 100, inputCacheHit: JSON.parse(line).used - 100, output: 0 }),
+  };
+  const produce = (tokenCap) => makeCliAdapter(meteredSpec).produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null, tokenCap });
+
+  test('a spawn the cap killed carries its metered tokens, unpriced, with its span', async () => {
+    const tokenCap = mintTokenCap(120);
+    await assert.rejects(produce(tokenCap), (err) => {
+      assert.equal(err.bound, 'tokens');
+      assert.deepEqual(err.usage.tokens, { inputCacheMiss: 100, inputCacheHit: 50, output: 0 });
+      assert.deepEqual(err.usage.cost, { basis: 'unpriced', reason: 'not-reported' });
+      assert.ok(Date.parse(err.usage.span.to) >= Date.parse(err.usage.span.from));
+      return true;
+    });
+    assert.match(tokenCap.describe(), /^150 of 120 tokens$/, 'the footer record and the cap charge the same spend');
+  });
+
+  test('a spawn refused before it ran carries a null usage — nothing was spent', async () => {
+    const tokenCap = mintTokenCap(1);
+    tokenCap.open().observe(1);
+    await assert.rejects(produce(tokenCap), (err) => {
+      assert.equal(err.bound, 'tokens');
+      assert.equal(err.usage, null);
+      return true;
+    });
+  });
+});
+
 // zai-worker-death-nt0: every error out of produceReview carries what the worker RECORDED before it
 // died, read before the collector's directory is torn down. Exercised through a REAL child that drives
 // the collector's file and then dies — the whole seam, not a stub of it. [LAW:behavior-not-structure]

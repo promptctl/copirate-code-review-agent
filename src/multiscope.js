@@ -627,7 +627,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
   const spawnRecords = [];
-  const spanOnlyUsage = (err) => (err.span ? { span: err.span } : null);
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
@@ -640,10 +639,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
           deadline,
           now,
           onRetry: ({ attempt, limit, delay, err }) => {
-            // [LAW:no-silent-failure] A retried attempt burned real time; it appears as its own
-            // record (span-only — a failed spawn reports no tokens) rather than vanishing into
-            // the retry loop. err.span is absent when the failure predated the spawn: nothing ran.
-            spawnRecords.push(spawnRecord(tag, 'retried', spanOnlyUsage(err)));
+            // [LAW:no-silent-failure] A retried attempt burned real time and tokens; it appears as
+            // its own record rather than vanishing into the retry loop. err.usage is the dead spawn's
+            // record, stamped by the adapter seam: its span and metered tokens, or null when the
+            // failure predated the spawn and nothing ran.
+            spawnRecords.push(spawnRecord(tag, 'retried', err.usage));
             log(`${label}: transient error (attempt ${attempt}/${limit}), retrying in ${Math.round(delay / 1000)}s: ${err.message}`);
           },
         },
@@ -653,7 +653,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     } catch (err) {
       // The settling failure's burned time is recorded BEFORE the error escapes — a deadline-killed
       // worker is absorbed as 'unreviewed' by the pool downstream, but its record is already here.
-      spawnRecords.push(spawnRecord(tag, 'failed', spanOnlyUsage(err)));
+      spawnRecords.push(spawnRecord(tag, 'failed', err.usage));
       throw err;
     }
   };
@@ -728,9 +728,11 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     const stops = scopes.map((s, i) => outcomes[i].passes[0].curtailed);
     const failed = stops.find(c => c.cause === 'failure');
     if (failed) throw failed.error;
-    const bound = stops[0].cause;
-    throw new BudgetExhaustedError(bound,
-      `The review's ${BOUNDS[bound].label} was reached before any scope completed — no review to deliver. ${BOUNDS[bound].remedy}`,
+    // Every bound that stopped a scope is named with its remedy — one scope refused by the clock and the
+    // rest by the cap is a run whose operator must raise both. The error's type carries the first.
+    const { exhaustedBounds } = coverage;
+    throw new BudgetExhaustedError(exhaustedBounds[0],
+      `The review's ${exhaustedBounds.map(b => BOUNDS[b].label).join(' and ')} ${exhaustedBounds.length > 1 ? 'were' : 'was'} reached before any scope completed — no review to deliver. ${exhaustedBounds.map(b => BOUNDS[b].remedy).join(' ')}`,
     );
   }
   const { sweeps, unreviewed, scopeFailures, exhaustedBounds } = coverage;
