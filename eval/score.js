@@ -34,7 +34,7 @@ const path = require('path');
 const crypto = require('crypto');
 // [LAW:one-source-of-truth] The one src require, and the only kind that keeps this module's pure load:
 // src/effort.js owns the effort TYPE, so it also owns which axis set each schema version had. The scorer
-// reads that rule rather than restating it — a second copy of "what did a pre-readSet run do" is exactly
+// reads that rule rather than restating it — a second copy of "which axes did a record of this version carry" is exactly
 // the divergence this import exists to prevent. effort.js is stdlib-free, so importing it still performs
 // no IO. [LAW:effects-at-boundaries]
 const { completeEffort } = require('../src/effort');
@@ -258,17 +258,10 @@ function parseEffort(record, label) {
   const ok = typeof raw === 'object' && !Array.isArray(raw)
     && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
     && Number.isInteger(raw.sweepCap) && raw.sweepCap >= 0
-    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string')
-    // The read-set arm is accepted as any string, exactly as reasoningTier is, rather than against
-    // src/effort.js's vocabulary: this parser reads RECORDS, and a record naming an arm this tree no
-    // longer declares is a real historical run, not a malformed one. An unknown arm still cannot be
-    // averaged into anything — it forms its own arm and refuses by mismatch below. [LAW:one-way-deps]
-    // the eval reader stays independent of the engine's current vocabulary.
-    && (raw.readSet === undefined || raw.readSet === null || typeof raw.readSet === 'string');
+    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string');
   if (!ok) {
     throw new Error(
-      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>, ` +
-      `readSet: <string|null>}, got ${JSON.stringify(raw)}.`,
+      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>}, got ${JSON.stringify(raw)}.`,
     );
   }
   // [LAW:parse-dont-validate] The profile leaves here COMPLETE — every axis of the current type carries a
@@ -287,7 +280,7 @@ function describeEffort(effort) {
     ? 'unrecorded'
     // Every axis renders a value because parseEffort hands over a complete profile; only reasoningTier
     // spells its null, and it spells it as a REAL value ('none' = no raise proposed), never as an absence.
-    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'} readSet=${effort.readSet}`;
+    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'}`;
 }
 
 // [LAW:parse-dont-validate] A case-out dir's runs are one population or they are not scorable: the mean

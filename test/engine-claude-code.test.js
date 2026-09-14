@@ -357,10 +357,6 @@ describe('claudeCodeAdapter interface declarations', () => {
     assert.equal(CLAUDE_TIMEOUT_MS, 3_000_000);
   });
 
-  test('contextWindow is 200,000 — the floor across the models this engine fronts', () => {
-    assert.equal(claudeCodeAdapter.contextWindow, 200_000);
-  });
-
   test('apiTypes contains only "anthropic-messages"', () => {
     assert.deepEqual(claudeCodeAdapter.capabilities.apiTypes, ['anthropic-messages']);
   });
@@ -509,7 +505,7 @@ describe('parseResultEnvelope — robust to json and stream-json', () => {
   test('an overflow names the window as the cause, not the prompt authoring', () => {
     const envelope = JSON.stringify({ type: 'result', is_error: true, result: 'Prompt is too long' });
     assert.throws(() => assertSucceeded(envelope), (e) =>
-      e.message.startsWith('Claude Code review failed: Prompt is too long — the worker material (diff + instructions) plus its file reads exceeded the model context window'));
+      e.message.startsWith('Claude Code review failed: Prompt is too long — the worker prompt plus the files it read exceeded the model context window'));
   });
 
   test('a multi-line stream with no terminal result is a failure (assertSucceeded throws)', () => {

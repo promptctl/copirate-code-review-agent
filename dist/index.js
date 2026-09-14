@@ -29928,7 +29928,7 @@ function wrappy (fn, cb) {
 "use strict";
 
 
-const { TIER_RANK, READ_SETS } = __nccwpck_require__(4652);
+const { TIER_RANK } = __nccwpck_require__(4652);
 
 // The budget gradient's pure decision (zai-budget-qzm.4): given the day's spend so far, the daily
 // budget, this review's diff size, and the candidate effort profiles, pick the highest-effort profile
@@ -30065,63 +30065,17 @@ function reasoningFactor(tier) {
   return REASONING_COST_MULTIPLIER[TIER_RANK[tier]];
 }
 
-// [LAW:one-source-of-truth] The per-round cost MULTIPLIER of each read-set arm (effort.js READ_SETS).
-// 'assigned' is the shipped baseline at 1.0 — each worker opens only its own scope, so one round reads
-// the changed set about ONCE however many scopes the plan has. Since partition.js rule 4, a concern cut
-// into k parts is read k times (each part reads its siblings), but rule 4's partCount bound holds the
-// (k-1) extra reads at or below the changed set, so the arm reads at most 2x the changed set on a
-// lopsided diff and ~1x otherwise; a diff-shape spread inside the constant, not a second arm. 'changed'
-// is the pre-split behavior, where
-// every worker opens every changed file, so the read is duplicated once per scope: the round's read cost
-// scales with the scope count, which is a property of the PLAN and is not knowable here. This is a
-// fixed-diff RANKER, not an oracle (see estimatedCostUsd), so the arm is priced at a single conservative
-// constant standing for a typical plan's scope count rather than a fabricated per-plan number — what MUST
-// hold is that the duplicated-read arm always ranks costlier, and 1.0 < 1.6 holds that for every plan.
-// Like REASONING_COST_MULTIPLIER this is hand-tuned with NO machine source.
-// Source / last estimated: copirate-measurement-2mg.2, 2026-09-09 (UNMEASURED — the A/B this axis exists
-// to run reports per-review MINUTES, not dollars; recalibrate if full-read cost is ever metered).
-const READ_SET_COST_MULTIPLIER = { assigned: 1.0, changed: 1.6 };
-
-// [LAW:single-enforcer] [LAW:one-source-of-truth] Same exact-correspondence assertion the tier tables get,
-// for the same reason: an arm added to effort.js with no multiplier here would price as undefined → NaN,
-// and a NaN estimate never satisfies `<= cap`, so the candidate would be silently skipped rather than
-// priced. Checked ONCE at module load, in both directions — a missing entry is the NaN above, a surplus
-// one is a dead price for an arm that does not exist. [LAW:no-silent-failure]
-const PRICED_READ_SETS = Object.keys(READ_SET_COST_MULTIPLIER);
-if (PRICED_READ_SETS.length !== READ_SETS.length || !READ_SETS.every(a => Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, a))) {
-  throw new Error(
-    `READ_SET_COST_MULTIPLIER prices ${PRICED_READ_SETS.join(', ')} but effort.js declares read sets `
-    + `${READ_SETS.join(', ')}; keep the two tables in exact correspondence (one price per arm).`,
-  );
-}
-
-// [LAW:effects-at-boundaries] Pure. The per-round cost multiplier of a read-set arm.
-// [LAW:no-silent-failure] Unlike reasoningFactor, there is NO null arm to price: `null` readSet is a
-// wire-only artifact (a run recorded before the axis existed, parsed as a typed absence by eval/score.js)
-// and can never legitimately reach a producer's profile, so pricing it at 1.0 would hide a bug rather
-// than serve a value. Every arm outside the vocabulary throws, naming the known arms.
-function readSetFactor(readSet) {
-  if (!Object.prototype.hasOwnProperty.call(READ_SET_COST_MULTIPLIER, readSet)) {
-    throw new Error(
-      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
-    );
-  }
-  return READ_SET_COST_MULTIPLIER[readSet];
-}
-
 // [LAW:effects-at-boundaries] Pure. The deterministic cost ESTIMATE for a profile at a diff.
 // [LAW:verifiable-goals] It is a fixed-diff RANKER, NOT a dollar oracle: absolute cost is ~25% noisy
 // (cache-ratio variance), but at a FIXED diff perRoundBase is constant, so the ordering across
 // candidates is driven purely by the monotonic cost-bearing axes → exact tier ranking despite the
 // absolute noise. Tests assert monotonicity + reproducibility, NEVER absolute dollars.
-// [LAW:types-are-the-program] EffortProfile now carries FOUR cost-bearing axes, all priced HERE as
+// [LAW:types-are-the-program] EffortProfile now carries THREE cost-bearing axes, all priced HERE as
 // independent monotonic multiplicands on the per-round base: roundCap (how many rounds), sweepCap
 // (how many convergence passes each round runs — landed in zai-recall-upr.2 with its consumer, the
 // sweep loop in runMultiScopePass), reasoningTier (how hard each pass reasons — landed in
-// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam), and readSet
-// (whether each worker's full reads are split across the plan or duplicated per worker — landed in
-// copirate-measurement-2mg.2 with its consumer, the read-set projection at runScopeWorker). modelTier
-// becomes a fifth when its consumer migrates; reading an axis before the type carries it would be
+// zai-difficulty-0ea.3 with its consumer, the reasoning fold at the runMultiScope seam). modelTier
+// becomes a fourth when its consumer migrates; reading an axis before the type carries it would be
 // the false theorem effort.js refuses.
 // [LAW:dataflow-not-control-flow] the product is total — every profile prices, a null reasoningTier
 // multiplies by 1.0 and a sweepCap of 0 by 1, so a roundCap-only profile is unchanged.
@@ -30129,8 +30083,7 @@ function estimatedCostUsd(profile, diffSize) {
   return perRoundBaseUsd(diffSize)
     * effectiveRounds(profile.roundCap)
     * sweepFactor(profile.sweepCap)
-    * reasoningFactor(profile.reasoningTier)
-    * readSetFactor(profile.readSet);
+    * reasoningFactor(profile.reasoningTier);
 }
 
 // [LAW:effects-at-boundaries] Pure. The per-review spend cap: a floored fraction of REMAINING budget.
@@ -30227,8 +30180,6 @@ module.exports = {
   effectiveRounds,
   sweepFactor,
   reasoningFactor,
-  readSetFactor,
-  READ_SET_COST_MULTIPLIER,
   estimatedCostUsd,
   perReviewCapUsd,
   chooseProfile,
@@ -30290,14 +30241,13 @@ function collectorTools() {
     },
     {
       name: 'add_scope',
-      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and its worker reads those files in full. List in 'reads' the changed files other scopes own that this scope's files are coupled to (they call into them or are called from them): this scope's worker reads them in full as context but does not own them. Call once per scope. Do not use while reviewing code (use request_change for findings).",
+      description: "Record one review scope while PLANNING a review: a single concern to review and the exact files/aspect to examine in it. When reviewing a pull request, list that scope's changed files in 'files' — every changed file must be assigned to exactly one scope, and that scope's worker is accountable for them. Call once per scope. Do not use while reviewing code (use request_change for findings).",
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string', minLength: 1, pattern: '\\S' },
           focus: { type: 'string', minLength: 1, pattern: '\\S' },
           files: { type: 'array', items: { type: 'string' } },
-          reads: { type: 'array', items: { type: 'string' } },
         },
         required: ['name', 'focus'],
         additionalProperties: false,
@@ -30958,11 +30908,15 @@ const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
 
-// [LAW:one-source-of-truth] One well-known location for session transcripts, defined once. RUNNER_TEMP
-// is set by GitHub Actions and Gitea's act_runner alike; os.tmpdir() is the local-dev fallback. A
-// workflow points actions/upload-artifact at this directory to download the full session — the
-// action also sets it as the `transcript-dir` output so no path is hardcoded in the workflow.
-const TRANSCRIPT_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-transcripts');
+// [LAW:one-source-of-truth] The job's scratch root, resolved once: everything the job writes for itself
+// (transcripts, the diff files workers read) lives under it. RUNNER_TEMP is set by GitHub Actions and
+// Gitea's act_runner alike, and the runner deletes it after the job; os.tmpdir() is the local-dev fallback.
+const JOB_TEMP_DIR = process.env.RUNNER_TEMP || os.tmpdir();
+
+// One well-known location for session transcripts. A workflow points actions/upload-artifact at this
+// directory to download the full session — the action also sets it as the `transcript-dir` output so no
+// path is hardcoded in the workflow.
+const TRANSCRIPT_DIR = path.join(JOB_TEMP_DIR, 'agent-review-transcripts');
 
 const RULE = '='.repeat(72);
 const section = label => `\n${RULE}\n== ${label}\n${RULE}\n`;
@@ -31012,7 +30966,7 @@ function emitTranscript({ engine, model, prompt, stdout, stderr, label }) {
   }
 }
 
-module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
+module.exports = { JOB_TEMP_DIR, TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 /***/ }),
@@ -31480,6 +31434,44 @@ module.exports = {
 
 /***/ }),
 
+/***/ 1352:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
+const { annotatePatchWithLines } = __nccwpck_require__(9898);
+
+// [LAW:effects-at-boundaries] The change, on disk: each changed file's patch, annotated on the LINE grid
+// the review anchors to, written to <dir>/<filename>.diff. A worker reads the change with the same Read,
+// Grep and Glob it reads the repository with, and what it reads is its own decision; this module only
+// puts the change where those tools reach. A file with no patch (binary, or too large for the host to
+// render) has no diff file, and the prompt names it.
+// [LAW:no-silent-failure] A changed path that resolves outside the directory is refused, never written.
+// The caller names the directory: the diffs hold the change's code, so they belong under a directory the
+// caller already deletes, never an orphan temp dir that outlives the run.
+function writeDiffFiles(files, dir) {
+  const root = path.resolve(dir);
+  fs.mkdirSync(root, { recursive: true });
+  for (const f of files.filter(file => file.patch)) {
+    // path.join, not path.resolve: root is already absolute, and ncc reads a path.resolve over a template
+    // as a cwd-relative asset glob, copying every *.diff in the repo into dist on each build.
+    const target = path.join(root, `${f.filename}.diff`);
+    if (!target.startsWith(`${root}${path.sep}`)) {
+      throw new Error(`writeDiffFiles: changed path ${JSON.stringify(f.filename)} resolves outside the diff directory ${root}; refusing to write it.`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, `${f.filename} (${f.status})\n${annotatePatchWithLines(f.patch)}\n`);
+  }
+  return root;
+}
+
+module.exports = { writeDiffFiles };
+
+
+/***/ }),
+
 /***/ 9898:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -31579,24 +31571,6 @@ function* patchLines(patch) {
     }
     yield { kind: 'meta', text };
   }
-}
-
-// [LAW:effects-at-boundaries] Pure: the new-side line ranges this patch touches, one per hunk, in
-// patch order — what a worker told to read a file "around its changed lines" opens with Read
-// offset/limit instead of the whole file. A header without a length (`+12 @@`) is one line. A pure
-// deletion at the top of the file (`+0,0`) has no new-side line of its own; the read starts at line 1,
-// the nearest line that exists, never at a line 0 no file has.
-function hunkRanges(patch) {
-  const ranges = [];
-  for (const text of patch.split('\n')) {
-    const hunk = HUNK_HEADER.exec(text);
-    if (hunk) {
-      const from = Math.max(Number(hunk[1]), 1);
-      const length = hunk[2] === undefined ? 1 : Number(hunk[2]);
-      ranges.push({ from, to: from + Math.max(length, 1) - 1 });
-    }
-  }
-  return ranges;
 }
 
 function buildFileAnchors(file) {
@@ -31822,7 +31796,6 @@ function reconcileChangedSet(listed, parsed) {
 
 module.exports = {
   fileChurn,
-  hunkRanges,
   matchesPattern,
   parseReviewableFiles,
   reconcileChangedSet,
@@ -32152,19 +32125,11 @@ module.exports = {
 // convergence chain in runMultiScopePass, reads it here), `reasoningTier` (its consumer is the reasoning fold at the
 // runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
 // profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
-// to the engine's range), and `readSet` (its consumer is the read-set projection at runScopeWorker,
-// which decides WHICH files each worker opens in full). It GROWS a field as each remaining knob's
-// consumer is migrated off its current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today
-// per-config on the chain).
+// to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
+// current source: `modelTier` (today per-config on the chain).
 // Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its consumer
 // exists is a lie — so `reasoningTier` lands together with its fold consumer (multiscope.js) and its
 // price (budget.js estimatedCostUsd), never as an ungoverned placeholder.
-//
-// [LAW:one-source-of-truth] `readSet` and the still-unlanded `readBudget` are DIFFERENT axes and the
-// names invite conflating them. `readBudget` (MAX_DIFF_CHARS) bounds how much DIFF is rendered into the
-// prompt — the same text for every worker. `readSet` decides which changed files a worker OPENS in full
-// once it has that diff, which is per-WORKER and is the axis a multi-scope plan can split. Both are read
-// cost; only one is partitionable, which is why splitting was a lever at all.
 //
 // [LAW:one-source-of-truth] `reasoningTier` on the profile is the difficulty-PROPOSED RAISE, NOT a
 // review's absolute reasoning tier. The absolute per-config baseline stays `config.reasoning` (each
@@ -32195,38 +32160,6 @@ module.exports = {
 // is always finite. [LAW:types-are-the-program]
 const DEFAULT_SWEEP_CAP = 2;
 
-// [LAW:dataflow-not-control-flow] The read-set axis, as a table from each arm's NAME to the projection
-// that produces the files a worker opens in full. The vocabulary is the table's KEYS (READ_SETS below),
-// so a name can never exist without the meaning it selects — the pair that would drift if the two were
-// written separately. [LAW:one-source-of-truth]
-//   'assigned' — the worker reads only the scope it was assigned. N workers cost ~1× the read of the
-//                changed set (split), not N× (duplicated): the shipped cost cut.
-//   'changed'  — the worker reads the whole changed set, the pre-split behavior. It projects to the
-//                EMPTY list because that is already prompt.js's value for "read every changed file in
-//                full" (buildReviewInput's readFiles) — this axis picks which value flows to a seam
-//                that was always value-driven, and adds no second prompt path. [LAW:composability]
-// The projection takes the scope's eyesight (its owned files plus its second reads) and returns the read
-// set, so the two arms are one signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
-// `scope.files` remains the coverage record either way (the partition assigns every changed path once,
-// and pinnedProposal proves a replayed plan against the changed set), so an arm changes what a worker
-// READS and nothing about what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
-const READ_SET_PROJECTION = {
-  assigned: (scopeFiles) => scopeFiles,
-  changed: () => [],
-};
-
-// [LAW:one-source-of-truth] The arm vocabulary, derived from the projection table rather than listed a
-// second time: the CLIs validate against this and the error messages name it, so a new arm is one entry
-// in one table. [LAW:types-are-the-program]
-const READ_SETS = Object.keys(READ_SET_PROJECTION);
-
-// [LAW:one-source-of-truth] The default read set: the behavior the engine ships (each worker reads its
-// own scope). Unlike a cap there is no numeric "off" — the axis is a closed two-value vocabulary, so the
-// non-default arm is named, not spelled as a magic number. [LAW:no-mode-explosion] this is an A/B AXIS,
-// not a user knob: no action input sets it, and its non-default arm exists to be MEASURED
-// (copirate-measurement-2mg.2) — the shipped lever was priced on cost evidence with no recall verdict.
-const DEFAULT_READ_SET = 'assigned';
-
 // [LAW:dataflow-not-control-flow] The abstract reasoning-tier ladder, low→high, keyed to an ordinal
 // RANK. It is the union of every engine's declared reasoning-effort vocabulary: claude-code exposes
 // low..max, codex minimal..xhigh, opencode none. `xhigh` (codex's ceiling) and `max` (claude-code's
@@ -32236,7 +32169,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null), readSet: string }} EffortProfile
+// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE the engine's default
 // behavior (which, since zai-recall-upr.2, includes convergence sweeps: sweepCap > 0). An OPTIONS
@@ -32257,12 +32190,8 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // estimatedCostUsd — both land together with the axis, per this module's header. It is OWNED here
 // (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, not a
 // consumer knob. [LAW:no-mode-explosion]
-// `readSet` is the profile's read-partitioning axis (copirate-measurement-2mg.2): its consumer is the
-// projection at runScopeWorker, its price the read multiplicand in budget.js's estimatedCostUsd — both
-// land with the axis, per this module's header. It is OWNED here (DEFAULT_READ_SET), not sourced from an
-// action input: how a plan splits its reads is engine policy, not a consumer knob. [LAW:no-mode-explosion]
-function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null, readSet = DEFAULT_READ_SET } = {}) {
-  return { roundCap, sweepCap, reasoningTier, readSet };
+function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null } = {}) {
+  return { roundCap, sweepCap, reasoningTier };
 }
 
 // [LAW:one-source-of-truth] The version of the RECORDED profile, owned next to the type it versions —
@@ -32272,7 +32201,7 @@ function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reas
 // the record states the theorem that was true at its writing, so a reader never has to guess whether an
 // absent axis was a choice or an era. Bump it whenever defaultEffortProfile's axes change, and give the
 // outgoing version its row in the back-fill below — the bump and the row are one edit, never two.
-const EFFORT_SCHEMA = 'copirate-effort/v1';
+const EFFORT_SCHEMA = 'copirate-effort/v2';
 
 // [LAW:parse-dont-validate] A record carrying no version is NOT versionless: it was written in the era
 // before the version existed, and that era had exactly one axis set. So absence is a VALUE here — it gets
@@ -32282,21 +32211,19 @@ const EFFORT_SCHEMA = 'copirate-effort/v1';
 const UNVERSIONED_EFFORT_SCHEMA = 'copirate-effort/unversioned';
 
 // [LAW:dataflow-not-control-flow] The back-fill, as a TABLE from schema version to the axes the CODE
-// STRUCTURALLY HAD at that version — values, not an inference each reader re-derives at its own site.
-// [LAW:single-enforcer] one rule, read through completeEffort by every comparison site, replacing the
-// unanswerable "what arm did this run's missing axis run at?" with an answer this tree owns and can cite.
-//   unversioned -> readSet 'assigned': scope-bounded reads shipped in bfcd889 on 2026-07-06, before every
-//     stored run, and the axis did not exist to be set otherwise — the behavior was that arm as a matter
-//     of code, not of guesswork. Retro-editing the stored meta.json files to add the field would falsify
-//     the record; interpreting them through an owned rule is the honest form of the same knowledge.
-//     [LAW:one-source-of-truth] the value is spelled out rather than written as DEFAULT_READ_SET: this
-//     row is a HISTORICAL fact about code that shipped, and if the shipped default ever moves, what those
-//     runs did does not move with it. Binding the two would make the past follow the present.
+// STRUCTURALLY HAD at that version which a record of that version may lack — values, not an inference each
+// reader re-derives at its own site. [LAW:single-enforcer] one rule, read through completeEffort by every
+// comparison site.
+//   unversioned, v1 -> {}: those records carry roundCap, sweepCap and reasoningTier themselves. They also
+//     carry a readSet axis the profile no longer has (workers read diff files and choose their own reads
+//     since zai-material-bez); it passes through as recorded, and retro-editing the stored records to drop
+//     it would falsify them.
 //   current -> {}: a record written at the current version carries every axis itself, so there is nothing
 //     to supply — and an axis still missing is a DEFECT, refused loudly by completeEffort rather than
 //     quietly filled.
 const EFFORT_SCHEMA_BACKFILL = {
-  [UNVERSIONED_EFFORT_SCHEMA]: { readSet: 'assigned' },
+  [UNVERSIONED_EFFORT_SCHEMA]: {},
+  'copirate-effort/v1': {},
   [EFFORT_SCHEMA]: {},
 };
 
@@ -32358,24 +32285,6 @@ function completeEffort({ effort, effortSchema }) {
     );
   }
   return completed;
-}
-
-// [LAW:parse-dont-validate] Resolve the arm NAME to the projection it selects — the axis's one checkpoint,
-// and the only place its vocabulary is checked. It returns something that could not exist before the check
-// (the projection itself), so a caller holding one holds a proven arm: there is nothing left inland to
-// re-check, and no way to reach a worker with a name the table has no meaning for. [LAW:single-enforcer]
-// Callers resolve ONCE at a pass boundary rather than per worker, which is what puts the refusal BEFORE the
-// scout spawn instead of after it — a malformed arm costs nothing rather than a round of spend.
-// [LAW:no-silent-failure] an unknown arm is a caller bug, not something to coalesce to the default:
-// silently reading the shipped arm would make an A/B report the DEFAULT behavior under the other arm's
-// name — a measurement that lies rather than fails. Throw, naming the known arms.
-function readSetProjection(readSet) {
-  if (!Object.prototype.hasOwnProperty.call(READ_SET_PROJECTION, readSet)) {
-    throw new Error(
-      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
-    );
-  }
-  return READ_SET_PROJECTION[readSet];
 }
 
 // [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
@@ -32454,8 +32363,6 @@ function resolveReasoningTier(tier, engineEfforts) {
 
 module.exports = {
   DEFAULT_SWEEP_CAP,
-  DEFAULT_READ_SET,
-  READ_SETS,
   TIER_RANK,
   EFFORT_SCHEMA,
   UNVERSIONED_EFFORT_SCHEMA,
@@ -32466,7 +32373,6 @@ module.exports = {
   defaultEffortProfile,
   resolveReasoningTier,
   maxTier,
-  readSetProjection,
 };
 
 
@@ -32650,8 +32556,7 @@ function buildCommand({ config, collector, home }) {
     // 22k and the worker "succeeded" having judged a compaction summary of the diff, not the diff
     // (links-317-dolt-telemetry, session d54a1478). With it off the same overflow surfaces as the
     // "Prompt is too long" error assertSucceeded names, and the chain reports the scope unreviewed.
-    // The fit (src/window.js) is what keeps the material inside the window; this is the alarm that
-    // says so when it did not. Present in the pinned CLI (2.1.0) and current releases (2.1.267).
+    // Present in the pinned CLI (2.1.0) and current releases (2.1.267).
     DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
@@ -32701,7 +32606,7 @@ function assertSucceeded(stdout) {
     // context window — because the raw "Prompt is too long" reads like a prompt-authoring bug and sent
     // two investigations toward the instructions before the transcripts showed a 232k first request.
     const overflow = /prompt is too long/i.test(String(parsed.result ?? ''))
-      ? ' — the worker material (diff + instructions) plus its file reads exceeded the model context window; see contextWindow and the window fit in src/window.js'
+      ? ' — the worker prompt plus the files it read exceeded the model context window'
       : '';
     throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}${overflow}`);
   }
@@ -32786,18 +32691,6 @@ const classifyClaudeError = classifyError;
 const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
-  // [LAW:one-source-of-truth] The FLOOR across every model this engine fronts, measured on the case
-  // that overflowed it (a 232k first request failing "Prompt is too long" against Claude's 200k).
-  // The engine is not Claude-only — src/provider.js routes zai and deepseek through it — but no
-  // model routed here has a smaller window (GLM-5.x and DeepSeek V4 both declare 200k or more), and
-  // a model with a larger one gets material fit to 200k, which withholds early rather than late: the
-  // safe direction. Unlike codex/opencode, whose fronted models' windows are unknown to this repo,
-  // this floor is a known fact for the models in the provider table. An operator who overrides the
-  // model or base URL to something outside it is not validated against a window list (this repo keeps
-  // none, and a second table of model facts would drift); a smaller window there overflows LOUDLY —
-  // "Prompt is too long", the scope reported unreviewed — never as a silent compaction.
-  // Moves with a measurement, never a wish.
-  contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load
@@ -32905,13 +32798,6 @@ function makeCliAdapter(spec) {
     name: spec.name,
     toolNames: spec.toolNames,
     capabilities: spec.capabilities,
-    // The model context window this engine reviews inside, in tokens, or null when the engine does
-    // not declare one. The multi-scope pass hands it to the material so each worker's prompt is FIT
-    // to it (src/window.js) — the diff it is shown and the files it is told to read are sized so the
-    // first request cannot overflow. Forwarded as declared; runMultiScopePass (src/multiscope.js) is
-    // the one checkpoint of its vocabulary (null | positive integer). [LAW:one-source-of-truth]
-    contextWindow: spec.contextWindow,
-
     // buildPromptFor(toolNames) is applied with THIS engine's tool identifiers, so a failover chain
     // gives each engine its own MCP tool names in the prompt. [LAW:types-are-the-program]
     // [LAW:dataflow-not-control-flow] usage is a value extracted from the engine's own output and
@@ -33298,9 +33184,6 @@ function classifyError(err, text) {
 const codexAdapter = makeCliAdapter({
   name: 'codex',
   timeoutMs: CODEX_TIMEOUT_MS,
-  // Undeclared: codex fronts models of differing windows and compacts on its own; nothing is withheld
-  // from its workers and every read is full — the pre-fit behavior, as a value. [LAW:dataflow-not-control-flow]
-  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js. Illegal combos (e.g. anthropic-messages
@@ -33687,8 +33570,6 @@ function classifyError(err, text) {
 const opencodeAdapter = makeCliAdapter({
   name: 'opencode',
   timeoutMs: OPENCODE_TIMEOUT_MS,
-  // Undeclared: opencode fronts any provider's models; nothing is withheld and every read is full.
-  contextWindow: null,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth for config
     // validation in src/config.js. An EMPTY reasoningEfforts set is a deliberate, accurate theorem:
@@ -34661,13 +34542,12 @@ module.exports = {
 const os = __nccwpck_require__(857);
 const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, TransientError } = __nccwpck_require__(2887);
 const { DeadlineExceededError, BUDGET_REMEDY, remainingMs } = __nccwpck_require__(6757);
-const { defaultEffortProfile, maxTier, readSetProjection } = __nccwpck_require__(4652);
+const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { spawnRecord, scheduleRecord, spanMs, formatMs, passLabel, renderRunningTotal } = __nccwpck_require__(7932);
 const { planRecord } = __nccwpck_require__(8194);
 const { partitionByDirectory } = __nccwpck_require__(6231);
-const { seamsOf } = __nccwpck_require__(5702);
 const { renderDependencyDiffNote } = __nccwpck_require__(9838);
 const { NO_EXCLUSIONS, excludedPathList, fileChurn } = __nccwpck_require__(9898);
 const {
@@ -35001,7 +34881,7 @@ async function runScopeWorkers({ scopes, runOne, laneCount }) {
 // attempts on it, and config-level failover is the owner of what happens next. [LAW:dataflow-not-control-flow]
 // The killed spawn's burned time is not this chain's concern: the spawn seam recorded it (err.span)
 // before the error got here.
-async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, contextWindow, deadline, now, runningTotal }) {
+async function runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }) {
   // Pass 0 is seeded with NOTHING — its prompt stays byte-identical to the pre-sweep engine even when
   // a sibling chain has already recorded findings, because a scope that waited for a lane must not
   // be told its material "was already examined" (the sweep block's premise). A sweep is seeded with
@@ -35021,7 +34901,7 @@ async function runScopeChain({ scope, context, material, spawn, log, ledger, swe
   const attemptPass = async (pass) => {
     if (remainingMs(deadline, now()) <= 0) return { ...NOTHING_RECORDED, curtailed: { cause: 'budget' } };
     try {
-      const { findings, assessments } = await runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings: seedFor(pass), pass });
+      const { findings, assessments } = await runScopeWorker({ scope, context, material, spawn, log, priorFindings: seedFor(pass), pass });
       return { findings, assessments, curtailed: false };
     } catch (e) {
       if (e instanceof TransientError) throw e;
@@ -35083,22 +34963,11 @@ function curtailmentLogText(curtailed) {
 // [LAW:one-source-of-truth] `pass` is the index as DATA (0 = the review of record, 1..N = sweeps);
 // the human-facing 'sweep N ' label derives from it via sweepLabelPrefix, and the schedule record
 // carries the number — one value, both representations derived.
-// contextWindow is the engine's declared window (adapter.contextWindow: tokens, or null), handed to the
-// material so the worker's prompt is FIT to it (buildReviewInput → fitWorkerMaterial) — a value from the
-// adapter, threaded, never re-read from the registry here. [LAW:one-source-of-truth]
-async function runScopeWorker({ scope, context, material, spawn, log, readFilesFor, contextWindow, priorFindings = [], pass = 0 }) {
+async function runScopeWorker({ scope, context, material, spawn, log, priorFindings = [], pass = 0 }) {
   const focusText = workerFocusText(scope, context);
-  // [LAW:decomposition] What the worker opens IN FULL is the effort profile's read-set arm applied to this
-  // scope's eyesight — the files it owns plus the sibling files it reads as a second reader (readFilesFor,
-  // resolved once at the pass boundary): under the shipped 'assigned' arm that IS the pair, so N workers
-  // split the read and only a cut concern is read twice; under 'changed' it is the empty list, which is
-  // the material's own value for "read every changed file" — the pre-split behavior 2mg.2 prices against.
-  // [LAW:one-source-of-truth] The pair keeps the two facts apart: `read` is that projection; `assigned` is
-  // `scope.files` unprojected — the COVERAGE record the plan carries,
-  // and what picks the single worker owning a bumped go.mod. Collapsed back into one list, 'changed' would
-  // zero the ownership too and silently drop every dependency assessment. Repo material ignores it (no diff).
-  const buildPromptFor = (toolNames) =>
-    material.buildWorkerPrompt(focusText, toolNames, { assigned: scope.files, read: readFilesFor([...scope.files, ...scope.reads]), window: contextWindow }, priorFindings);
+  // `scope.files` is the COVERAGE record the plan carries, and what picks the single worker owning a bumped
+  // go.mod. What the worker reads is its own decision; repo material ignores the assignment (no diff).
+  const buildPromptFor = (toolNames) => material.buildWorkerPrompt(focusText, toolNames, scope.files, priorFindings);
   const label = `${sweepLabelPrefix(pass)}scope '${scope.name}'`;
   log(`${label} starting…`);
   // [LAW:dataflow-not-control-flow] Every record kind the spawn produced flows through this seam
@@ -35157,12 +35026,12 @@ function uniquelyNamed(scopes) {
 // [LAW:dataflow-not-control-flow]
 
 // [LAW:one-source-of-truth] The PR producer: the structure is a pure function of the changed paths, their
-// churn, their size and their seams (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
+// churn (src/partition.js), so five replays of one diff run five identical partitions — the property the LLM
 // scout could not offer (1 to 5 scopes per replay on a frozen case, copirate-determinism-5od). No spawn
 // is bought, so scoutUsage is null by the plan's own table. [LAW:effects-at-boundaries] Pure but for the
 // one progress line, exactly as pinnedProposal is.
-function partitionProposal({ changed, seams, laneCeiling, log }) {
-  const { scopes, context } = partitionByDirectory(changed, seams, { laneCeiling });
+function partitionProposal({ changed, laneCeiling, log }) {
+  const { scopes, context } = partitionByDirectory(changed, { laneCeiling });
   log(`partitioned ${changed.length} changed file(s) into ${scopes.length} scope(s): ${scopes.map(s => s.name).join(', ')}`);
   return { provenance: 'partition', scopes, context, scoutUsage: null };
 }
@@ -35199,9 +35068,8 @@ async function scoutProposal({ buildScoutPrompt, spawn, log }) {
 // proposal to hand the workers.
 //
 // [LAW:no-silent-failure] A partition is a cover with no overlap, and the refusal checks BOTH halves —
-// exact set equality against the changed paths in both directions, and no path claimed twice — and
-// that every second read names a path in the change, before the first worker at zero model spend. None
-// of the four may be waved through. A plan omitting a
+// exact set equality against the changed paths in both directions, and no path claimed twice — before
+// the first worker at zero model spend. None of the three may be waved through. A plan omitting a
 // changed file would leave that file read in full by no worker while its plan.json claimed a
 // partition of the whole change, so the pinned replay would be a different review wearing the plan's
 // name. A plan naming a file this diff does not contain is the same error read from the other side:
@@ -35225,18 +35093,12 @@ function pinnedProposal({ plan, changedPaths, log }) {
   const omitted = changedPaths.filter(p => !assigned.has(p));
   const foreign = [...assigned].filter(p => !changed.has(p));
   const duplicated = [...assigned].filter(p => claimed.indexOf(p) !== claimed.lastIndexOf(p));
-  // `reads` is eyesight, not ownership, so it takes no part in the cover — but a read naming a path this
-  // change does not contain is the same "plan belongs to some other change" error read from a fourth
-  // side, and it would otherwise surface only as a worker told to open a file that is not there, after
-  // the spawn was paid for. Refused here with the rest, at zero spend.
-  const unreadable = [...new Set(plan.scopes.flatMap(s => s.reads))].filter(p => !changed.has(p));
-  if (omitted.length + foreign.length + duplicated.length + unreadable.length > 0) {
+  if (omitted.length + foreign.length + duplicated.length > 0) {
     throw new Error(
       'Pinned plan does not partition this change — refusing before any spawn. ' +
       `Changed file(s) no scope claims (${omitted.length}): ${excludedPathList(omitted)}. ` +
       `File(s) the plan names that this change does not contain (${foreign.length}): ${excludedPathList(foreign)}. ` +
       `File(s) claimed by more than one scope (${duplicated.length}): ${excludedPathList(duplicated)}. ` +
-      `File(s) a scope reads that this change does not contain (${unreadable.length}): ${excludedPathList(unreadable)}. ` +
       'A plan that covers less than the change reviews less than the change and reports success; ' +
       'pin a plan recorded from THIS case, or drop --plan and let the partition compute it.',
     );
@@ -35259,12 +35121,7 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
-  // [LAW:parse-dont-validate] The read-set arm is resolved to its projection ONCE, here, before the scout
-  // spawns: every worker below is handed the resolved projection, so an arm outside the vocabulary is
-  // refused at zero spend rather than at the first worker's prompt. Same position and reason as the two
-  // gates below — the difference is that this one hands back the proven value it checked.
-  const readFilesFor = readSetProjection(readSet);
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -35280,15 +35137,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     throw new Error(`runMultiScopePass requires a positive integer laneCeiling (got ${JSON.stringify(laneCeiling)}); it comes from the machine's capacity (laneCeilingFromMemory).`);
   }
   const adapter = registry.get(config.engine);
-  // [LAW:parse-dont-validate] The engine's context window crosses from the adapter into the engine HERE,
-  // and this is its one checkpoint: null (undeclared) or a positive integer. An adapter that never
-  // declared the field hands over `undefined`, which the material's default would launder into
-  // "undeclared" and the fit into a NaN budget — either way a silent answer to a question nobody asked.
-  // Refused at zero spend with the field named, like the two gates above. [LAW:no-silent-failure]
-  const contextWindow = adapter.contextWindow;
-  if (contextWindow !== null && !(Number.isInteger(contextWindow) && contextWindow > 0)) {
-    throw new Error(`runMultiScopePass requires the engine adapter to declare contextWindow as null or a positive integer token count (got ${JSON.stringify(contextWindow)} from '${config.engine}').`);
-  }
 
   // [LAW:decomposition] Every engine spawn in this pass goes through one transient-retry seam, so a
   // single flaky request (a dropped socket, a 5xx) is absorbed in place — the scout and each worker
@@ -35391,7 +35239,7 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   const outcomes = await runScopeWorkers({
     scopes,
     laneCount,
-    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, readFilesFor, contextWindow, deadline, now, runningTotal }),
+    runOne: (scope) => runScopeChain({ scope, context, material, spawn, log, ledger, sweepCap, deadline, now, runningTotal }),
   });
   log(`all scopes done — ${runningTotal()}`);
   // A scope whose pass 0 did not complete is a COVERAGE gap, carried as data to the summary and the
@@ -35482,10 +35330,9 @@ const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
 // multi-scope pass builds its own prompts per spawn from `material`, so the latter two are unused
 // here — passed null, exactly as repo mode already passes null anchors. [LAW:composability]
 // log is the injected progress effect (core.info in the action, a stderr writer in the dev script).
-// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound, read-set arm
-// AND reasoning raise, and this is the ONE seam where the chain and the profile meet — so all three
-// projections happen here: sweepCap onto the pass's plain number, readSet onto the pass's arm (which the
-// pass resolves to a projection before spawning anything), and reasoningTier folded onto each config's own
+// [LAW:single-enforcer] The effort profile is the ONE source of the review's sweep bound AND reasoning
+// raise, and this is the ONE seam where the chain and the profile meet — so both projections happen here:
+// sweepCap onto the pass's plain number, and reasoningTier folded onto each config's own
 // reasoning as a FLOOR (maxTier). Folding into the chain — rather than threading the tier down to each
 // adapter — means the effective config flows through produceReview unchanged, so the engine clamps it
 // per its range (resolveReasoningTier) and `configUsed` (hence the attribution footer) automatically
@@ -35497,7 +35344,6 @@ const SWEEP_LOG_BY = { budget: 'time budget', failure: 'worker failure' };
 // effort profile because it is not effort — see LANE_MEMORY_BYTES.
 function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
-  const readSet = effort.readSet;
   const effectiveChain = chain.map(config => ({
     ...config,
     reasoning: maxTier(config.reasoning ?? null, effort.reasoningTier ?? null),
@@ -35507,7 +35353,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, readSet, log, plan, sleepFn, deadline, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -35525,10 +35371,10 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
 // prompt and a worker prompt from the inputs its mode already has; the engine above is material-blind.
 
-// PR material: the scout is handed the changed file paths; each worker sees the WHOLE annotated diff
-// (so every anchor stays valid) with its scope as the CONCENTRATE focus, but reads only its scope's
-// assigned files in full. files/maxDiffChars are the same values run.js uses to build the anchors, so
-// worker findings and anchors share one diff.
+// PR material: the partition gives each changed file one owning scope, and every worker is pointed at the
+// change's diff files (diffDir, written by writeDiffFiles, src/diff-files.js) and the repository, and reads
+// what it decides to. `files` are the same values run.js builds the anchors from, so worker findings and
+// anchors share one diff.
 // dependencySummaries is the (possibly empty) structured upstream-change context src/dependency-diff.js
 // fetched for any go.mod bump in this PR — the ONE source both the worker prompt (this material) and the
 // posted-review section (run.js) render from. [LAW:one-source-of-truth] The material derives the prompt
@@ -35536,30 +35382,23 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
 // directive can name the exact modules. [] is the common case (no bump, or the feature is off): the note
 // is '' and the bump list empty, flowing through unchanged. [LAW:dataflow-not-control-flow]
 // priorPushbacks is the (possibly empty) set of this PR's earlier findings the author replied to
-// (fetchPriorPushbacks, src/transport.js). Every worker receives all of them — like the whole diff, which
-// each worker also sees — so a rebuttal about any file informs whichever worker owns it, and the scout
+// (fetchPriorPushbacks, src/transport.js). Every worker receives all of them, so a rebuttal about any file informs whichever worker owns it, and the scout
 // need not partition them. [] (a first round, or no replies) flows through unchanged. [LAW:dataflow-not-control-flow]
 // excluded is filterFiles' record of what EXCLUDE_PATTERNS took OUT of `files` ({patterns, paths}) — the
 // one fact neither the scout nor a worker can recover from the material it is handed, since both are
 // handed only what survived the filter. It reaches BOTH prompts because both reason about completeness:
 // the scout plans coverage of the changed set, a worker judges it. NO_EXCLUSIONS (an unfiltered run,
 // e.g. scripts/local-review.js) renders nothing in either. [LAW:dataflow-not-control-flow]
-// [LAW:parse-dont-validate] `files` must carry the content measurement measureChangedFiles (src/window.js)
-// stamps — the worker prompt's window fit sizes every full read by it — and THIS is the checkpoint: the
-// material boundary, before any lane spawns, so an unmeasured changed set is refused at zero spend with
-// the seam named, never discovered inside a worker as a TypeError absorbed into "scope failed".
-function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
-  const unmeasured = files.find(f => !f.content || !Number.isInteger(f.content.tokens) || !Number.isInteger(f.content.lines) || !f.content.symbols);
-  if (unmeasured) {
-    throw new Error(`buildPrMaterial: changed file '${unmeasured.filename}' carries no content measurement; the changed set must pass through measureChangedFiles (src/window.js) before it becomes review material.`);
+// [LAW:no-silent-failure] diffDir is required: without it every worker would be told to read diffs at a
+// path that does not exist, and the refusal belongs here, before any lane spawns.
+function buildPrMaterial({ files, diffDir, reviewedRepoRoot, dependencySummaries = [], priorPushbacks = [], excluded = NO_EXCLUSIONS }) {
+  if (typeof diffDir !== 'string' || diffDir.length === 0) {
+    throw new Error(`buildPrMaterial: diffDir must name the directory writeDiffFiles (src/diff-files.js) wrote this change's diff files to (got ${JSON.stringify(diffDir)}).`);
   }
   const changedPaths = files.map(f => f.filename);
   // [LAW:one-source-of-truth] The partition's size dimension is the SAME per-file count the budget and the
-  // difficulty classifier sum (fileChurn) — never a second line-counter beside them; its read cost is the
-  // SAME line count the window fit sizes a full read by; and its seams are derived once here, from the
-  // symbols the measurement stamped, for every scope the partition hands a second read to.
-  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f), lines: f.content.lines }));
-  const seams = seamsOf(files);
+  // difficulty classifier sum (fileChurn) — never a second line-counter beside them.
+  const changed = files.map(f => ({ filename: f.filename, churn: fileChurn(f) }));
   const dependencyDiffNote = renderDependencyDiffNote(dependencySummaries);
   // Only a resolved bump has upstream context to judge; an unresolved one renders as a plain line in the
   // sink and carries no model assessment, so it is excluded from the assess directive. [LAW:no-silent-failure]
@@ -35574,13 +35413,10 @@ function buildPrMaterial({ files, maxDiffChars, reviewedRepoRoot, dependencySumm
     // [LAW:dataflow-not-control-flow] The lane ceiling reaches the cut as a value — the one machine fact
     // the plan consults, so a concern is never cut into more parts than the runner can run beside the
     // other scopes (rule 4). A pinned plan replays whatever width it was cut at.
-    proposal: ({ log, laneCeiling }) => partitionProposal({ changed, seams, laneCeiling, log }),
+    proposal: ({ log, laneCeiling }) => partitionProposal({ changed, laneCeiling, log }),
     // priorFindings is the convergence-sweep value threaded per pass by runScopeWorker: [] on the
     // initial pass (byte-identical prompt), the cumulative found list on a sweep. [LAW:dataflow-not-control-flow]
-    // [LAW:dataflow-not-control-flow] The assignment, the read set and the window arrive as one record and
-    // land on the parameters that own them; the lists default to empty and the window to null (undeclared:
-    // nothing withheld, every read full) — the broad single-scope call, values not modes.
-    buildWorkerPrompt: (focusText, toolNames, { assigned = [], read = [], window = null } = {}, priorFindings) => buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles: assigned, readFiles: read, window, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, assigned, priorFindings) => buildReviewInput({ files, diffDir, toolNames, reviewedRepoRoot, focus: focusText, scopeFiles: assigned, dependencyDiffNote, dependencyBumps, priorPushbacks, priorFindings, excluded }).prompt,
   };
 }
 
@@ -35599,9 +35435,9 @@ function buildRepoMaterial({ scope, excludePatterns, reviewedRepoRoot }) {
       log,
     }),
     // Repo mode has no diff to partition, so a repo worker reviews its scope broadly by exploring the
-    // tree; the assigned/read pair the PR worker uses is deliberately ignored here, while the convergence
+    // tree; the assignment the PR worker uses is deliberately ignored here, while the convergence
     // sweep's priorFindings flows through exactly as in PR material. [LAW:dataflow-not-control-flow]
-    buildWorkerPrompt: (focusText, toolNames, _assignedRead, priorFindings) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot, priorFindings }).prompt,
+    buildWorkerPrompt: (focusText, toolNames, _assigned, priorFindings) => buildRepoReviewInput({ scope: focusText, excludePatterns, toolNames, reviewedRepoRoot, priorFindings }).prompt,
   };
 }
 
@@ -35664,25 +35500,9 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //      fills, contiguous in companion order (a test and the source it names are one unit, never parted).
 //      A cut that would leave a part under SCOPE_CHURN_FLOOR is not made: that group is at the floor,
 //      and stays one scope.
-//   5. Every scope then READS, beyond the files it owns, the changed files the change couples to them —
-//      its seams (src/seams.js) — heaviest coupling first, until the read budget is spent. The budget is
-//      ONE more read of the changed set: every file is read once by its owner, and the seam reads
-//      together may reach that volume again and never exceed it — the 2x ceiling the owner set
-//      (zai-timing-8jk, 2026-09-04), a ceiling and not a target. A loosely coupled change has few seams
-//      and spends little; a tightly coupled one spends to the ceiling and the plan says which seams
-//      went unread. A cut concern's parts read their siblings by construction — the cut made them one
-//      concern, so every sibling file is a candidate at whatever coupling the seams give it, zero
-//      included — ranked with the rest, so a part reads the sibling it is coupled to first and the
-//      others as the budget allows. That is what lets the cut go finer than two (8jk.4 halved with full
-//      eyesight and bought no wall clock; the material a worker sees is what its spawn costs). In a
-//      language the seam shapes do not parse every sibling ties at zero, and the budget — one read of
-//      the set — cannot cover k parts each reading k-1 siblings once k passes two: it is spread evenly
-//      (each part's first sibling before any part's second) and the unread rest is named in the plan.
-//      A many-part cut in such a language is read across less than the two-part cut #167 shipped.
 // Every changed path lands in exactly one scope's `files` by construction, so no coverage sweep,
 // duplicate check, or withheld-path strip exists downstream: the type of the output IS the theorem.
-// `reads` is eyesight, never ownership — pinnedProposal proves `files` as the cover and `reads` as
-// membership in the changed set: a read outside the change is refused, a read is never counted as coverage.
+// A scope says only what its worker is accountable for; what the worker reads is its own decision.
 // [LAW:types-are-the-program]
 
 // [LAW:one-source-of-truth] The one width lever this rule has. A scope is one worker spawn (~5 min,
@@ -35701,8 +35521,8 @@ const MIN_SCOPE_FILES = 2;
 //                      against 3m36s for the next, and 13 of 14 failed or retried attempts sat on scopes
 //                      of 364–571 lines. 360 is the bottom of that band.
 //   SCOPE_CHURN_FLOOR — the largest INDIVISIBLE reviewable unit, in lines: below ~100 the fit says a
-//                      part saves under 30 s of a spawn that costs a whole extra lane and a second read,
-//                      and a single file is never cut in two (a half-file has no reader for its seam).
+//                      part saves under 30 s of a spawn that costs a whole extra lane, and a single file
+//                      is never cut in two.
 //                      No review is faster than one spawn over this floor: ≈ 83 s × 100^0.21 ≈ 3m35s of
 //                      pass-0 wall clock plus the sweep chain, and no partition can go below it.
 const LOPSIDED_RATIO = 2;
@@ -35719,9 +35539,6 @@ const TEST_STEM_SUFFIX = /(\.test|\.spec|_test|-test)$/;
 
 // The label a root-keyed scope carries: '.' is a path, not a name a reader can follow.
 const ROOT_SCOPE_NAME = 'top-level';
-// How many unread seams the plan's context names before counting the rest — presentation, like
-// MAX_EXCLUDED_PATHS_SHOWN (src/diff.js): the count is always stated, the names are a sample.
-const UNREAD_SEAMS_SHOWN = 5;
 
 // [LAW:effects-at-boundaries] Pure path arithmetic. Diff paths are always '/'-separated (git's own form,
 // parseReviewableFiles refuses anything else), so no platform separator is consulted.
@@ -35782,39 +35599,18 @@ function depthOf(dir) {
   return dir === '.' ? 0 : dir.split('/').length;
 }
 
-// The scope's focus: the same three directives the LLM scout was told to write into every focus, now
-// authored once. It names the files (so the worker knows its assignment even before the read-targets
-// line) and points the worker at the import edges the change crosses — the seam checks are where
-// multi-file defects live. [LAW:one-source-of-truth]
-// `reads` renders as a value — [{ file, coupling }], [] (no seam reaches this scope) says nothing — in
-// two sentences that each say what the second read is FOR: a file the change COUPLES to this scope (a
-// detected seam), and a sibling part of the same concern read at no detected coupling because the cut
-// alone made them one concern. Overclaiming a seam the change never showed would mislead the worker
-// about what to check. Either way a finding in another scope's file is recorded, never left for its
-// owner: dedupe merges the overlap. [LAW:dataflow-not-control-flow]
-function focusFor(dir, files, reads) {
+// The scope's focus, authored once: it names the files the worker is accountable for and points it at
+// the import edges the change crosses, where multi-file defects live. [LAW:one-source-of-truth]
+function focusFor(dir, files) {
   const where = dir === '.' ? 'the repository root' : dir;
-  const coupled = reads.filter(r => r.coupling > 0).map(r => r.file);
-  const siblings = reads.filter(r => r.coupling === 0).map(r => r.file);
-  const seam = (coupled.length > 0
-    ? ` The change couples these files to yours — ${coupled.join(', ')} — and other scopes own them.`
-    : '')
-    + (siblings.length > 0
-      ? ` This concern is reviewed in parts for size; the rest of it that you also read — ${siblings.join(', ')} — is owned by sibling parts.`
-      : '')
-    + (reads.length > 0
-      ? ' Read those files in full too: the seam between your files and theirs is yours to check, and a defect you '
-        + 'notice in one of them is recorded, never left for the worker that owns it.'
-      : '');
-  return `Review the changes to ${files.join(', ')} in ${where}.${seam} Also read the files they import and check `
+  return `Review the changes to ${files.join(', ')} in ${where}. Also read the files they import and check `
     + 'each connection: the dependency points one way, and no single fact is defined or owned on both sides.';
 }
 
 // Rule 4. The part count a group is cut into: the cap-sized parts it fills (a group at or under the cap
 // fills one, and is not cut — this count is the ONE place the cap is read), but never more parts than
 // there are lanes left to run them beside the other scopes: a part beyond the runner's width waits for
-// a lane and buys no wall clock, it only pays a spawn's fixed cost. The read budget no longer bounds
-// it: a part reads its seams, not the whole group, and rule 5 holds every read under the one ceiling.
+// a lane and buys no wall clock, it only pays a spawn's fixed cost.
 // `lanesFree` is the runner's lane ceiling less the other scopes (Infinity when no ceiling is handed in).
 // [LAW:one-source-of-truth]
 function partCount(groupChurn, lanesFree) {
@@ -35823,7 +35619,7 @@ function partCount(groupChurn, lanesFree) {
 
 // A cut of `units` into k contiguous parts of near-equal churn: each unit joins the part its churn's
 // midpoint falls in. A unit is a companion group — a source and the tests that name it — so a cut can
-// never part a test from its source: the seam a test covers is the one seam no second reader can replace.
+// never part a test from its source.
 // Pure arithmetic over the order given.
 function cutInto(units, churnOf, k) {
   const target = units.reduce((sum, unit) => sum + churnOf(unit), 0) / k;
@@ -35850,81 +35646,22 @@ function partsOf(units, churnOf, lanesFree) {
   return [units.flat()];
 }
 
-// Rule 5. The seam reads, spent from one budget. A candidate is a (scope, file) pair where the file is
-// owned elsewhere and either the change couples it to something the scope owns — its coupling is the
-// sum of the seam weights between the file and the scope's files — or it belongs to a sibling part of
-// the same cut concern (coupling as the seams give it, zero included). Candidates are taken heaviest
-// first; each costs the file's line count (what a full read opens), and one that no longer fits is
-// passed over for the lighter ones that still do, so the budget is spent, never merely stopped at.
-// Deterministic: at equal coupling the candidates INTERLEAVE across scopes — every scope's first such
-// read before any scope's second, then by scope index and file — so a budget that cannot cover every
-// tie (a many-part cut with no detected seams) is spread across the parts, not handed to the first.
-// [LAW:effects-at-boundaries] pure over the seam table.
-// Scopes are addressed by INDEX throughout: a name is a rendering (two directories can render alike —
-// a directory literally called `top-level` and the root — and multiscope.js uniquifies names later), and
-// keying the spend on one would let two scopes share a reads list. [LAW:one-source-of-truth]
-// The budget is the changed set's own line count: one more read of the whole, the ceiling named above.
-// Returns each scope's reads (in coupling order — the order the worker is told them) and the candidates
-// the budget could not cover, so the plan can say so. [LAW:no-silent-failure]
-function seamReads(owned, seams, linesOf) {
-  const weight = new Map();
-  for (const { a, b, weight: w } of seams) {
-    weight.set(`${a}\0${b}`, w);
-    weight.set(`${b}\0${a}`, w);
-  }
-  const allFiles = owned.flatMap(s => s.files);
-  const candidates = [];
-  owned.forEach(({ files, concern }, scope) => {
-    const own = new Set(files);
-    const sibling = new Set(owned.filter((s, j) => j !== scope && s.concern === concern).flatMap(s => s.files));
-    for (const file of allFiles) {
-      if (own.has(file)) continue;
-      const coupling = files.reduce((sum, f) => sum + (weight.get(`${f}\0${file}`) ?? 0), 0);
-      if (coupling > 0 || sibling.has(file)) candidates.push({ scope, file, coupling, rank: 0 });
-    }
-  });
-  // A candidate's rank is its position among its own scope's candidates at the same coupling.
-  const ranked = new Map();
-  for (const c of candidates.sort((x, y) => x.scope - y.scope || (x.file < y.file ? -1 : 1))) {
-    const key = `${c.scope}\0${c.coupling}`;
-    c.rank = ranked.get(key) ?? 0;
-    ranked.set(key, c.rank + 1);
-  }
-  candidates.sort((x, y) => y.coupling - x.coupling || x.rank - y.rank || x.scope - y.scope || (x.file < y.file ? -1 : 1));
-  let remaining = allFiles.reduce((sum, f) => sum + linesOf(f), 0);
-  const reads = owned.map(() => []);
-  const unread = [];
-  for (const c of candidates) {
-    if (linesOf(c.file) <= remaining) {
-      remaining -= linesOf(c.file);
-      reads[c.scope].push({ file: c.file, coupling: c.coupling });
-    } else {
-      unread.push(c);
-    }
-  }
-  return { reads, unread, covered: candidates.length - unread.length };
-}
-
 // [LAW:parse-dont-validate] The one producer of a PR review's partition. In: the changed files a review
-// will cover as { filename, churn, lines } (already filtered by EXCLUDE_PATTERNS — a withheld path never
-// reaches here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget
-// is calibrated on; lines is the content measurement measureChangedFiles stamps, what a full read costs)
-// and the change's seams (seamsOf, src/seams.js), plus the runner's lane ceiling (laneCeilingFromMemory,
-// src/multiscope.js — the one machine fact the cut consults, as a value; absent, no width binds). Out:
-// the scopes as the workers run them, each minted
-// through parseScopeValue so a scope from this producer is the SAME stamped value as one recorded by a
-// scout or read from a pinned plan, plus the orientation line every worker and the posted summary
-// share. [LAW:single-enforcer]
+// will cover as { filename, churn } (already filtered by EXCLUDE_PATTERNS — a withheld path never reaches
+// here, so it can never be assigned; churn is fileChurn, src/diff.js, the same count the budget is
+// calibrated on), plus the runner's lane ceiling (laneCeilingFromMemory, src/multiscope.js — the one
+// machine fact the cut consults, as a value; absent, no width binds). Out: the scopes as the workers run
+// them, each minted through parseScopeValue so a scope from this producer is the SAME stamped value as
+// one recorded by a scout or read from a pinned plan, plus the orientation line every worker and the
+// posted summary share. [LAW:single-enforcer]
 // [LAW:no-silent-failure] An empty change has no partition; refusing here names the fact rather than
 // letting planRecord refuse an empty scope list two seams later.
-function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, laneCeiling = Infinity } = {}) {
+function partitionByDirectory(changed, { minFiles = MIN_SCOPE_FILES, laneCeiling = Infinity } = {}) {
   if (changed.length === 0) {
     throw new Error('partitionByDirectory: no changed files to partition — a review with no files has no structure.');
   }
   const churnByPath = new Map(changed.map(f => [f.filename, f.churn]));
   const churnOf = (p) => churnByPath.get(p);
-  const linesByPath = new Map(changed.map(f => [f.filename, f.lines]));
-  const linesOf = (p) => linesByPath.get(p);
   const changedPaths = [...churnByPath.keys()].sort();
   const concern = concernOf(changedPaths);
   const groups = new Map();
@@ -35967,24 +35704,14 @@ function partitionByDirectory(changed, seams, { minFiles = MIN_SCOPE_FILES, lane
     const files = [...merged.get(dir)].sort(companionOrder);
     const name = dir === '.' ? ROOT_SCOPE_NAME : dir;
     const parts = dir === cut ? partsOf(unitsOf(files), churnOf, lanesFree) : [files];
-    return parts.map((own, i) => ({ dir, concern: dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
+    return parts.map((own, i) => ({ dir, name: parts.length === 1 ? name : `${name} ${i + 1}/${parts.length}`, files: own }));
   });
-  const { reads, unread, covered } = seamReads(owned, seams, linesOf);
   const scopes = owned
-    .map(({ dir, name, files }, i) => ({ name, focus: focusFor(dir, files, reads[i]), files, reads: reads[i].map(r => r.file) }))
+    .map(({ dir, name, files }) => ({ name, focus: focusFor(dir, files), files }))
     .map((scope, index) => parseScopeValue(scope, index));
   const areas = scopes.map(s => `${s.name} (${s.files.length} file${s.files.length === 1 ? '' : 's'})`).join(', ');
-  // [LAW:no-silent-failure] A seam the budget could not cover is a coverage fact about THIS plan — a
-  // cross-file defect on it has no second reader — and it is said in the one line every worker and the
-  // posted summary read, never left to be inferred from a shorter reads list. Full coverage says nothing.
-  const shown = unread.slice(0, UNREAD_SEAMS_SHOWN);
-  const unreadNote = unread.length > 0
-    ? ` The read ceiling (one further read of the changed set, ${[...linesByPath.values()].reduce((a, b) => a + b, 0)} lines) covered `
-      + `${covered} of ${covered + unread.length} coupled reads; ${unread.length} left unread beyond their owner, heaviest first: `
-      + `${shown.map(c => `${c.file} (for ${owned[c.scope].name})`).join(', ')}${unread.length > shown.length ? ` (and ${unread.length - shown.length} more)` : ''}.`
-    : '';
   const context = `This pull request changes ${changedPaths.length} file${changedPaths.length === 1 ? '' : 's'} `
-    + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.${unreadNote}`;
+    + `in ${scopes.length} area${scopes.length === 1 ? '' : 's'}: ${areas}.`;
   return { scopes, context };
 }
 
@@ -36017,7 +35744,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files, reads }, recorded
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
 // whole rather than projected, so a scope field added later cannot be silently dropped on the way to
 // disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so
@@ -36296,9 +36023,8 @@ module.exports = { preflight, probeConfig, classifyProbe, PROBE_TIMEOUT_MS };
 
 "use strict";
 
-const { annotatePatchWithLines, hunkRanges, NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
+const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
 const { findingLineText } = __nccwpck_require__(1565);
-const { estimateTokens, fitWorkerMaterial } = __nccwpck_require__(8705);
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -36395,23 +36121,13 @@ function reviewCharter(toolNames) {
 // as reviewer instructions), so the repo is named here as an explicit value and the agent reads
 // it by absolute path — never via cwd-relative discovery. [LAW:effects-at-boundaries]
 // focus is a free-text value naming the part of the change this review should concentrate on (a
-// multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
-// (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
-// never a branch. The diff shown is the worker's eyesight (readFiles, below); its anchors are the
-// change's own, so every LINE it sees stays valid.
-// [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
-// value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
-// owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
-// arm, src/effort.js, applied to that assignment). Under the shipped 'assigned' arm readFiles is the
-// assignment plus the scope's `reads` — the changed files the change couples to it (src/partition.js
-// rule 5, src/seams.js) — so the two coincide only for a scope with no seams, which is why one list once passed for both.
-// Under 'changed' they diverge fully: readFiles is empty and every worker reads the whole set while
-// exactly one still owns the bump. Empty readFiles is the whole-set read
-// (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
+// multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad review (the single-scope
+// case); a non-empty value narrows attention — the same prompt, varied by value, never a branch.
+// scopeFiles is what the scope was ASSIGNED: the coverage record, and what decides which single worker
+// owns a bumped go.mod below.
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
-// appends the fetched upstream-change context after the diff, same placement as the unshowable-
-// files note below. [LAW:dataflow-not-control-flow]
+// is appended at the end of the prompt, after the excluded-files note. [LAW:dataflow-not-control-flow]
 // [LAW:one-source-of-truth] The convergence-sweep block, rendered once here for BOTH materials (PR and
 // repo workers): the findings this round has already recorded, injected so a sweep pass hunts only for
 // what is NOT yet on the list (zai-recall-upr.2). It follows the pushback block's pattern exactly —
@@ -36439,93 +36155,16 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
 // excluded is filterFiles' record of what EXCLUDE_PATTERNS removed from this diff ({patterns, paths}).
 // NO_EXCLUSIONS (nothing removed) renders nothing, so an unfiltered review is byte-identical.
 // [LAW:dataflow-not-control-flow]
-// [LAW:one-type-per-behavior] A file GitHub returns without a patch (too large — roughly >400 changed
-// lines — or binary) and a file whose diff overran the MAX_DIFF_CHARS budget are the SAME behavior: a
-// changed file whose diff cannot be shown inline. They are two instances of one type, not two modes, so
-// they merge into ONE value: the inline entry a file gets, or null when it gets none. Patchless files
-// were previously filtered out at `f.patch` and vanished silently while the scout still assigned them to
-// a scope, so workers hunted for diff lines that did not exist. [LAW:no-silent-failure]
-// [LAW:one-source-of-truth] This is the ONE derivation of "which files are on the LINE grid before the
-// window is consulted": the worker prompt renders from it, and run.js derives the review's anchors from
-// it (showableFiles), so a worker can never be shown a grid the sink cannot anchor.
-function inlineEntries(files, maxDiffChars) {
-  const entries = new Map();
-  let totalChars = 0;
-  for (const f of files) {
-    if (!f.patch) { entries.set(f.filename, null); continue; }
-    // No flatten: parseReviewableFiles refused any path that could break this heading, and flattening
-    // one here would hand the model a filename that does not match the file it must read.
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
-    if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
-      entries.set(f.filename, null);
-    } else {
-      entries.set(f.filename, entry);
-      totalChars += entry.length;
-    }
-  }
-  return entries;
-}
-
-// The files whose diff can be shown inline under MAX_DIFF_CHARS — the anchorable set. A hunk the
-// window later withholds from one worker stays anchorable: a finding that worker records at the
-// file's real line lands on the same new-side numbering the grid carries. [LAW:one-source-of-truth]
-function showableFiles(files, maxDiffChars) {
-  return showable(files, inlineEntries(files, maxDiffChars));
-}
-const showable = (files, entries) => files.filter(f => entries.get(f.filename) !== null);
-
-// [LAW:one-source-of-truth] How a worker is told to open ONE file whose diff is not on its grid,
-// read straight off the fit's per-file plan (src/window.js READ_KINDS) and the file's own status.
-// Every kind the plan can assign to a withheld file has a sentence; a kind that cannot reach here
-// fails loudly rather than rendering "undefined" into a prompt: 'in-diff' requires a shown hunk, and
-// 'none' on a file that still exists would mean a file on this worker's grid that it does not read —
-// impossible, since the grid IS the read set (buildReviewInput), so it can only be a deleted file.
-function withheldReadInstruction(file, read) {
-  if (read === 'full') return 'read it in full';
-  if (read === 'targeted') return targetedReadText(file);
-  if (read === 'none' && file.status === 'removed') return 'deleted by this change — there is no file to read';
-  throw new Error(`withheldReadInstruction: a withheld hunk cannot carry read kind '${read}' (${file.filename}, ${file.status})`);
-}
-
-// [LAW:one-source-of-truth] The one instruction for a file the fit could not afford whole, used by the
-// withheld note and the read-target passage alike. It never says "read around the hunks" of a file
-// whose hunks ARE the file (an added file, a lockfile): the bound is what a finding needs, the changed
-// lines are where to start, and a generated artifact is skipped outright — the one class that both
-// dominates this case's material (a 1,527-line go.sum of hashes) and carries nothing to review.
-function targetedReadText(file) {
-  return `does not fit whole alongside this diff — open only the parts a finding needs, with Read offset and limit, starting from its changed lines (${changedLinesText(file)}); never the whole file, and skip it entirely when it is a lockfile or other generated artifact`;
-}
-
-// The changed-line ranges a targeted read opens, as prose: from the patch's hunk headers when the
-// host supplied a patch, and an honest "not known here" when it did not (GitHub omits the patch of
-// a file over ~400 changed lines or binary) — the worker then finds the touched region itself.
-// `patch` is genuinely optional in the domain; this is the one place its absence is rendered.
-function changedLinesText(file) {
-  const ranges = file.patch ? hunkRanges(file.patch) : [];
-  return ranges.length > 0
-    ? `lines ${ranges.map(r => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`)).join(', ')} of ${file.content.lines}`
-    : `${file.content.lines} lines; the host supplied no patch, so Grep for what this change touches and read around that`;
-}
-
-// `window` is the engine's context window in tokens (null = undeclared → nothing is withheld and every
-// read is full). Every file carries `content` — the measurement measureChangedFiles (src/window.js)
-// stamps and buildPrMaterial (the material boundary) requires — because the fit sizes full reads by it.
-// [LAW:parse-dont-validate] the stamp is checked once, there; this builder is inland and reads it.
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], readFiles = [], window = null, dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
-  // [LAW:one-source-of-truth] Which hunks CAN be shown is decided once, over the whole change, under the
-  // same MAX_DIFF_CHARS derivation run.js builds the anchors from — so no worker is ever shown a grid the
-  // sink cannot anchor, however narrow its eyesight.
-  const entries = inlineEntries(files, maxDiffChars);
-  // [FRAMING:parts-and-seams] A worker's MATERIAL is its eyesight: the changed files it reads in full —
-  // the scope it owns plus the seams the partition handed it (readFiles) — are also the only hunks on its
-  // grid. Jurisdiction and eyesight were two facts on one value until zai-timing-8jk.5; showing every
-  // worker the whole diff while narrowing only its full reads left each spawn's cost the whole change's
-  // (8jk.4 measured it: halving a scope with full eyesight bought no wall clock). An empty readFiles is
-  // the whole change (a single-scope review, the 'changed' arm, repo mode). The rest of the change is
-  // NAMED to the worker below, never silently absent. [LAW:dataflow-not-control-flow]
-  const eyesight = readFiles.length > 0 ? new Set(readFiles) : new Set(files.map(f => f.filename));
-  const seen = files.filter(f => eyesight.has(f.filename));
-  const elsewhere = files.filter(f => !eyesight.has(f.filename)).map(f => f.filename);
+// diffDir is where writeDiffFiles (src/diff-files.js) put the change: <diffDir>/<filename>.diff for every
+// changed file with a patch. The prompt names the directory and the worker decides what to read, with the
+// same tools it reads the repository with; nothing here chooses a worker's material. A changed file with
+// no patch (binary, or too large for the host to render) has no diff file, so it is named rather than
+// silently absent. [LAW:no-silent-failure]
+function buildReviewInput({ files, diffDir, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
+  const unpatched = files.filter(f => !f.patch).map(f => f.filename);
+  const unpatchedNote = unpatched.length > 0
+    ? `\n    These changed files have no diff file (binary, or too large for the host to render): ${unpatched.join(', ')}. Read them in the repository if they matter; a finding in one is recorded at the file's real line number, and the host posts it in the review body's "Findings outside the reviewed diff" section.`
+    : '';
 
   // [LAW:no-silent-failure] The reviewer is TOLD what was taken out of its view. Absence of a changed
   // file is otherwise indistinguishable from nobody having changed it, and a model reasoning about "the
@@ -36534,34 +36173,26 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // finding blocks, so a false one costs a human adjudication.
   // [FRAMING:representation] It names the PATHS, not just the patterns, because naming only the patterns
   // MEASURABLY LOST: delivered verbatim to all 15 spawns of a real run, it still drew that same finding.
-  // A predicate about an unseen file asks the model to notice an absence, recall the globs, test a name it
-  // was never shown, and then retract a conclusion it has already evidenced from the repo's own rules.
-  // Naming the file as changed-and-withheld deletes the premise instead of arguing with the conclusion —
-  // there is no absence left to interpret. The rule-compliance clause is load-bearing for the same reason:
-  // the model had READ the repo rule demanding these files change, and a note that only forbids the
-  // conclusion loses to a rule the repository states emphatically.
-  // [LAW:one-type-per-behavior] This is deliberately NOT merged with the unshowable-files note above,
-  // which they superficially resemble: an unshowable file is still REVIEWABLE (read it at its absolute
-  // path and record findings against it), an excluded one is out of bounds entirely. Same absence from
-  // the diff, opposite instruction — two types, not one with a flag.
-  // [LAW:dataflow-not-control-flow] A value: no paths removed ⇒ no block. Patterns that matched nothing
-  // hid nothing, so silence is the truth there, not an omission.
+  // Naming the file as changed-and-withheld deletes the premise instead of arguing with the conclusion.
+  // The rule-compliance clause is load-bearing for the same reason: the model had READ the repo rule
+  // demanding these files change, and a note that only forbids the conclusion loses to a rule the
+  // repository states emphatically.
+  // [LAW:one-type-per-behavior] Deliberately NOT merged with the no-diff-file note above: a file with no
+  // patch is still REVIEWABLE (read it in the repository), an excluded one is out of bounds entirely.
+  // Same absence from the diff directory, opposite instruction — two types, not one with a flag.
   const excludedNote = excluded.paths.length > 0
-    ? `\n\n**Withheld from this diff — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
-      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence below is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`
+    ? `\n\n**Withheld from the diff files — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
+      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence from the diff directory is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`
     : '';
 
   const dependencyNote = dependencyDiffNote ? `\n\n${dependencyDiffNote}` : '';
 
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
-  // concentration instruction. The worker sees the whole diff (anchors stay valid) and concentrates
-  // its deepest reading on the named part, but records EVERY genuine issue it notices anywhere —
-  // suppressing out-of-scope findings would be control flow ("don't run the report") solving a problem
-  // the pipeline already solves as dataflow: overlap is de-duplicated when scopes' findings merge
-  // (dedupeFindings), so a finding another worker may also catch costs nothing to report and is never
-  // silently withheld. [LAW:no-silent-failure]
+  // concentration instruction. The worker concentrates its deepest reading on the named part but records
+  // EVERY genuine issue it notices anywhere — overlap is de-duplicated when scopes' findings merge
+  // (dedupeFindings), so a finding another worker may also catch costs nothing to report. [LAW:no-silent-failure]
   const focusBlock = focus
-    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The diff below shows every changed hunk this review reads — the part named above and the changed files the change couples to it — both for context and because you must not stay silent about a real bug just because it falls outside the named part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange}. Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
+    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    Other workers review the rest of the change. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the change, still record it with ${toolNames.requestChange}. Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks render as a VALUE: [] yields '' (a cold review,
@@ -36578,7 +36209,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
         const reply = p.replies.join('\n        ↳ ');
         return `      • [${loc}] your earlier finding: ${p.finding}\n        the author replied: ${reply}`;
       }).join('\n')
-      + `\n    If a reply soundly shows the finding was wrong or already handled, do NOT record that same point again this round — the fix, if any, is already in the diff below, which you review fresh. If a reply is itself mistaken and the bug is still real in the current code, you MAY record it again, but state a direct, specific counter to the author's reasoning rather than repeating your original words. These are prior context, not part of the current diff; they never limit what you review, and you must still flag every NEW issue.\n`
+      + `\n    If a reply soundly shows the finding was wrong or already handled, do NOT record that same point again this round — the fix, if any, is already in the current change, which you review fresh. If a reply is itself mistaken and the bug is still real in the current code, you MAY record it again, but state a direct, specific counter to the author's reasoning rather than repeating your original words. These are prior context, not part of the current change; they never limit what you review, and you must still flag every NEW issue.\n`
     : '';
 
   const priorFindingsBlock = renderPriorFindingsBlock(priorFindings, toolNames);
@@ -36587,17 +36218,16 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // When present, tell the worker WHAT to do with the fetched upstream context — cross-check it
   // against this repo's own usage rather than just reading it as trivia.
   const dependencyInstructionBlock = dependencyDiffNote
-    ? `\n    This PR bumps a dependency version. Upstream commit/file context for that bump is included below (the
-    section starting "Dependency version bump"). Use \`Grep\` to find where this repo calls into the bumped
-    module, then judge whether anything in the upstream range breaks, deprecates, or changes the behavior of a
-    symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
-    renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
-    summary; if something is, name the exact upstream change and the call site it affects
-    — as ${toolNames.requestChange} on the go.mod version line: the displayed LINE value if that line is
-    shown above, or go.mod's real line number if its diff was too large to show inline (the host then posts
-    the finding in the review body's "Findings outside the reviewed diff" section; see the unshowable-files
-    note above) —
-    never route it to the ${toolNames.finishReview} summary and never drop it because the anchor isn't available.\n`
+    ? `\n    This PR bumps a dependency version. Upstream commit/file context for that bump is included at the end of
+    these instructions (the section starting "Dependency version bump"). Use \`Grep\` to find where this repo
+    calls into the bumped module, then judge whether anything in the upstream range breaks, deprecates, or
+    changes the behavior of a symbol this repo actually uses — a removed export, a changed function signature,
+    a changed default, a renamed field. If nothing this repo uses is affected, say so briefly in the
+    ${toolNames.finishReview} summary; if something is, name the exact upstream change and the call site it
+    affects — as ${toolNames.requestChange} on the go.mod version line: its LINE value from go.mod's diff file,
+    or go.mod's real line number if go.mod has no diff file (the host then posts the finding in the review
+    body's "Findings outside the reviewed diff" section) — never route it to the ${toolNames.finishReview}
+    summary and never drop it because the anchor isn't available.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The assess directive is rendered by a VALUE, not a mode: it fires only
@@ -36616,43 +36246,39 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
     ONCE, copying the module path VERBATIM: ${bumpedModules.join(', ')}. Provide your
     merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
-    commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
+    commit context — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
     routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
     The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
     a symbol this repo uses, still record that as a ${toolNames.requestChange} (on go.mod's real version line if
-    no LINE anchor is shown — it is carried as an unanchored finding), because the assessment's verdict is
+    go.mod has no diff file — it is carried as an unanchored finding), because the assessment's verdict is
     presentation — findings drive the merge decision.\n`
     : '';
 
-  // [LAW:one-source-of-truth] ONE rendering of the worker prompt, with two holes — the read targets
-  // and the diff — that the window fit fills. The fit needs the size of everything ELSE first, so the
-  // template is rendered once with the holes empty to measure the fixed prose (the two notes below
-  // are fixed too: they do not move with the fit), then once more with the plan's material.
-  // [LAW:effects-at-boundaries] both renders are pure; the measurement is the same estimateTokens the
-  // fit uses for hunks and reads, so "fits" means one thing.
-  const render = (readTargets, diffs) => `
+  return {
+    prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
-    BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
-    visible in the full surrounding context of the function and module — a missing guard, a caller you'd
-    break, a value that can't be what this line assumes. Do not form or report any judgment until you
-    have read the files you are responsible for in full. Then read past those files where the change
-    reaches past them: when it alters a function's signature or return shape, an exported symbol, a shared
-    constant, or an invariant other code assumes, the failure it introduces surfaces at the call sites,
-    not in the diff — Grep the repository for that symbol's other uses and read those specific sites before
-    you judge the change safe. Follow the exact thing the change touches to where it is used; this is
-    targeted reading, not a sweep of the whole tree. That same reading cuts both ways: it exposes a break
-    the hunk hides, and it clears a false alarm the hunk suggests. So before you record any finding, confirm
-    the suspected fault against that fuller context — the definition and callers the change reaches, not the
-    hunk alone; if that context shows the code is actually correct, do not record it, and if the check is
-    genuinely inconclusive, record the issue anyway, stating what remains unverified, rather than
-    withholding it.
 
-    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
-    find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
-    integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
+    The change is on disk as diff files, one per changed file: the diff of <path> is ${diffDir}/<path>.diff.
+    Glob ${diffDir} to list every changed file. In a diff file, each line a comment can attach to is prefixed
+    LINE N, where N is that line's number in the changed file.${unpatchedNote}
+${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
+    You decide what to read. Start from the diffs, then read the changed files in the repository and whatever
+    the change touches: most bugs are only visible in the full surrounding context of the function and
+    module — a missing guard, a caller you'd break, a value that can't be what this line assumes. When the
+    change alters a function's signature or return shape, an exported symbol, a shared constant, or an
+    invariant other code assumes, the failure it introduces surfaces at the call sites, not in the diff —
+    Grep the repository for that symbol's other uses and read those sites before you judge the change safe.
+    Skip generated or vendored artifacts (bundled or minified output, lockfiles). That same reading cuts both
+    ways: it exposes a break the diff hides, and it clears a false alarm the diff suggests. So before you
+    record any finding, confirm the suspected fault against that fuller context; if that context shows the
+    code is actually correct, do not record it, and if the check is genuinely inconclusive, record the issue
+    anyway, stating what remains unverified, rather than withholding it.
+
+    Call ${toolNames.requestChange} for each issue you find. Every recorded change must use path (the changed
+    file's repository path, never its diff file's path), line (the LINE value from its diff file), body, and
+    severity (an integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
     exactly once. The summary is one line describing what the change does. It states no verdict: whether
     the change needs fixing is the HOST's call, derived from the recorded findings, and the charter below
     forbids stating it here — asking for it here too would be the prompt contradicting itself. [LAW:one-source-of-truth]
@@ -36669,7 +36295,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     not touch are NOT findings for this review — never record one with ${toolNames.requestChange}; you
     may mention a significant one in a single sentence of the ${toolNames.finishReview} summary as
     context for the maintainer, and that mention carries no verdict weight. You can ONLY attach a
-    comment to a line shown as LINE N — a line this diff added or kept as
+    comment to a line marked LINE N in a diff file — a line this diff added or kept as
     context; the host does not allow comments on unchanged or deleted code. When the change creates a
     problem whose root cause sits in unchanged code (it feeds a bad value into an existing function, or
     relies on an existing loose type), attach the comment to the changed LINE responsible for the new
@@ -36678,104 +36304,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     the host posts it in the review body's "Findings outside the reviewed diff" section — rather than
     dropping it.
 
-    ${reviewCharter(toolNames)}
-    \n\n${diffs}`;
-  // [LAW:effects-at-boundaries] Pure over its lists: the withheld-files note. An empty list renders
-  // nothing, so this is one path, not a "patchless mode". [LAW:one-type-per-behavior] A hunk GitHub
-  // never supplied, one over MAX_DIFF_CHARS, and one the window fit withheld are ONE behavior — a changed
-  // file whose diff is not on this worker's grid — so they are one list and one note; what differs per
-  // file is HOW MUCH of it to read, which the fit decided and the line states. The recovery route is the
-  // one the pipeline already owns: a recorded finding whose line is off the diff grid becomes an
-  // UNANCHORED finding (partitionFindings), which counts toward the verdict and renders in the review
-  // body — so the riskiest (biggest) changed files stay reviewable, and an issue in them can never
-  // bypass the merge gate via summary prose.
-  const withheldNoteText = (entries) => entries.length > 0
-    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — a line the diff below carries is anchored inline as usual, and one it does not carry is posted by the host in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
-    : '';
-
-  // [LAW:effects-at-boundaries] Pure over its lists: what the worker opens, as three lists that each
-  // render nothing when empty — files read in full, files whose diff below IS their whole content (new in
-  // this change — reading them again would spend the window twice on one file, the exact duplication that
-  // overflowed links-317's workers), and files too large to open whole. A non-empty readFiles narrows the
-  // full read to this worker's assigned files (another worker reads the rest — the read cost is split, not
-  // duplicated N times); an empty readFiles reads the whole changed set (single-scope PR, repo mode, or
-  // the 'changed' read-set arm). Either way the whole shown diff is the same for every worker, so
-  // cross-file context and report-anywhere are unchanged.
-  // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
-  // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
-  // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
-  // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
-  // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
-  // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
-  // before recording, dropping one the context refutes and recording an inconclusive one with its
-  // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
-  // consequence lives in the rendered passage below, not a second "read more context" instruction.
-  // No flatten anywhere here: these are paths the worker must OPEN. Collapsing a separator would name a
-  // file that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
-  // such a path at the boundary instead, so every path reaching this line is byte-exact and single-line.
-  // [LAW:no-silent-failure]
-  const readTargetsText = ({ full, inDiff, targeted }) => {
-    const inDiffSentence = inDiff.length > 0
-      ? `These changed files are NEW in this change and their diff below is their complete content — do NOT Read them again, review them from the diff: ${inDiff.join(', ')}. `
-      : '';
-    const targetedSentence = targeted.length > 0
-      ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
-      : '';
-    const fullSentence = full.length > 0
-      ? `Read the complete content of THESE files — the changed files this scope reads in full: ${full.join(', ')}. `
-        + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
-      : '';
-    // [LAW:no-silent-failure] The changed files outside this worker's eyesight are named: a changed file
-    // simply missing from the diff is indistinguishable from nobody having changed it, and a model that
-    // infers "the bundle was never rebuilt" from an absence it was never told about reports the gap as a
-    // defect (the same lesson the withheld-by-EXCLUDE_PATTERNS note above records). Unlike an excluded
-    // file, one of these MAY be consulted when a finding needs it — it is another worker's, not out of bounds.
-    // Named through the same bounded list the excluded note uses (excludedPathList): the count is always
-    // stated, the names are a sample, so a wide change cannot grow the fixed prose past the window.
-    const elsewhereSentence = elsewhere.length > 0
-      ? `The other ${elsewhere.length} changed file(s) in this pull request — ${excludedPathList(elsewhere)} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
-      : '';
-    return (readFiles.length > 0
-      ? fullSentence + inDiffSentence + targetedSentence + elsewhereSentence
-        + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
-        + `over Reading the whole file, and read another file in full only when a finding truly requires it. Do not pre-read the tree.`
-      : `Read the complete content of every changed file that contains code — skip only generated or vendored `
-        + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them. `
-        + inDiffSentence + targetedSentence).trim();
-  };
-
-  // [LAW:one-source-of-truth] The prose that depends on the plan — the withheld-files note and the three
-  // read lists — is rendered by the same two functions that render the final prompt, so the fit measures
-  // exactly what will be sent. It is measured at its CEILING: every file withheld with the longest
-  // instruction (targeted), and every file named in all three read lists at once. A real plan places
-  // each file in at most one line of the note and exactly one read list, so it is a sub-selection of
-  // this rendering and never longer — the budget the hunks and reads are sized against already holds
-  // the prose. The over-count is a few tokens per file, paid once, for a bound that needs no argument.
-  const names = seen.map(f => f.filename);
-  const plan = fitWorkerMaterial({
-    window,
-    fixedTokens: estimateTokens(render(readTargetsText({ full: names, inDiff: names, targeted: seen }), withheldNoteText(seen.map(f => ({ file: f, read: 'targeted' }))) + excludedNote + dependencyNote)),
-    files: seen.map(f => ({ filename: f.filename, status: f.status, hunk: entries.get(f.filename), content: f.content })),
-    // [LAW:dataflow-not-control-flow] The read-set arm as the fit's value: this scope's assigned
-    // files, or null for "every changed file" (single-scope PR, repo mode, the 'changed' arm).
-    readSet: readFiles.length > 0 ? new Set(readFiles) : null,
-  });
-  const planOf = new Map(plan.map(p => [p.filename, p]));
-  const shown = seen.filter(f => planOf.get(f.filename).hunk === 'shown');
-  const withheld = seen.filter(f => planOf.get(f.filename).hunk === 'withheld');
-  const readAs = (kind) => seen.filter(f => planOf.get(f.filename).read === kind);
-
-  const withheldNote = withheldNoteText(withheld.map(f => ({ file: f, read: planOf.get(f.filename).read })));
-  const diffs = shown.map(f => entries.get(f.filename)).join('\n\n') + withheldNote + excludedNote + dependencyNote;
-
-  const readTargets = readTargetsText({ full: readAs('full').map(f => f.filename), inDiff: readAs('in-diff').map(f => f.filename), targeted: readAs('targeted') });
-
-  return {
-    // [LAW:one-source-of-truth] The anchorable set: the files whose diff is on the LINE grid under
-    // MAX_DIFF_CHARS (showableFiles) — a hunk the window withheld from THIS worker stays anchorable,
-    // because a finding it records at the file's real line lands on the same new-side numbering.
-    files: showable(seen, entries),
-    prompt: render(readTargets, diffs),
+    ${reviewCharter(toolNames)}${excludedNote}${dependencyNote}`,
   };
 }
 
@@ -36901,7 +36430,7 @@ Plan the review of this repository. There is no diff. The repository under revie
   };
 }
 
-module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput, showableFiles };
+module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput };
 
 
 /***/ }),
@@ -37500,17 +37029,15 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  // [LAW:parse-dont-validate] name, focus and every file entry (owned or read) are stamped single-line here. All
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All
   // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
-  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // block (via workerFocusText), the assigned-files line — and all three are MODEL-AUTHORED, so an
   // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
   // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
   // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
-  // `files` is what the scope OWNS (the coverage record: every changed path in exactly one scope's files);
-  // `reads` is what it opens in full BEYOND that — the changed files the change couples to it, its seams
-  // (src/partition.js rule 5, src/seams.js). Two facts, one shape each; both default to
-  // the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
-  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files), reads: pathList(scope.reads) };
+  // `files` is what the scope OWNS: the coverage record, every changed path in exactly one scope's files.
+  // It defaults to the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
+  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files) };
 }
 function pathList(value) {
   return Array.isArray(value)
@@ -37802,8 +37329,7 @@ const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
-const { showableFiles } = __nccwpck_require__(3479);
-const { measureChangedFiles } = __nccwpck_require__(8705);
+const { writeDiffFiles } = __nccwpck_require__(1352);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
 const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = __nccwpck_require__(3746);
@@ -37822,7 +37348,7 @@ const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = __nccwpck_requir
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
-const { TRANSCRIPT_DIR } = __nccwpck_require__(9806);
+const { JOB_TEMP_DIR, TRANSCRIPT_DIR } = __nccwpck_require__(9806);
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -38219,7 +37745,6 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
 async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
-  const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -38523,18 +38048,15 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // [LAW:effects-at-boundaries] The one read of the changed files' sizes, at the run boundary: every
-  // changed file is measured in the reviewed checkout (the tree the workers' Read tool opens), and the
-  // measured set is what the anchors and the material are built from — the window fit sizes each
-  // worker's reads by it. [LAW:parse-dont-validate] the stamp travels with the files; buildPrMaterial
-  // requires it.
-  const measured = measureChangedFiles(filteredFiles, REVIEWED_REPO_ROOT);
-  // Anchors are engine-agnostic (purely diff-line based): the files whose diff is on the LINE grid under
-  // MAX_DIFF_CHARS (showableFiles — the same derivation the worker prompt renders from). The material
-  // rebuilds the worker prompt per attempt so each engine gets its own tool identifiers.
+  // Anchors are engine-agnostic (purely diff-line based): every changed file with a patch is on the LINE
+  // grid its diff file carries, and the diff files are written from the same filtered files, so a worker's
+  // LINE N and the sink's anchor are one number. The material rebuilds the worker prompt per attempt so
+  // each engine gets its own tool identifiers.
   // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
   // retry timing; the whole plan→workers pass is one attempt per config.
-  const anchors = buildReviewAnchors(showableFiles(measured, maxDiffChars));
+  const anchors = buildReviewAnchors(filteredFiles);
+  // Under the job's scratch root, which the runner deletes at the end of the job, so the PR's code never outlives it.
+  const diffDir = writeDiffFiles(filteredFiles, fs.mkdtempSync(path.join(JOB_TEMP_DIR, 'review-diffs-')));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
@@ -38559,7 +38081,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }
   }
-  const material = buildPrMaterial({ files: measured, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
+  const material = buildPrMaterial({ files: filteredFiles, diffDir, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
@@ -39054,148 +38576,6 @@ function renderTimingBreakdown(schedule, totalMs, prTime = '') {
 }
 
 module.exports = { spawnRecord, scheduleRecord, spanMs, sumMs, describeSchedule, formatMs, passLabel, renderRunningTotal, renderTimingBreakdown };
-
-
-/***/ }),
-
-/***/ 5702:
-/***/ ((module) => {
-
-"use strict";
-
-
-// THE SEAMS OF A CHANGE — where two changed files couple through the symbols the change touches — as a
-// pure function of each file's text and its patch. Same change, same seams, every run.
-//
-// [FRAMING:parts-and-seams] A scope says what a worker JUDGES; what it may LOOK AT beyond that is set
-// by the seams the change actually has (zai-timing-8jk.5). Until this module the only second read the
-// partition could hand out was "every sibling part of a cut concern, in full" — a flat rate that read
-// the whole concern k times and, measured on links-317 (8jk.4), bought no wall clock: each half's
-// eyesight was still the whole. A seam is narrower than a sibling: file A has a seam with file B when
-// the change's own lines in A use a symbol B defines (A calls into what B owns), or the change's own
-// lines in B define a symbol A uses anywhere (B alters what A relies on). That is the coupling a
-// cross-file defect lives on, and it is discoverable from material the engine already holds — the
-// patch and the checkout — with no spawn and no model.
-//
-// [LAW:effects-at-boundaries] Nothing here reads a file or a clock. symbolsOf takes text; changedSymbolsOf
-// takes a patch; seamsOf takes the stamped records and returns weights. measureChangedFiles (src/window.js)
-// is the one reader, and it stamps symbolsOf's result beside the token and line measurement so the
-// partition never sees text.
-
-// [LAW:one-source-of-truth] The one reading of "a use": an identifier in the position a call, a member
-// access, a type or a constructor puts it — `Name(`, `.Name`, `Name{`, `&Name`, `*Name` — a word the
-// languages under review agree on (letter or underscore, then word characters) in a shape only code
-// produces. A bare word is NOT a use: prose in a README, a LICENSE, a comment, or a go.sum line mentions
-// `check` and `run` and `Work` freely, and counting those made every changed file couple to every other
-// (the first cut of this module spent the whole read budget on all four frozen cases, docs included).
-// Nor is an operand: `i < len` is a comparison, not a generic, so `<` is not a use shape (a generic's
-// type is used elsewhere in a shape that is), and `&`/`*` count only at a token's start — `&Conn{` and
-// `*sql.DB`, never `flags&MASK` or `a*height`. A use matters only when some changed file defines the
-// same name.
-const USE_MEMBER = /\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
-const USE_CALL = /(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*[({]/g;
-const USE_TYPE = /(?:^|[\s(,=:[])[&*]([A-Za-z_][A-Za-z0-9_]*)\b/g;
-
-// [LAW:one-type-per-behavior] What DEFINES a symbol, as one table of line shapes with one capture each —
-// the declaration forms of the languages this reviewer meets (Go, JavaScript/TypeScript, Python, Rust,
-// Kotlin/Scala, shell), not one parser per language. A shape is here because a real changed set carried
-// it; a language whose declarations take none of these shapes contributes no seams and its files are
-// read by their owner alone, which is the pre-seam behavior, never an error.
-const DEFINITION_SHAPES = [
-  // Go: `func Name(` and `func (r *T) Name(`.
-  /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/,
-  // Keyworded declarations, optionally exported/public/async: JS/TS, Python, Rust, Kotlin, Go's type/const/var.
-  /^\s*(?:export\s+(?:default\s+)?|pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum|struct|trait|def|fn|const|let|var|val|namespace|module)\s+([A-Za-z_]\w*)/,
-  // CommonJS: `exports.name =` and `module.exports.name =`.
-  /^\s*(?:module\.)?exports\.([A-Za-z_]\w*)\s*=/,
-  // Shell: `name() {`.
-  /^\s*([A-Za-z_]\w*)\s*\(\)\s*\{/,
-  // A method: `  name(args) {` and TypeScript's `  async name(args): T {`. Keywords that open a block
-  // with parentheses (if, for, while, switch, catch) are the shapes this rule must NOT read as methods.
-  /^\s+(?:(?:static|async|public|private|protected|readonly|override)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*(?::[^{;]*)?\{\s*$/,
-];
-const BLOCK_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'match', 'select', 'elif', 'except', 'until', 'unless', 'when', 'case']);
-// Go's grouped declarations — `var (` / `const (` / `type (` … `)` — define one name per indented line
-// (`ErrNoRows = errors.New(…)`, `timeout time.Duration`). Only inside such a group is an indented name
-// a definition: an indented `err = f()` in a function body is a reassignment of a local, and reading it
-// as a definition made every file that reassigns `err`, `count` or `result` a definer of that name.
-const GROUP_OPEN = /^(?:var|const|type)\s*\(\s*$/;
-const GROUP_CLOSE = /^\)/;
-const GROUP_MEMBER = /^\s+([A-Za-z_]\w*)\b/;
-
-// [LAW:effects-at-boundaries] Pure: the symbols a text defines and the symbols it uses, each once.
-// Returned as sorted arrays so the stamp is a plain, comparable, serialisable value.
-function symbolsOf(text) {
-  const defines = new Set();
-  const uses = new Set();
-  let inGroup = false;
-  for (const line of text.split('\n')) {
-    for (const shape of DEFINITION_SHAPES) {
-      const m = shape.exec(line);
-      if (m && !BLOCK_KEYWORDS.has(m[1])) defines.add(m[1]);
-    }
-    if (GROUP_OPEN.test(line)) inGroup = true;
-    else if (GROUP_CLOSE.test(line)) inGroup = false;
-    else if (inGroup) {
-      const m = GROUP_MEMBER.exec(line);
-      if (m) defines.add(m[1]);
-    }
-    for (const shape of [USE_CALL, USE_MEMBER, USE_TYPE]) {
-      for (const m of line.matchAll(shape)) if (!BLOCK_KEYWORDS.has(m[1])) uses.add(m[1]);
-    }
-  }
-  return { defines: [...defines].sort(), uses: [...uses].sort() };
-}
-
-// [LAW:one-source-of-truth] The changed lines of a patch are the lines fileChurn (src/diff.js) counts —
-// a `+` or `-` at column 0 — read here as text rather than tallied. A file with no patch (binary, or
-// too large for the host to render) changed nothing this module can see.
-function changedSymbolsOf(patch) {
-  if (!patch) return symbolsOf('');
-  const changed = patch.split('\n').filter(line => line[0] === '+' || line[0] === '-').map(line => line.slice(1));
-  return symbolsOf(changed.join('\n'));
-}
-
-// [LAW:effects-at-boundaries] Pure: the seams among a changed set, as weighted unordered pairs.
-//   files — [{ filename, patch, content: { symbols: { defines, uses } } }], the measured changed set.
-// Returns [{ a, b, weight }] with a < b and weight > 0, heaviest first (ties by name), where weight is
-// the number of symbols the seam carries, each discounted by how many changed files define it: a name
-// one file owns is a seam of weight 1; a name five files define (`Close` on five types, `err` assigned
-// in every function) is ambiguous and weighs a fifth per pair. No threshold decides what counts —
-// every live symbol counts, and the read budget (src/partition.js) decides how far down the ranking a
-// review can afford to look. [LAW:dataflow-not-control-flow]
-// A file DEFINES a symbol if its current text does, or its changed lines did: a definition the change
-// DELETED is still that file's, and a caller elsewhere that still uses it is the seam this module most
-// exists to find (a removed or renamed export still used elsewhere) — it weighs 1, never a division
-// by no definer. A symbol both files define is neither's seam: A's use of it is A's own.
-function seamsOf(files) {
-  const used = new Map(files.map(f => [f.filename, new Set(f.content.symbols.uses)]));
-  const changed = new Map(files.map(f => [f.filename, changedSymbolsOf(f.patch)]));
-  const defined = new Map(files.map(f => [f.filename, new Set([...f.content.symbols.defines, ...changed.get(f.filename).defines])]));
-  const definers = new Map();
-  for (const [name, symbols] of defined) {
-    for (const s of symbols) definers.set(s, (definers.get(s) ?? 0) + 1);
-  }
-  const live = (a, b) => {
-    // The change's lines in `a` use what `b` defines, or the change's lines in `b` define what `a` uses.
-    const symbols = new Set();
-    for (const s of changed.get(a).uses) if (defined.get(b).has(s)) symbols.add(s);
-    for (const s of changed.get(b).defines) if (used.get(a).has(s)) symbols.add(s);
-    return [...symbols].filter(s => !defined.get(a).has(s));
-  };
-  const names = [...defined.keys()].sort();
-  const seams = [];
-  for (let i = 0; i < names.length; i++) {
-    for (let j = i + 1; j < names.length; j++) {
-      const symbols = new Set([...live(names[i], names[j]), ...live(names[j], names[i])]);
-      const weight = [...symbols].reduce((sum, s) => sum + 1 / definers.get(s), 0);
-      if (weight > 0) seams.push({ a: names[i], b: names[j], weight });
-    }
-  }
-  return seams.sort((x, y) => y.weight - x.weight || (x.a < y.a ? -1 : x.a > y.a ? 1 : x.b < y.b ? -1 : 1));
-}
-
-module.exports = { symbolsOf, changedSymbolsOf, seamsOf };
 
 
 /***/ }),
@@ -40170,7 +39550,7 @@ async function fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingRe
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
 // fake API. [LAW:dataflow-not-control-flow] The cap is a value, not a mode: maxRounds <= 0 is the
-// documented "unlimited" sentinel (matching MAX_DIFF_CHARS), so there is no separate enable flag.
+// documented "unlimited" sentinel, so there is no separate enable flag.
 // Skip once priorReviews has reached the cap — with maxRounds=5, rounds recorded at priorReviews
 // 0..4 run and the 6th push (priorReviews=5) is skipped, yielding exactly 5 reviews.
 function roundCapReached(priorReviews, maxRounds) {
@@ -42177,175 +41557,6 @@ module.exports = {
   isAnthropicEndpoint,
   isSubscription,
 };
-
-
-/***/ }),
-
-/***/ 8705:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-const fs = __nccwpck_require__(9896);
-const path = __nccwpck_require__(6928);
-const { symbolsOf } = __nccwpck_require__(5702);
-
-// [FRAMING:representation] The model's context window is a hard wall, and until this module nothing
-// in the engine represented it: a worker's material was "the whole diff plus every assigned file read
-// in full", and whether that fit the window was decided by the model's reading choices, not by the
-// engine. On links-317-dolt-telemetry every worker's FIRST request was ~232k tokens against a 200k
-// window (eval/out/ab-sweep0-logs, sessions ef6bfa54/29ed8a63/fefe3d0e) — the prompt alone overflowed
-// before a single Read, and the workers that "succeeded" did so only because the CLI auto-compacted
-// the diff into a summary and reviewed that. This module makes the window a VALUE and the fit a pure
-// function of it and the material: what is shown inline, what is withheld, what is read in full, what
-// is read only around its hunks. [LAW:types-are-the-program] the fit is a per-file discriminated plan;
-// the prompt renders it and adds no judgment of its own. [LAW:no-mode-explosion] nothing here is an
-// operator input — the window is the engine's declared fact, the sizes are the material's.
-
-// [LAW:one-source-of-truth] Tokens are estimated ONCE, here, by one rule every consumer shares. The rule
-// is deliberately two-class rather than chars/4, because the material that overflowed is exactly the
-// material chars/4 misjudges by 3x: a go.sum hunk of base64 hashes and dotted module paths tokenizes at
-// roughly one token PER CHARACTER (measured 0.9 on that case's 1,527-line hunk — 195 KB of hash-dense
-// lines accounting for ~175k of the 232k), while ordinary prose and code run ~3.5 chars per token. A
-// line is hash-dense when it carries an opaque run: 24+ unbroken base64/hex-alphabet characters with at
-// least three digits, which no identifier and no sentence produces. The estimate errs HIGH by design
-// (1.0 over the measured 0.9; 3.5 over the ~4 code typically gets): the bound this feeds must never say
-// "fits" of something that does not, and a slightly early withholding costs one hunk's inline anchors,
-// not a review. Calibrated against that transcript: this rule estimates ~223k for the worker prompt
-// the API counted at ~220k (232k less the CLI's own ~12k system prompt and tool schemas) — the two
-// classes' errors partly cancel there, which is why neither rate is trimmed toward its measurement.
-const OPAQUE_RUN = /[A-Za-z0-9+/=]{24,}/g;
-const OPAQUE_MIN_DIGITS = 3;
-const OPAQUE_TOKENS_PER_CHAR = 1.0;
-const PROSE_CHARS_PER_TOKEN = 3.5;
-
-function isHashDense(line) {
-  for (const run of line.match(OPAQUE_RUN) ?? []) {
-    if ((run.match(/\d/g) ?? []).length >= OPAQUE_MIN_DIGITS) return true;
-  }
-  return false;
-}
-
-// [LAW:effects-at-boundaries] Pure: a conservative token count for a text. The newline is counted with
-// its line — it is a character the model pays for like any other.
-function estimateTokens(text) {
-  let tokens = 0;
-  for (const line of text.split('\n')) {
-    const chars = line.length + 1;
-    tokens += isHashDense(line) ? chars * OPAQUE_TOKENS_PER_CHAR : chars / PROSE_CHARS_PER_TOKEN;
-  }
-  return Math.ceil(tokens);
-}
-
-// [LAW:one-source-of-truth] The share of the window a worker needs BEYOND its material and its planned
-// reads, declared once with its basis. Two parts, both measured on the transcripts named above:
-//   - the engine's own fixed cost — system prompt, tool schemas, the reviewer instructions — ~12k
-//     (the scout's first request on that case: 12,168 tokens carrying a ~2k-token prompt);
-//   - a turn's working growth — thinking, tool-call arguments, Grep results, the targeted reads this
-//     module allows, the recorded findings — up to ~57k over a 23-turn session (that scout, 12k → 69k).
-// 70k is the sum rounded up. This is a capacity guardrail exactly like LANE_MEMORY_BYTES (multiscope.js):
-// it is not effort, it is not tunable per review, and it moves only with a new measurement of what a
-// worker's turn actually costs. A window of null (an engine that has not declared one) makes the
-// budget Infinity — nothing is withheld and every read is full, the same path with a different value.
-// [LAW:dataflow-not-control-flow]
-const WORKER_HEADROOM_TOKENS = 70_000;
-
-// [LAW:types-are-the-program] The read plan's vocabulary. A file's `read` is exactly one of:
-//   'full'     — open the whole file (it fits alongside the diff);
-//   'targeted' — too large to fit whole: read only around its hunks, by offset and limit;
-//   'in-diff'  — the file is new in this change and its hunk is shown, so the diff IS its full content;
-//   'none'     — not this worker's to open (a file outside its read set, or a deleted file with no head content).
-// A file's `hunk` is 'shown' (inline, on the LINE grid) or 'withheld' (no inline diff — findings on it
-// are recorded at real line numbers and posted unanchored).
-const READ_KINDS = ['full', 'targeted', 'in-diff', 'none'];
-
-// [LAW:effects-at-boundaries] Pure: the fit of one worker's material into the window.
-//   window      — the engine's declared context window in tokens, or null (unknown → unbounded).
-//   fixedTokens — the prompt's fit-independent prose (instructions, charter, focus, prior context).
-//   files       — [{ filename, status, hunk: string|null, content: { tokens, lines } }] in diff order;
-//                 hunk is the rendered inline entry, or null when it cannot be shown at all (no patch,
-//                 or over MAX_DIFF_CHARS) — those are withheld before the window is consulted.
-//   readSet     — Set of filenames this worker opens in full (the read-set arm's projection), or null
-//                 for "every changed file" (the single-scope PR and the 'changed' arm).
-// Returns [{ filename, hunk, read }] in the same order.
-//
-// The algebra: budget = window − headroom − fixed. Hunks are placed first, because the LINE grid is
-// the review's anchoring and the whole diff is what every worker shares; when they do not all fit,
-// the LARGEST is withheld first, then the next, until they do — one withheld hunk costs that file its
-// inline anchors and nothing else, whereas withholding many small ones would blind the worker to most
-// of the change to keep one lockfile's hashes on screen. Reads take what remains, smallest first, so
-// the count of files read whole is maximal; the rest are targeted. Deterministic: ties break on name.
-// [LAW:no-silent-failure] A finite window the fixed prose alone overruns is refused loudly — it means
-// the instructions, not the material, are the problem, and no allocation can fix that.
-function fitWorkerMaterial({ window, fixedTokens, files, readSet }) {
-  const budget = window === null ? Infinity : window - WORKER_HEADROOM_TOKENS - fixedTokens;
-  if (budget <= 0) {
-    throw new Error(`fitWorkerMaterial: the worker's fixed prompt (${fixedTokens} tokens) plus its ${WORKER_HEADROOM_TOKENS}-token headroom already exceeds the ${window}-token context window; no material can be placed.`);
-  }
-  const hunkTokens = new Map(files.filter(f => f.hunk !== null).map(f => [f.filename, estimateTokens(f.hunk)]));
-  const shown = new Set(hunkTokens.keys());
-  let placed = [...hunkTokens.values()].reduce((a, b) => a + b, 0);
-  const byHunkSizeDesc = [...hunkTokens.entries()].sort(([an, at], [bn, bt]) => bt - at || an.localeCompare(bn));
-  for (const [name, tokens] of byHunkSizeDesc) {
-    if (placed <= budget) break;
-    shown.delete(name);
-    placed -= tokens;
-  }
-
-  const opens = (f) => (readSet === null || readSet.has(f.filename)) && f.status !== 'removed';
-  const read = new Map(files.map(f => [f.filename, 'none']));
-  const candidates = [];
-  for (const f of files.filter(opens)) {
-    if (f.status === 'added' && shown.has(f.filename)) read.set(f.filename, 'in-diff');
-    else candidates.push(f);
-  }
-  candidates.sort((a, b) => a.content.tokens - b.content.tokens || a.filename.localeCompare(b.filename));
-  let remaining = budget - placed;
-  for (const f of candidates) {
-    if (f.content.tokens <= remaining) {
-      read.set(f.filename, 'full');
-      remaining -= f.content.tokens;
-    } else {
-      read.set(f.filename, 'targeted');
-    }
-  }
-  return files.map(f => ({ filename: f.filename, hunk: shown.has(f.filename) ? 'shown' : 'withheld', read: read.get(f.filename) }));
-}
-
-// [LAW:effects-at-boundaries] The ONE effect this module owns: measure each changed file's content as
-// it stands in the reviewed checkout — the tree the worker's Read tool will open — and stamp the
-// measurement onto the record: its size (tokens, lines — what a full read costs the window) and its
-// symbols (what it defines and mentions — what the seams between changed files are derived from,
-// src/seams.js). One read, every measurement; the text itself travels no further. [LAW:parse-dont-validate] `content` is the stamp: buildPrMaterial and
-// buildReviewInput require it on every file, so an unmeasured changed set cannot reach a worker prompt.
-// A removed file has no head content (nothing to read); every other status is read from the checkout.
-// [LAW:no-silent-failure] A listed file missing from the checkout is refused with the path and root
-// named: the worker would fail to open it too, and a review that silently sized it at zero would plan
-// a full read of a file that is not there. `readContent` is the injected reader (fs by default) so the
-// measurement is a value a test can supply. Changed files under review are UTF-8 text in practice; a
-// binary file measured as text errs high, the safe direction.
-// The line count a Read tool sees: a file's trailing newline ends its last line, it does not start
-// another, so "a\nb\n" is two lines and an empty file is none.
-function lineCount(text) {
-  if (text.length === 0) return 0;
-  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
-}
-
-function measureChangedFiles(files, reviewedRepoRoot, readContent = (absPath) => fs.readFileSync(absPath, 'utf8')) {
-  return files.map(f => {
-    if (f.status === 'removed') return { ...f, content: { tokens: 0, lines: 0, symbols: symbolsOf('') } };
-    const absPath = path.join(reviewedRepoRoot, f.filename);
-    let text;
-    try {
-      text = readContent(absPath);
-    } catch (e) {
-      throw new Error(`The reviewed checkout at ${reviewedRepoRoot} has no readable ${f.filename} (listed as ${f.status} in this change): ${e.message}. The review reads changed files from that checkout, so it must be at the change's head.`);
-    }
-    return { ...f, content: { tokens: estimateTokens(text), lines: lineCount(text), symbols: symbolsOf(text) } };
-  });
-}
-
-module.exports = { estimateTokens, fitWorkerMaterial, measureChangedFiles, WORKER_HEADROOM_TOKENS, READ_KINDS };
 
 
 /***/ }),
@@ -52886,7 +52097,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.66.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.67.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

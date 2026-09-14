@@ -21,7 +21,7 @@
 // checked-out tree's own — the case's pin and src/effort.js's default — and are ASSERTED against the
 // baseline's, because a candidate run at a different N, engine, or arm is not comparable: its pooled rate
 // measures a different thing. Asserted, never forced: this CLI has NO arm flag of any kind — not
-// --sweep-cap, not --read-set — so a tree whose default effort profile moved on ANY axis is refused
+// --sweep-cap — so a tree whose default effort profile moved on ANY axis is refused
 // rather than quietly replayed at the baseline's arm, which would gate a PR while neutralizing the very
 // change under test. The assertion is per-PROFILE, not per-axis (describeEffort renders the whole
 // value), so an axis added to src/effort.js is covered here the day it lands, with no edit. That is why
@@ -54,8 +54,8 @@ Usage: ANTHROPIC_API_KEY=… <engine credential(s)> node eval/compare.js [option
                          whichever baseline is resolved and is imposed on the replay; the engine, matcher,
                          and review-effort arm are the checked-out tree's own (or this CLI's flag) and are
                          ASSERTED against the baseline's — a mismatch refuses rather than adapts. A tree
-                         whose default effort profile (src/effort.js: DEFAULT_SWEEP_CAP, DEFAULT_READ_SET,
-                         …) differs from the baseline's on any axis is REFUSED before any spend, not
+                         whose default effort profile (src/effort.js: DEFAULT_SWEEP_CAP, …) differs from
+                         the baseline's on any axis is REFUSED before any spend, not
                          replayed at the baseline's arm: re-freeze, or price the lever with an A/B (see
                          eval/README, "Varying a lever").
   --matcher <kind>       Semantic matcher for scoring the candidate: 'llm' (default) or 'lexical'. MUST
@@ -633,7 +633,7 @@ function main() {
       throw new Error(`--out ${candidateRoot} holds ${foreign.length} run(s) that are not this candidate's:\n${foreign.map(f => `  ${f.dir} ${f.reason}`).join('\n')}\nPick a fresh --out, or remove them first.`);
     }
     // The arm is not provable from identity the way the engine is, so a run left here at another
-    // --sweep-cap or --read-set passes every check above and would only surface in score.js's agreedScope at 7b —
+    // --sweep-cap passes every check above and would only surface in score.js's agreedScope at 7b —
     // after the rest of the suite has replayed at full spend. [LAW:no-silent-failure]
     const misarmed = misarmedRuns(candidateEffort, prior);
     if (misarmed.length > 0) {

@@ -6,8 +6,7 @@ const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
 const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
-const { showableFiles } = require('./prompt');
-const { measureChangedFiles } = require('./window');
+const { writeDiffFiles } = require('./diff-files');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
 const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = require('./multiscope');
@@ -26,7 +25,7 @@ const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = require('./deadl
 const { synthesizeProviderConfig } = require('./provider');
 const { selectConfig } = require('./selection');
 const { preflight } = require('./preflight');
-const { TRANSCRIPT_DIR } = require('./debug');
+const { JOB_TEMP_DIR, TRANSCRIPT_DIR } = require('./debug');
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -423,7 +422,6 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
 async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now()) {
-  const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -727,18 +725,15 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     return;
   }
 
-  // [LAW:effects-at-boundaries] The one read of the changed files' sizes, at the run boundary: every
-  // changed file is measured in the reviewed checkout (the tree the workers' Read tool opens), and the
-  // measured set is what the anchors and the material are built from — the window fit sizes each
-  // worker's reads by it. [LAW:parse-dont-validate] the stamp travels with the files; buildPrMaterial
-  // requires it.
-  const measured = measureChangedFiles(filteredFiles, REVIEWED_REPO_ROOT);
-  // Anchors are engine-agnostic (purely diff-line based): the files whose diff is on the LINE grid under
-  // MAX_DIFF_CHARS (showableFiles — the same derivation the worker prompt renders from). The material
-  // rebuilds the worker prompt per attempt so each engine gets its own tool identifiers.
+  // Anchors are engine-agnostic (purely diff-line based): every changed file with a patch is on the LINE
+  // grid its diff file carries, and the diff files are written from the same filtered files, so a worker's
+  // LINE N and the sink's anchor are one number. The material rebuilds the worker prompt per attempt so
+  // each engine gets its own tool identifiers.
   // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
   // retry timing; the whole plan→workers pass is one attempt per config.
-  const anchors = buildReviewAnchors(showableFiles(measured, maxDiffChars));
+  const anchors = buildReviewAnchors(filteredFiles);
+  // Under the job's scratch root, which the runner deletes at the end of the job, so the PR's code never outlives it.
+  const diffDir = writeDiffFiles(filteredFiles, fs.mkdtempSync(path.join(JOB_TEMP_DIR, 'review-diffs-')));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
@@ -763,7 +758,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
       core.warning(`Failed to fetch prior-round pushbacks for PR #${pullNumber}: ${e.message}. Proceeding without pushback context.`);
     }
   }
-  const material = buildPrMaterial({ files: measured, maxDiffChars, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
+  const material = buildPrMaterial({ files: filteredFiles, diffDir, reviewedRepoRoot: REVIEWED_REPO_ROOT, dependencySummaries, priorPushbacks, excluded });
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);

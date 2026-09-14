@@ -97,17 +97,15 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  // [LAW:parse-dont-validate] name, focus and every file entry (owned or read) are stamped single-line here. All
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All
   // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
-  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // block (via workerFocusText), the assigned-files line — and all three are MODEL-AUTHORED, so an
   // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
   // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
   // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
-  // `files` is what the scope OWNS (the coverage record: every changed path in exactly one scope's files);
-  // `reads` is what it opens in full BEYOND that — the changed files the change couples to it, its seams
-  // (src/partition.js rule 5, src/seams.js). Two facts, one shape each; both default to
-  // the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
-  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files), reads: pathList(scope.reads) };
+  // `files` is what the scope OWNS: the coverage record, every changed path in exactly one scope's files.
+  // It defaults to the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
+  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files) };
 }
 function pathList(value) {
   return Array.isArray(value)

@@ -897,7 +897,7 @@ async function fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingRe
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
 // fake API. [LAW:dataflow-not-control-flow] The cap is a value, not a mode: maxRounds <= 0 is the
-// documented "unlimited" sentinel (matching MAX_DIFF_CHARS), so there is no separate enable flag.
+// documented "unlimited" sentinel, so there is no separate enable flag.
 // Skip once priorReviews has reached the cap — with maxRounds=5, rounds recorded at priorReviews
 // 0..4 run and the 6th push (priorReviews=5) is skipped, yielding exactly 5 reviews.
 function roundCapReached(priorReviews, maxRounds) {

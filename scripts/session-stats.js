@@ -2,8 +2,7 @@
 // [LAW:effects-at-boundaries] Pure: given a captured session transcript (or any raw engine stream),
 // report what tools the engine actually invoked. This is the analytical counterpart to buildTranscript
 // (src/debug.js): that one FRAMES the engine's raw streams; this one READS them back to answer the one
-// question the transcript exists to answer — did the engine explore the repo (Read/Grep/Glob), or only
-// consume the inline diff? No IO, no parsing of a specific framing: it scans for tool-invocation events
+// question the transcript exists to answer — what did the engine read (Read/Grep/Glob)? No IO, no parsing of a specific framing: it scans for tool-invocation events
 // in whatever JSONL the engine emitted, so it works on a framed transcript and on raw stdout alike.
 
 const EXPLORE_TOOLS = ['Read', 'Grep', 'Glob'];

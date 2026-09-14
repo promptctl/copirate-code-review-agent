@@ -3,8 +3,8 @@
 // ── The pre-spawn gate: which pull requests get an engine, and which get a review with no engine ──
 //
 // zai-coverage-bxa lived exactly here, in glue no unit test could see. Every seam downstream was
-// already correct in isolation — buildReviewInput hands a patchless file to the worker as a
-// read-in-full target, an off-grid finding partitions as unanchored, and an unanchored finding still
+// already correct in isolation — buildReviewInput names a patchless file to the worker as one with
+// no diff file to read in the repository, an off-grid finding partitions as unanchored, and an unanchored finding still
 // forces REQUEST_CHANGES — yet runPrReview filtered the changed set on `f.patch` before any of them
 // ran, and posted a clean APPROVE on a pull request nothing had opened. Two definitions of
 // "reviewable" in two files, the stricter one first. [LAW:single-enforcer]
@@ -20,6 +20,8 @@
 // Read at require time by @actions/github (context.repo) and src/run.js (REVIEWED_REPO_ROOT).
 process.env.GITHUB_REPOSITORY = 'acme/widget';
 process.env.GITHUB_WORKSPACE = '/home/runner/work/widget/widget';
+// The runner always provides it; run.js writes the change's diff files under it.
+process.env.RUNNER_TEMP = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'pr-review-gate-'));
 // core.getInput reads INPUT_*; every unset input is '' and takes its own off-value, so the budget
 // gradient, difficulty scaling, dependency diff and config file are all off — simple mode.
 Object.assign(process.env, {
@@ -31,7 +33,6 @@ Object.assign(process.env, {
   INPUT_GITHUB_REVIEW_TOKEN: 'gh-review-token',
   INPUT_PR_NUMBER: '7',
   INPUT_HEAD_SHA: 'head-sha',
-  INPUT_MAX_DIFF_CHARS: '0',
 });
 
 const { test, describe, beforeEach } = require('node:test');
@@ -127,11 +128,7 @@ preflightModule.preflight = async () => ({ ok: true, results: [] });
 // Stand in for the whole scout→workers pass, capturing the material it was handed so the worker
 // prompt this run would have sent can be built from it — the real buildReviewInput, via the real
 // buildPrMaterial, exactly as an engine would receive it.
-// The changed files are measured in the reviewed checkout (GITHUB_WORKSPACE above), which this test
-// does not materialize: the reader is injected as empty content, the same seam the eval replay uses.
-const windowModule = require('../src/window');
-const realMeasure = windowModule.measureChangedFiles;
-windowModule.measureChangedFiles = (files, root) => realMeasure(files, root, () => '');
+// The run writes each patched file's diff to a real temp directory (writeDiffFiles); nothing here stubs it.
 multiscope.runMultiScope = async ({ material, chain }) => {
   engineSpawns.push(material);
   return {
@@ -143,7 +140,7 @@ multiscope.runMultiScope = async ({ material, chain }) => {
 const { runPrReview } = require('../src/run');
 
 const review = () => runPrReview('Review Agent', [], defaultEffortProfile({ roundCap: 0 }), null);
-const workerPrompt = (material) => material.buildWorkerPrompt('the whole change', TOOL_NAMES, { assigned: material.changedPaths, read: material.changedPaths }, []);
+const workerPrompt = (material) => material.buildWorkerPrompt('the whole change', TOOL_NAMES, material.changedPaths, []);
 
 describe('a pull request whose every changed file arrives without a patch', () => {
   // GitHub omits `patch` for a file whose diff is large (roughly >400 changed lines) or binary, so
@@ -159,15 +156,14 @@ describe('a pull request whose every changed file arrives without a patch', () =
     assert.equal(engineSpawns.length, 1);
   });
 
-  test('hands the worker every patchless file as a read-in-full target at its absolute path', async () => {
+  test('names every patchless file to the worker as one to read in the repository', async () => {
     host.files = patchless;
     await review();
     const prompt = workerPrompt(engineSpawns[0]);
-    assert.match(prompt, /could not be shown \(too large or binary/);
-    assert.match(prompt, /\/home\/runner\/work\/widget\/widget\/src\/engine\.js/);
-    assert.match(prompt, /\/home\/runner\/work\/widget\/widget\/assets\/logo\.png/);
-    // No diff was shown, so nothing is on the LINE grid — the worker cites real file line numbers.
-    assert.doesNotMatch(prompt, /```diff/);
+    assert.match(prompt, /These changed files have no diff file \(binary, or too large for the host to render\): src\/engine\.js, assets\/logo\.png\. Read them in the repository/);
+    assert.match(prompt, /checked out at \/home\/runner\/work\/widget\/widget/);
+    // No diff file exists for them, so nothing is on the LINE grid — the worker cites real file line numbers.
+    assert.match(prompt, /recorded at the file's real line number/);
   });
 
   test('a finding in a patchless file blocks the merge, rendered outside the reviewed diff', async () => {
@@ -218,7 +214,7 @@ describe('a pull request with no reviewable changed file', () => {
   });
 });
 
-describe('a pull request whose diffs are shown inline (unchanged behavior)', () => {
+describe('a pull request whose changed files carry patches', () => {
   test('spawns the engine and anchors a finding to the diff line', async () => {
     host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,2 +1,3 @@\n const a = 1;\n+const b = 2;' }];
     engineFindings = [{ path: 'src/a.js', line: 2, body: 'shadowed name', severity: 3 }];
@@ -230,7 +226,7 @@ describe('a pull request whose diffs are shown inline (unchanged behavior)', () 
     assert.equal(posted.comments[0].line, 2);
   });
 
-  test('a clean review of a shown diff still approves', async () => {
+  test('a clean review of a patched change still approves', async () => {
     host.files = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' }];
     await review();
     assert.equal(host.reviews[0].event, 'APPROVE');

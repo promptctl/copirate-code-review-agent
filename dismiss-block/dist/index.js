@@ -30023,24 +30023,6 @@ function* patchLines(patch) {
   }
 }
 
-// [LAW:effects-at-boundaries] Pure: the new-side line ranges this patch touches, one per hunk, in
-// patch order — what a worker told to read a file "around its changed lines" opens with Read
-// offset/limit instead of the whole file. A header without a length (`+12 @@`) is one line. A pure
-// deletion at the top of the file (`+0,0`) has no new-side line of its own; the read starts at line 1,
-// the nearest line that exists, never at a line 0 no file has.
-function hunkRanges(patch) {
-  const ranges = [];
-  for (const text of patch.split('\n')) {
-    const hunk = HUNK_HEADER.exec(text);
-    if (hunk) {
-      const from = Math.max(Number(hunk[1]), 1);
-      const length = hunk[2] === undefined ? 1 : Number(hunk[2]);
-      ranges.push({ from, to: from + Math.max(length, 1) - 1 });
-    }
-  }
-  return ranges;
-}
-
 function buildFileAnchors(file) {
   const anchors = new Map();
   for (const entry of patchLines(file.patch)) {
@@ -30264,7 +30246,6 @@ function reconcileChangedSet(listed, parsed) {
 
 module.exports = {
   fileChurn,
-  hunkRanges,
   matchesPattern,
   parseReviewableFiles,
   reconcileChangedSet,
@@ -30549,7 +30530,7 @@ const { parseScopeValue } = __nccwpck_require__(1565);
 //
 // The recorded plan value:
 //   { planSchema, provenance, context, scopes, scoutUsage }
-// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files, reads }, recorded
+// scopes is the list AS THE WORKERS RAN IT — names uniquified — each { name, focus, files }, recorded
 // whole rather than projected, so a scope field added later cannot be silently dropped on the way to
 // disk. context is the planning text prefixed onto every worker's focus (workerFocusText); it is NOT
 // byte-exact recoverable from summary.txt, where composeSummary embeds it inside composed prose, so
@@ -30788,17 +30769,15 @@ function parseScopeValue(scope, index) {
   if (typeof focus !== 'string' || focus.trim().length === 0) {
     throw new Error(`Review collector scope ${index + 1} ('${name.trim()}') has an invalid focus.`);
   }
-  // [LAW:parse-dont-validate] name, focus and every file entry (owned or read) are stamped single-line here. All
+  // [LAW:parse-dont-validate] name, focus and every file entry are stamped single-line here. All
   // reach line-structured sinks — the aggregated summary's scope list, the worker prompt's CONCENTRATE
-  // block (via workerFocusText), the read-targets line — and all three are MODEL-AUTHORED, so an
+  // block (via workerFocusText), the assigned-files line — and all three are MODEL-AUTHORED, so an
   // unstamped one puts attacker-steerable text at column 0 of a prompt, where a continuation line reads
   // as an instruction rather than as data. Stamping at the single boundary that produces a scope is what
   // makes every one of those sinks safe without any of them checking. [LAW:single-enforcer]
-  // `files` is what the scope OWNS (the coverage record: every changed path in exactly one scope's files);
-  // `reads` is what it opens in full BEYOND that — the changed files the change couples to it, its seams
-  // (src/partition.js rule 5, src/seams.js). Two facts, one shape each; both default to
-  // the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
-  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files), reads: pathList(scope.reads) };
+  // `files` is what the scope OWNS: the coverage record, every changed path in exactly one scope's files.
+  // It defaults to the empty list, so a scout's scope and a partition's are one type. [LAW:one-type-per-behavior]
+  return { name: flattenBody(name), focus: flattenBody(focus), files: pathList(scope.files) };
 }
 function pathList(value) {
   return Array.isArray(value)
@@ -32315,7 +32294,7 @@ async function fetchPriorPushbacks(octokit, owner, repo, pullNumber, { findingRe
 
 // [LAW:effects-at-boundaries] Pure decision, split from the I/O above so it is testable without a
 // fake API. [LAW:dataflow-not-control-flow] The cap is a value, not a mode: maxRounds <= 0 is the
-// documented "unlimited" sentinel (matching MAX_DIFF_CHARS), so there is no separate enable flag.
+// documented "unlimited" sentinel, so there is no separate enable flag.
 // Skip once priorReviews has reached the cap — with maxRounds=5, rounds recorded at priorReviews
 // 0..4 run and the 6th push (priorReviews=5) is skipped, yielding exactly 5 reviews.
 function roundCapReached(priorReviews, maxRounds) {

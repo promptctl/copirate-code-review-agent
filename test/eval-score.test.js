@@ -565,13 +565,13 @@ test('callJudge posts to the pinned Anthropic messages endpoint with the model i
 // arm produced it and a dir cannot hold two. These cover the arm's parse, its one rendering, and the
 // checkpoint that turns a pile of run dirs into a scorable population.
 describe('the arm a run was produced under', () => {
-  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' };
+  const profile = { roundCap: 0, sweepCap: 2, reasoningTier: null };
   // A record as run-case.js writes one: the profile and the schema version naming its axis set, together.
   const recorded = effort => ({ effort, effortSchema: EFFORT_SCHEMA });
 
   test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
     assert.deepEqual(parseEffort(recorded(profile), 'meta.json'), profile);
-    assert.deepEqual(parseEffort(recorded({ roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' }), 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high', readSet: 'changed' });
+    assert.deepEqual(parseEffort(recorded({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }), 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high' });
   });
 
   test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
@@ -609,7 +609,7 @@ describe('the arm a run was produced under', () => {
         fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ case: caseName, ...meta }) + '\n');
         return dir;
       };
-      const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } });
+      const a1 = mk('case-a', '2026-01-01T00-00-00-000Z-run1', { candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } });
       const a2 = mk('case-a', '2026-01-01T00-00-01-000Z-run1', {});
       mk('case-a', '2026-01-01T00-00-02-000Z-run1', { candidate: { sha: 'abc', dirty: false } }, false); // crashed: no findings.json
       mk('case-c', '2026-01-01T00-00-03-000Z-run1', { candidate: { sha: 'abc', dirty: false } });       // not a gated case
@@ -621,7 +621,7 @@ describe('the arm a run was produced under', () => {
       assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
       fs.rmSync(misplaced, { recursive: true, force: true });
       assert.deepEqual(prior, [
-        { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } },
+        { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } },
         // The arm rides through beside the tree, and a run recorded before either existed reads as null for
         // both — the census the arm check below consumes.
         { case: 'case-a', dir: a2, candidate: null, effort: null },
@@ -638,7 +638,7 @@ describe('the arm a run was produced under', () => {
   });
   
   test('a malformed arm is refused naming the field, never coerced into a plausible profile', () => {
-    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 3 }, { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: [] }]) {
+    for (const bad of ['high', [], { sweepCap: 2 }, { roundCap: 0, sweepCap: -1, reasoningTier: null }, { roundCap: 0, sweepCap: 1.5, reasoningTier: null }, { roundCap: 0, sweepCap: 2, reasoningTier: 3 }]) {
       assert.throws(() => parseEffort(recorded(bad), 'meta.json'), /'effort' must be/, JSON.stringify(bad));
     }
   });
@@ -653,31 +653,15 @@ describe('the arm a run was produced under', () => {
       { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
       { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile } } },
     ];
-    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none readSet=assigned' });
+    assert.deepEqual(agreedScope(runs), { case: 'alpha', effort: 'roundCap=0 sweepCap=2 reasoningTier=none' });
   });
 
-  // [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): the 40 runs already on disk carry three axes
-  // and no schema version, and the read-set arm they ran under is a FACT about the code of that era
-  // (scope-bounded reads shipped in bfcd889, 2026-07-06, before every stored run) — not a guess. The
-  // back-fill is what turns that fact into a value the comparison sites can read.
-  test('a record written before the read-set axis resolves to the arm the code structurally had', () => {
+  // [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): the runs already on disk carry no schema
+  // version, and must still pool with a current record at the same axes.
+  test('a record written before the schema version pools with a current record at the same arm', () => {
     const legacy = parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } }, 'meta.json');
-    assert.equal(legacy.readSet, 'assigned');
-    // ...which is the whole point: it now pools with runs of the same arm, and still refuses the other one.
+    assert.deepEqual(legacy, parseEffort(recorded(profile), 'meta.json'));
     assert.equal(describeEffort(legacy), describeEffort(profile));
-    assert.notEqual(describeEffort(legacy), describeEffort({ ...profile, readSet: 'changed' }));
-    // The same record re-read from a scorecard-summary, where absence is spelled as an explicit null,
-    // resolves identically — one fact, one value, whichever spelling it arrives in.
-    assert.deepEqual(parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: null } }, 'x'), legacy);
-  });
-
-  test('a record stamped with the CURRENT schema must carry every axis itself — a gap is a defect, not an era', () => {
-    // The recorder is derived from the type, so a current-schema record missing an axis means the writer
-    // fell behind. Filling it from a default would launder that into a plausible arm; it is refused by name.
-    assert.throws(
-      () => parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null }, effortSchema: EFFORT_SCHEMA }, 'meta.json'),
-      /missing readSet/,
-    );
   });
 
   test('a schema this tree has no row for is refused, never interpreted through another version\'s rules', () => {
@@ -685,15 +669,6 @@ describe('the arm a run was produced under', () => {
       () => parseEffort({ ...recorded(profile), effortSchema: 'copirate-effort/v99' }, 'meta.json'),
       /Unknown effort schema/,
     );
-  });
-
-  test('the two read-set arms are distinct arms, and a dir holding both is refused by name', () => {
-    const runs = [
-      { dir: '/out/alpha/r1', meta: { case: 'alpha', effort: profile } },
-      { dir: '/out/alpha/r2', meta: { case: 'alpha', effort: { ...profile, readSet: 'changed' } } },
-    ];
-    assert.throws(() => agreedScope(runs), /r2 ran at effort .*readSet=changed.* earlier runs ran at .*readSet=assigned/s);
-    assert.deepEqual(misarmedRuns(profile, [{ dir: 'r1', effort: { ...profile, readSet: 'changed' } }]).map(m => m.dir), ['r1']);
   });
 
   test('a dir resumed under a different --sweep-cap is refused, not averaged into a band naming neither arm', () => {

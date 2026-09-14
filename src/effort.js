@@ -14,19 +14,11 @@
 // convergence chain in runMultiScopePass, reads it here), `reasoningTier` (its consumer is the reasoning fold at the
 // runMultiScope seam — the one place the chain and the effort profile meet — which reconciles the
 // profile's proposed tier with each config's own reasoning via `maxTier` before the adapter clamps it
-// to the engine's range), and `readSet` (its consumer is the read-set projection at runScopeWorker,
-// which decides WHICH files each worker opens in full). It GROWS a field as each remaining knob's
-// consumer is migrated off its current source: `readBudget` (today MAX_DIFF_CHARS), `modelTier` (today
-// per-config on the chain).
+// to the engine's range). It GROWS a field as each remaining knob's consumer is migrated off its
+// current source: `modelTier` (today per-config on the chain).
 // Adding a field to a well-formed producer is cheap [LAW:carrying-cost]; adding it before its consumer
 // exists is a lie — so `reasoningTier` lands together with its fold consumer (multiscope.js) and its
 // price (budget.js estimatedCostUsd), never as an ungoverned placeholder.
-//
-// [LAW:one-source-of-truth] `readSet` and the still-unlanded `readBudget` are DIFFERENT axes and the
-// names invite conflating them. `readBudget` (MAX_DIFF_CHARS) bounds how much DIFF is rendered into the
-// prompt — the same text for every worker. `readSet` decides which changed files a worker OPENS in full
-// once it has that diff, which is per-WORKER and is the axis a multi-scope plan can split. Both are read
-// cost; only one is partitionable, which is why splitting was a lever at all.
 //
 // [LAW:one-source-of-truth] `reasoningTier` on the profile is the difficulty-PROPOSED RAISE, NOT a
 // review's absolute reasoning tier. The absolute per-config baseline stays `config.reasoning` (each
@@ -57,38 +49,6 @@
 // is always finite. [LAW:types-are-the-program]
 const DEFAULT_SWEEP_CAP = 2;
 
-// [LAW:dataflow-not-control-flow] The read-set axis, as a table from each arm's NAME to the projection
-// that produces the files a worker opens in full. The vocabulary is the table's KEYS (READ_SETS below),
-// so a name can never exist without the meaning it selects — the pair that would drift if the two were
-// written separately. [LAW:one-source-of-truth]
-//   'assigned' — the worker reads only the scope it was assigned. N workers cost ~1× the read of the
-//                changed set (split), not N× (duplicated): the shipped cost cut.
-//   'changed'  — the worker reads the whole changed set, the pre-split behavior. It projects to the
-//                EMPTY list because that is already prompt.js's value for "read every changed file in
-//                full" (buildReviewInput's readFiles) — this axis picks which value flows to a seam
-//                that was always value-driven, and adds no second prompt path. [LAW:composability]
-// The projection takes the scope's eyesight (its owned files plus its second reads) and returns the read
-// set, so the two arms are one signature — never a caller-side branch on the arm. It is deliberately NOT keyed to scope IDENTITY:
-// `scope.files` remains the coverage record either way (the partition assigns every changed path once,
-// and pinnedProposal proves a replayed plan against the changed set), so an arm changes what a worker
-// READS and nothing about what the plan CLAIMS to cover. Those are two facts, and only one of them is effort.
-const READ_SET_PROJECTION = {
-  assigned: (scopeFiles) => scopeFiles,
-  changed: () => [],
-};
-
-// [LAW:one-source-of-truth] The arm vocabulary, derived from the projection table rather than listed a
-// second time: the CLIs validate against this and the error messages name it, so a new arm is one entry
-// in one table. [LAW:types-are-the-program]
-const READ_SETS = Object.keys(READ_SET_PROJECTION);
-
-// [LAW:one-source-of-truth] The default read set: the behavior the engine ships (each worker reads its
-// own scope). Unlike a cap there is no numeric "off" — the axis is a closed two-value vocabulary, so the
-// non-default arm is named, not spelled as a magic number. [LAW:no-mode-explosion] this is an A/B AXIS,
-// not a user knob: no action input sets it, and its non-default arm exists to be MEASURED
-// (copirate-measurement-2mg.2) — the shipped lever was priced on cost evidence with no recall verdict.
-const DEFAULT_READ_SET = 'assigned';
-
 // [LAW:dataflow-not-control-flow] The abstract reasoning-tier ladder, low→high, keyed to an ordinal
 // RANK. It is the union of every engine's declared reasoning-effort vocabulary: claude-code exposes
 // low..max, codex minimal..xhigh, opencode none. `xhigh` (codex's ceiling) and `max` (claude-code's
@@ -98,7 +58,7 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 // The single representation of review effort. Produced at one seam (a default in simple mode,
 // overridable via the config file later) and consumed uniformly by the engine.
-// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null), readSet: string }} EffortProfile
+// @typedef {{ roundCap: number, sweepCap: number, reasoningTier: (string|null) }} EffortProfile
 
 // [LAW:effects-at-boundaries] Pure. The default profile — its values ARE the engine's default
 // behavior (which, since zai-recall-upr.2, includes convergence sweeps: sweepCap > 0). An OPTIONS
@@ -119,12 +79,8 @@ const TIER_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 // estimatedCostUsd — both land together with the axis, per this module's header. It is OWNED here
 // (DEFAULT_SWEEP_CAP), not sourced from an action input: the sweep bound is engine policy, not a
 // consumer knob. [LAW:no-mode-explosion]
-// `readSet` is the profile's read-partitioning axis (copirate-measurement-2mg.2): its consumer is the
-// projection at runScopeWorker, its price the read multiplicand in budget.js's estimatedCostUsd — both
-// land with the axis, per this module's header. It is OWNED here (DEFAULT_READ_SET), not sourced from an
-// action input: how a plan splits its reads is engine policy, not a consumer knob. [LAW:no-mode-explosion]
-function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null, readSet = DEFAULT_READ_SET } = {}) {
-  return { roundCap, sweepCap, reasoningTier, readSet };
+function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reasoningTier = null } = {}) {
+  return { roundCap, sweepCap, reasoningTier };
 }
 
 // [LAW:one-source-of-truth] The version of the RECORDED profile, owned next to the type it versions —
@@ -134,7 +90,7 @@ function defaultEffortProfile({ roundCap = 0, sweepCap = DEFAULT_SWEEP_CAP, reas
 // the record states the theorem that was true at its writing, so a reader never has to guess whether an
 // absent axis was a choice or an era. Bump it whenever defaultEffortProfile's axes change, and give the
 // outgoing version its row in the back-fill below — the bump and the row are one edit, never two.
-const EFFORT_SCHEMA = 'copirate-effort/v1';
+const EFFORT_SCHEMA = 'copirate-effort/v2';
 
 // [LAW:parse-dont-validate] A record carrying no version is NOT versionless: it was written in the era
 // before the version existed, and that era had exactly one axis set. So absence is a VALUE here — it gets
@@ -144,21 +100,19 @@ const EFFORT_SCHEMA = 'copirate-effort/v1';
 const UNVERSIONED_EFFORT_SCHEMA = 'copirate-effort/unversioned';
 
 // [LAW:dataflow-not-control-flow] The back-fill, as a TABLE from schema version to the axes the CODE
-// STRUCTURALLY HAD at that version — values, not an inference each reader re-derives at its own site.
-// [LAW:single-enforcer] one rule, read through completeEffort by every comparison site, replacing the
-// unanswerable "what arm did this run's missing axis run at?" with an answer this tree owns and can cite.
-//   unversioned -> readSet 'assigned': scope-bounded reads shipped in bfcd889 on 2026-07-06, before every
-//     stored run, and the axis did not exist to be set otherwise — the behavior was that arm as a matter
-//     of code, not of guesswork. Retro-editing the stored meta.json files to add the field would falsify
-//     the record; interpreting them through an owned rule is the honest form of the same knowledge.
-//     [LAW:one-source-of-truth] the value is spelled out rather than written as DEFAULT_READ_SET: this
-//     row is a HISTORICAL fact about code that shipped, and if the shipped default ever moves, what those
-//     runs did does not move with it. Binding the two would make the past follow the present.
+// STRUCTURALLY HAD at that version which a record of that version may lack — values, not an inference each
+// reader re-derives at its own site. [LAW:single-enforcer] one rule, read through completeEffort by every
+// comparison site.
+//   unversioned, v1 -> {}: those records carry roundCap, sweepCap and reasoningTier themselves. They also
+//     carry a readSet axis the profile no longer has (workers read diff files and choose their own reads
+//     since zai-material-bez); it passes through as recorded, and retro-editing the stored records to drop
+//     it would falsify them.
 //   current -> {}: a record written at the current version carries every axis itself, so there is nothing
 //     to supply — and an axis still missing is a DEFECT, refused loudly by completeEffort rather than
 //     quietly filled.
 const EFFORT_SCHEMA_BACKFILL = {
-  [UNVERSIONED_EFFORT_SCHEMA]: { readSet: 'assigned' },
+  [UNVERSIONED_EFFORT_SCHEMA]: {},
+  'copirate-effort/v1': {},
   [EFFORT_SCHEMA]: {},
 };
 
@@ -220,24 +174,6 @@ function completeEffort({ effort, effortSchema }) {
     );
   }
   return completed;
-}
-
-// [LAW:parse-dont-validate] Resolve the arm NAME to the projection it selects — the axis's one checkpoint,
-// and the only place its vocabulary is checked. It returns something that could not exist before the check
-// (the projection itself), so a caller holding one holds a proven arm: there is nothing left inland to
-// re-check, and no way to reach a worker with a name the table has no meaning for. [LAW:single-enforcer]
-// Callers resolve ONCE at a pass boundary rather than per worker, which is what puts the refusal BEFORE the
-// scout spawn instead of after it — a malformed arm costs nothing rather than a round of spend.
-// [LAW:no-silent-failure] an unknown arm is a caller bug, not something to coalesce to the default:
-// silently reading the shipped arm would make an A/B report the DEFAULT behavior under the other arm's
-// name — a measurement that lies rather than fails. Throw, naming the known arms.
-function readSetProjection(readSet) {
-  if (!Object.prototype.hasOwnProperty.call(READ_SET_PROJECTION, readSet)) {
-    throw new Error(
-      `Unknown read set ${JSON.stringify(readSet)}. Known read sets: ${READ_SETS.join(', ')}.`,
-    );
-  }
-  return READ_SET_PROJECTION[readSet];
 }
 
 // [LAW:effects-at-boundaries] Pure. The higher of two abstract reasoning tiers by TIER_RANK — the
@@ -316,8 +252,6 @@ function resolveReasoningTier(tier, engineEfforts) {
 
 module.exports = {
   DEFAULT_SWEEP_CAP,
-  DEFAULT_READ_SET,
-  READ_SETS,
   TIER_RANK,
   EFFORT_SCHEMA,
   UNVERSIONED_EFFORT_SCHEMA,
@@ -328,5 +262,4 @@ module.exports = {
   defaultEffortProfile,
   resolveReasoningTier,
   maxTier,
-  readSetProjection,
 };

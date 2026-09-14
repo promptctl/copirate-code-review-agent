@@ -210,8 +210,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case.js eval/cases/<case-name> -n 3
 # options: -n/--repeats <N> (default 1), --out <dir> (default eval/out),
 #          --memory-budget <bytes> (default: the whole host; freeze-suite passes each lane its share),
 #          --sweep-cap <N> (default: the engine's own DEFAULT_SWEEP_CAP),
-#          --plan <plan.json> (default: the partition is computed from the changed paths and their churn),
-#          --read-set <assigned|changed> (default: the engine's own DEFAULT_READ_SET)
+#          --plan <plan.json> (default: the partition is computed from the changed paths and their churn)
 ```
 
 It extracts `repo.tar.gz` to a temp dir (that becomes `REVIEWED_REPO_ROOT`), feeds
@@ -253,16 +252,15 @@ eval/out/<case-name>/<timestamp>-run<i>/
                     no CI log to scrape.
   plan.json       — the replay's STRUCTURE, as the engine's own record (src/plan.js's planRecord):
                     { planSchema, provenance, context, scopes, scoutUsage }, where scopes is the
-                    partition the workers actually ran (each { name, focus, files, reads }; every changed
-                    path lands in exactly one scope's files, and reads is what the scope opens in full
-                    beyond its own — the changed files the change couples to it, src/seams.js) and context is the planning text prefixed onto every
+                    partition the workers actually ran (each { name, focus, files }; every changed
+                    path lands in exactly one scope's files) and context is the planning text prefixed onto every
                     worker's focus. provenance names which producer RAN — 'partition' (a PR run: the
                     scopes are a pure function of the changed file paths and their churn, no spawn, scoutUsage null), 'scout'
                     (a repo-mode run, which has no diff to compute from and buys its plan from a scout
                     spawn; scoutUsage is what deciding it cost) or 'pinned' (a --plan replay, scoutUsage
                     null). This file is a valid --plan input: see below.
   meta.json       — provenance: case, timestamp, run index, the resolved engine config, findingCount,
-                    effort ({roundCap, sweepCap, reasoningTier, readSet}: the arm the run ACTUALLY ran at; null
+                    effort ({roundCap, sweepCap, reasoningTier}: the arm the run ACTUALLY ran at; null
                     on runs from before it was recorded, which matches only other nulls), and candidate
                     ({sha, dirty}: the tree that produced the run; null on runs from before it was
                     recorded).
@@ -283,7 +281,6 @@ flag's default is read from `src/effort.js`, which owns the value — nothing he
 | Flag | Axis | Arms |
 | --- | --- | --- |
 | `--sweep-cap <N>` | convergence sweeps allowed per scope after its first pass | `0` is the pre-convergence single-pass behavior; unset is `DEFAULT_SWEEP_CAP` |
-| `--read-set <arm>` | which changed files each scope worker opens **in full** | `assigned` (shipped: the read is split across the plan) or `changed` (pre-split: every worker reads the whole changed set); unset is `DEFAULT_READ_SET` |
 
 An axis is only ever varied **one at a time**: two arms that differ on two axes produce a delta
 attributable to neither.
@@ -299,20 +296,11 @@ CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-swe
 for c in eval/out/ab-sweep2/*/ eval/out/ab-sweep0/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done
 ```
 
-The read-set arms run the same way — the flag is the only thing that changes:
-
-```bash
-# arm A — split reads, the shipped cost cut
-CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-assigned --read-set assigned
-# arm B — every worker reads the whole changed set, the behavior the cut replaced
-CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/ab-read-changed --read-set changed
-```
-
 Every run records the effort profile it actually ran under in its `meta.json`, and both ends
 **refuse** a mix: `freeze-suite.js` reads the arm of every run already under `--out` and aborts
 before resolving a credential, and `score.js` refuses a case-out dir whose runs disagree. Both name
 both arms. That is what makes the resume story safe: re-running a suite into an existing `--out`
-under a different `--sweep-cap` or `--read-set` — forgetting the flag while topping up an arm is the easy slip —
+under a different `--sweep-cap` — forgetting the flag while topping up an arm is the easy slip —
 would otherwise look exactly like a completed suite, queue only the deficit at the new arm, and
 produce a band that blends two arms and describes neither. A run replayed before the arm was recorded counts
 as its own value — `unrecorded` matches only `unrecorded`, because nothing proves what it
@@ -327,7 +315,7 @@ candidate against a floor it never ran under.
 
 `compare.js` closes the last layer, and it is the one a live PR meets: it holds a candidate to the
 baseline's arm the way it already holds it to the pinned engine. A tree whose default effort profile
-(`src/effort.js`: `DEFAULT_SWEEP_CAP`, `DEFAULT_READ_SET`, …) differs from the baseline's **on any axis**
+(`src/effort.js`: `DEFAULT_SWEEP_CAP`, …) differs from the baseline's **on any axis**
 is **refused before any spend**, as are prior runs left under a resumed `--out` at another arm (which
 carry the candidate's own tree identity, so nothing else would catch them until scoring, after the suite
 had replayed). It compares whole profiles instead of named axes and carries no arm flag of its own, so an
@@ -346,13 +334,9 @@ than `MIN_SCOPE_FILES` (currently 2) merges into its parent, and the repository 
 the size dimension (zai-timing-8jk.4): on a lopsided plan — the largest group at least `LOPSIDED_RATIO`
 (2) times the runner-up — a largest group of more than `SCOPE_CHURN_CAP` (360) changed lines is cut into
 as many parts of near-equal churn as the cap fills; a source and the test that names it are never
-parted, and a cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. Then the
-seam reads (zai-timing-8jk.5): every scope reads, beyond the files it owns, the changed files the change
-couples to it (`src/seams.js` — a changed use of a symbol another changed file defines, or a changed
-definition of a symbol another changed file uses, weighted by how many changed files define the symbol),
-heaviest coupling first, from a budget of one further read of the changed set's lines; what the budget
-cannot cover is named in the plan's context. A worker's diff is its eyesight — its own hunks and its
-seams' — and the rest of the change is named to it, not shown. Same diff, same structure, every run.
+parted, and a cut that would leave a part under `SCOPE_CHURN_FLOOR` (100 lines) is not made. A scope
+says what its worker is accountable for; every worker reads the change's diff files and decides what else
+to read. Same diff, same structure, every run.
 Only repo mode still buys its plan from a scout spawn, because there is no diff to compute one from.
 
 It was not always so. The plan used to be re-decided by an LLM scout on every single invocation and
@@ -391,8 +375,7 @@ spawns anything to decide the plan.
 A plan that does not partition **this** case's changed files *exactly* is refused before any engine spawn,
 at zero spend. A partition is a cover with no overlap, and all three ways to miss it are refused: a
 changed file no scope claims, a file the plan names that the diff lacks, and a file claimed by more than
-one scope. A fourth refusal reads the same error from the `reads` side: a scope that reads a file the
-diff lacks belongs to some other change, and is refused with the rest. Nothing downstream repairs coverage — every changed
+one scope. Nothing downstream repairs coverage — every changed
 path lands in exactly one scope because the producer puts it there, not because a later sweep catches
 what it missed — so a changed file no scope claims would simply go unreviewed while its `plan.json`
 claimed a partition of the whole change: a different review wearing the plan's name, which is the one
@@ -609,7 +592,7 @@ Full-suite workflow (run → score → freeze):
 #    Per-replay logs land in the SIBLING eval/out/freeze-<sha>-logs/, so every child of the out
 #    root below is a case run dir and the glob in step 2 needs no exclusions.
 CLAUDE_CODE_OAUTH_TOKEN=… node eval/freeze-suite.js -n 5 --out eval/out/freeze-<sha>
-#    (a baseline is frozen at the DEFAULT effort profile; --sweep-cap and --read-set belong to
+#    (a baseline is frozen at the DEFAULT effort profile; --sweep-cap belongs to
 #     A/B roots, not to this one)
 # 2. Score each case (writes scorecard-summary.json per case).
 for c in eval/out/freeze-<sha>/*/; do ANTHROPIC_API_KEY=… node eval/score.js "$c"; done

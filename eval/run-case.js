@@ -32,11 +32,10 @@ const { execFileSync } = require('child_process');
 // from it rather than copied here. This is the one src require at module load: effort.js has an EMPTY
 // require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
 // cannot bind TRANSCRIPT_DIR before main() redirects RUNNER_TEMP.
-const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS, defaultEffortProfile, recordEffort } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP, defaultEffortProfile, recordEffort } = require('../src/effort');
 // [LAW:one-source-of-truth] The CLI-integer rule's owner; freeze-suite.js imports the same one. Empty
 // require graph, so this stays a pure-helper import under the load-purity rule above.
 const { parseIntAtLeast, parsePositiveInt } = require('./cli-int');
-const { parseOneOf } = require('./cli-enum');
 
 const USAGE = `Replay a frozen eval case through the real review engine (no GitHub) and leave per-run
 artifacts (findings.json, summary.txt, usage.json, schedule.json, plan.json, transcripts/) for the scorer to reduce.
@@ -63,24 +62,19 @@ Usage: node eval/run-case.js <case-dir> [options]
                       changed files exactly (a file it omits, one it names that the diff lacks, or one
                       it claims in more than one scope) is refused before the first spawn. Omitted (the default), the engine computes the
                       partition from the changed paths — the same structure on every replay.
-  --read-set <arm>    Which changed files each scope worker opens IN FULL (default: the engine's own
-                      DEFAULT_READ_SET). 'assigned' is the shipped behavior — a worker reads only its own
-                      scope, so the read is split across the plan. 'changed' is the pre-split behavior —
-                      every worker reads the whole changed set. Recorded and mix-refused exactly as
-                      --sweep-cap is.
   --help              Show this help.
 
 The engine (provider/model/reasoning) is PINNED by case.json and cannot be overridden here — a replay
 on a different model would corrupt any baseline comparison, so a mismatch is refused loudly. Review
 EFFORT is not pinned by the case: it is the lever an A/B varies over one frozen case, which is why
---sweep-cap and --read-set are offered where --model is refused.
+--sweep-cap is offered where --model is refused.
 `;
 
 // [LAW:effects-at-boundaries] Pure arg parse: flags + one required positional map to a plain options
 // value; no IO. `--flag value` and `--flag=value` both supported; `-n` is the one short alias.
 function parseArgs(argv) {
-  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP, readSet: DEFAULT_READ_SET, plan: null };
-  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap', 'read-set': 'readSet', plan: 'plan' };
+  const opts = { caseDir: null, repeats: 1, out: 'eval/out', memoryBudget: null, sweepCap: DEFAULT_SWEEP_CAP, plan: null };
+  const keyFor = { repeats: 'repeats', out: 'out', 'memory-budget': 'memoryBudget', 'sweep-cap': 'sweepCap', plan: 'plan' };
   const aliases = { n: 'repeats' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -122,11 +116,6 @@ function parseArgs(argv) {
   // given?". [LAW:dataflow-not-control-flow] Its floor is 0 — the sweeps-off arm is a legal setting,
   // not a bad input — which is why it parses against 0 rather than through parsePositiveInt.
   opts.sweepCap = parseIntAtLeast(opts.sweepCap, '--sweep-cap', 0);
-  // The read-set arm leaves the parser as a member of the vocabulary, with no absent case for the same
-  // reason the cap has none: unset means DEFAULT_READ_SET, already in the slot. It is a NAMED arm rather
-  // than a number because the axis has no off position — 'changed' is not "less" reading, it is a
-  // different partitioning of the same reading. [LAW:dataflow-not-control-flow]
-  opts.readSet = parseOneOf(opts.readSet, '--read-set', READ_SETS);
   // The plan leaves the parser as a PATH, not a record: reading and parsing the file is IO, and this
   // parser does none — main resolves it at the run boundary, where every other file this replay opens is
   // opened. null is the absence with a meaning ('this replay computes its own partition'), which is the
@@ -383,24 +372,19 @@ function loadDiffFiles(diffPath) {
 // reviewer against a prompt production never sends — the instrument measuring the wrong thing.
 // [LAW:effects-at-boundaries] Pure: it computes and throws. The caller owns the stderr line, composed
 // from the `excluded` returned here.
-// readContent is the injected file reader measureChangedFiles takes (fs by default): the replay measures
-// the case's extracted tree exactly as run.js measures the checkout. [LAW:effects-at-boundaries]
-function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot, readContent }) {
+// [LAW:one-source-of-truth] The diff files are written by the same writer run.js uses (writeDiffFiles), from
+// the same filtered files the anchors come from, so a replay's workers read exactly what a live review's do.
+function buildCaseMaterial({ allFiles, excludePatterns, reviewedRepoRoot, diffDir }) {
   const { filterFiles } = require('../src/diff');
   const { buildPrMaterial } = require('../src/multiscope');
-  const { measureChangedFiles } = require('../src/window');
+  const { writeDiffFiles } = require('../src/diff-files');
   const { reviewed: files, excluded } = filterFiles(allFiles, excludePatterns);
   // [LAW:no-silent-failure] Every changed file excluded means there is nothing to review — a case that
   // would replay as a vacuous empty review must say so, not quietly produce a zero-finding artifact.
   if (files.length === 0) {
     throw new Error(`All ${allFiles.length} changed file(s) were excluded by the case's EXCLUDE_PATTERNS — nothing to review.`);
   }
-  // maxDiffChars: 0 (no truncation) exactly as scripts/local-review.js does — the frozen diff is the whole
-  // material the workers see, anchored against the same (filtered) files.
-  // [LAW:one-source-of-truth] The same measurement production stamps (run.js), from the same seam, so
-  // a replay's workers are fit to the window exactly as a live review's are.
-  const measured = measureChangedFiles(files, reviewedRepoRoot, readContent);
-  return { files: measured, excluded, material: buildPrMaterial({ files: measured, maxDiffChars: 0, reviewedRepoRoot, excluded }) };
+  return { files, excluded, material: buildPrMaterial({ files, diffDir: writeDiffFiles(files, diffDir), reviewedRepoRoot, excluded }) };
 }
 
 // [LAW:no-ambient-temporal-coupling] Drain the engine's frozen TRANSCRIPT_DIR into this run's dir, then
@@ -475,6 +459,8 @@ async function main() {
     const allFiles = loadDiffFiles(manifest.diffPath);
     const { files, excluded, material } = buildCaseMaterial({
       allFiles, excludePatterns: manifest.excludePatterns, reviewedRepoRoot: treeTemp,
+      // Beside the transcripts, never inside the reviewed tree, and removed with stagingTemp below.
+      diffDir: path.join(stagingTemp, 'diffs'),
     });
     if (excluded.paths.length > 0) process.stderr.write(`Excluded ${excluded.paths.length} file(s) matching the case's EXCLUDE_PATTERNS: ${excluded.paths.join(', ')}\n`);
 
@@ -494,7 +480,7 @@ async function main() {
     // of a case is the same arm by construction, and this is the exact value meta.json records — the
     // scorer reads the arm off the run instead of re-deriving it from a directory name or the operator's
     // memory of which flag they typed.
-    const effort = defaultEffortProfile({ sweepCap: opts.sweepCap, readSet: opts.readSet });
+    const effort = defaultEffortProfile({ sweepCap: opts.sweepCap });
 
     const runDirs = [];
     for (let i = 1; i <= opts.repeats; i++) {
