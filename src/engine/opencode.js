@@ -266,6 +266,13 @@ function meterUsage() {
   };
 }
 
+// OpenCode's dollars are its own per-step estimate, carried on the step events and summed by extractUsage;
+// no local table prices the tokens a live meter read, so a spawn that died with no report leaves its
+// metered tokens unpriced rather than inventing a figure. [LAW:no-silent-failure]
+function priceMetered() {
+  return { basis: 'unpriced', reason: 'not-reported' };
+}
+
 // [LAW:single-enforcer] The shared transient vocabulary (429/529/network drop) is classified once in
 // src/failover.js (classifyTransient); opencode consumes it whole and adds nothing engine-specific.
 // OpenCode retries many transient API errors internally, so these signals fire mainly when a failure
@@ -303,6 +310,7 @@ const opencodeAdapter = makeCliAdapter({
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -319,4 +327,5 @@ module.exports = {
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
 };

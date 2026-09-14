@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const core = require('@actions/core');
 const { TransientError, classifyTransient } = require('../failover');
-const { priceFromTable, spawnFromRequest, sumCost, emptyTokens, addTokens } = require('../usage');
+const { priceFromTable, spawnFromRequest, spawnFromTokens, sumCost, emptyTokens, addTokens } = require('../usage');
 const { makeCliAdapter } = require('./cli');
 const { createJsonRpcClient } = require('./jsonrpc');
 const { resolveReasoningTier } = require('../effort');
@@ -291,6 +291,14 @@ function meterUsage() {
   };
 }
 
+// [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died with no session
+// report, through the same price table extractUsage uses. The metered total no longer says how its requests
+// split, so it is priced as one spawn from its tokens — which proves each request's context only as an upper
+// bound, and stays unpriced (with the table's own reason) wherever that bound crosses a context tier.
+function priceMetered(tokens, config, startedAt) {
+  return priceFromTable(spawnFromTokens(startedAt, tokens), config.model);
+}
+
 function extractUsage({ requests }, config, startedAt) {
   if (requests.length === 0) return null;
   const perRequest = requests.map(tokensOfRequest);
@@ -332,6 +340,7 @@ const codexAdapter = makeCliAdapter({
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior —
@@ -347,4 +356,5 @@ module.exports = {
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
 };

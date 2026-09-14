@@ -40,6 +40,19 @@ describe('claude-code meterUsage', () => {
     assert.deepEqual(lastReading(claudeCode.meterUsage(), stream), tokens);
   });
 
+  test('priceMetered prices metered tokens as extractUsage prices the report, on a table-priced endpoint', () => {
+    const config = { model: 'glm-5.1', endpoint: { baseUrl: 'https://api.z.ai/api/anthropic', credential: { kind: 'api-key', value: 'k' } } };
+    const at = new Date('2026-09-14T00:00:00Z');
+    const { tokens, cost } = claudeCode.extractUsage(stream.join('\n'), config, at);
+    assert.equal(cost.basis, 'dollars');
+    assert.deepEqual(claudeCode.priceMetered(tokens, config, at), cost);
+  });
+
+  test('priceMetered on a genuine Anthropic endpoint is unpriced — only the envelope carries that figure', () => {
+    const config = { model: 'claude-sonnet-5', endpoint: { baseUrl: 'https://api.anthropic.com', credential: { kind: 'api-key', value: 'k' } } };
+    assert.deepEqual(claudeCode.priceMetered({ inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, config, new Date()), { basis: 'unpriced', reason: 'not-reported' });
+  });
+
   test('a line that is not a usage event reads as nothing', () => {
     const meter = claudeCode.meterUsage();
     assert.equal(meter('not json'), null);
@@ -65,6 +78,13 @@ describe('codex meterUsage', () => {
     assert.deepEqual(tokens, { inputCacheMiss: 5_000, inputCacheHit: 28_000, output: 800 });
   });
 
+  test('priceMetered prices a metered total from the table, as extractUsage prices a single request', () => {
+    const at = new Date('2026-09-14T00:00:00Z');
+    const { tokens, cost } = codex.extractUsage({ requests: [requests[0]] }, { model: 'gpt-5.4-mini' }, at);
+    assert.equal(cost.basis, 'dollars');
+    assert.deepEqual(codex.priceMetered(tokens, { model: 'gpt-5.4-mini' }, at), cost);
+  });
+
   test('a usage notification it cannot read throws, so the spawn is stopped loudly rather than uncounted', () => {
     const meter = codex.meterUsage();
     assert.throws(() => meter(JSON.stringify({ jsonrpc: '2.0', method: 'thread/tokenUsage/updated', params: {} })), /carried no request usage/);
@@ -83,5 +103,9 @@ describe('opencode meterUsage', () => {
     const { tokens } = opencode.extractUsage(stream.join('\n'));
     assert.deepEqual(lastReading(opencode.meterUsage(), stream), tokens);
     assert.deepEqual(tokens, { inputCacheMiss: 180, inputCacheHit: 50, output: 23 });
+  });
+
+  test('priceMetered leaves metered tokens unpriced — opencode self-reports its dollars, and no table prices them', () => {
+    assert.deepEqual(opencode.priceMetered({ inputCacheMiss: 180, inputCacheHit: 50, output: 23 }, {}, new Date()), { basis: 'unpriced', reason: 'not-reported' });
   });
 });

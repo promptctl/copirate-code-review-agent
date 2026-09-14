@@ -308,6 +308,14 @@ function costFromEnvelope(env, config, buckets, startedAt) {
   return priceFromTable(spawnFromTokens(startedAt, buckets), config.model);
 }
 
+// [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died before its
+// result envelope: costFromEnvelope's own resolution, handed no envelope. A table-priced endpoint (z.ai,
+// DeepSeek) prices them exactly as a report would be priced; a subscription's list price and a genuine
+// Anthropic endpoint's figure exist only in the envelope, so they resolve as unreported.
+function priceMetered(tokens, config, startedAt) {
+  return costFromEnvelope({}, config, tokens, startedAt);
+}
+
 // [LAW:single-enforcer] Classification of the shared transient vocabulary (429/529/network drop) lives
 // once in src/failover.js (classifyTransient); this adapter contributes only its genuinely
 // engine-specific bit — the Anthropic-compatible CLI echoes the Retry-After header, so it passes
@@ -347,6 +355,7 @@ const claudeCodeAdapter = makeCliAdapter({
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
 });
 
 // The spawn primitives are exported as pure functions for direct unit testing of their behavior
@@ -362,5 +371,6 @@ module.exports = {
   classifyError,
   extractUsage,
   meterUsage,
+  priceMetered,
   parseResultEnvelope,
 };

@@ -24,11 +24,12 @@ function removeQuietly(dir, label) {
   }
 }
 
-// The usage record of a spawn that died: null when it never ran; its span alone when it ran but metered
-// nothing; otherwise its metered tokens, whose cost no engine reported. [LAW:dataflow-not-control-flow]
-function usageOfDeadSpawn({ span, metered }) {
+// The usage record of a spawn that died with no engine report: null when it never ran; its span alone when
+// it ran but metered nothing; otherwise the tokens its live meter read — what the cap charged — priced by
+// the engine's own priceMetered, the resolution its report would have made. [LAW:dataflow-not-control-flow]
+function usageOfDeadSpawn(spec, config, { span, metered }) {
   if (!span) return null;
-  return metered ? { tokens: metered, cost: { basis: 'unpriced', reason: 'not-reported' }, span } : { span };
+  return metered ? { tokens: metered, cost: spec.priceMetered(metered, config, new Date(span.from)), span } : { span };
 }
 
 // [LAW:one-type-per-behavior] claude-code and codex are ONE behavior — a CLI agent spawned as a
@@ -88,7 +89,7 @@ function makeCliAdapter(spec) {
     async produceReview({ config, buildPromptFor, instructionsPath, deadline = null, tokenCap = mintTokenCap(0) }) {
       const collector = createReviewCollector();
       const spend = tokenCap.open();
-      let reportedTokens = 0;
+      let reported = null;
       try {
         // Built inside the stamped try: a prompt that fails to build (a window fit that cannot fit,
         // a file read that fails) is a worker death like any other, and must carry the (empty)
@@ -115,14 +116,13 @@ function makeCliAdapter(spec) {
             // The throw carries the span out, matching the invariant runEngine's own rejections
             // already hold: no outcome of a spawn that ran loses its duration (zai-timing-31d.4).
             try {
-              const raw = spec.extractUsage(output, config, new Date(span.from));
-              reportedTokens = raw ? totalTokens(raw.tokens) : 0;
+              reported = spec.extractUsage(output, config, new Date(span.from));
               // The spawn's usage record: tokens and cost are the ENGINE's report and go absent
               // together when it reported nothing; span is the HOST's clock and is always present —
               // a duration cannot go missing the way a provider's token count can (zai-timing-31d.4).
               // [LAW:one-type-per-behavior] One record answers "what did this spawn consume", in
               // tokens, dollars, and seconds.
-              const usage = { ...(raw ?? {}), span };
+              const usage = { ...(reported ?? {}), span };
               const review = readCollectedReview(collector.recordsPath);
               // [LAW:dataflow-not-control-flow] scopes (a scout run), findings (a worker run), and
               // dependency assessments (a worker that reviewed a go.mod bump) are all carried through as
@@ -149,15 +149,15 @@ function makeCliAdapter(spec) {
         // them. Any error at all is stamped, so downstream holds a value and never asks whether
         // this one happened to carry it. [LAW:parse-dont-validate]
         err.recorded = readRecordedFindings(collector.recordsPath);
-        // The same half for what the spawn SPENT. A spawn that died has no engine report — the cap's
-        // kill is the common case — so its record is the live meter's last reading: the tokens the cap
-        // already charged, so the footer and the cap count one spend. Its cost is unpriced, because no
-        // engine reported the figure, and one unpriced spawn marks the pass's cost unpriced rather than
-        // letting a dollar total silently omit it. A failure before the spawn ran (no span) spent nothing.
-        err.usage = usageOfDeadSpawn(err);
+        // The same half for what the spawn SPENT. An engine that reported before a later step failed keeps
+        // its report. A spawn that died with none — the cap's kill is the common case — is recorded from the
+        // live meter's last reading, the tokens the cap already charged, so the footer and the cap count one
+        // spend, and the engine prices them as it would have priced its report. A failure before the spawn
+        // ran (no span) spent nothing.
+        err.usage = reported ? { ...reported, span: err.span } : usageOfDeadSpawn(spec, config, err);
         throw err;
       } finally {
-        spend.settle(reportedTokens);
+        spend.settle(reported ? totalTokens(reported.tokens) : 0);
         removeQuietly(collector.dir, 'collector dir');
       }
     },

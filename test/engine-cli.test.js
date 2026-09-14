@@ -25,6 +25,7 @@ function specThatRecords(onExtract) {
       env: { RECORDS: collector.recordsPath },
     }),
     meterUsage: () => () => null,
+    priceMetered: (tokens) => ({ basis: 'dollars', usd: (tokens.inputCacheMiss + tokens.inputCacheHit) / 1000 }),
     session: promptOnStdin,
     assertSucceeded: () => {},
     classifyError: err => err,
@@ -112,16 +113,35 @@ describe('makeCliAdapter — a dead spawn\'s spend rides out on its error', () =
   };
   const produce = (tokenCap) => makeCliAdapter(meteredSpec).produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null, tokenCap });
 
-  test('a spawn the cap killed carries its metered tokens, unpriced, with its span', async () => {
+  test('a spawn the cap killed carries its metered tokens, priced by the engine, with its span', async () => {
     const tokenCap = mintTokenCap(120);
     await assert.rejects(produce(tokenCap), (err) => {
       assert.equal(err.bound, 'tokens');
       assert.deepEqual(err.usage.tokens, { inputCacheMiss: 100, inputCacheHit: 50, output: 0 });
-      assert.deepEqual(err.usage.cost, { basis: 'unpriced', reason: 'not-reported' });
+      assert.deepEqual(err.usage.cost, { basis: 'dollars', usd: 0.15 });
       assert.ok(Date.parse(err.usage.span.to) >= Date.parse(err.usage.span.from));
       return true;
     });
     assert.match(tokenCap.describe(), /^150 of 120 tokens$/, 'the footer record and the cap charge the same spend');
+  });
+
+  test('a spawn whose engine reported usage before a later step failed keeps the report, not the meter', async () => {
+    const report = { tokens: { inputCacheMiss: 7, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0.5 } };
+    const adapter = makeCliAdapter({
+      ...meteredSpec,
+      extractUsage: () => report,
+      // prints usage and exits cleanly without ever recording finish_review
+      buildCommand: () => ({ command: process.execPath, args: ['-e', 'console.log(JSON.stringify({ used: 150 }))'], env: { PATH: process.env.PATH } }),
+    });
+    await assert.rejects(
+      adapter.produceReview({ config: CONFIG, buildPromptFor: () => 'prompt', instructionsPath: null, tokenCap: mintTokenCap(0) }),
+      (err) => {
+        assert.deepEqual(err.usage.tokens, report.tokens);
+        assert.deepEqual(err.usage.cost, report.cost);
+        assert.ok(err.usage.span, 'the report is stamped with the spawn span');
+        return true;
+      },
+    );
   });
 
   test('a spawn refused before it ran carries a null usage — nothing was spent', async () => {
