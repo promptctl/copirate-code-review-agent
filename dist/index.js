@@ -32878,9 +32878,10 @@ function removeQuietly(dir, label) {
 // go.mod-owning worker) `assessments`. This is a REQUIRED part of the contract, not optional: the
 // multi-scope aggregator accesses `r.findings`/`r.assessments` with no fallback, so an adapter that omits a
 // field fails loud rather than silently degrading (e.g. every bump rendering "unassessed"). A new engine —
-// including a direct-API one that never touches this factory — must return all five. An error thrown out of produceReview carries
-// `recorded` ({ findings, assessments }: what the worker drove through the collector before it died)
-// and, once the spawn ran, `span`. [LAW:composability]
+// including a direct-API one that never touches this factory — must return all five. Every error thrown
+// out of produceReview carries `recorded` ({ findings, assessments }: what the worker drove through the
+// collector before it died — the empty pair when it died before recording anything, or before it ever
+// spawned) and, once the spawn ran, `span`. [LAW:composability]
 // The whole MCP-collector dance (createReviewCollector -> materializeHome -> spawn -> readCollectedReview)
 // is a PRIVATE detail in here — the registry/run.js contract is produceReview, never the subprocess
 // mechanics. [LAW:carrying-cost]
@@ -32921,9 +32922,12 @@ function makeCliAdapter(spec) {
     // `deadline` (epoch ms, null = no budget) flows through untouched to runEngine, the one place
     // it bounds the spawn's lifetime — the adapter neither reads the clock nor re-decides policy.
     async produceReview({ config, buildPromptFor, instructionsPath, deadline = null }) {
-      const prompt = buildPromptFor(spec.toolNames);
       const collector = createReviewCollector();
       try {
+        // Built inside the stamped try: a prompt that fails to build (a window fit that cannot fit,
+        // a file read that fails) is a worker death like any other, and must carry the (empty)
+        // salvage out rather than be the one unstamped escape the chain cannot read.
+        const prompt = buildPromptFor(spec.toolNames);
         // The isolated scratch working directory (see the factory header). Empty and outside the
         // reviewed repo tree, so no repo-committed project-instruction file is auto-loaded.
         const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'zai-reviewer-cwd-'));

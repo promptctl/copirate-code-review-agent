@@ -132,6 +132,15 @@ describe('makeCliAdapter — a dead spawn\'s recorded findings ride out on its e
     });
   });
 
+  test('a prompt that fails to build is stamped too — the chain never meets an error without the salvage', async () => {
+    const adapter = makeCliAdapter(specThatRecordsThenDies('process.exit(0)'));
+    await assert.rejects(adapter.produceReview({ config: CONFIG, buildPromptFor: () => { throw new Error('fixed prompt exceeds the window'); }, instructionsPath: null }), (err) => {
+      assert.match(err.message, /exceeds the window/);
+      assert.deepEqual(err.recorded, { findings: [], assessments: [] });
+      return true;
+    });
+  });
+
   test('a worker that dies having recorded nothing carries the empty salvage — a value, never an absent field', async () => {
     const adapter = makeCliAdapter(specThatRecordsThenDies('process.exit(2)'));
     await assert.rejects(produce(adapter), (err) => {
