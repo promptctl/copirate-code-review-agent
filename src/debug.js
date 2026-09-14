@@ -4,11 +4,15 @@ const os = require('os');
 const path = require('path');
 const core = require('@actions/core');
 
-// [LAW:one-source-of-truth] One well-known location for session transcripts, defined once. RUNNER_TEMP
-// is set by GitHub Actions and Gitea's act_runner alike; os.tmpdir() is the local-dev fallback. A
-// workflow points actions/upload-artifact at this directory to download the full session — the
-// action also sets it as the `transcript-dir` output so no path is hardcoded in the workflow.
-const TRANSCRIPT_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-transcripts');
+// [LAW:one-source-of-truth] The job's scratch root, resolved once: everything the job writes for itself
+// (transcripts, the diff files workers read) lives under it. RUNNER_TEMP is set by GitHub Actions and
+// Gitea's act_runner alike, and the runner deletes it after the job; os.tmpdir() is the local-dev fallback.
+const JOB_TEMP_DIR = process.env.RUNNER_TEMP || os.tmpdir();
+
+// One well-known location for session transcripts. A workflow points actions/upload-artifact at this
+// directory to download the full session — the action also sets it as the `transcript-dir` output so no
+// path is hardcoded in the workflow.
+const TRANSCRIPT_DIR = path.join(JOB_TEMP_DIR, 'agent-review-transcripts');
 
 const RULE = '='.repeat(72);
 const section = label => `\n${RULE}\n== ${label}\n${RULE}\n`;
@@ -58,4 +62,4 @@ function emitTranscript({ engine, model, prompt, stdout, stderr, label }) {
   }
 }
 
-module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
+module.exports = { JOB_TEMP_DIR, TRANSCRIPT_DIR, buildTranscript, emitTranscript };

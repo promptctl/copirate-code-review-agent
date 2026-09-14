@@ -30908,11 +30908,15 @@ const os = __nccwpck_require__(857);
 const path = __nccwpck_require__(6928);
 const core = __nccwpck_require__(7484);
 
-// [LAW:one-source-of-truth] One well-known location for session transcripts, defined once. RUNNER_TEMP
-// is set by GitHub Actions and Gitea's act_runner alike; os.tmpdir() is the local-dev fallback. A
-// workflow points actions/upload-artifact at this directory to download the full session — the
-// action also sets it as the `transcript-dir` output so no path is hardcoded in the workflow.
-const TRANSCRIPT_DIR = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'agent-review-transcripts');
+// [LAW:one-source-of-truth] The job's scratch root, resolved once: everything the job writes for itself
+// (transcripts, the diff files workers read) lives under it. RUNNER_TEMP is set by GitHub Actions and
+// Gitea's act_runner alike, and the runner deletes it after the job; os.tmpdir() is the local-dev fallback.
+const JOB_TEMP_DIR = process.env.RUNNER_TEMP || os.tmpdir();
+
+// One well-known location for session transcripts. A workflow points actions/upload-artifact at this
+// directory to download the full session — the action also sets it as the `transcript-dir` output so no
+// path is hardcoded in the workflow.
+const TRANSCRIPT_DIR = path.join(JOB_TEMP_DIR, 'agent-review-transcripts');
 
 const RULE = '='.repeat(72);
 const section = label => `\n${RULE}\n== ${label}\n${RULE}\n`;
@@ -30962,7 +30966,7 @@ function emitTranscript({ engine, model, prompt, stdout, stderr, label }) {
   }
 }
 
-module.exports = { TRANSCRIPT_DIR, buildTranscript, emitTranscript };
+module.exports = { JOB_TEMP_DIR, TRANSCRIPT_DIR, buildTranscript, emitTranscript };
 
 
 /***/ }),
@@ -37344,7 +37348,7 @@ const { parseTimeBudgetMinutes, mintDeadline, BUDGET_REMEDY } = __nccwpck_requir
 const { synthesizeProviderConfig } = __nccwpck_require__(3676);
 const { selectConfig } = __nccwpck_require__(675);
 const { preflight } = __nccwpck_require__(9866);
-const { TRANSCRIPT_DIR } = __nccwpck_require__(9806);
+const { JOB_TEMP_DIR, TRANSCRIPT_DIR } = __nccwpck_require__(9806);
 
 // ACTION_ROOT resolves to the repo root whether running as an action (GITHUB_ACTION_PATH
 // is set) or from src/ during local development (one level above __dirname).
@@ -38051,8 +38055,8 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
   // [LAW:one-source-of-truth] [LAW:no-ambient-temporal-coupling] runMultiScope (via produceReview) owns
   // retry timing; the whole plan→workers pass is one attempt per config.
   const anchors = buildReviewAnchors(filteredFiles);
-  // Under RUNNER_TEMP, which the runner deletes at the end of the job, so the PR's code never outlives it.
-  const diffDir = writeDiffFiles(filteredFiles, fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'review-diffs-')));
+  // Under the job's scratch root, which the runner deletes at the end of the job, so the PR's code never outlives it.
+  const diffDir = writeDiffFiles(filteredFiles, fs.mkdtempSync(path.join(JOB_TEMP_DIR, 'review-diffs-')));
   const dependencySummaries = await resolveDependencySummaries(octokit, filteredFiles, dependencyDiffOn);
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks (the PR author's replies to earlier findings)
   // feed this round's workers so RA stops re-litigating soundly-rebutted points. The pairing is keyed by
