@@ -1,7 +1,6 @@
 'use strict';
-const { annotatePatchWithLines, hunkRanges, NO_EXCLUSIONS, excludedPathList } = require('./diff');
+const { NO_EXCLUSIONS, excludedPathList } = require('./diff');
 const { findingLineText } = require('./review');
-const { estimateTokens, fitWorkerMaterial } = require('./window');
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
 // whole-repo review builders. It is deliberately NOT a laws-compliance audit: a code review exists to
@@ -98,23 +97,13 @@ function reviewCharter(toolNames) {
 // as reviewer instructions), so the repo is named here as an explicit value and the agent reads
 // it by absolute path — never via cwd-relative discovery. [LAW:effects-at-boundaries]
 // focus is a free-text value naming the part of the change this review should concentrate on (a
-// multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad whole-diff review
-// (the single-scope case); a non-empty value narrows attention — the same prompt, varied by value,
-// never a branch. The diff shown is the worker's eyesight (readFiles, below); its anchors are the
-// change's own, so every LINE it sees stays valid.
-// [LAW:one-source-of-truth] scopeFiles and readFiles are TWO facts about a worker, deliberately not one
-// value: scopeFiles is what the scope was ASSIGNED (the coverage record — it decides which single worker
-// owns a bumped go.mod below), readFiles is what the worker OPENS in full (the effort profile's read-set
-// arm, src/effort.js, applied to that assignment). Under the shipped 'assigned' arm readFiles is the
-// assignment plus the scope's `reads` — the changed files the change couples to it (src/partition.js
-// rule 5, src/seams.js) — so the two coincide only for a scope with no seams, which is why one list once passed for both.
-// Under 'changed' they diverge fully: readFiles is empty and every worker reads the whole set while
-// exactly one still owns the bump. Empty readFiles is the whole-set read
-// (single-scope PR, or repo mode) — a value, not a branch. [LAW:decomposition]
+// multi-scope worker's scope). [LAW:dataflow-not-control-flow] '' is the broad review (the single-scope
+// case); a non-empty value narrows attention — the same prompt, varied by value, never a branch.
+// scopeFiles is what the scope was ASSIGNED: the coverage record, and what decides which single worker
+// owns a bumped go.mod below.
 // dependencyDiffNote is a value, not a mode: '' (the common case — no dependency-manifest bump,
 // or the DEPENDENCY_DIFF input off) renders nothing; a non-empty note (src/dependency-diff.js)
-// appends the fetched upstream-change context after the diff, same placement as the unshowable-
-// files note below. [LAW:dataflow-not-control-flow]
+// is appended at the end of the prompt, after the excluded-files note. [LAW:dataflow-not-control-flow]
 // [LAW:one-source-of-truth] The convergence-sweep block, rendered once here for BOTH materials (PR and
 // repo workers): the findings this round has already recorded, injected so a sweep pass hunts only for
 // what is NOT yet on the list (zai-recall-upr.2). It follows the pushback block's pattern exactly —
@@ -142,93 +131,16 @@ function renderPriorFindingsBlock(priorFindings, toolNames) {
 // excluded is filterFiles' record of what EXCLUDE_PATTERNS removed from this diff ({patterns, paths}).
 // NO_EXCLUSIONS (nothing removed) renders nothing, so an unfiltered review is byte-identical.
 // [LAW:dataflow-not-control-flow]
-// [LAW:one-type-per-behavior] A file GitHub returns without a patch (too large — roughly >400 changed
-// lines — or binary) and a file whose diff overran the MAX_DIFF_CHARS budget are the SAME behavior: a
-// changed file whose diff cannot be shown inline. They are two instances of one type, not two modes, so
-// they merge into ONE value: the inline entry a file gets, or null when it gets none. Patchless files
-// were previously filtered out at `f.patch` and vanished silently while the scout still assigned them to
-// a scope, so workers hunted for diff lines that did not exist. [LAW:no-silent-failure]
-// [LAW:one-source-of-truth] This is the ONE derivation of "which files are on the LINE grid before the
-// window is consulted": the worker prompt renders from it, and run.js derives the review's anchors from
-// it (showableFiles), so a worker can never be shown a grid the sink cannot anchor.
-function inlineEntries(files, maxDiffChars) {
-  const entries = new Map();
-  let totalChars = 0;
-  for (const f of files) {
-    if (!f.patch) { entries.set(f.filename, null); continue; }
-    // No flatten: parseReviewableFiles refused any path that could break this heading, and flattening
-    // one here would hand the model a filename that does not match the file it must read.
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${annotatePatchWithLines(f.patch)}\n\`\`\``;
-    if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
-      entries.set(f.filename, null);
-    } else {
-      entries.set(f.filename, entry);
-      totalChars += entry.length;
-    }
-  }
-  return entries;
-}
-
-// The files whose diff can be shown inline under MAX_DIFF_CHARS — the anchorable set. A hunk the
-// window later withholds from one worker stays anchorable: a finding that worker records at the
-// file's real line lands on the same new-side numbering the grid carries. [LAW:one-source-of-truth]
-function showableFiles(files, maxDiffChars) {
-  return showable(files, inlineEntries(files, maxDiffChars));
-}
-const showable = (files, entries) => files.filter(f => entries.get(f.filename) !== null);
-
-// [LAW:one-source-of-truth] How a worker is told to open ONE file whose diff is not on its grid,
-// read straight off the fit's per-file plan (src/window.js READ_KINDS) and the file's own status.
-// Every kind the plan can assign to a withheld file has a sentence; a kind that cannot reach here
-// fails loudly rather than rendering "undefined" into a prompt: 'in-diff' requires a shown hunk, and
-// 'none' on a file that still exists would mean a file on this worker's grid that it does not read —
-// impossible, since the grid IS the read set (buildReviewInput), so it can only be a deleted file.
-function withheldReadInstruction(file, read) {
-  if (read === 'full') return 'read it in full';
-  if (read === 'targeted') return targetedReadText(file);
-  if (read === 'none' && file.status === 'removed') return 'deleted by this change — there is no file to read';
-  throw new Error(`withheldReadInstruction: a withheld hunk cannot carry read kind '${read}' (${file.filename}, ${file.status})`);
-}
-
-// [LAW:one-source-of-truth] The one instruction for a file the fit could not afford whole, used by the
-// withheld note and the read-target passage alike. It never says "read around the hunks" of a file
-// whose hunks ARE the file (an added file, a lockfile): the bound is what a finding needs, the changed
-// lines are where to start, and a generated artifact is skipped outright — the one class that both
-// dominates this case's material (a 1,527-line go.sum of hashes) and carries nothing to review.
-function targetedReadText(file) {
-  return `does not fit whole alongside this diff — open only the parts a finding needs, with Read offset and limit, starting from its changed lines (${changedLinesText(file)}); never the whole file, and skip it entirely when it is a lockfile or other generated artifact`;
-}
-
-// The changed-line ranges a targeted read opens, as prose: from the patch's hunk headers when the
-// host supplied a patch, and an honest "not known here" when it did not (GitHub omits the patch of
-// a file over ~400 changed lines or binary) — the worker then finds the touched region itself.
-// `patch` is genuinely optional in the domain; this is the one place its absence is rendered.
-function changedLinesText(file) {
-  const ranges = file.patch ? hunkRanges(file.patch) : [];
-  return ranges.length > 0
-    ? `lines ${ranges.map(r => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`)).join(', ')} of ${file.content.lines}`
-    : `${file.content.lines} lines; the host supplied no patch, so Grep for what this change touches and read around that`;
-}
-
-// `window` is the engine's context window in tokens (null = undeclared → nothing is withheld and every
-// read is full). Every file carries `content` — the measurement measureChangedFiles (src/window.js)
-// stamps and buildPrMaterial (the material boundary) requires — because the fit sizes full reads by it.
-// [LAW:parse-dont-validate] the stamp is checked once, there; this builder is inland and reads it.
-function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], readFiles = [], window = null, dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
-  // [LAW:one-source-of-truth] Which hunks CAN be shown is decided once, over the whole change, under the
-  // same MAX_DIFF_CHARS derivation run.js builds the anchors from — so no worker is ever shown a grid the
-  // sink cannot anchor, however narrow its eyesight.
-  const entries = inlineEntries(files, maxDiffChars);
-  // [FRAMING:parts-and-seams] A worker's MATERIAL is its eyesight: the changed files it reads in full —
-  // the scope it owns plus the seams the partition handed it (readFiles) — are also the only hunks on its
-  // grid. Jurisdiction and eyesight were two facts on one value until zai-timing-8jk.5; showing every
-  // worker the whole diff while narrowing only its full reads left each spawn's cost the whole change's
-  // (8jk.4 measured it: halving a scope with full eyesight bought no wall clock). An empty readFiles is
-  // the whole change (a single-scope review, the 'changed' arm, repo mode). The rest of the change is
-  // NAMED to the worker below, never silently absent. [LAW:dataflow-not-control-flow]
-  const eyesight = readFiles.length > 0 ? new Set(readFiles) : new Set(files.map(f => f.filename));
-  const seen = files.filter(f => eyesight.has(f.filename));
-  const elsewhere = files.filter(f => !eyesight.has(f.filename)).map(f => f.filename);
+// diffDir is where writeDiffFiles (src/diff-files.js) put the change: <diffDir>/<filename>.diff for every
+// changed file with a patch. The prompt names the directory and the worker decides what to read, with the
+// same tools it reads the repository with; nothing here chooses a worker's material. A changed file with
+// no patch (binary, or too large for the host to render) has no diff file, so it is named rather than
+// silently absent. [LAW:no-silent-failure]
+function buildReviewInput({ files, diffDir, toolNames, reviewedRepoRoot, focus = '', scopeFiles = [], dependencyDiffNote = '', dependencyBumps = [], priorPushbacks = [], priorFindings = [], excluded = NO_EXCLUSIONS }) {
+  const unpatched = files.filter(f => !f.patch).map(f => f.filename);
+  const unpatchedNote = unpatched.length > 0
+    ? `\n    These changed files have no diff file (binary, or too large for the host to render): ${unpatched.join(', ')}. Read them in the repository if they matter; a finding in one is recorded at the file's real line number, and the host posts it in the review body's "Findings outside the reviewed diff" section.`
+    : '';
 
   // [LAW:no-silent-failure] The reviewer is TOLD what was taken out of its view. Absence of a changed
   // file is otherwise indistinguishable from nobody having changed it, and a model reasoning about "the
@@ -237,34 +149,26 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // finding blocks, so a false one costs a human adjudication.
   // [FRAMING:representation] It names the PATHS, not just the patterns, because naming only the patterns
   // MEASURABLY LOST: delivered verbatim to all 15 spawns of a real run, it still drew that same finding.
-  // A predicate about an unseen file asks the model to notice an absence, recall the globs, test a name it
-  // was never shown, and then retract a conclusion it has already evidenced from the repo's own rules.
-  // Naming the file as changed-and-withheld deletes the premise instead of arguing with the conclusion —
-  // there is no absence left to interpret. The rule-compliance clause is load-bearing for the same reason:
-  // the model had READ the repo rule demanding these files change, and a note that only forbids the
-  // conclusion loses to a rule the repository states emphatically.
-  // [LAW:one-type-per-behavior] This is deliberately NOT merged with the unshowable-files note above,
-  // which they superficially resemble: an unshowable file is still REVIEWABLE (read it at its absolute
-  // path and record findings against it), an excluded one is out of bounds entirely. Same absence from
-  // the diff, opposite instruction — two types, not one with a flag.
-  // [LAW:dataflow-not-control-flow] A value: no paths removed ⇒ no block. Patterns that matched nothing
-  // hid nothing, so silence is the truth there, not an omission.
+  // Naming the file as changed-and-withheld deletes the premise instead of arguing with the conclusion.
+  // The rule-compliance clause is load-bearing for the same reason: the model had READ the repo rule
+  // demanding these files change, and a note that only forbids the conclusion loses to a rule the
+  // repository states emphatically.
+  // [LAW:one-type-per-behavior] Deliberately NOT merged with the no-diff-file note above: a file with no
+  // patch is still REVIEWABLE (read it in the repository), an excluded one is out of bounds entirely.
+  // Same absence from the diff directory, opposite instruction — two types, not one with a flag.
   const excludedNote = excluded.paths.length > 0
-    ? `\n\n**Withheld from this diff — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
-      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence below is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`
+    ? `\n\n**Withheld from the diff files — changed in this pull request:** ${excludedPathList(excluded.paths)}\n\n`
+      + `These ${excluded.paths.length} file(s) are part of this change and were modified by it; EXCLUDE_PATTERNS (${excluded.patterns.join(', ')}) removed them from your view, so their absence from the diff directory is a display setting, not evidence about the change. Their contents are unobservable from this material, so no claim about their state — updated, not updated, regenerated, stale, or inconsistent with the rest of the change — can be supported here, and that holds equally for a repository rule you have read requiring that they change: you cannot check compliance in either direction from what you were given. Do not read these paths, and record no finding that rests on one of them, wherever you would anchor it.`
     : '';
 
   const dependencyNote = dependencyDiffNote ? `\n\n${dependencyDiffNote}` : '';
 
   // [LAW:dataflow-not-control-flow] focus renders as a value: '' yields no block, a scope yields a
-  // concentration instruction. The worker sees the whole diff (anchors stay valid) and concentrates
-  // its deepest reading on the named part, but records EVERY genuine issue it notices anywhere —
-  // suppressing out-of-scope findings would be control flow ("don't run the report") solving a problem
-  // the pipeline already solves as dataflow: overlap is de-duplicated when scopes' findings merge
-  // (dedupeFindings), so a finding another worker may also catch costs nothing to report and is never
-  // silently withheld. [LAW:no-silent-failure]
+  // concentration instruction. The worker concentrates its deepest reading on the named part but records
+  // EVERY genuine issue it notices anywhere — overlap is de-duplicated when scopes' findings merge
+  // (dedupeFindings), so a finding another worker may also catch costs nothing to report. [LAW:no-silent-failure]
   const focusBlock = focus
-    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    The diff below shows every changed hunk this review reads — the part named above and the changed files the change couples to it — both for context and because you must not stay silent about a real bug just because it falls outside the named part. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the diff, still record it with ${toolNames.requestChange}. Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
+    ? `\n    CONCENTRATE THIS REVIEW on one part of the change: ${focus}\n    Other workers review the rest of the change. Read the named part most deeply, but if you notice a genuine issue ANYWHERE in the change, still record it with ${toolNames.requestChange}. Overlapping findings are de-duplicated downstream, so nothing is lost by reporting an issue another review may also catch.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] Prior-round pushbacks render as a VALUE: [] yields '' (a cold review,
@@ -281,7 +185,7 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
         const reply = p.replies.join('\n        ↳ ');
         return `      • [${loc}] your earlier finding: ${p.finding}\n        the author replied: ${reply}`;
       }).join('\n')
-      + `\n    If a reply soundly shows the finding was wrong or already handled, do NOT record that same point again this round — the fix, if any, is already in the diff below, which you review fresh. If a reply is itself mistaken and the bug is still real in the current code, you MAY record it again, but state a direct, specific counter to the author's reasoning rather than repeating your original words. These are prior context, not part of the current diff; they never limit what you review, and you must still flag every NEW issue.\n`
+      + `\n    If a reply soundly shows the finding was wrong or already handled, do NOT record that same point again this round — the fix, if any, is already in the current change, which you review fresh. If a reply is itself mistaken and the bug is still real in the current code, you MAY record it again, but state a direct, specific counter to the author's reasoning rather than repeating your original words. These are prior context, not part of the current change; they never limit what you review, and you must still flag every NEW issue.\n`
     : '';
 
   const priorFindingsBlock = renderPriorFindingsBlock(priorFindings, toolNames);
@@ -290,17 +194,16 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
   // When present, tell the worker WHAT to do with the fetched upstream context — cross-check it
   // against this repo's own usage rather than just reading it as trivia.
   const dependencyInstructionBlock = dependencyDiffNote
-    ? `\n    This PR bumps a dependency version. Upstream commit/file context for that bump is included below (the
-    section starting "Dependency version bump"). Use \`Grep\` to find where this repo calls into the bumped
-    module, then judge whether anything in the upstream range breaks, deprecates, or changes the behavior of a
-    symbol this repo actually uses — a removed export, a changed function signature, a changed default, a
-    renamed field. If nothing this repo uses is affected, say so briefly in the ${toolNames.finishReview}
-    summary; if something is, name the exact upstream change and the call site it affects
-    — as ${toolNames.requestChange} on the go.mod version line: the displayed LINE value if that line is
-    shown above, or go.mod's real line number if its diff was too large to show inline (the host then posts
-    the finding in the review body's "Findings outside the reviewed diff" section; see the unshowable-files
-    note above) —
-    never route it to the ${toolNames.finishReview} summary and never drop it because the anchor isn't available.\n`
+    ? `\n    This PR bumps a dependency version. Upstream commit/file context for that bump is included at the end of
+    these instructions (the section starting "Dependency version bump"). Use \`Grep\` to find where this repo
+    calls into the bumped module, then judge whether anything in the upstream range breaks, deprecates, or
+    changes the behavior of a symbol this repo actually uses — a removed export, a changed function signature,
+    a changed default, a renamed field. If nothing this repo uses is affected, say so briefly in the
+    ${toolNames.finishReview} summary; if something is, name the exact upstream change and the call site it
+    affects — as ${toolNames.requestChange} on the go.mod version line: its LINE value from go.mod's diff file,
+    or go.mod's real line number if go.mod has no diff file (the host then posts the finding in the review
+    body's "Findings outside the reviewed diff" section) — never route it to the ${toolNames.finishReview}
+    summary and never drop it because the anchor isn't available.\n`
     : '';
 
   // [LAW:dataflow-not-control-flow] The assess directive is rendered by a VALUE, not a mode: it fires only
@@ -319,43 +222,39 @@ function buildReviewInput({ files, maxDiffChars, toolNames, reviewedRepoRoot, fo
     ? `\n    You own this PR's go.mod bump. For EACH of these bumped modules, call ${toolNames.assessDependency} exactly
     ONCE, copying the module path VERBATIM: ${bumpedModules.join(', ')}. Provide your
     merge-risk judgment as fields: 'impact' (ONE line synthesizing what materially changed upstream from the
-    commit context above — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
+    commit context — not a list of commits), 'affected' (true/false — does THIS repo's own usage break or
     change?), 'callSite' (the file or file:line where, when affected — omit when not), and 'verdict' ('safe' =
     routine, merge freely; 'review' = worth a human glance; 'risky' = a breaking change that touches this repo).
     The host renders this into the review's dependency summary. It does NOT replace a finding: if the bump breaks
     a symbol this repo uses, still record that as a ${toolNames.requestChange} (on go.mod's real version line if
-    no LINE anchor is shown — it is carried as an unanchored finding), because the assessment's verdict is
+    go.mod has no diff file — it is carried as an unanchored finding), because the assessment's verdict is
     presentation — findings drive the merge decision.\n`
     : '';
 
-  // [LAW:one-source-of-truth] ONE rendering of the worker prompt, with two holes — the read targets
-  // and the diff — that the window fit fills. The fit needs the size of everything ELSE first, so the
-  // template is rendered once with the holes empty to measure the fixed prose (the two notes below
-  // are fixed too: they do not move with the fit), then once more with the plan's material.
-  // [LAW:effects-at-boundaries] both renders are pure; the measurement is the same estimateTokens the
-  // fit uses for hunks and reads, so "fits" means one thing.
-  const render = (readTargets, diffs) => `
+  return {
+    prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
-${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
-    BEFORE judging anything, ${readTargets} The diff shows only the changed hunks; most bugs are only
-    visible in the full surrounding context of the function and module — a missing guard, a caller you'd
-    break, a value that can't be what this line assumes. Do not form or report any judgment until you
-    have read the files you are responsible for in full. Then read past those files where the change
-    reaches past them: when it alters a function's signature or return shape, an exported symbol, a shared
-    constant, or an invariant other code assumes, the failure it introduces surfaces at the call sites,
-    not in the diff — Grep the repository for that symbol's other uses and read those specific sites before
-    you judge the change safe. Follow the exact thing the change touches to where it is used; this is
-    targeted reading, not a sweep of the whole tree. That same reading cuts both ways: it exposes a break
-    the hunk hides, and it clears a false alarm the hunk suggests. So before you record any finding, confirm
-    the suspected fault against that fuller context — the definition and callers the change reaches, not the
-    hunk alone; if that context shows the code is actually correct, do not record it, and if the check is
-    genuinely inconclusive, record the issue anyway, stating what remains unverified, rather than
-    withholding it.
 
-    Each visible diff line is annotated as LINE N. Call ${toolNames.requestChange} for each issue you
-    find. Every recorded change must use path, line (the displayed LINE value), body, and severity (an
-    integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
+    The change is on disk as diff files, one per changed file: the diff of <path> is ${diffDir}/<path>.diff.
+    Glob ${diffDir} to list every changed file. In a diff file, each line a comment can attach to is prefixed
+    LINE N, where N is that line's number in the changed file.${unpatchedNote}
+${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
+    You decide what to read. Start from the diffs, then read the changed files in the repository and whatever
+    the change touches: most bugs are only visible in the full surrounding context of the function and
+    module — a missing guard, a caller you'd break, a value that can't be what this line assumes. When the
+    change alters a function's signature or return shape, an exported symbol, a shared constant, or an
+    invariant other code assumes, the failure it introduces surfaces at the call sites, not in the diff —
+    Grep the repository for that symbol's other uses and read those sites before you judge the change safe.
+    Skip generated or vendored artifacts (bundled or minified output, lockfiles). That same reading cuts both
+    ways: it exposes a break the diff hides, and it clears a false alarm the diff suggests. So before you
+    record any finding, confirm the suspected fault against that fuller context; if that context shows the
+    code is actually correct, do not record it, and if the check is genuinely inconclusive, record the issue
+    anyway, stating what remains unverified, rather than withholding it.
+
+    Call ${toolNames.requestChange} for each issue you find. Every recorded change must use path (the changed
+    file's repository path, never its diff file's path), line (the LINE value from its diff file), body, and
+    severity (an integer 1-5 — see the charter below). When the review is complete, call ${toolNames.finishReview}
     exactly once. The summary is one line describing what the change does. It states no verdict: whether
     the change needs fixing is the HOST's call, derived from the recorded findings, and the charter below
     forbids stating it here — asking for it here too would be the prompt contradicting itself. [LAW:one-source-of-truth]
@@ -372,7 +271,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     not touch are NOT findings for this review — never record one with ${toolNames.requestChange}; you
     may mention a significant one in a single sentence of the ${toolNames.finishReview} summary as
     context for the maintainer, and that mention carries no verdict weight. You can ONLY attach a
-    comment to a line shown as LINE N — a line this diff added or kept as
+    comment to a line marked LINE N in a diff file — a line this diff added or kept as
     context; the host does not allow comments on unchanged or deleted code. When the change creates a
     problem whose root cause sits in unchanged code (it feeds a bad value into an existing function, or
     relies on an existing loose type), attach the comment to the changed LINE responsible for the new
@@ -381,104 +280,7 @@ ${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}$
     the host posts it in the review body's "Findings outside the reviewed diff" section — rather than
     dropping it.
 
-    ${reviewCharter(toolNames)}
-    \n\n${diffs}`;
-  // [LAW:effects-at-boundaries] Pure over its lists: the withheld-files note. An empty list renders
-  // nothing, so this is one path, not a "patchless mode". [LAW:one-type-per-behavior] A hunk GitHub
-  // never supplied, one over MAX_DIFF_CHARS, and one the window fit withheld are ONE behavior — a changed
-  // file whose diff is not on this worker's grid — so they are one list and one note; what differs per
-  // file is HOW MUCH of it to read, which the fit decided and the line states. The recovery route is the
-  // one the pipeline already owns: a recorded finding whose line is off the diff grid becomes an
-  // UNANCHORED finding (partitionFindings), which counts toward the verdict and renders in the review
-  // body — so the riskiest (biggest) changed files stay reviewable, and an issue in them can never
-  // bypass the merge gate via summary prose.
-  const withheldNoteText = (entries) => entries.length > 0
-    ? `\n\n> **Note:** These changed files' diffs could not be shown (too large or binary, or the diff exceeded \`MAX_DIFF_CHARS\`, or withheld so the rest of the diff fits your context window). Each line says how much of the file to read. Record any issue with ${toolNames.requestChange} using the file's real line number from the file — a line the diff below carries is anchored inline as usual, and one it does not carry is posted by the host in the review body's "Findings outside the reviewed diff" section; never put it in the ${toolNames.finishReview} summary:\n${entries.map(({ file, read }) => `> - ${reviewedRepoRoot}/${file.filename} — ${withheldReadInstruction(file, read)}`).join('\n')}`
-    : '';
-
-  // [LAW:effects-at-boundaries] Pure over its lists: what the worker opens, as three lists that each
-  // render nothing when empty — files read in full, files whose diff below IS their whole content (new in
-  // this change — reading them again would spend the window twice on one file, the exact duplication that
-  // overflowed links-317's workers), and files too large to open whole. A non-empty readFiles narrows the
-  // full read to this worker's assigned files (another worker reads the rest — the read cost is split, not
-  // duplicated N times); an empty readFiles reads the whole changed set (single-scope PR, repo mode, or
-  // the 'changed' read-set arm). Either way the whole shown diff is the same for every worker, so
-  // cross-file context and report-anywhere are unchanged.
-  // Depth beyond the assigned files is finding-driven, never a tree pre-read: a worker may Grep for the
-  // call sites of a symbol its change alters (a broken caller is often invisible in the diff) and read
-  // those specific sites, but Grep-first and full-reads-only-when-a-finding-needs-it keep this targeted —
-  // depth, not a completeness sweep (copirate-review-loop-5pw.2). That same call-site reading runs both
-  // directions: it surfaces a break the hunk hides (recall, .2) AND refutes a false alarm the hunk suggests
-  // (precision, copirate-review-loop-5pw.3) — the worker verifies a suspicion against that fuller context
-  // before recording, dropping one the context refutes and recording an inconclusive one with its
-  // uncertainty stated in the body (never withheld). One lever, two directions; the record-time
-  // consequence lives in the rendered passage below, not a second "read more context" instruction.
-  // No flatten anywhere here: these are paths the worker must OPEN. Collapsing a separator would name a
-  // file that does not exist and the worker would silently review nothing — parseReviewableFiles refuses
-  // such a path at the boundary instead, so every path reaching this line is byte-exact and single-line.
-  // [LAW:no-silent-failure]
-  const readTargetsText = ({ full, inDiff, targeted }) => {
-    const inDiffSentence = inDiff.length > 0
-      ? `These changed files are NEW in this change and their diff below is their complete content — do NOT Read them again, review them from the diff: ${inDiff.join(', ')}. `
-      : '';
-    const targetedSentence = targeted.length > 0
-      ? `These changed files do not fit whole alongside this diff — never Read one in full: open only the parts a finding needs, with Read offset and limit, starting from its changed lines, and skip it entirely when it is a lockfile or other generated artifact: ${targeted.map(f => `${f.filename} (${changedLinesText(f)})`).join('; ')}. `
-      : '';
-    const fullSentence = full.length > 0
-      ? `Read the complete content of THESE files — the changed files this scope reads in full: ${full.join(', ')}. `
-        + `Skip any among them that are generated or vendored artifacts (bundled or minified output, lockfiles) or pure documentation. `
-      : '';
-    // [LAW:no-silent-failure] The changed files outside this worker's eyesight are named: a changed file
-    // simply missing from the diff is indistinguishable from nobody having changed it, and a model that
-    // infers "the bundle was never rebuilt" from an absence it was never told about reports the gap as a
-    // defect (the same lesson the withheld-by-EXCLUDE_PATTERNS note above records). Unlike an excluded
-    // file, one of these MAY be consulted when a finding needs it — it is another worker's, not out of bounds.
-    // Named through the same bounded list the excluded note uses (excludedPathList): the count is always
-    // stated, the names are a sample, so a wide change cannot grow the fixed prose past the window.
-    const elsewhereSentence = elsewhere.length > 0
-      ? `The other ${elsewhere.length} changed file(s) in this pull request — ${excludedPathList(elsewhere)} — are owned and read by other scopes' workers, so their diffs are not shown here: their absence from this diff is the plan's division of labour, not evidence about the change. Do NOT read them in full — that duplicates their work and their cost. `
-      : '';
-    return (readFiles.length > 0
-      ? fullSentence + inDiffSentence + targetedSentence + elsewhereSentence
-        + `You may consult another file when a specific finding needs it — one your assigned files import, or a caller elsewhere that uses a symbol they change: prefer Grep to confirm a symbol, signature, or its call sites `
-        + `over Reading the whole file, and read another file in full only when a finding truly requires it. Do not pre-read the tree.`
-      : `Read the complete content of every changed file that contains code — skip only generated or vendored `
-        + `artifacts (bundled or minified output, lockfiles) and pure documentation. Test files count: read them. `
-        + inDiffSentence + targetedSentence).trim();
-  };
-
-  // [LAW:one-source-of-truth] The prose that depends on the plan — the withheld-files note and the three
-  // read lists — is rendered by the same two functions that render the final prompt, so the fit measures
-  // exactly what will be sent. It is measured at its CEILING: every file withheld with the longest
-  // instruction (targeted), and every file named in all three read lists at once. A real plan places
-  // each file in at most one line of the note and exactly one read list, so it is a sub-selection of
-  // this rendering and never longer — the budget the hunks and reads are sized against already holds
-  // the prose. The over-count is a few tokens per file, paid once, for a bound that needs no argument.
-  const names = seen.map(f => f.filename);
-  const plan = fitWorkerMaterial({
-    window,
-    fixedTokens: estimateTokens(render(readTargetsText({ full: names, inDiff: names, targeted: seen }), withheldNoteText(seen.map(f => ({ file: f, read: 'targeted' }))) + excludedNote + dependencyNote)),
-    files: seen.map(f => ({ filename: f.filename, status: f.status, hunk: entries.get(f.filename), content: f.content })),
-    // [LAW:dataflow-not-control-flow] The read-set arm as the fit's value: this scope's assigned
-    // files, or null for "every changed file" (single-scope PR, repo mode, the 'changed' arm).
-    readSet: readFiles.length > 0 ? new Set(readFiles) : null,
-  });
-  const planOf = new Map(plan.map(p => [p.filename, p]));
-  const shown = seen.filter(f => planOf.get(f.filename).hunk === 'shown');
-  const withheld = seen.filter(f => planOf.get(f.filename).hunk === 'withheld');
-  const readAs = (kind) => seen.filter(f => planOf.get(f.filename).read === kind);
-
-  const withheldNote = withheldNoteText(withheld.map(f => ({ file: f, read: planOf.get(f.filename).read })));
-  const diffs = shown.map(f => entries.get(f.filename)).join('\n\n') + withheldNote + excludedNote + dependencyNote;
-
-  const readTargets = readTargetsText({ full: readAs('full').map(f => f.filename), inDiff: readAs('in-diff').map(f => f.filename), targeted: readAs('targeted') });
-
-  return {
-    // [LAW:one-source-of-truth] The anchorable set: the files whose diff is on the LINE grid under
-    // MAX_DIFF_CHARS (showableFiles) — a hunk the window withheld from THIS worker stays anchorable,
-    // because a finding it records at the file's real line lands on the same new-side numbering.
-    files: showable(seen, entries),
-    prompt: render(readTargets, diffs),
+    ${reviewCharter(toolNames)}${excludedNote}${dependencyNote}`,
   };
 }
 
@@ -604,4 +406,4 @@ Plan the review of this repository. There is no diff. The repository under revie
   };
 }
 
-module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput, showableFiles };
+module.exports = { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput };

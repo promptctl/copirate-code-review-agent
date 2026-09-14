@@ -43,16 +43,6 @@ test('parseArgs rejects bad input loudly', () => {
   assert.equal(parseArgs(['--sweep-cap', '0']).sweepCap, 0);
   assert.throws(() => parseArgs(['--sweep-cap', '-1']), /--sweep-cap must be a non-negative integer/);
   assert.throws(() => parseArgs(['--sweep-cap=  ']), /--sweep-cap must be a non-negative integer/);
-  // The read-set arm, forwarded to every replay: unset is the engine's own default, both arms are
-  // settings, and anything else is refused HERE — before a lane resolves a credential, so a typo costs
-  // nothing rather than N replays at an arm nobody asked for.
-  assert.equal(parseArgs([]).readSet, require('../src/effort').DEFAULT_READ_SET);
-  assert.equal(parseArgs(['--read-set', 'changed']).readSet, 'changed');
-  assert.equal(parseArgs(['--read-set=assigned']).readSet, 'assigned');
-  assert.throws(() => parseArgs(['--read-set', 'all']), /--read-set must be one of assigned, changed/);
-  // Blank is refused by this CLI's own non-empty guard, which runs over EVERY flag before any value
-  // parser sees it — so the arm never reaches parseOneOf as ''. Two loud refusals, one for each reason.
-  assert.throws(() => parseArgs(['--read-set=']), /Option --read-set requires a non-empty value/);
 });
 
 describe('planJobs', () => {
@@ -325,7 +315,7 @@ const path = require('node:path');
 const { censusCases, superviseSpawn, inFlight, credentialInputFor, replaySpawnSpec, resolvePlanSet } = require('../eval/freeze-suite');
 // The arm an unflagged replay runs at, from the module that owns the number — a literal here would fail
 // these tests with an unrelated arm-mismatch the day that default moves. [LAW:one-source-of-truth]
-const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 const tmpTree = () => fs.mkdtempSync(path.join(os.tmpdir(), 'freeze-suite-test-'));
 const writeCase = (casesDir, dirName, manifestName) => {
@@ -340,7 +330,7 @@ const writeCase = (casesDir, dirName, manifestName) => {
 // written together. `effort` defaults to the arm an unflagged replay runs at, which is what a resume the
 // census must accept looks like.
 // `candidate` is the tree that produced the run; a run planted without one is a pre-provenance record.
-const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null, readSet: DEFAULT_READ_SET }, candidate = undefined) => {
+const writeRun = (outRoot, caseName, runName, findings, effort = { roundCap: 0, sweepCap: DEFAULT_SWEEP_CAP, reasoningTier: null }, candidate = undefined) => {
   const dir = path.join(outRoot, caseName, runName);
   fs.mkdirSync(dir, { recursive: true });
   if (findings) {
@@ -555,7 +545,6 @@ describe('laneReplay hands the injected replay its share of the host', () => {
       lanes: [{ name: 'A', value: 'a' }, { name: 'B', value: 'b' }],
       totalMemBytes: 8 * 2 ** 30,
       sweepCap: 0,
-      readSet: 'assigned',
       replay: async args => { seen.push(args); return { exitCode: 0, durationMs: 1 }; },
     });
     // The plan rides on the JOB, stamped by planJobs, which is why the plan set is not threaded here.
@@ -563,7 +552,7 @@ describe('laneReplay hands the injected replay its share of the host', () => {
     assert.deepEqual(await replay(call), { exitCode: 0, durationMs: 1 });
     // The suite's own facts — the memory share and the arm every replay runs — are folded in here, so
     // the lane loop never carries either.
-    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0, readSet: 'assigned' }]);
+    assert.deepEqual(seen, [{ ...call, memoryBudget: 4 * 2 ** 30, sweepCap: 0 }]);
   });
 });
 
@@ -578,7 +567,6 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     outRoot: '/out/freeze-abc',
     memoryBudget: 8 * 2 ** 30,
     sweepCap: 0,
-    readSet: 'assigned',
   });
 
   test("one replay of one case at N=1, into the suite out root, planning against the lane's memory share", () => {
@@ -588,7 +576,7 @@ describe('replaySpawnSpec puts the lane credential in the pinned provider slot',
     // would multiply the per-lane memory guardrail by L.
     // The arm is on the child's argv too, always — never implicit at the default — so which arm a replay
     // ran is readable from the spawn, not inferred from the suite's flags.
-    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30), '--sweep-cap', '0', '--read-set', 'assigned']);
+    assert.deepEqual(s.args, [path.join(__dirname, '..', 'eval', 'run-case.js'), '/cases/alpha', '-n', '1', '--out', '/out/freeze-abc', '--memory-budget', String(8 * 2 ** 30), '--sweep-cap', '0']);
     // Resolved from the module, not the caller's cwd: run-case.js reads repo-relative paths.
     assert.equal(s.cwd, path.join(__dirname, '..'));
   });
@@ -710,7 +698,7 @@ describe('the CLI refuses a mixed-arm resume before it needs a credential', () =
     const casesDir = path.join(root, 'cases');
     const outRoot = path.join(root, 'out');
     writeCase(casesDir, 'good', 'good');
-    writeRun(outRoot, 'good', 'run-1', true, { roundCap: 0, sweepCap: 0, reasoningTier: null, readSet: 'assigned' });
+    writeRun(outRoot, 'good', 'run-1', true, { roundCap: 0, sweepCap: 0, reasoningTier: null });
 
     // N=2 against one completed run leaves a real deficit, so without the guard this invocation would plan
     // a replay and go looking for a lane — and the pinned provider's credential is stripped from the
@@ -1055,7 +1043,7 @@ describe('resolvePlanSet proves the plan set before the suite spends anything', 
     fs.mkdirSync(caseDir, { recursive: true });
     fs.writeFileSync(path.join(caseDir, file), JSON.stringify({
       planSchema: PLAN_SCHEMA, provenance: 'scout', context: 'ctx',
-      scopes: [{ name: 's', focus: 'f', files: ['a.js'], reads: [] }], scoutUsage: null, ...overrides,
+      scopes: [{ name: 's', focus: 'f', files: ['a.js'] }], scoutUsage: null, ...overrides,
     }));
   };
 

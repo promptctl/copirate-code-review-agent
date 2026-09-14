@@ -3,7 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial } = require('../eval/run-case');
-const { DEFAULT_SWEEP_CAP, DEFAULT_READ_SET, READ_SETS } = require('../src/effort');
+const { DEFAULT_SWEEP_CAP } = require('../src/effort');
 
 test('parseArgs takes the required positional and applies defaults', () => {
   const o = parseArgs(['eval/cases/foo']);
@@ -45,31 +45,6 @@ test('parseArgs takes --memory-budget as a positive integer of bytes, in both fl
   assert.throws(() => parseArgs(['foo', '--memory-budget', '1.5']), /--memory-budget must be a positive integer/);
   assert.throws(() => parseArgs(['foo', '--memory-budget', 'lots']), /--memory-budget must be a positive integer/);
   assert.throws(() => parseArgs(['foo', '--memory-budget']), /--memory-budget requires a value/);
-});
-
-// [LAW:verifiable-goals] AC (copirate-measurement-2mg.2): the whole-changed-set read arm is expressible
-// at the CLI, and ONLY the declared arms are — a misspelled arm must never resolve to the shipped one,
-// because the arm's whole job is to name which behavior produced the recall number.
-describe('parseArgs takes --read-set as one of the declared arms, in both flag forms', () => {
-  test('the unshipped arm is a legal SETTING, and the vocabulary is the axis owner\'s, not a copy', () => {
-    assert.equal(parseArgs(['foo', '--read-set', 'changed']).readSet, 'changed');
-    assert.equal(parseArgs(['foo', '--read-set=changed']).readSet, 'changed');
-    assert.equal(parseArgs(['foo', '--read-set=assigned']).readSet, 'assigned');
-    for (const arm of READ_SETS) assert.equal(parseArgs(['foo', `--read-set=${arm}`]).readSet, arm);
-  });
-
-  test('unset is the engine\'s own default arm, with no absent case to branch on', () => {
-    assert.equal(parseArgs(['foo']).readSet, DEFAULT_READ_SET);
-  });
-
-  test('a value outside the vocabulary is refused, naming the arms and echoing what was typed', () => {
-    // '' is the `--read-set=` form: refused by membership, with no coercion step that could invent an
-    // arm out of it — the enum counterpart of --sweep-cap='s Number('') === 0 trap.
-    for (const bad of ['', 'all', 'Assigned', 'asigned', 'none', '0']) {
-      assert.throws(() => parseArgs(['foo', `--read-set=${bad}`]), /--read-set must be one of assigned, changed/, `--read-set=${bad}`);
-    }
-    assert.throws(() => parseArgs(['foo', '--read-set']), /--read-set requires a value/);
-  });
 });
 
 // [LAW:effects-at-boundaries] The plan leaves the parser as a PATH, never a record: reading and parsing
@@ -292,7 +267,7 @@ const CASE_TOOL_NAMES = {
 
 test("buildCaseMaterial filters the case through production's seam and returns the split", () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
   });
   assert.deepEqual(files.map(f => f.filename), ['src/a.js']);
   assert.deepEqual(excluded, { patterns: ['dist/**'], paths: ['dist/index.js'] });
@@ -303,42 +278,24 @@ test("buildCaseMaterial filters the case through production's seam and returns t
 // buildPrMaterial call would leave a replay scoring the reviewer against a prompt production never sends.
 test("buildCaseMaterial threads the exclusion record into the material, so a replay renders production's prompts", () => {
   const { material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
+    allFiles: CASE_FILES, excludePatterns: ['dist/**'], reviewedRepoRoot: '/tmp/tree',
   });
-  const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, { assigned: ['src/a.js'], read: ['src/a.js'] });
-  assert.match(worker, /Withheld from this diff — changed in this pull request:\*\* dist\/index\.js/);
+  const worker = material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, ['src/a.js']);
+  assert.match(worker, /Withheld from the diff files — changed in this pull request:\*\* dist\/index\.js/);
 });
 
 test('buildCaseMaterial with no exclusions reviews every file and says nothing about exclusion', () => {
   const { files, excluded, material } = buildCaseMaterial({
-    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree', readContent: () => '',
+    allFiles: CASE_FILES, excludePatterns: [], reviewedRepoRoot: '/tmp/tree',
   });
   assert.equal(files.length, 2);
   assert.deepEqual(excluded.paths, []);
-  assert.ok(!material.buildWorkerPrompt('scope', CASE_TOOL_NAMES).includes('EXCLUDE_PATTERNS'));
-});
-
-// The default reader is the production wiring: main() never passes readContent, so a replay measures
-// the extracted tree exactly as run.js measures the checkout. A stub in every other test here would let
-// a shadowed default (say, () => '') pass the suite while every real replay measured its files empty.
-test('buildCaseMaterial without readContent measures the file as it stands on disk', () => {
-  const fs = require('fs');
-  const os = require('os');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-case-material-'));
-  try {
-    fs.mkdirSync(path.join(root, 'src'));
-    fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const x = 1;\nconst y = 2;\n');
-    const { files } = buildCaseMaterial({ allFiles: [CASE_FILES[0]], excludePatterns: [], reviewedRepoRoot: root });
-    assert.equal(files[0].content.lines, 2);
-    assert.ok(files[0].content.tokens > 0);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  assert.ok(!material.buildWorkerPrompt('scope', CASE_TOOL_NAMES, []).includes('EXCLUDE_PATTERNS'));
 });
 
 test('buildCaseMaterial refuses a case whose patterns exclude everything, rather than replaying it empty', () => {
   assert.throws(
-    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree', readContent: () => '' }),
+    () => buildCaseMaterial({ allFiles: CASE_FILES, excludePatterns: ['**'], reviewedRepoRoot: '/tmp/tree' }),
     /All 2 changed file\(s\) were excluded/,
   );
 });
@@ -389,7 +346,7 @@ const { workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord } =
 const mintedPlan = () => require('../src/plan').planRecord({
   provenance: 'scout',
   context: 'ctx',
-  scopes: [{ name: 'auth', focus: 'the auth change', files: ['src/auth.js'], reads: [] }],
+  scopes: [{ name: 'auth', focus: 'the auth change', files: ['src/auth.js'] }],
   scoutUsage: null,
 });
 

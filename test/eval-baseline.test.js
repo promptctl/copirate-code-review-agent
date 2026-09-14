@@ -116,8 +116,8 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   // A summary written before the arm was recorded carries a typed absence, never an invented default.
   assert.equal(s.effort, null);
   assert.deepEqual(
-    parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' } }), 'x').effort,
-    { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' },
+    parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null } }), 'x').effort,
+    { roundCap: 3, sweepCap: 0, reasoningTier: null },
   );
   assert.throws(() => parseCaseSummary(summaryFixture({ effort: { roundCap: 3 } }), 'x'), /'effort' must be/);
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary.
@@ -255,7 +255,7 @@ test('buildBaseline computes per-full-run cost only when every run is costed', (
 });
 
 test('buildBaseline records the arm the suite was measured at, and the markdown names it', () => {
-  const arm = { roundCap: 3, sweepCap: 0, reasoningTier: null, readSet: 'assigned' };
+  const arm = { roundCap: 3, sweepCap: 0, reasoningTier: null };
   const cases = [
     caseEntry('case-a', { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 }, { effort: arm }),
     caseEntry('case-b', { mean: 1, min: 1, max: 1, n: 2 }, { effort: arm }),
@@ -274,28 +274,25 @@ test('buildBaseline records the arm the suite was measured at, and the markdown 
 });
 
 // [LAW:verifiable-goals] AC (copirate-determinism-5od.emv): the runs already on disk — 40 of them, three
-// axes, no schema version — must become comparable to a new arm THROUGH the back-fill, and buildBaseline
-// must accept the pairing. This is what makes the 'assigned' half of copirate-measurement-2mg.2 a
-// measurement already paid for rather than one to re-buy.
-test('a pre-readSet summary and one that names the arm freeze as ONE arm, and the other arm is still refused', () => {
+// axes, no schema version — must be comparable to a new run at the same axes THROUGH the back-fill, and
+// buildBaseline must accept the pairing.
+test('a pre-version summary and a current one freeze as ONE arm, and another arm is still refused', () => {
   const band = { mean: 0.5, min: 0.3333, max: 0.6667, n: 2 };
   // As the stored scorecard-summary.json files are written: three axes, no version.
   const era = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }), 'stored.json').effort;
-  assert.equal(era.readSet, 'assigned', 'the back-fill resolves the era to the arm the code structurally had');
-  // A summary from a run that named its arm: every axis carries a value.
-  const named = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null, readSet: 'assigned' } }), 'fresh.json').effort;
+  const named = parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 2, reasoningTier: null } }), 'fresh.json').effort;
 
   const paired = buildBaseline({
     cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: named })],
     provenance: { sha: 'deadbeef', date: '2026-09-09' },
   });
   assert.deepEqual(paired.effort, named);
-  assert.match(renderBaselineMarkdown(paired), /readSet=assigned/);
+  assert.match(renderBaselineMarkdown(paired), /roundCap=3 sweepCap=2 reasoningTier=none/);
 
-  // The point of certifying the era is that it now names a SPECIFIC arm — so the other one is refused by
-  // exactly the rule that has always refused a mixed suite. Comparable is not the same as interchangeable.
+  // Comparable is not the same as interchangeable: a different arm is refused by exactly the rule that
+  // has always refused a mixed suite.
   assert.throws(() => buildBaseline({
-    cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: { ...named, readSet: 'changed' } })],
+    cases: [caseEntry('case-a', band, { effort: era }), caseEntry('case-b', band, { effort: { ...named, sweepCap: 0 } })],
     provenance: { sha: 'deadbeef', date: '2026-09-09' },
   }), /freezes one arm, not an average of two/);
 });

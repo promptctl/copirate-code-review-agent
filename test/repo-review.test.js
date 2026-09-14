@@ -11,10 +11,8 @@ const TOOL_NAMES = {
 };
 
 const REPO_ROOT = '/home/runner/work/acme/acme';
-// Changed files carry the content measurement the material requires (measureChangedFiles); the reader
-// is injected as empty content, since these tests exercise the prompt's shape, not the window fit.
-const { measureChangedFiles } = require('../src/window');
-const stamp = (files) => measureChangedFiles(files, REPO_ROOT, () => '');
+// The diff directory the prompt names; buildReviewInput only names it, so no file is written here.
+const DIFF_DIR = '/tmp/review-diffs';
 
 // --- buildRepoReviewInput (the full-repo MATERIAL) ---
 
@@ -79,10 +77,10 @@ describe('buildRepoReviewInput', () => {
 // --- buildReviewInput (the PR-diff MATERIAL) — repo-root anchoring ---
 
 describe('buildReviewInput repo-root anchoring', () => {
-  const FILES = stamp([{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }]);
+  const FILES = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const x = 1;' }];
 
   test('names the reviewed repo by absolute path and states cwd is outside it', () => {
-    const { prompt } = buildReviewInput({ files: FILES, maxDiffChars: 0, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
+    const { prompt } = buildReviewInput({ diffDir: DIFF_DIR, files: FILES, toolNames: TOOL_NAMES, reviewedRepoRoot: REPO_ROOT });
     assert.match(prompt, /checked out at \/home\/runner\/work\/acme\/acme/);
     assert.match(prompt, /working directory is intentionally outside the repository/);
   });

@@ -2,8 +2,8 @@
 'use strict';
 // Run a FAITHFUL review locally — the real engine, the real prompt, the real collector — against a
 // real diff, with NO GitHub. It answers the diagnostic question "what does the engine actually do?":
-// it reports, per attempt, whether the engine explored the repo (Read/Grep/Glob) or reviewed the
-// inline diff only, alongside the findings it produced and the cost.
+// it reports, per attempt, which diff files the engine read and how far into the repo it went
+// (Read/Grep/Glob), alongside the findings it produced and the cost.
 //
 // It reuses the action's own seams — synthesizeProviderConfig (config), parseUnifiedDiff (diff), and
 // runMultiScope (the SAME adaptive multi-scope engine production runs) — so its behavior matches a
@@ -30,8 +30,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { summarizeSession } = require('./session-stats');
 
-const USAGE = `Run a faithful local review (real engine, real collector, no GitHub) and report whether
-the engine explored the repo or reviewed the diff only.
+const USAGE = `Run a faithful local review (real engine, real collector, no GitHub) and report which
+diff files the engine read and what it read in the repo.
 
 Usage: node scripts/local-review.js [options]
 
@@ -44,8 +44,8 @@ Usage: node scripts/local-review.js [options]
   --use <name>        Config name to select from --config (default: the file's 'default').
   --range <expr>      git diff range for the material (default: "HEAD~1 HEAD"). Ignored in repo mode.
   --diff <file>       Use a unified .diff file instead of computing one from --range. The checkout at
-                      --repo must be at that diff's head: the changed files are measured and read from
-                      it, exactly as production reads the PR's checkout.
+                      --repo must be at that diff's head: workers read the changed files from it,
+                      exactly as production reads the PR's checkout.
   --repo <path>       Reviewed repo root (default: current directory). Read by the engine by absolute path.
   --mode <pr|repo>    Review mode (default: pr). repo = whole-repo exploration, no diff.
   --scope <text>      Optional free-text scope, repo mode only.
@@ -144,8 +144,9 @@ function renderTimingLine(schedule, totalMs) {
 }
 
 // [LAW:effects-at-boundaries] Pure: render the report string from values. Highlights the one signal
-// this tool exists for — explore-or-not, and whether exploration reached beyond the changed files.
-function formatReport({ config, mode, files, result, sessions, repo, totalMs }) {
+// this tool exists for — which diff files each session read, and whether its repo reads reached beyond
+// the changed files.
+function formatReport({ config, mode, files, result, sessions, repo, diffDir, totalMs }) {
   const { renderCostLine } = require('../src/usage');
   const lines = [];
   lines.push('================ local-review report ================');
@@ -160,11 +161,16 @@ function formatReport({ config, mode, files, result, sessions, repo, totalMs }) 
   sessions.forEach((s, i) => {
     const c = s.toolCounts;
     const counts = Object.keys(c).length ? Object.entries(c).map(([n, v]) => `${n}=${v}`).join(', ') : '(none)';
-    const readsRel = s.reads.map(p => path.relative(repo, p));
+    // A read is a diff read exactly when it lands inside the run's diff directory; everything else is a
+    // repo read, rendered repo-relative.
+    const inDiffDir = p => p.startsWith(diffDir + path.sep);
+    const diffReads = s.reads.filter(inDiffDir).map(p => path.relative(diffDir, p));
+    const readsRel = s.reads.filter(p => !inDiffDir(p)).map(p => path.relative(repo, p));
     const beyond = readsRel.filter(r => !changed.has(r));
     lines.push(`--- engine session ${i + 1}/${sessions.length} ---`);
-    lines.push(`  EXPLORED REPO: ${s.explored ? `YES (${s.exploreCalls} Read/Grep/Glob call(s))` : 'NO — reviewed the inline diff only'}`);
+    lines.push(`  EXPLORED REPO: ${s.explored ? `YES (${s.exploreCalls} Read/Grep/Glob call(s))` : 'NO — made no Read/Grep/Glob call'}`);
     lines.push(`  tool calls:    ${counts}`);
+    lines.push(`  diffs read:    ${diffReads.length ? diffReads.join(', ') : 'none'}`);
     if (readsRel.length) lines.push(`  files read:    ${readsRel.join(', ')}`);
     lines.push(`  beyond diff:   ${beyond.length ? beyond.join(', ') : 'nothing — exploration (if any) stayed within the changed files'}`);
     if (s.greps.length) lines.push(`  grep patterns: ${s.greps.join(' | ')}`);
@@ -267,7 +273,7 @@ async function main() {
   process.env.RUNNER_TEMP = runTemp;
   const { TRANSCRIPT_DIR } = require('../src/debug');
   const { runMultiScope, buildPrMaterial, buildRepoMaterial } = require('../src/multiscope');
-  const { measureChangedFiles } = require('../src/window');
+  const { writeDiffFiles } = require('../src/diff-files');
   const registry = require('../src/engine/registry');
 
   const repo = path.resolve(opts.repo);
@@ -278,12 +284,13 @@ async function main() {
   const config = chain[0];
   const files = opts.mode === 'pr' ? loadDiffFiles(opts) : [];
   const instructionsPath = path.join(__dirname, '..', 'review-agent', 'instructions.md');
+  const diffDir = path.join(runTemp, 'diffs');
 
   // [LAW:one-type-per-behavior] Pick the material by mode — the only thing PR and repo differ on,
   // exactly as run.js does — then drive the identical production engine. The local harness IS the
   // production path minus the GitHub sink.
   const material = opts.mode === 'pr'
-    ? buildPrMaterial({ files: measureChangedFiles(files, repo), maxDiffChars: 0, reviewedRepoRoot: repo })
+    ? buildPrMaterial({ files, diffDir: writeDiffFiles(files, diffDir), reviewedRepoRoot: repo })
     : buildRepoMaterial({ scope: opts.scope, excludePatterns: [], reviewedRepoRoot: repo });
 
   process.stderr.write(`Running multi-scope ${opts.mode} review: ${config.name} (${config.model}) over ${opts.mode === 'pr' ? `${files.length} file(s)` : 'whole repo'}…\n`);
@@ -295,7 +302,7 @@ async function main() {
     startedAt,
   });
 
-  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, totalMs: Date.now() - startedAt });
+  const report = formatReport({ config: configUsed, mode: opts.mode, files, result: review, sessions: readSessions(TRANSCRIPT_DIR), repo, diffDir, totalMs: Date.now() - startedAt });
   process.stdout.write(`\n${report}\n`);
 }
 

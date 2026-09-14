@@ -103,11 +103,12 @@ test('parseArgs still accepts --base-url for the api-key providers it applies to
   }
 });
 
-test('formatReport surfaces the explore verdict, beyond-diff reads, findings, and cost', () => {
+test('formatReport surfaces the explore verdict, diff reads, beyond-diff reads, findings, and cost', () => {
   const report = formatReport({
     config: { name: 'auto→deepseek', engine: 'claude-code', model: 'deepseek-v4-pro', endpoint: { baseUrl: 'https://x/anthropic', credential: { kind: 'api-key', value: 'k' } } },
     mode: 'pr',
     repo: '/repo',
+    diffDir: '/run/diffs',
     files: [{ filename: 'src/run.js' }],
     result: {
       findings: [{ path: 'src/run.js', line: 52, body: 'comment is a WHAT-comment' }],
@@ -123,10 +124,12 @@ test('formatReport surfaces the explore verdict, beyond-diff reads, findings, an
     },
     // Read the changed file (src/run.js) AND a sibling (src/engine/run.js): same basename, different
     // file — only the latter is beyond the diff, and repo-relative paths must keep them distinct.
-    sessions: [{ file: '/tmp/t.txt', toolCounts: { Read: 2 }, exploreCalls: 2, explored: true, reads: ['/repo/src/run.js', '/repo/src/engine/run.js'], greps: [], globs: [] }],
+    // The diff file for src/run.js is a diff read, never a repo read.
+    sessions: [{ file: '/tmp/t.txt', toolCounts: { Read: 3 }, exploreCalls: 3, explored: true, reads: ['/run/diffs/src/run.js.diff', '/repo/src/run.js', '/repo/src/engine/run.js'], greps: [], globs: [] }],
     totalMs: 128000,
   });
   assert.match(report, /EXPLORED REPO: YES/);
+  assert.match(report, /diffs read:\s+src\/run\.js\.diff\n/);
   assert.match(report, /files read:\s+src\/run\.js, src\/engine\/run\.js/);
   assert.match(report, /beyond diff:\s+src\/engine\/run\.js/); // the sibling, not the changed file
   assert.doesNotMatch(report, /beyond diff:\s+src\/engine\/run\.js, src\/run\.js/); // changed file is NOT beyond

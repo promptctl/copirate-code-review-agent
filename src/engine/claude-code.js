@@ -172,8 +172,7 @@ function buildCommand({ config, collector, home }) {
     // 22k and the worker "succeeded" having judged a compaction summary of the diff, not the diff
     // (links-317-dolt-telemetry, session d54a1478). With it off the same overflow surfaces as the
     // "Prompt is too long" error assertSucceeded names, and the chain reports the scope unreviewed.
-    // The fit (src/window.js) is what keeps the material inside the window; this is the alarm that
-    // says so when it did not. Present in the pinned CLI (2.1.0) and current releases (2.1.267).
+    // Present in the pinned CLI (2.1.0) and current releases (2.1.267).
     DISABLE_AUTO_COMPACT: '1',
     NO_COLOR: '1',
   };
@@ -223,7 +222,7 @@ function assertSucceeded(stdout) {
     // context window — because the raw "Prompt is too long" reads like a prompt-authoring bug and sent
     // two investigations toward the instructions before the transcripts showed a 232k first request.
     const overflow = /prompt is too long/i.test(String(parsed.result ?? ''))
-      ? ' — the worker material (diff + instructions) plus its file reads exceeded the model context window; see contextWindow and the window fit in src/window.js'
+      ? ' — the worker prompt plus the files it read exceeded the model context window'
       : '';
     throw new Error(`Claude Code review failed: ${parsed.result || 'unknown error'}${overflow}`);
   }
@@ -308,18 +307,6 @@ const classifyClaudeError = classifyError;
 const claudeCodeAdapter = makeCliAdapter({
   name: 'claude-code',
   timeoutMs: CLAUDE_TIMEOUT_MS,
-  // [LAW:one-source-of-truth] The FLOOR across every model this engine fronts, measured on the case
-  // that overflowed it (a 232k first request failing "Prompt is too long" against Claude's 200k).
-  // The engine is not Claude-only — src/provider.js routes zai and deepseek through it — but no
-  // model routed here has a smaller window (GLM-5.x and DeepSeek V4 both declare 200k or more), and
-  // a model with a larger one gets material fit to 200k, which withholds early rather than late: the
-  // safe direction. Unlike codex/opencode, whose fronted models' windows are unknown to this repo,
-  // this floor is a known fact for the models in the provider table. An operator who overrides the
-  // model or base URL to something outside it is not validated against a window list (this repo keeps
-  // none, and a second table of model facts would drift); a smaller window there overflows LOUDLY —
-  // "Prompt is too long", the scope reported unreviewed — never as a silent compaction.
-  // Moves with a measurement, never a wish.
-  contextWindow: 200_000,
   capabilities: {
     // [LAW:types-are-the-program] Capability declarations are the single source of truth
     // for config validation in src/config.js (T4). Illegal combos are rejected at load

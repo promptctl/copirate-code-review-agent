@@ -45,19 +45,19 @@ test('a run at the same case, sha and arm is a hit; the whole comparison is one 
   assert.deepEqual(differingFields(wanted, measurementFields({ caseName: 'case-b', sha: SHA, effort: defaultEffortProfile() })), ['case']);
   assert.deepEqual(differingFields(wanted, measurementFields({ caseName: 'case-a', sha: OTHER_SHA, effort: defaultEffortProfile() })), ['sha']);
   assert.deepEqual(differingFields(wanted, measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile({ sweepCap: 0 }) })), ['sweepCap']);
-  assert.deepEqual(differingFields(wanted, measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile({ readSet: 'changed' }) })), ['readSet']);
+  assert.deepEqual(differingFields(wanted, measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile({ reasoningTier: 'high' }) })), ['reasoningTier']);
 });
 
 // The ticket's load-bearing requirement: key on the COMPLETED profile, never on the raw meta.json. A
-// record written before the readSet axis existed and a record written after it, at the SHIPPED arm, are
+// record written before the schema version existed and a record written after it, at the same arm, are
 // one measurement — otherwise the index holds one row per era instead of one per arm, and every stored
-// run on disk today (all of which predate the field) matches nothing.
+// run on disk that predates the version matches nothing.
 test('an era record and a current record at the same arm are ONE measurement, not two', () => {
   const era = { case: 'case-a', candidate: { sha: SHA, dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } };
   const current = meta({ effort: defaultEffortProfile({ sweepCap: 2 }) });
   const of = record => measurementOf({ dir: 'd', root: 'r', meta: parseMeta(JSON.stringify(record), 'm'), treeIdentity }).fields;
   assert.deepEqual(of(era), of(current));
-  assert.equal(measurementKey(of(era)), `case=case-a sha=${SHA} roundCap=0 sweepCap=2 reasoningTier=none readSet=assigned`);
+  assert.equal(measurementKey(of(era)), `case=case-a sha=${SHA} roundCap=0 sweepCap=2 reasoningTier=none`);
 });
 
 test('the corpus walk finds run dirs at both depths and names each run its poolable root', () => {
@@ -99,11 +99,11 @@ test('an existing measurement is found and located; a differing sha is a MISS na
 });
 
 test('a differing ARM is a miss naming that axis, so two arms are never counted as one measurement', () => {
-  const dir = writeCorpus({ 'ab-sweep2/case-a/run1': meta({ effort: defaultEffortProfile({ readSet: 'changed' }) }) });
+  const dir = writeCorpus({ 'ab-sweep0/case-a/run1': meta({ effort: defaultEffortProfile({ sweepCap: 0 }) }) });
   const miss = lookupMeasurement(collect(dir), measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile() }));
   assert.equal(miss.hits.length, 0);
-  assert.deepEqual(miss.nearest.map(n => n.differing), [['readSet']]);
-  assert.match(renderConsultation({ consultations: [miss], unidentified: [] }), /readSet: has changed, wants assigned/);
+  assert.deepEqual(miss.nearest.map(n => n.differing), [['sweepCap']]);
+  assert.match(renderConsultation({ consultations: [miss], unidentified: [] }), /sweepCap: has 0, wants 2/);
   fs.rmSync(dir, { recursive: true });
 });
 
@@ -167,7 +167,7 @@ test('only a hit outside the root being filled is something already owned', () =
 test('only the closest tier of misses is reported, not every same-case miss', () => {
   const dir = writeCorpus({
     'r/case-a/one-off': meta({ sha: OTHER_SHA }),                                             // differs in sha alone
-    'r/case-a/two-off': meta({ sha: OTHER_SHA, effort: defaultEffortProfile({ readSet: 'changed' }) }),  // sha AND arm
+    'r/case-a/two-off': meta({ sha: OTHER_SHA, effort: defaultEffortProfile({ sweepCap: 0 }) }),  // sha AND arm
   });
   const miss = lookupMeasurement(collect(dir), measurementFields({ caseName: 'case-a', sha: SHA, effort: defaultEffortProfile() }));
   assert.deepEqual(miss.nearest.map(n => n.differing), [['sha']]);

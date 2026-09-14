@@ -95,24 +95,6 @@ function* patchLines(patch) {
   }
 }
 
-// [LAW:effects-at-boundaries] Pure: the new-side line ranges this patch touches, one per hunk, in
-// patch order — what a worker told to read a file "around its changed lines" opens with Read
-// offset/limit instead of the whole file. A header without a length (`+12 @@`) is one line. A pure
-// deletion at the top of the file (`+0,0`) has no new-side line of its own; the read starts at line 1,
-// the nearest line that exists, never at a line 0 no file has.
-function hunkRanges(patch) {
-  const ranges = [];
-  for (const text of patch.split('\n')) {
-    const hunk = HUNK_HEADER.exec(text);
-    if (hunk) {
-      const from = Math.max(Number(hunk[1]), 1);
-      const length = hunk[2] === undefined ? 1 : Number(hunk[2]);
-      ranges.push({ from, to: from + Math.max(length, 1) - 1 });
-    }
-  }
-  return ranges;
-}
-
 function buildFileAnchors(file) {
   const anchors = new Map();
   for (const entry of patchLines(file.patch)) {
@@ -336,7 +318,6 @@ function reconcileChangedSet(listed, parsed) {
 
 module.exports = {
   fileChurn,
-  hunkRanges,
   matchesPattern,
   parseReviewableFiles,
   reconcileChangedSet,

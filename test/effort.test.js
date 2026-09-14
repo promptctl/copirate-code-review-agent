@@ -2,12 +2,12 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 
-const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK, readSetProjection, READ_SETS, DEFAULT_READ_SET, EFFORT_SCHEMA, UNVERSIONED_EFFORT_SCHEMA, EFFORT_SCHEMA_BACKFILL, effortAxes, recordEffort, completeEffort } = require('../src/effort');
+const { defaultEffortProfile, resolveReasoningTier, maxTier, TIER_RANK, EFFORT_SCHEMA, UNVERSIONED_EFFORT_SCHEMA, effortAxes, recordEffort, completeEffort } = require('../src/effort');
 const registry = require('../src/engine/registry');
 
 describe('defaultEffortProfile', () => {
   test('carries only the axes it governs — no lane count; that is machine capacity, derived in the pool', () => {
-    assert.deepEqual(defaultEffortProfile(), { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'assigned' });
+    assert.deepEqual(defaultEffortProfile(), { roundCap: 0, sweepCap: 2, reasoningTier: null });
   });
 
   test('defaults sweepCap to the convergence-sweep bound (2) and folds a supplied one', () => {
@@ -25,12 +25,6 @@ describe('defaultEffortProfile', () => {
     assert.equal(defaultEffortProfile({ reasoningTier: 'high' }).reasoningTier, 'high');
   });
 
-  test('defaults readSet to the shipped split-read arm and folds a supplied one', () => {
-    assert.equal(defaultEffortProfile().readSet, 'assigned');
-    assert.equal(defaultEffortProfile().readSet, DEFAULT_READ_SET);
-    assert.equal(defaultEffortProfile({ readSet: 'changed' }).readSet, 'changed');
-  });
-
   test('returns a fresh object each call (no shared mutable default)', () => {
     const a = defaultEffortProfile();
     a.sweepCap = 99;
@@ -45,37 +39,6 @@ describe('defaultEffortProfile', () => {
   test('defaults roundCap to the neutral 0 (unlimited) sentinel when unsupplied', () => {
     assert.equal(defaultEffortProfile().roundCap, 0);
     assert.equal(defaultEffortProfile({}).roundCap, 0);
-  });
-});
-
-describe('readSetProjection — the read-set arm, resolved to what a worker opens', () => {
-  // The axis's CONTRACT: which files a worker opens in full, given its scope's assignment. Asserted
-  // through the resolved projection — the only way a caller can reach the meaning — never by reading
-  // the table directly, so a different table shape with the same behavior still passes.
-  test("'assigned' reads exactly the scope's own files — the shipped split-read arm", () => {
-    const files = ['a.js', 'b.js'];
-    assert.deepEqual(readSetProjection('assigned')(files), files);
-  });
-
-  test("'changed' reads the whole changed set, spelled as prompt.js's empty-list value for it", () => {
-    assert.deepEqual(readSetProjection('changed')(['a.js', 'b.js']), []);
-  });
-
-  test('the two arms disagree on the same scope — the A/B is expressible at all', () => {
-    const files = ['a.js'];
-    assert.notDeepEqual(readSetProjection('assigned')(files), readSetProjection('changed')(files));
-  });
-
-  test('every declared arm resolves to a projection — no name without a meaning', () => {
-    for (const arm of READ_SETS) assert.equal(typeof readSetProjection(arm), 'function');
-  });
-
-  test('an arm outside the vocabulary throws, naming the known arms — never coalesced to the default', () => {
-    // The measurement-integrity case: a silent fall back to 'assigned' would report the SHIPPED
-    // behavior under the other arm's name, so the A/B would read as "no difference" and be believed.
-    for (const bad of [undefined, null, '', 'all', 'ASSIGNED', 0]) {
-      assert.throws(() => readSetProjection(bad), /Unknown read set/);
-    }
   });
 });
 
@@ -254,12 +217,13 @@ describe('the recorded effort profile is complete and versioned', () => {
 
   test('a null is absence for every axis except the one whose own default is null', () => {
     // An explicit null at the current schema is the second spelling of absence, and it is refused exactly
-    // as an omitted key is — otherwise it renders as a literal `readSet=null`, an arm name no vocabulary
-    // has. The one exception declares itself: reasoningTier's null IS its value.
-    assert.throws(
-      () => completeEffort({ effort: { ...defaultEffortProfile(), readSet: null }, effortSchema: EFFORT_SCHEMA }),
-      /missing readSet/,
-    );
+    // as an omitted key is. The one exception declares itself: reasoningTier's null IS its value.
+    for (const axis of ['roundCap', 'sweepCap']) {
+      assert.throws(
+        () => completeEffort({ effort: { ...defaultEffortProfile(), [axis]: null }, effortSchema: EFFORT_SCHEMA }),
+        new RegExp(`missing ${axis}`),
+      );
+    }
     assert.equal(completeEffort({ effort: { ...defaultEffortProfile(), reasoningTier: null }, effortSchema: EFFORT_SCHEMA }).reasoningTier, null);
   });
 
@@ -270,29 +234,27 @@ describe('the recorded effort profile is complete and versioned', () => {
     assert.deepEqual(completeEffort(record), profile);
   });
 
-  test('the unversioned era resolves to the arm the code structurally had, in either spelling of absence', () => {
-    // bfcd889 (2026-07-06) shipped scope-bounded reads before every stored run, so a record from before the
-    // axis existed did not choose 'assigned' — it could not have done anything else.
-    const era = { roundCap: 0, sweepCap: 2, reasoningTier: null };
-    assert.equal(completeEffort({ effort: era }).readSet, 'assigned');
-    assert.equal(completeEffort({ effort: { ...era, readSet: null } }).readSet, 'assigned');
-    assert.equal(completeEffort({ effort: era, effortSchema: UNVERSIONED_EFFORT_SCHEMA }).readSet, 'assigned');
+  test('every known schema resolves a complete record unchanged, in either spelling of an unversioned record', () => {
+    const profile = { roundCap: 3, sweepCap: 1, reasoningTier: 'high' };
+    for (const effortSchema of [undefined, UNVERSIONED_EFFORT_SCHEMA, 'copirate-effort/v1', EFFORT_SCHEMA]) {
+      assert.deepEqual(completeEffort({ effort: profile, effortSchema }), profile, String(effortSchema));
+    }
   });
 
-  test('a back-filled axis never overwrites a value the record actually carries', () => {
-    const era = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'changed' };
-    assert.equal(completeEffort({ effort: era }).readSet, 'changed');
-    // ...and an axis no row names passes through untouched, which is what keeps reasoningTier's REAL null
-    // (meaning "propose no raise") from being read as an absence and filled.
-    assert.equal(completeEffort({ effort: era }).reasoningTier, null);
+  test('no schema supplies an axis: a record missing one is refused at every known version', () => {
+    for (const effortSchema of [undefined, UNVERSIONED_EFFORT_SCHEMA, 'copirate-effort/v1', EFFORT_SCHEMA]) {
+      assert.throws(
+        () => completeEffort({ effort: { roundCap: 0, reasoningTier: null }, effortSchema }),
+        /missing sweepCap/,
+        String(effortSchema),
+      );
+    }
   });
 
-  test('the back-fill is a historical fact, not a mirror of the current default', () => {
-    // If DEFAULT_READ_SET ever moves, what those 40 stored runs did does not move with it. The row is
-    // spelled out for exactly this reason, so the test states it rather than comparing to the default.
-    assert.equal(EFFORT_SCHEMA_BACKFILL[UNVERSIONED_EFFORT_SCHEMA].readSet, 'assigned');
-    // The current version supplies nothing: its records are complete by construction.
-    assert.deepEqual(EFFORT_SCHEMA_BACKFILL[EFFORT_SCHEMA], {});
+  test('a recorded value passes through untouched, including a field an older profile carried', () => {
+    // v1 records carry a readSet field the profile no longer has; it passes through as recorded.
+    const v1 = { roundCap: 0, sweepCap: 2, reasoningTier: null, readSet: 'changed' };
+    assert.deepEqual(completeEffort({ effort: v1, effortSchema: 'copirate-effort/v1' }), v1);
   });
 
   test('a schema with no row is refused, never interpreted through some other version\'s rules', () => {
