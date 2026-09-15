@@ -1134,6 +1134,8 @@ describe('sumCost', () => {
   test('REFUSES to add across bases — a mixed sum is unpriced, never a blended number', () => {
     const mixed = sumCost([{ basis: 'dollars', usd: 1.2 }, { basis: 'subscription', notionalUsd: 40 }]);
     assert.equal(mixed.basis, 'unpriced');
+    // Both costs were reported; the reason must not claim an engine reported none.
+    assert.equal(mixed.reason, 'mixed-basis');
     assert.equal('usd' in mixed, false);
     assert.equal('notionalUsd' in mixed, false);
   });
@@ -1218,6 +1220,12 @@ describe('costWarning', () => {
     const w = costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'not-reported' } }, ANTHROPIC_CONFIG);
     assert.match(w, /claude-code reported no cost/);
     assert.doesNotMatch(w, /price-table|PRICES_PER_MILLION/);
+  });
+
+  test('mixed-basis says both configs reported and cannot be added — never that an engine reported none', () => {
+    const w = costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'mixed-basis' } }, ANTHROPIC_CONFIG);
+    assert.match(w, /different units/);
+    assert.doesNotMatch(w, /reported no cost/);
   });
 
   test('a fully-reported subscription run does not warn — its figure is present, it is simply not spend', () => {

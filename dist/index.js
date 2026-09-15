@@ -38382,13 +38382,10 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     spend,
     record: cause => recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }),
   });
-  let review;
-  let spentOn;
   try {
-    let configUsed;
-    ({ review, configUsed } = await runMultiScope({
+    const { review, configUsed } = await runMultiScope({
       chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
-    }));
+    });
     warnBudgetExhausted(review);
     warnScopeFailures(review);
 
@@ -38406,26 +38403,28 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // structured summaries the prompt note derived from — now enriched by the workers' per-module
     // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
     const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-    spentOn = attributedConfig(spend.configs(), configUsed);
+    const spentOn = attributedConfig(spend.configs(), configUsed);
     // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
     // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
     const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
-    guard.delivering();
-    await submitReview(
-      reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-      // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
-      // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
-      // and the sink alone decides what they mean for approval.
-      { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
-      Boolean(reviewToken), transport, footer,
-    );
+    // The ledger append is part of delivery, so a signal landing mid-post waits for it too.
+    await guard.deliver(async () => {
+      await submitReview(
+        reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+        // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+        // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+        // and the sink alone decides what they mean for approval.
+        { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
+        Boolean(reviewToken), transport, footer,
+      );
+      await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
+    });
   } catch (err) {
     await guard.failed(err);
     throw err;
   } finally {
     guard.done();
   }
-  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
@@ -38469,13 +38468,12 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
 
     const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt, spentOn: attributedConfig(spend.configs(), configUsed) });
     report = renderRepoReport({ reviewerName, scope, review, footer });
-    guard.delivering();
     // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
     // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
     // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
     // is written first so findings are never lost if the Step Summary write fails (e.g. an
     // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
-    core.info(report);
+    await guard.deliver(() => core.info(report));
   } catch (err) {
     await guard.failed(err);
     throw err;
@@ -39130,31 +39128,42 @@ function attributedConfig(configs, fallback) {
 const SPAWN_SETTLE_CEILING_MS = 2_000;
 
 // [LAW:single-enforcer] The ONE place a run's spend is recorded when no posted review carries it. A run's
-// review path is wrapped between its first spawn and the moment its review is handed to the host, and
+// review path is wrapped from its first spawn until its review has been delivered, and
 // whichever exit comes first — a throw or a signal — claims the record. There is exactly one record:
 // the claim is a promise, so a signal landing while a throw is still posting awaits that same post
 // rather than starting a second one, and a throw that follows a signal-killed pass does the same.
 //
-// Once the review is being DELIVERED its marker is on its way to the host, so a signal records nothing:
-// the run cannot know whether the post landed, and a duplicate would double-count the PR total. A throw
-// while delivering means the host refused the review, so the spend is recorded then.
+// [LAW:no-ambient-temporal-coupling] DELIVERY is the other claim, and it is a promise too, so the two
+// exits exclude each other as states rather than by timing. deliver(send) hands the review to the host
+// and is refused once a record is claimed: a signal that killed the engines lets the pass resolve with the
+// findings its workers recorded, and delivering that review as well would put two markers for one spend
+// on the PR. A signal that lands once delivery has begun returns the delivery itself, so shutdown awaits
+// the post rather than exiting under it; a delivery the host refuses records the spend as a failure,
+// inside that same awaited promise. `send` covers everything the delivered run still owes, the ledger
+// entry included, because the process exits as soon as the promise a signal returned settles.
 //
 // `record(cause)` is the mode's own sink (a PR notice plus the ledger, or a log line in repo mode).
 // `onSignal` is the registration seam, injected so the signal arm is testable without signalling the
 // test process. [LAW:effects-at-boundaries]
 function guardSpend({ spend, record, onSignal = onSignalFinalize }) {
   let recording = null;
-  let delivering = false;
+  let delivery = null;
   const claim = (cause) => {
     recording ??= within(spend.close(), SPAWN_SETTLE_CEILING_MS).then(() => record(cause));
     return recording;
   };
-  const unregister = onSignal((signal) => (delivering && recording === null
-    ? undefined
-    : claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`)));
+  const failed = (err) => claim(`The run failed: ${err.message}`);
+  const unregister = onSignal((signal) => delivery
+    ?? claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`));
   return {
-    delivering() { delivering = true; },
-    failed: (err) => claim(`The run failed: ${err.message}`),
+    deliver(send) {
+      if (recording !== null) {
+        return Promise.reject(new Error('The review was not delivered: the run is ending, and its spend is being recorded as unfinished.'));
+      }
+      delivery = Promise.resolve().then(send).catch(err => failed(err).then(() => { throw err; }));
+      return delivery;
+    },
+    failed,
     done: unregister,
   };
 }
@@ -41407,7 +41416,7 @@ function priceFromTable(spawn, model) {
 //
 //   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
 //   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
-//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported' }   dollars, but the figure is unrecoverable
+//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported'|'mixed-basis' }   dollars, but the figure is unrecoverable
 //
 // The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
 // subscription run at all: `available:false` says "we do not know", when in fact we know the number
@@ -41961,9 +41970,9 @@ function parseCostMarker(body) {
 // dollar of spend and a notional list-price dollar are different UNITS; adding them yields a number
 // that means nothing, which is exactly the bug this ticket exists to kill. [LAW:no-silent-failure]
 // A mixed-basis sum resolves to 'unpriced' — an honest "we cannot give you one number" — never a
-// silent blend. Within one multi-scope pass the basis is uniform by construction (every spawn runs
-// on ONE config), so the mixed arm is unreachable there; it is resolved as a VALUE anyway rather
-// than assumed away, because the sum is a pure function and must total whatever it is handed.
+// silent blend. A run's spend spans every config a failover reached, so a chain that falls over from a
+// subscription engine to a dollars one reaches the mixed arm; its reason says the costs were reported
+// and cannot be added, never that an engine reported none.
 // One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's reason, exactly as before.
 // A subscription sum with any unreported notional is wholly unreported: a partial list price summed
 // as if it were the total would understate the run, which is the same lie in a smaller font.
@@ -41971,7 +41980,7 @@ function sumCost(costs) {
   const unpriced = costs.find(c => c.basis === 'unpriced');
   if (unpriced) return unpriced;
   const bases = new Set(costs.map(c => c.basis));
-  if (bases.size !== 1) return { basis: 'unpriced', reason: 'not-reported' };
+  if (bases.size !== 1) return { basis: 'unpriced', reason: 'mixed-basis' };
   if (costs[0].basis === 'subscription') {
     const notionals = costs.map(c => c.notionalUsd);
     return {
@@ -42186,6 +42195,9 @@ const UNPRICED_REMEDY = {
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".',
+  'mixed-basis': (tag) => `This run failed over between a Claude subscription config and a dollar-billed one, ending on ${tag}; `
+    + 'each reported its cost, but subscription list price and dollars are different units and are never added, '
+    + 'so the review footer shows cost as "unknown" and the daily ledger counts this run as unknown.',
 };
 
 function costWarning(usage, config) {

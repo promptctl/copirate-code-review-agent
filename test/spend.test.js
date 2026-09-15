@@ -97,18 +97,42 @@ describe('guardSpend', () => {
     assert.deepEqual(recorded[0].usages, [usage(7)]);
   });
 
-  test('a signal while the review is being delivered records nothing — its marker is already on the way', async () => {
+  test('a signal while the review is being delivered records nothing, and shutdown waits for the delivery', async () => {
     const { guard, recorded, signal } = harness();
-    guard.delivering();
-    assert.equal(signal('SIGTERM'), undefined);
+    const posting = deferred();
+    let delivered = false;
+    const delivery = guard.deliver(async () => { await posting.promise; delivered = true; });
+    const finalizing = signal('SIGTERM');
+    let finalized = false;
+    finalizing.then(() => { finalized = true; });
+    await new Promise(setImmediate);
+    assert.equal(finalized, false, 'shutdown would have exited while the review was still being posted');
+    posting.resolve();
+    await Promise.all([delivery, finalizing]);
+    assert.equal(delivered, true);
     assert.equal(recorded.length, 0);
   });
 
-  test('a throw while delivering means the host refused the review, so the spend is recorded', async () => {
-    const { guard, recorded } = harness();
-    guard.delivering();
-    await guard.failed(new Error('HttpError: Resource not accessible by integration'));
+  test('a delivery the host refuses records the spend once, inside the promise a signal awaits', async () => {
+    const { guard, recorded, signal } = harness();
+    const refused = new Error('HttpError: Resource not accessible by integration');
+    const delivery = guard.deliver(async () => { throw refused; });
+    const finalizing = signal('SIGTERM');
+    await assert.rejects(delivery, refused);
+    await finalizing.catch(() => {});
+    await guard.failed(refused);
     assert.equal(recorded.length, 1);
+    assert.match(recorded[0].cause, /^The run failed: HttpError/);
+  });
+
+  test('a review is refused delivery once a signal has claimed the record, so one spend never posts twice', async () => {
+    const { guard, recorded, signal } = harness();
+    await signal('SIGINT');
+    let sent = false;
+    await assert.rejects(guard.deliver(async () => { sent = true; }), /not delivered/);
+    assert.equal(sent, false);
+    assert.equal(recorded.length, 1);
+    assert.match(recorded[0].cause, /stopped by SIGINT/);
   });
 
   test('once the review is delivered the guard stops listening for signals', () => {

@@ -841,13 +841,10 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     spend,
     record: cause => recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }),
   });
-  let review;
-  let spentOn;
   try {
-    let configUsed;
-    ({ review, configUsed } = await runMultiScope({
+    const { review, configUsed } = await runMultiScope({
       chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
-    }));
+    });
     warnBudgetExhausted(review);
     warnScopeFailures(review);
 
@@ -865,26 +862,28 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // structured summaries the prompt note derived from — now enriched by the workers' per-module
     // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
     const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-    spentOn = attributedConfig(spend.configs(), configUsed);
+    const spentOn = attributedConfig(spend.configs(), configUsed);
     // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
     // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
     const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
-    guard.delivering();
-    await submitReview(
-      reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-      // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
-      // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
-      // and the sink alone decides what they mean for approval.
-      { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
-      Boolean(reviewToken), transport, footer,
-    );
+    // The ledger append is part of delivery, so a signal landing mid-post waits for it too.
+    await guard.deliver(async () => {
+      await submitReview(
+        reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+        // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+        // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+        // and the sink alone decides what they mean for approval.
+        { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
+        Boolean(reviewToken), transport, footer,
+      );
+      await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
+    });
   } catch (err) {
     await guard.failed(err);
     throw err;
   } finally {
     guard.done();
   }
-  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
@@ -928,13 +927,12 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
 
     const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt, spentOn: attributedConfig(spend.configs(), configUsed) });
     report = renderRepoReport({ reviewerName, scope, review, footer });
-    guard.delivering();
     // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
     // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
     // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
     // is written first so findings are never lost if the Step Summary write fails (e.g. an
     // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
-    core.info(report);
+    await guard.deliver(() => core.info(report));
   } catch (err) {
     await guard.failed(err);
     throw err;

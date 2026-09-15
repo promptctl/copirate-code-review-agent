@@ -70,31 +70,42 @@ function attributedConfig(configs, fallback) {
 const SPAWN_SETTLE_CEILING_MS = 2_000;
 
 // [LAW:single-enforcer] The ONE place a run's spend is recorded when no posted review carries it. A run's
-// review path is wrapped between its first spawn and the moment its review is handed to the host, and
+// review path is wrapped from its first spawn until its review has been delivered, and
 // whichever exit comes first — a throw or a signal — claims the record. There is exactly one record:
 // the claim is a promise, so a signal landing while a throw is still posting awaits that same post
 // rather than starting a second one, and a throw that follows a signal-killed pass does the same.
 //
-// Once the review is being DELIVERED its marker is on its way to the host, so a signal records nothing:
-// the run cannot know whether the post landed, and a duplicate would double-count the PR total. A throw
-// while delivering means the host refused the review, so the spend is recorded then.
+// [LAW:no-ambient-temporal-coupling] DELIVERY is the other claim, and it is a promise too, so the two
+// exits exclude each other as states rather than by timing. deliver(send) hands the review to the host
+// and is refused once a record is claimed: a signal that killed the engines lets the pass resolve with the
+// findings its workers recorded, and delivering that review as well would put two markers for one spend
+// on the PR. A signal that lands once delivery has begun returns the delivery itself, so shutdown awaits
+// the post rather than exiting under it; a delivery the host refuses records the spend as a failure,
+// inside that same awaited promise. `send` covers everything the delivered run still owes, the ledger
+// entry included, because the process exits as soon as the promise a signal returned settles.
 //
 // `record(cause)` is the mode's own sink (a PR notice plus the ledger, or a log line in repo mode).
 // `onSignal` is the registration seam, injected so the signal arm is testable without signalling the
 // test process. [LAW:effects-at-boundaries]
 function guardSpend({ spend, record, onSignal = onSignalFinalize }) {
   let recording = null;
-  let delivering = false;
+  let delivery = null;
   const claim = (cause) => {
     recording ??= within(spend.close(), SPAWN_SETTLE_CEILING_MS).then(() => record(cause));
     return recording;
   };
-  const unregister = onSignal((signal) => (delivering && recording === null
-    ? undefined
-    : claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`)));
+  const failed = (err) => claim(`The run failed: ${err.message}`);
+  const unregister = onSignal((signal) => delivery
+    ?? claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`));
   return {
-    delivering() { delivering = true; },
-    failed: (err) => claim(`The run failed: ${err.message}`),
+    deliver(send) {
+      if (recording !== null) {
+        return Promise.reject(new Error('The review was not delivered: the run is ending, and its spend is being recorded as unfinished.'));
+      }
+      delivery = Promise.resolve().then(send).catch(err => failed(err).then(() => { throw err; }));
+      return delivery;
+    },
+    failed,
     done: unregister,
   };
 }

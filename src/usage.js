@@ -626,7 +626,7 @@ function priceFromTable(spawn, model) {
 //
 //   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
 //   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
-//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported' }   dollars, but the figure is unrecoverable
+//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported'|'mixed-basis' }   dollars, but the figure is unrecoverable
 //
 // The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
 // subscription run at all: `available:false` says "we do not know", when in fact we know the number
@@ -1180,9 +1180,9 @@ function parseCostMarker(body) {
 // dollar of spend and a notional list-price dollar are different UNITS; adding them yields a number
 // that means nothing, which is exactly the bug this ticket exists to kill. [LAW:no-silent-failure]
 // A mixed-basis sum resolves to 'unpriced' — an honest "we cannot give you one number" — never a
-// silent blend. Within one multi-scope pass the basis is uniform by construction (every spawn runs
-// on ONE config), so the mixed arm is unreachable there; it is resolved as a VALUE anyway rather
-// than assumed away, because the sum is a pure function and must total whatever it is handed.
+// silent blend. A run's spend spans every config a failover reached, so a chain that falls over from a
+// subscription engine to a dollars one reaches the mixed arm; its reason says the costs were reported
+// and cannot be added, never that an engine reported none.
 // One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's reason, exactly as before.
 // A subscription sum with any unreported notional is wholly unreported: a partial list price summed
 // as if it were the total would understate the run, which is the same lie in a smaller font.
@@ -1190,7 +1190,7 @@ function sumCost(costs) {
   const unpriced = costs.find(c => c.basis === 'unpriced');
   if (unpriced) return unpriced;
   const bases = new Set(costs.map(c => c.basis));
-  if (bases.size !== 1) return { basis: 'unpriced', reason: 'not-reported' };
+  if (bases.size !== 1) return { basis: 'unpriced', reason: 'mixed-basis' };
   if (costs[0].basis === 'subscription') {
     const notionals = costs.map(c => c.notionalUsd);
     return {
@@ -1405,6 +1405,9 @@ const UNPRICED_REMEDY = {
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
     + 'the review footer shows cost as "unknown".',
+  'mixed-basis': (tag) => `This run failed over between a Claude subscription config and a dollar-billed one, ending on ${tag}; `
+    + 'each reported its cost, but subscription list price and dollars are different units and are never added, '
+    + 'so the review footer shows cost as "unknown" and the daily ledger counts this run as unknown.',
 };
 
 function costWarning(usage, config) {
