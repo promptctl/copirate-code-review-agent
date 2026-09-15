@@ -7,12 +7,12 @@
 > workflow's first step now refuses and the PR label trigger is deleted, so this is
 > enforced at the point of spend rather than asserted here.
 >
-> **The bar is wall clock under 45 minutes.** There is no dollar target, deliberately:
-> the pinned engine is a subscription, `baseline.json` records `costPerFullRunUsd: null`,
-> and the ~$360 figure quoted around this repo is the *notional* list-price equivalent of
-> the quota burned — not money billed. The scarce resources are **wall clock** and
-> **subscription quota** (about a day of one account per suite, across a pool that PR
-> reviews draw from too). Optimise those; report the notional figure, never target it.
+> **The bar is wall clock under 45 minutes.** One full suite costs **~$360** at Anthropic
+> API price. A subscription changes who pays that, not what the suite costs, so report it
+> with every run. There is still no dollar target, deliberately: the owner set wall clock
+> as the bar, and the other hard limit is **subscription quota** (about a day of one
+> account per suite, across a pool that PR reviews draw from too). Optimise wall clock
+> and quota; the cost is what those choices spend.
 >
 > **Why more parallelism is not the answer.** Wall clock is
 > `ceil(replays / lanes) × per-replay`. The suite is 20 replays at 13–27 min; the
@@ -719,12 +719,15 @@ freeze names the engine tree instead. Only the `mainSha` field name still carrie
 assumption; `compare.js` ranks baselines by which commit last touched `baseline.json`, never
 by reachability, so nothing mechanical depends on it.
 
-**Cost basis: subscription quota, not dollars.** No run reports a cost, so `baseline.js`
-records `costPerFullRunUsd: null` with `uncostedRuns: 20` rather than passing a partial sum
-off as a total. The CLI's own meter is notional here — one *failed* `links-317` replay
-reported $4.01 that was never billed. The real currency is wall clock and quota: ~13–27 min
-per replay, ~4.5 h for the suite across three subscription lanes, and the daily wall
-(midnight America/Denver) reached on all three accounts before the last replay landed.
+**Cost: spent, but not recorded in this freeze.** When these runs were frozen, the code
+reported a subscription run's cost on a separate basis that the scorer does not count, so
+`baseline.js` recorded `costPerFullRunUsd: null` with `uncostedRuns: 20` rather than passing
+a partial sum off as a total. The null belongs to this freeze: since 1.69.0 (#173) a
+subscription run reports its API-price cost in dollars and `eval/score.js` counts it. One
+figure did survive: a *failed* `links-317` replay cost $4.01. Wall clock and quota were the
+other limits: ~13–27 min per replay, ~4.5 h for the suite across three subscription lanes,
+and the daily wall (midnight America/Denver) reached on all three accounts before the last
+replay landed.
 
 ### Superseded: the deepseek baselines
 
@@ -867,8 +870,8 @@ of this section documents the shape to **restore** with the moratorium, not the 
 
 Two triggers, both deliberate spends. `compare.js` prints the authoritative cost estimate (the
 baseline's recorded $/full-run × the full-suite passes still owed) before spending. For the current N=5 × 4-case baseline that
-estimate is **no dollar figure at all** — the pinned engine bills against subscription quota, so the
-baseline records `costPerFullRunUsd: null`. The spend is quota and wall clock: 20 replays at 13–27 min
+estimate prints as unknown: the freeze predates 1.69.0 (#173), so the baseline records
+`costPerFullRunUsd: null`. The suite still costs ~$360 at API price, and takes 20 replays at 13–27 min
 each, which `compare.js` hands to `freeze-suite.js` to spread across credential lanes. The workflow
 names **three lanes** (`--credentials`, one subscription account each, secrets named after the
 keychain items they came from), so a lane carries at most 7 replays and a full gate run is about
