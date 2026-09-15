@@ -33697,7 +33697,7 @@ const ANY_MARKER_RE = new RegExp(
 // to a DIFFERENT value than it was written from. A record that disagrees with itself is worse than no
 // record. Screening only the figure was exactly that bug one field wide — a negative token count
 // still went out to be rejected on the way back in.
-// [LAW:types-are-the-program] So an unpriced cost, an unreported notional, a NaN from a broken
+// [LAW:types-are-the-program] So an unpriced cost, a NaN from a broken
 // upstream, a nonsensical negative, and a config naming no model all reach the same honest end: an
 // absent field, which is what "not recorded" looks like.
 //
