@@ -19,10 +19,8 @@ const usageOf = cost => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, outpu
 // A machine-written ledger entry: the sentinel then the reused cost marker.
 const entry = (usd, created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'dollars', usd }), CONFIG), created_at });
 const unknownEntry = (created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'unpriced', reason: 'no-price' }), CONFIG), created_at });
-// A review billed to Claude subscription quota: $0 spent, a known Anthropic list price.
-const subscriptionEntry = (notionalUsd, created_at) => ({ body: ledgerEntryBody(usageOf({ basis: 'subscription', notionalUsd }), CONFIG), created_at });
 
-const ZERO_TALLIES = { billed: { total: 0, count: 0, unknownCount: 0 }, notional: { total: 0, count: 0, unknownCount: 0 } };
+const ZERO_TALLY = { total: 0, count: 0, unknownCount: 0 };
 
 const NOON = new Date('2026-07-11T12:00:00Z'); // today (UTC) = 2026-07-11
 
@@ -53,84 +51,66 @@ describe('ledgerEntryBody', () => {
 
 describe('sumCostToday', () => {
   test('sums only entries dated today (UTC of now); yesterday and tomorrow are excluded', () => {
-    const { billed } = sumCostToday([
+    const spent = sumCostToday([
       entry(0.10, '2026-07-11T03:00:00Z'), // today, early
       entry(0.20, '2026-07-11T23:59:59Z'), // today, late
       entry(9.99, '2026-07-10T23:59:59Z'), // yesterday — excluded
       entry(9.99, '2026-07-12T00:00:00Z'), // tomorrow — excluded
     ], NOON);
-    assert.equal(Number(billed.total.toFixed(2)), 0.30);
-    assert.equal(billed.count, 2);
+    assert.equal(Number(spent.total.toFixed(2)), 0.30);
+    assert.equal(spent.count, 2);
   });
 
   test('the day boundary is UTC, not local — an entry just after UTC midnight counts, just before does not', () => {
     // now is early in the UTC day; a negative-offset LOCAL tz would call the 23:59:59Z instant "today",
     // but UTC-day comparison does not — proving the filter is UTC.
     const earlyUtc = new Date('2026-07-11T00:30:00Z');
-    const { billed } = sumCostToday([
+    const spent = sumCostToday([
       entry(0.10, '2026-07-11T00:00:01Z'), // today (UTC) — included
       entry(0.10, '2026-07-10T23:59:59Z'), // yesterday (UTC) — excluded
     ], earlyUtc);
-    assert.equal(billed.count, 1);
+    assert.equal(spent.count, 1);
   });
 
   test('[LAW:single-enforcer] a comment NOT leading with the sentinel is excluded even if it carries a cost marker (human quote)', () => {
     const humanQuote = { body: `I see the bot posts ${LEDGER_MARKER} ${costMarker(usageOf({ basis: 'dollars', usd: 999 }), CONFIG)} — my own note`, created_at: '2026-07-11T10:00:00Z' };
-    const { billed } = sumCostToday([humanQuote], NOON);
-    assert.equal(billed.total, 0); // the human's $999 is NOT summed
-    assert.equal(billed.count, 0);
-    assert.equal(billed.unknownCount, 0); // not even counted as an entry — it is not one
+    assert.deepEqual(sumCostToday([humanQuote], NOON), ZERO_TALLY); // not summed, not even counted as an entry
   });
 
   test('leading whitespace before the sentinel is tolerated (trimStart)', () => {
-    const { billed } = sumCostToday([
+    const spent = sumCostToday([
       { body: `\n  ${ledgerEntryBody(usageOf({ basis: 'dollars', usd: 0.07 }), CONFIG)}`, created_at: '2026-07-11T10:00:00Z' },
     ], NOON);
-    assert.equal(billed.count, 1);
+    assert.equal(spent.count, 1);
   });
 
   test('[LAW:no-silent-failure] a today entry with an unknown cost is counted as unknown, never dropped', () => {
-    const { billed } = sumCostToday([
+    const spent = sumCostToday([
       entry(0.05, '2026-07-11T09:00:00Z'),
       unknownEntry('2026-07-11T10:00:00Z'),
     ], NOON);
-    assert.equal(Number(billed.total.toFixed(2)), 0.05);
-    assert.equal(billed.count, 1);
-    assert.equal(billed.unknownCount, 1); // the day's spend is an honest lower bound
+    assert.equal(Number(spent.total.toFixed(2)), 0.05);
+    assert.equal(spent.count, 1);
+    assert.equal(spent.unknownCount, 1); // the day's spend is an honest lower bound
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2: a subscription review contributes $0.00 to the
-  // ledger DOLLAR total — so it cannot move the DAILY_BUDGET_USD gate — while its notional figure is
-  // still recorded and readable. The evidence on the ticket: $63.59 of list price on one PR would
-  // otherwise have rationed a budget against money nobody spent.
-  test('a subscription entry contributes $0 to the day\'s dollars while its list price stays visible', () => {
-    const { billed, notional } = sumCostToday([
-      entry(0.05, '2026-07-11T09:00:00Z'),
-      subscriptionEntry(63.59, '2026-07-11T10:00:00Z'),
-    ], NOON);
-    assert.equal(Number(billed.total.toFixed(2)), 0.05);   // the subscription's $63.59 is NOT in here
-    assert.equal(billed.count, 1);
-    assert.equal(billed.unknownCount, 0);                // it is not an "unknown" spend either — it is zero
-    assert.equal(notional.total, 63.59);                   // and it is not suppressed: still reported
-    assert.equal(notional.count, 1);
-  });
-
-  // [LAW:no-silent-failure] A subscription review whose list price was never reported is still $0 of
-  // spend — its missing figure must not be laundered into the billed unknown count, which would make
-  // the day's spend read as a lower bound when it is exactly known.
-  test('a subscription entry with an unknown list price is notional-unknown, never billed-unknown', () => {
-    const { billed, notional } = sumCostToday([subscriptionEntry(null, '2026-07-11T10:00:00Z')], NOON);
-    assert.deepEqual(billed, { total: 0, count: 0, unknownCount: 0 });
-    assert.deepEqual(notional, { total: 0, count: 0, unknownCount: 1 });
+  // An entry posted before 1.69.0 for a Claude subscription run carries the legacy notional marker. Its
+  // figure is that run's API-price cost, so it is the day's spend like any other — dropping it would
+  // under-count the budget by every such review already on the ledger.
+  test("a legacy subscription entry is counted as the API-price cost it records", () => {
+    const legacy = { body: `${LEDGER_MARKER}\n<!-- agent-review-notional-usd:{"notionalUsd":63.59} -->`, created_at: '2026-07-11T10:00:00Z' };
+    const spent = sumCostToday([entry(0.05, '2026-07-11T09:00:00Z'), legacy], NOON);
+    assert.equal(Number(spent.total.toFixed(2)), 63.64);
+    assert.equal(spent.count, 2);
+    assert.equal(spent.unknownCount, 0);
   });
 
   test('a non-string body is tolerated (skipped, not a crash)', () => {
-    const { billed } = sumCostToday([{ body: null, created_at: '2026-07-11T10:00:00Z' }], NOON);
-    assert.equal(billed.count, 0);
+    assert.equal(sumCostToday([{ body: null, created_at: '2026-07-11T10:00:00Z' }], NOON).count, 0);
   });
 
   test('no comments yields zeroes', () => {
-    assert.deepEqual(sumCostToday([], NOON), ZERO_TALLIES);
+    assert.deepEqual(sumCostToday([], NOON), ZERO_TALLY);
   });
 
   test('[LAW:no-silent-failure] a real ledger entry with a corrupt timestamp fails loud, never a silent wrong-day', () => {
@@ -139,8 +119,7 @@ describe('sumCostToday', () => {
 
   test('a NON-ledger comment with a bad/absent timestamp is skipped by the sentinel gate first — no crash', () => {
     // The gate is checked before the date parse, so a stray human comment cannot red the run on its timestamp.
-    const { billed } = sumCostToday([{ body: 'a human note', created_at: 'garbage' }], NOON);
-    assert.equal(billed.count, 0);
+    assert.equal(sumCostToday([{ body: 'a human note', created_at: 'garbage' }], NOON).count, 0);
   });
 });
 
@@ -155,21 +134,21 @@ describe('readSpentToday', () => {
       entry(0.03, '2026-07-11T09:00:00Z'),
       entry(9.99, '2026-07-10T09:00:00Z'), // yesterday — excluded
     ]]);
-    const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
-    assert.equal(Number(billed.total.toFixed(2)), 0.08);
-    assert.equal(billed.count, 2);
+    const spent = await readSpentToday(octokit, 'o', 'r', 42, NOON);
+    assert.equal(Number(spent.total.toFixed(2)), 0.08);
+    assert.equal(spent.count, 2);
   });
 
   test('exhausts pagination — a full first page forces a second fetch (spend spans pages)', async () => {
     const full = Array.from({ length: 100 }, () => entry(0.01, '2026-07-11T08:00:00Z'));
     const octokit = fakeOctokit([full, [entry(0.01, '2026-07-11T08:00:00Z'), { body: 'human note', created_at: '2026-07-11T08:00:00Z' }]]);
-    const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
-    assert.equal(billed.count, 101);
-    assert.equal(Number(billed.total.toFixed(2)), 1.01);
+    const spent = await readSpentToday(octokit, 'o', 'r', 42, NOON);
+    assert.equal(spent.count, 101);
+    assert.equal(Number(spent.total.toFixed(2)), 1.01);
   });
 
   test('an empty ledger issue yields zeroes', async () => {
-    assert.deepEqual(await readSpentToday(fakeOctokit([[]]), 'o', 'r', 42, NOON), ZERO_TALLIES);
+    assert.deepEqual(await readSpentToday(fakeOctokit([[]]), 'o', 'r', 42, NOON), ZERO_TALLY);
   });
 
   test('the issue number is threaded to the API', async () => {
@@ -203,19 +182,6 @@ describe('appendCost', () => {
     assert.deepEqual(parseCost(calls[0].body), { basis: 'unpriced', reason: 'not-reported' });
   });
 
-  // [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL: a subscription review records an
-  // entry like every other, and its exclusion from the day's dollars is the marker NAME, not a caller
-  // that skips the append. Skipping would make the subscription's consumption invisible rather than
-  // merely unbilled — the ticket names that as a BAD approach explicitly.
-  test('a subscription review still appends an entry, carrying its notional marker', async () => {
-    const calls = [];
-    await appendCost(capturingOctokit(calls), 'o', 'r', 42, usageOf({ basis: 'subscription', notionalUsd: 63.59 }), CONFIG);
-    assert.equal(calls.length, 1);
-    assert.ok(calls[0].body.startsWith(`${LEDGER_MARKER}\n`), `entry must lead with the sentinel: ${calls[0].body}`);
-    assert.match(calls[0].body, /<!-- agent-review-notional-usd:/); // the notional NAME, invisible to every spend fold
-    assert.deepEqual(parseCost(calls[0].body), { basis: 'subscription', notionalUsd: 63.59 });
-  });
-
   test('[LAW:no-silent-failure] an API error propagates — the module never swallows a failed append', async () => {
     const octokit = { rest: { issues: { createComment: async () => { throw new Error('403 issues:write missing'); } } } };
     await assert.rejects(() => appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG), /issues:write/);
@@ -233,8 +199,8 @@ describe('appendCost', () => {
     };
     await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.05 }), CONFIG);
     await appendCost(octokit, 'o', 'r', 42, usageOf({ basis: 'dollars', usd: 0.03 }), CONFIG);
-    const { billed } = await readSpentToday(octokit, 'o', 'r', 42, NOON);
-    assert.equal(Number(billed.total.toFixed(2)), 0.08);
-    assert.equal(billed.count, 2);
+    const spent = await readSpentToday(octokit, 'o', 'r', 42, NOON);
+    assert.equal(Number(spent.total.toFixed(2)), 0.08);
+    assert.equal(spent.count, 2);
   });
 });

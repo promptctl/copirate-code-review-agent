@@ -206,8 +206,6 @@ function assertSucceeded(stdout) {
 // total_cost_usd, so a missing figure surfaces "unknown" loudly. [LAW:one-type-per-behavior]
 // An observed numeric 0 (a provider OpenCode does not price) is a real {basis:'dollars', usd:0}; the
 // reported USD is OpenCode's estimate, so the renderer marks every cost line "est." [FRAMING:representation]
-// The basis is always 'dollars': opencode declares credentialKinds ['api-key'], so no opencode run
-// can be billed to a subscription and this adapter has no notional arm to reach.
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;

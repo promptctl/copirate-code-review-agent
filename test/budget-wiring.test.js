@@ -11,7 +11,7 @@ const {
 } = require('../src/budget');
 const { defaultEffortProfile } = require('../src/effort');
 const { resolveBudgetedEffort } = require('../src/run');
-const { ledgerEntryBody } = require('../src/ledger');
+const { LEDGER_MARKER, ledgerEntryBody } = require('../src/ledger');
 
 // The churn axis the budget cost estimate is calibrated against: added + deleted content lines.
 describe('diffChurn', () => {
@@ -131,25 +131,20 @@ describe('resolveBudgetedEffort', () => {
   };
   const ledgerUsage = (cost) => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost });
   const ledgerComment = (usd, created_at) => ({ body: ledgerEntryBody(ledgerUsage({ basis: 'dollars', usd }), LEDGER_CONFIG), created_at });
-  const subscriptionLedgerComment = (notionalUsd, created_at) => ({ body: ledgerEntryBody(ledgerUsage({ basis: 'subscription', notionalUsd }), LEDGER_CONFIG), created_at });
+  // A ledger entry posted before 1.69.0 for a Claude subscription run, under the legacy notional marker.
+  const legacySubscriptionLedgerComment = (notionalUsd, created_at) => ({ body: `${LEDGER_MARKER}\n<!-- agent-review-notional-usd:{"notionalUsd":${notionalUsd}} -->`, created_at });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2, end to end through the seam that actually
-  // rations. The two halves of this test are the SAME day and the SAME dollar figure, differing only
-  // in what paid for it — which is exactly the fact the old two-arm cost type could not represent.
-  // Real spend of $63.59 against a $10 budget throttles to the floor; $63.59 of Anthropic LIST PRICE
-  // billed to plan quota must not move the gate at all, because no money was spent.
-  // The evidence on the ticket: reviewing PR #113 reported $63.59 across four subscription rounds.
-  test('subscription list price does not throttle the budget; the same figure in real dollars does', async () => {
+  // The cost is the API price of the usage, whatever paid for it: a subscription run's recorded figure
+  // throttles the budget exactly as the same figure recorded as dollars does.
+  test('a subscription run throttles the budget by its API-price cost, like any other run', async () => {
     const budgeted = (comments) => resolveBudgetedEffort({
       octokit: fakeOctokit(comments), owner: 'o', repo: 'r', issueNumber: 1, now: today,
       filteredFiles: smallDiff, candidates, dailyBudget: 10,
     });
-    const spent = await budgeted([ledgerComment(63.59, '2026-07-11T08:00:00Z')]);
-    const quota = await budgeted([subscriptionLedgerComment(63.59, '2026-07-11T08:00:00Z')]);
-    assert.equal(quota.roundCap, 5, 'a quota-billed day must leave the full budget available');
-    assert.ok(spent.roundCap < quota.roundCap, `real overspend must throttle: spent=${spent.roundCap} quota=${quota.roundCap}`);
-    // And the control: an empty day and a quota-only day are indistinguishable to the gradient.
-    assert.equal(quota.roundCap, (await budgeted([])).roundCap);
+    const dollars = await budgeted([ledgerComment(63.59, '2026-07-11T08:00:00Z')]);
+    const subscription = await budgeted([legacySubscriptionLedgerComment(63.59, '2026-07-11T08:00:00Z')]);
+    assert.equal(subscription.roundCap, dollars.roundCap);
+    assert.ok(subscription.roundCap < (await budgeted([])).roundCap, 'an overspent day must throttle');
   });
 
   test('ample remaining budget chooses the full configured effort (the ceiling)', async () => {

@@ -240,19 +240,6 @@ describe('sumUsage', () => {
     assert.equal(total.cost.usd, 0.05);
   });
 
-  // A multi-scope pass on a subscription config: the scout and every worker share one basis, so the
-  // pass total is notional too — and carries no `usd` field for a spend fold to reach for.
-  test('a subscription pass sums to a notional total, never a spend total', () => {
-    const total = sumUsage([
-      { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost: { basis: 'subscription', notionalUsd: 18.86 } },
-      { tokens: { inputCacheMiss: 20, inputCacheHit: 0, output: 7 }, cost: { basis: 'subscription', notionalUsd: 7.28 } },
-    ]);
-    assert.equal(totalInputTokens(total.tokens), 30);
-    assert.equal(total.cost.basis, 'subscription');
-    assert.ok(Math.abs(total.cost.notionalUsd - 26.14) < 1e-9);
-    assert.equal('usd' in total.cost, false);
-  });
-
   test('returns null when no spawn reported usage', () => {
     assert.equal(sumUsage([null, null]), null);
     assert.equal(sumUsage([]), null);

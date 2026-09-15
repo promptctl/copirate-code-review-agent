@@ -1,5 +1,5 @@
 'use strict';
-const { costMarker, parseCost, emptyTallies, tallyCost } = require('./usage');
+const { costMarker, parseCost, emptyTally, tallyCost } = require('./usage');
 
 // The append-only daily cost ledger: the persistent cross-run store of actual review spend, scoped to
 // one repo-day, that the budget gradient (zai-budget-qzm) reads before deciding this review's effort.
@@ -39,10 +39,8 @@ const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 // because the day's ledger is exactly as repriceable-after-the-fact as the review is, and writing a
 // poorer record here would have made the ledger the one place a corrected price table could not
 // reach. [LAW:one-source-of-truth] one marker writer, one record, two sinks.
-// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
-// records an entry like any other, and its exclusion from the day's dollars is the marker NAME
-// costMarker chose, never a caller that skips appendCost. A skipped append would make the
-// subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
+// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL — every review records an entry,
+// whichever credential paid for it. [LAW:no-silent-failure]
 //
 // A ledger entry records what a review SPENT, and has no wall clock of its own to record: the day's
 // ledger is read by the budget gate, which asks about dollars, while agent time is asked about per PR
@@ -71,22 +69,16 @@ function utcDay(dateish) {
 // [LAW:no-silent-failure] An entry whose figure is 'unknown' or unparseable raises unknownCount,
 // never dropped, so the caller reports the day's spend as an honest lower bound rather than a
 // silently-partial sum — the same shape summarizePriorReviews returns for a PR.
-//
-// THE SPEND EXCLUSION, IN PRACTICE. A subscription review's entry carries the NOTIONAL marker, so it
-// lands in the `notional` tally and contributes nothing to `billed` — the day's dollar spend excludes
-// it BY CONSTRUCTION, not by a guard, and no `usd` field exists on its cost for this fold to read.
-// It is equally NOT an unknown billed entry: its spend is known exactly, and it is zero. The
-// subscription's consumption stays visible in `notional` rather than becoming invisible.
 function sumCostToday(comments, now) {
   const today = utcDay(now);
-  const tallies = emptyTallies();
+  const tally = emptyTally();
   for (const c of comments) {
     const body = typeof c.body === 'string' ? c.body : '';
     if (!body.trimStart().startsWith(LEDGER_MARKER)) continue;
     if (utcDay(c.created_at) !== today) continue;
-    tallyCost(tallies, parseCost(body));
+    tallyCost(tally, parseCost(body));
   }
-  return tallies;
+  return tally;
 }
 
 // [LAW:effects-at-boundaries] Effect: read the ledger issue's comments and return today's summed spend

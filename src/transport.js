@@ -4,7 +4,7 @@ const { parseUnifiedDiff, parseReviewableFiles, reconcileChangedSet } = require(
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = require('./review');
-const { parseCostRecord, emptyTallies, tallyCost, emptyTally, tallyQuantity } = require('./usage');
+const { parseCostRecord, tallyCost, emptyTally, tallyQuantity } = require('./usage');
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 
@@ -704,11 +704,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
   // fifty. Inland, isOwnArtifact re-asks nothing: it receives a set that could not be empty.
   const owners = requireIdentities(identities);
   let count = 0;
-  // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
-  // list price for the rounds billed to subscription quota. They are reported side by side and
-  // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
-  // subscription must not report one blended number that is true of neither.
-  const tallies = emptyTallies();
+  const cost = emptyTally();
   // [LAW:one-source-of-truth] The PR's CUMULATIVE AGENT TIME (zai-timing-31d.3), tallied on this same
   // pass and inside this same marker gate — so "which rounds count toward the total" has exactly one
   // definition, the one that already decides the round count and the cost. A second walk of the
@@ -804,15 +800,15 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
       }
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
-      // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
+      // [LAW:no-silent-failure] An agent round with a numeric figure is summed;
       // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
       // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
-      // that basis's total is an honest lower bound (+), never silently omitted.
+      // the total is an honest lower bound (+), never silently omitted.
       // ONE parse of the body feeding BOTH folds — the record carries the cost and the round's wall
       // clock together (they ride one marker), so reading it twice would be two chances to disagree
       // about what this body says. [LAW:one-source-of-truth]
       const record = parseCostRecord(body);
-      tallyCost(tallies, record === null ? null : record.cost);
+      tallyCost(cost, record === null ? null : record.cost);
       // [LAW:no-silent-failure] A round whose marker predates duration recording reports null and is
       // counted as UNRECORDED, never as zero: it happened, and its time is unknown. The renderer
       // (renderPrTime) states the count so the total reads as the lower bound it is.
@@ -821,7 +817,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, duration, reviews, latestArtifact, releaseFailureBodies };
+  return { count, cost, duration, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:

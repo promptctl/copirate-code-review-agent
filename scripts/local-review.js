@@ -197,7 +197,7 @@ function formatReport({ config, mode, files, result, sessions, repo, diffDir, to
   lines.push('');
 
   // [LAW:one-source-of-truth] The action's OWN cost renderer, not a second rendering of the same
-  // value — so a subscription run reads here exactly as it will read in the posted footer, and this
+  // value — so a run reads here exactly as it will read in the posted footer, and this
   // diagnostic cannot drift into disagreeing with production about what a run cost.
   const costLine = renderCostLine(result.usage, config);
   lines.push(costLine ? `usage: ${costLine.replace(/^_|_$/g, '')}` : 'usage: not reported');

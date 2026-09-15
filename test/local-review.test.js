@@ -144,8 +144,8 @@ test('formatReport surfaces the explore verdict, diff reads, beyond-diff reads, 
 });
 
 // Each credential kind gets its own label, so the report cannot reach for a field the other kind
-// carries — and so a subscription run says plainly that its cost is quota, not dollars.
-test('formatReport labels an oauth endpoint as subscription-billed', () => {
+// carries. The cost line is the API-price cost whatever the credential.
+test('formatReport labels an oauth endpoint as subscription-billed, and reports its API-price cost', () => {
   const report = formatReport({
     config: {
       name: 'auto→claude-subscription',
@@ -163,16 +163,15 @@ test('formatReport labels an oauth endpoint as subscription-billed', () => {
     result: {
       findings: [],
       summary: 'clean',
-      usage: { tokens: { inputCacheMiss: 1000, inputCacheHit: 0, output: 200 }, cost: { basis: 'subscription', notionalUsd: 63.59 } },
+      usage: { tokens: { inputCacheMiss: 1000, inputCacheHit: 0, output: 200 }, cost: { basis: 'dollars', usd: 63.59 } },
     },
     sessions: [],
     totalMs: 128000,
   });
   assert.match(report, /endpoint: oauth \(subscription\) → https:\/\/api\.anthropic\.com/);
   assert.match(report, /billed to plan quota, not per token/);
-  // The local diagnostic reads the same way the posted footer will: the list price is present, and
-  // labelled as not-billed rather than presented as spend.
-  assert.match(report, /Not billed \(Claude subscription\) · \$63\.5900 at Anthropic list price/);
+  // The local diagnostic reads the same way the posted footer will.
+  assert.match(report, /Cost: \$63\.5900/);
 });
 
 // [LAW:one-source-of-truth] formatReport looks a credential kind up in a label table, and PRESETS is
