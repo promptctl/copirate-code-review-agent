@@ -94,10 +94,10 @@ jobs:
           only shape that does.
 
           Do NOT re-enable this workflow to "just get one number". A run costs about a
-          day of one account's quota and competes with PR reviews on the same pool. Its
-          dollar figure is NOTIONAL, not billed — the pinned engine is a subscription and
-          baseline.json records costPerFullRunUsd: null. Quota and wall clock are the
-          real currency.
+          day of one account's quota and competes with PR reviews on the same pool. One
+          full suite costs about $360 at Anthropic API price. baseline.json records
+          costPerFullRunUsd: null only because that freeze predates 1.69.0; the null is
+          a gap in the record, not a cheaper run.
 
           The redesign, its measured levers, and the acceptance that lifts this ban are
           in ticket zai-eval-harness-5ux. Delete this step as part of THAT change.
