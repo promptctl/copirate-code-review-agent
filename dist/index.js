@@ -38359,6 +38359,20 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
     // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
     const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+    // [LAW:one-source-of-truth] A rejected post does not prove the review is absent: GitHub can commit it and
+    // still answer with a timeout or a 5xx. Delivering is not idempotent, so the host is asked instead of
+    // guessed at, through the same author-gated round count that produced `prior`. A round that appeared
+    // since this run read the PR is this run's review, and its marker already carries the spend; an
+    // unfinished notice on top of it would count the run twice. A read that fails too leaves the question
+    // unanswered, and the original error stands.
+    const landedDespite = async (err) => {
+      const after = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities).catch((readErr) => {
+        core.warning(`Could not confirm whether the review reached PR #${pullNumber} after posting failed (${readErr.message}).`);
+        throw err;
+      });
+      if (after.count === prior.count) throw err;
+      core.warning(`Posting the review reported an error (${err.message}), but the review is on PR #${pullNumber}; its spend is recorded there.`);
+    };
     // The ledger append is part of delivery, so a signal landing mid-post waits for it too.
     await guard.deliver(async () => {
       await submitReview(
@@ -38368,7 +38382,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
         // and the sink alone decides what they mean for approval.
         { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
         Boolean(reviewToken), transport, footer,
-      );
+      ).catch(landedDespite);
       await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
     });
   } catch (err) {

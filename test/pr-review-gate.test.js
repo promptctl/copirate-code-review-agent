@@ -383,4 +383,32 @@ describe('a run that spends and then fails', () => {
     assert.ok(host.reviews[0].body.trimEnd().endsWith(UNFINISHED_MARKER));
     assert.equal(parseCostRecord(host.reviews[0].body).cost.usd, 0.25);
   });
+
+  // The other half of an errored post: GitHub committed the review and the response was lost. The review's
+  // own marker already carries the spend, so a second, unfinished marker would count this run twice.
+  test('a review the host committed despite answering with an error is not recorded a second time', async () => {
+    host.files = patched;
+    host.engine = async ({ spend, chain }) => {
+      await spend.attempt(chain[0], async () => ({ usage: spent }));
+      return { review: { summary: 'Reviewed.', findings: [], unreviewedScopes: [], scopeFailures: [], exhaustedBounds: [], assessments: [], usage: spent }, configUsed: chain[0] };
+    };
+    const original = github.getOctokit;
+    github.getOctokit = (token) => {
+      const octokit = fakeOctokit(token);
+      octokit.rest.pulls.createReview = async (args) => {
+        host.reviews.push(args);
+        host.priorReviews = [...host.priorReviews, { id: 90 + host.reviews.length, state: 'COMMENTED', user: { login: 'github-actions[bot]', type: 'Bot' }, body: args.body }];
+        throw Object.assign(new Error('Server Error'), { status: 502 });
+      };
+      return octokit;
+    };
+    try {
+      await review();
+    } finally {
+      github.getOctokit = original;
+    }
+    assert.equal(host.reviews.length, 1);
+    assert.ok(!host.reviews[0].body.trimEnd().endsWith(UNFINISHED_MARKER));
+    assert.equal(parseCostRecord(host.reviews[0].body).cost.usd, 0.25);
+  });
 });
