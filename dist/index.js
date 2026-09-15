@@ -32425,7 +32425,7 @@ const os = __nccwpck_require__(857);
 const { parseRetryAfterMs, classifyTransient } = __nccwpck_require__(2887);
 const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = __nccwpck_require__(8861);
 const { makeCliAdapter } = __nccwpck_require__(2890);
-const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = __nccwpck_require__(9614);
+const { isAnthropicEndpoint, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = __nccwpck_require__(9614);
 const { resolveReasoningTier } = __nccwpck_require__(4652);
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -32691,33 +32691,22 @@ function meterUsage() {
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
-// and this is the ONE place its basis is resolved — every consumer downstream reads the basis rather
-// than re-deriving it from the config. Two facts decide it, in this order:
-//
-//   1. Does this config pay in plan QUOTA? An oauth credential is pinned to Anthropic's own baseUrl
-//      by PRESETS, so the run is genuinely Anthropic and total_cost_usd is the right Anthropic-priced
-//      number — but it is a LIST PRICE for tokens nobody was charged for. Tag it notional; never
-//      recompute it, and never let it reach a spend fold. Asking this first is what keeps
-//      isAnthropicEndpoint a plain hostname whitelist with no subscription special case.
-//   2. Otherwise, is the endpoint genuinely Anthropic? If so total_cost_usd is real spend (or
-//      'not-reported' when absent). If not (z.ai, deepseek, …) that figure is the WRONG VENDOR's, so
-//      it is ignored entirely and the cost comes from the provider's own price-table entry —
-//      'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+// and this is the ONE place it is resolved — every consumer downstream reads it rather than
+// re-deriving it from the config. One fact decides it: is the endpoint genuinely Anthropic? If so
+// total_cost_usd is Claude Code's own API-price figure (or 'not-reported' when absent), whichever
+// credential paid — a subscription token is pinned to Anthropic's host by PRESETS, so it takes this
+// arm too. If not (z.ai, deepseek, …) that figure is the WRONG VENDOR's, so it is ignored entirely and
+// the cost comes from the provider's own price-table entry — 'no-price' when the model is not yet
+// listed. [LAW:no-silent-failure]
 //
 // [LAW:types-are-the-program] Every figure this returns is checked with Number.isFinite, not
 // typeof==='number' (which accepts NaN), so a garbage total_cost_usd becomes an unreported figure and
 // never a NaN that later renders "$NaN" or poisons a total. The invariant is enforced here at the
 // source so no downstream consumer needs its own guard.
 // `startedAt` reaches only the price-table arm, and that is the whole story of which figures vary with
-// time: the two arms above take Claude Code's own Anthropic-priced number, which already knows when it
-// was computed. Only the arm that prices from OUR table needs to say when the tokens were spent.
+// time: the Anthropic arm takes Claude Code's own number, which already knows when it was computed.
+// Only the arm that prices from OUR table needs to say when the tokens were spent.
 function costFromEnvelope(env, config, buckets, startedAt) {
-  if (isSubscription(config)) {
-    return {
-      basis: 'subscription',
-      notionalUsd: Number.isFinite(env.total_cost_usd) ? env.total_cost_usd : null,
-    };
-  }
   if (isAnthropicEndpoint(config)) {
     return Number.isFinite(env.total_cost_usd)
       ? { basis: 'dollars', usd: env.total_cost_usd }
@@ -32730,8 +32719,8 @@ function costFromEnvelope(env, config, buckets, startedAt) {
 
 // [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died before its
 // result envelope: costFromEnvelope's own resolution, handed no envelope. A table-priced endpoint (z.ai,
-// DeepSeek) prices them exactly as a report would be priced; a subscription's list price and a genuine
-// Anthropic endpoint's figure exist only in the envelope, so they resolve as unreported.
+// DeepSeek) prices them exactly as a report would be priced; a genuine Anthropic endpoint's figure
+// exists only in the envelope, so it resolves as unreported.
 function priceMetered(tokens, config, startedAt) {
   return costFromEnvelope({}, config, tokens, startedAt);
 }
@@ -33252,8 +33241,6 @@ function tokensOfRequest(u) {
 // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
 // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
 // no card for a request) and telling them apart is the price table's job, not the adapter's.
-// The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
-// ever be billed to a subscription and this adapter has no notional arm to reach.
 // [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds it
 // every stdout line). Each thread/tokenUsage/updated is one model request's usage, seen once, so the
 // running total is their sum through the same parse and conversion extractUsage applies to the session
@@ -33635,8 +33622,6 @@ function assertSucceeded(stdout) {
 // total_cost_usd, so a missing figure surfaces "unknown" loudly. [LAW:one-type-per-behavior]
 // An observed numeric 0 (a provider OpenCode does not price) is a real {basis:'dollars', usd:0}; the
 // reported USD is OpenCode's estimate, so the renderer marks every cost line "est." [FRAMING:representation]
-// The basis is always 'dollars': opencode declares credentialKinds ['api-key'], so no opencode run
-// can be billed to a subscription and this adapter has no notional arm to reach.
 function extractUsage(stdout) {
   let sawTokens = false;
   let sawCost = false;
@@ -33805,6 +33790,7 @@ const { remainingMs } = __nccwpck_require__(6757);
 const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
 const { mintTokenCap } = __nccwpck_require__(7889);
 const { totalTokens } = __nccwpck_require__(9614);
+const { onSignalStop } = __nccwpck_require__(2507);
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
@@ -33840,8 +33826,9 @@ function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
 // from the ACTION's group: if the action dies first (workflow cancel, TIME_BUDGET_MINUTES 0, a
 // budget above the job's timeout-minutes), a group-based job kill no longer reaches the engine and
 // it can orphan on a persistent self-hosted/act_runner host, burning provider credits. The reaper
-// SIGKILLs every live group on process 'exit' and on SIGINT/SIGTERM (re-exiting with the
-// conventional code), so the engine dies with the action on every path the action can observe.
+// SIGKILLs every live group on process 'exit' and, as a shutdown STOP, the instant SIGINT/SIGTERM
+// lands (src/shutdown.js owns the exit that follows, after the run records what it spent), so the
+// engine dies with the action on every path the action can observe.
 // GitHub-hosted runners additionally evaporate the VM at job end — the reaper is what closes the
 // self-hosted gap. ESRCH is the goal state, never an error.
 const liveEngineGroups = new Set();
@@ -33856,12 +33843,7 @@ function installShutdownReaper() {
   if (reaperInstalled) return;
   reaperInstalled = true;
   process.on('exit', reapLiveEngineGroups);
-  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
-    process.on(signal, () => {
-      reapLiveEngineGroups();
-      process.exit(code);
-    });
-  }
+  onSignalStop(reapLiveEngineGroups);
 }
 
 function parseJsonEnvelope(stdout) {
@@ -34595,7 +34577,7 @@ module.exports = {
 
 "use strict";
 
-const { costMarker, parseCost, emptyTallies, tallyCost } = __nccwpck_require__(9614);
+const { costMarker, parseCost, emptyTally, tallyCost } = __nccwpck_require__(9614);
 
 // The append-only daily cost ledger: the persistent cross-run store of actual review spend, scoped to
 // one repo-day, that the budget gradient (zai-budget-qzm) reads before deciding this review's effort.
@@ -34635,10 +34617,8 @@ const LEDGER_MARKER = '<!-- agent-review-cost-ledger-entry -->';
 // because the day's ledger is exactly as repriceable-after-the-fact as the review is, and writing a
 // poorer record here would have made the ledger the one place a corrected price table could not
 // reach. [LAW:one-source-of-truth] one marker writer, one record, two sinks.
-// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL for every basis — a subscription review
-// records an entry like any other, and its exclusion from the day's dollars is the marker NAME
-// costMarker chose, never a caller that skips appendCost. A skipped append would make the
-// subscription's consumption invisible instead of merely unbilled. [LAW:no-silent-failure]
+// [LAW:dataflow-not-control-flow] The append is UNCONDITIONAL — every review records an entry,
+// whichever credential paid for it. [LAW:no-silent-failure]
 //
 // A ledger entry records what a review SPENT, and has no wall clock of its own to record: the day's
 // ledger is read by the budget gate, which asks about dollars, while agent time is asked about per PR
@@ -34667,22 +34647,16 @@ function utcDay(dateish) {
 // [LAW:no-silent-failure] An entry whose figure is 'unknown' or unparseable raises unknownCount,
 // never dropped, so the caller reports the day's spend as an honest lower bound rather than a
 // silently-partial sum — the same shape summarizePriorReviews returns for a PR.
-//
-// THE SPEND EXCLUSION, IN PRACTICE. A subscription review's entry carries the NOTIONAL marker, so it
-// lands in the `notional` tally and contributes nothing to `billed` — the day's dollar spend excludes
-// it BY CONSTRUCTION, not by a guard, and no `usd` field exists on its cost for this fold to read.
-// It is equally NOT an unknown billed entry: its spend is known exactly, and it is zero. The
-// subscription's consumption stays visible in `notional` rather than becoming invisible.
 function sumCostToday(comments, now) {
   const today = utcDay(now);
-  const tallies = emptyTallies();
+  const tally = emptyTally();
   for (const c of comments) {
     const body = typeof c.body === 'string' ? c.body : '';
     if (!body.trimStart().startsWith(LEDGER_MARKER)) continue;
     if (utcDay(c.created_at) !== today) continue;
-    tallyCost(tallies, parseCost(body));
+    tallyCost(tally, parseCost(body));
   }
-  return tallies;
+  return tally;
 }
 
 // [LAW:effects-at-boundaries] Effect: read the ledger issue's comments and return today's summed spend
@@ -34741,6 +34715,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, Tr
 const { remainingMs } = __nccwpck_require__(6757);
 const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
 const { mintTokenCap } = __nccwpck_require__(7889);
+const { mintSpendMeter } = __nccwpck_require__(6185);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
@@ -35319,9 +35294,10 @@ function pinnedProposal({ plan, changedPaths, log }) {
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
-// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return —
-// plus `schedule`, the pass's recorded shape (zai-timing-31d.5) — so every downstream sink stays
-// unchanged. [LAW:decomposition]
+// unit. Returns the {summary, findings} a single engine spawn used to return — plus `schedule`, the
+// pass's recorded shape (zai-timing-31d.5). What the pass SPENT is not on its return value: every
+// attempt is recorded in `spend`, the run's meter, as it settles, so a pass that throws or that
+// failover discards still leaves its spend with the run (runMultiScope folds it). [LAW:decomposition]
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
@@ -35331,7 +35307,7 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -35357,17 +35333,19 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // spawn ATTEMPT settles here, so every attempt leaves a tagged record — the successful spawn with
   // its full usage, a transiently-failed-then-retried attempt with the span it burned (err.span,
   // stamped by runEngine; the gap PR #134 deferred), and the settling failure (a deadline kill, an
-  // exhausted retry) with its span before the error escapes to whoever absorbs it. The pass total
-  // AND the schedule both derive from this one list, so no phase can appear in one and be forgotten
-  // by the other. [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
+  // exhausted retry) with its span before the error escapes to whoever absorbs it. The schedule
+  // derives from this one list, so no phase can appear in the run and be forgotten by the breakdown.
+  // [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
   // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label. Every
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
+  // Each attempt also settles through `spend.attempt`, the run's meter: the schedule is this pass's
+  // shape, the meter is the run's spend, and both read the one usage value the adapter stamped.
   const spawnRecords = [];
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
-        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap }),
+        () => spend.attempt(config, () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap })),
         {
           sleepFn,
           // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
@@ -35490,11 +35468,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // the go.mod-owning worker records any; dedupeAssessments (keyed by module) collapses the multi-go.mod
     // case — and the sweep-pass re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(outcomes.flatMap(o => o.assessments)),
-    // [LAW:one-source-of-truth] The pass total folds from the SAME record list the schedule reports,
-    // so "what this pass consumed" has one owner: a spawn in the schedule is in the total, and a
-    // spawn in the total is in the schedule — including retried attempts and deadline-killed scopes,
-    // whose span-only records widen the envelope exactly as a reviewed spawn's does.
-    usage: sumUsage(spawnRecords.map(r => r.usage)),
     // The pass's recorded shape (zai-timing-31d.5): the scheduling facts as actually used, plus one
     // record per spawn attempt. laneCount is the count the pool RAN — the plan's width under the
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
@@ -35559,7 +35532,11 @@ const SWEEP_LOG_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, BOUNDS[b]
 // [LAW:one-source-of-truth] `tokenCap` is the run's one token cap, and every config the chain fails over to
 // spends from it: failover restarts the pass, never the count. A caller that sets no cap gets an uncapped
 // one — the same code path with a limit that is never reached.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+// [LAW:one-source-of-truth] `spend` is the run's meter, shared the same way: the review's `usage` is folded
+// from it once the chain settles, so a pass failover retried is in the footer beside the pass that posted.
+// A caller that must read the spend of a run that THROWS (run.js) mints the meter and passes it in; a
+// caller that only reads a returned review gets its own.
+async function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
@@ -35570,7 +35547,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, spend, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -35582,7 +35559,8 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
   // byte-identical (remainingMs is Infinity there).
   const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  const result = await produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  return { ...result, review: { ...result.review, usage: sumUsage(spend.usages()) } };
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
@@ -37545,11 +37523,12 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName, announceUnfinished, renderUnfinishedBody } = __nccwpck_require__(7228);
 const { writeDiffFiles } = __nccwpck_require__(1352);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
-const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = __nccwpck_require__(3746);
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName, sumUsage } = __nccwpck_require__(3746);
+const { mintSpendMeter, attributedConfig, guardSpend } = __nccwpck_require__(6185);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = __nccwpck_require__(5120);
 const { assessDifficulty } = __nccwpck_require__(4260);
@@ -37699,7 +37678,16 @@ async function preflightChain(chain) {
 // diagnostics, findings are the product. Named here, an absent envelope is an absent schedule, an
 // absent total and an absent prior duration — three values the renderer already knows how to report
 // as gaps, the last of them as no cumulative clause at all. [LAW:no-silent-failure]
-function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
+// `spentOn` is the config the cost MARKER attributes the spend to (attributedConfig, src/spend.js), which
+// differs from `configUsed` only when a failover spread the run's spend across models or endpoints.
+function buildReviewFooter(usage, configUsed, priorCost, timing = {}) {
+  return `${buildAttributionFooter(configUsed)}\n\n${buildSpendFooter(usage, configUsed, priorCost, timing)}`;
+}
+
+// [LAW:decomposition] What a run SPENT, as the footer states it: the cost line, the timing block and the
+// cost marker. A posted review carries it under its attribution line; an unfinished-run notice carries it
+// alone, since no config reviewed anything. One builder, so the two bodies cannot record spend differently.
+function buildSpendFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null, spentOn = configUsed } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -37729,8 +37717,61 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
   // Recording is outside the try above on purpose — the render is the fragile part (formatting a
   // schedule), while `totalMs` is a number the run's own clock minted, and a failed BLOCK must not
   // also cost the next round its summand.
-  const marker = costMarker(usage, configUsed, totalMs);
-  return [buildAttributionFooter(configUsed), costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+  const marker = costMarker(usage, spentOn, totalMs);
+  return [costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+}
+
+// The failure output's statement of what a run spent before it stopped. [LAW:no-silent-failure] A run that
+// dies after spending must never read as a $0 run in its own log.
+function unfinishedSpendLine(cause, usage, config) {
+  const costLine = renderCostLine(usage, config);
+  return `${cause} It posted no review, and spent: ${costLine ? costLine.replace(/^_|_$/g, '') : 'an amount its engine did not report'}`;
+}
+
+// [LAW:effects-at-boundaries] Append a run's actual cost to the daily ledger, once its cost is known — after
+// a review submits, or when an unfinished run is recorded. Only when the budget gradient is active
+// (ledgerIssue set). [LAW:no-silent-failure] a failed append warns and continues: the day's ledger becomes a
+// known LOWER bound, never a run aborted for a bookkeeping write. The cost VALUE is the one the footer
+// already reported, never re-estimated.
+async function appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config }) {
+  if (ledgerIssue === null) return;
+  try {
+    await appendCost(octokit, owner, repo, ledgerIssue, usage, config);
+  } catch (e) {
+    core.warning(
+      `Budget: failed to append this run's cost to ledger issue #${ledgerIssue} (${e.message}) — `
+      + "the day's ledger now UNDER-counts by this run (a known lower bound). Verify issues:write access.",
+    );
+  }
+}
+
+// The PR sink for a run that spent and posted no review: guardSpend's `record` (src/spend.js), reached by a
+// throw or a signal. It names the spend in the run log, posts the unfinished notice whose cost marker the
+// PR's running total folds, and appends the ledger entry. A run whose attempts recorded no usage at all
+// ended before any engine ran; it spent nothing, so there is nothing to count.
+async function recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  const config = configs[configs.length - 1];
+  const spentOn = attributedConfig(configs, config);
+  core.error(unfinishedSpendLine(cause, usage, config));
+  const footer = buildSpendFooter(usage, config, prior.cost, { totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+  try {
+    await announceUnfinished(reviewOctokit, { owner, repo, pullNumber, commitId: headSha, body: renderUnfinishedBody(reviewerName, { cause, footer }) });
+    core.info(`Posted an unfinished-run notice to PR #${pullNumber}, recording this run's spend.`);
+  } catch (e) {
+    core.error(`Could not post the unfinished-run notice to PR #${pullNumber} (${e.message}); this PR's running total does not include this run's spend.`);
+  }
+  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config: spentOn });
+}
+
+// The repo-mode sink for the same exit: no PR and no ledger, so the run log is where the spend is named.
+async function logUnfinishedRepoRun({ spend, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  core.error(unfinishedSpendLine(cause, usage, configs[configs.length - 1]));
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
@@ -37826,36 +37867,11 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
-    // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
-    // nothing else. A subscription round's marker lands it in `notional`, a tally this line never
-    // reads — it cannot throttle a budget against money that was never spent. The tally shape is
-    // unit-blind (see emptyTally in src/usage.js); the unit is whatever the BUCKET means, which is
-    // why the bucket and not a field name is what keeps list price out of the day's spend.
-    spentToday = ledger.billed.total;
-    if (ledger.billed.unknownCount > 0) {
+    spentToday = ledger.total;
+    if (ledger.unknownCount > 0) {
       core.warning(
-        `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
+        `Budget: ledger issue #${issueNumber} has ${ledger.unknownCount} entr(ies) with unknown cost — `
         + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
-      );
-    }
-    // [LAW:no-silent-failure] Subscription consumption is reported, not hidden: the operator sees what
-    // the day's quota-billed reviews would have cost at list price, stated as the separate figure it
-    // is. It is emitted here and summed into nothing.
-    const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
-    if (notionalRounds > 0) {
-      // [LAW:no-silent-failure] The rounds counted and the dollars summed come from DIFFERENT
-      // populations: every notional round is counted, but only the ones that reported a list price
-      // are summed. Printing the figure bare would pass a partial total off as complete — the exact
-      // accounting lie this change exists to kill — so an unreported remainder is named, the same
-      // honesty the billed tally gets above. [LAW:dataflow-not-control-flow] the remainder selects a
-      // string; one unconditional render consumes it.
-      const unreported = ledger.notional.unknownCount > 0
-        ? `, a LOWER bound — ${ledger.notional.unknownCount} of them reported no list price`
-        : '';
-      core.info(
-        `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
-        + `dollars — $${ledger.notional.total.toFixed(4)} at Anthropic list price${unreported}. It is `
-        + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
   } catch (e) {
@@ -37970,7 +37986,7 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -38311,51 +38327,69 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
+  // [LAW:single-enforcer] From the first spawn until the review carrying its cost marker is handed to the
+  // host, the run's spend is guarded: a throw or a signal records it as an unfinished-run notice plus the
+  // ledger entry, so a run that dies after spending is still counted (guardSpend, src/spend.js).
+  const guard = guardSpend({
+    spend,
+    record: cause => recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }),
   });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  try {
+    const { review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    });
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
-  // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
-  // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
-  // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
-  // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
-  const { anchored, unanchored } = partitionFindings(review.findings, anchors);
-  for (const f of unanchored) {
-    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-  }
-
-  // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
-  // structured summaries the prompt note derived from — now enriched by the workers' per-module
-  // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
-  const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-  // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
-  // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration });
-  await submitReview(
-    reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
-    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
-    // and the sink alone decides what they mean for approval.
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
-    Boolean(reviewToken), transport, footer,
-  );
-
-  // [LAW:effects-at-boundaries] Append THIS review's actual cost to the daily ledger, AFTER submit — the
-  // cost is known only now. Only when the budget gradient is active (ledgerIssue set). [LAW:no-silent-failure]
-  // a failed append warns and continues: the day's ledger becomes a known LOWER bound, never a review
-  // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
-  if (ledgerIssue !== null) {
-    try {
-      await appendCost(octokit, owner, repo, ledgerIssue, review.usage, configUsed);
-    } catch (e) {
-      core.warning(
-        `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `
-        + "the day's ledger now UNDER-counts by this review (a known lower bound). Verify issues:write access.",
-      );
+    // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
+    // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
+    // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
+    // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
+    // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
+    const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+    for (const f of unanchored) {
+      core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
     }
+
+    // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
+    // structured summaries the prompt note derived from — now enriched by the workers' per-module
+    // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
+    const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
+    const spentOn = attributedConfig(spend.configs(), configUsed);
+    // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
+    // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
+    const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+    // [LAW:one-source-of-truth] A rejected post does not prove the review is absent: GitHub can commit it and
+    // still answer with a timeout or a 5xx. Delivering is not idempotent, so the host is asked instead of
+    // guessed at, through the same author-gated round count that produced `prior`. A round that appeared
+    // since this run read the PR is this run's review, and its marker already carries the spend; an
+    // unfinished notice on top of it would count the run twice. A read that fails too leaves the question
+    // unanswered, and the original error stands.
+    const landedDespite = async (err) => {
+      const after = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities).catch((readErr) => {
+        core.warning(`Could not confirm whether the review reached PR #${pullNumber} after posting failed (${readErr.message}).`);
+        throw err;
+      });
+      if (after.count === prior.count) throw err;
+      core.warning(`Posting the review reported an error (${err.message}), but the review is on PR #${pullNumber}; its spend is recorded there.`);
+    };
+    // The ledger append is part of delivery, so a signal landing mid-post waits for it too.
+    await guard.deliver(async () => {
+      await submitReview(
+        reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+        // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+        // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+        // and the sink alone decides what they mean for approval.
+        { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
+        Boolean(reviewToken), transport, footer,
+      ).catch(landedDespite);
+      await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
+    });
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
   }
 }
 
@@ -38363,7 +38397,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
 // `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
 // at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -38386,21 +38420,32 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     `Running multi-scope whole-repo review with ${chain.length} config(s) in chain`
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
-  });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  // The same spend guard runPrReview holds, with the run log as its sink: this mode has no PR and no ledger.
+  const guard = guardSpend({ spend, record: cause => logUnfinishedRepoRun({ spend, cause }) });
+  let report;
+  let review;
+  try {
+    let configUsed;
+    ({ review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    }));
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
-  const report = renderRepoReport({ reviewerName, scope, review, footer });
-
-  // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
-  // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
-  // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
-  // is written first so findings are never lost if the Step Summary write fails (e.g. an
-  // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
-  core.info(report);
+    const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt, spentOn: attributedConfig(spend.configs(), configUsed) });
+    report = renderRepoReport({ reviewerName, scope, review, footer });
+    // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
+    // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
+    // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
+    // is written first so findings are never lost if the Step Summary write fails (e.g. an
+    // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
+    await guard.deliver(() => core.info(report));
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
+  }
   core.info(`Whole-repo review complete: ${review.findings.length} finding(s).`);
   await core.summary.addRaw(report).write();
 }
@@ -38461,11 +38506,14 @@ async function run() {
     return;
   }
   const effort = defaultEffortProfile({ roundCap });
+  // The run's spend meter, minted at the same boundary as the token cap and threaded the same way: every
+  // spawn attempt of whichever mode runs is recorded in it, and every exit reads it (src/spend.js).
+  const spend = mintSpendMeter();
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
@@ -38877,6 +38925,220 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 /***/ }),
 
+/***/ 2507:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const core = __nccwpck_require__(7484);
+
+// [LAW:no-ambient-temporal-coupling] The ONE owner of how this process ends on a signal. Two kinds of
+// work run, in an order that is a property of this module and never of who happened to register first:
+// STOPS run synchronously the instant the signal lands (killing engine process groups, so nothing keeps
+// spending), then FINALIZERS run concurrently to record what the run can still record, and then the
+// process exits with the signal's conventional code.
+//
+// It exists because the order used to be luck. Signal listeners fire in registration order, and the
+// engine reaper's listener called process.exit synchronously, so any later listener that needed an
+// await — posting what a cancelled run spent — was killed before its request left.
+//
+// The bound is the runner's, not a tuning knob: a cancelled GitHub Actions step (a newer push under
+// cancel-in-progress, or timeout-minutes) is sent SIGINT, then SIGTERM 7.5s later, then SIGKILL 2.5s
+// after that. SHUTDOWN_CEILING_MS sits under the first gap, so a shutdown the SIGINT starts exits on its
+// own terms before the runner escalates. It is a termination ceiling: finalizers that finish sooner exit
+// sooner, and a finalizer that hangs cannot hold the process past it.
+const SHUTDOWN_CEILING_MS = 7_000;
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+
+// [LAW:no-shared-mutable-globals] Both registries are owned here and changed only through the two
+// registration functions below; nothing else reads them.
+const stops = new Set();
+const finalizers = new Set();
+let installed = false;
+let shuttingDown = false;
+
+// Resolves once `promise` settles or `ms` passes, whichever is first, to whether it settled in time.
+// Never rejects: a rejection is the promise's own caller's to report.
+function within(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    const settle = () => { clearTimeout(timer); resolve(true); };
+    promise.then(settle, settle);
+  });
+}
+
+async function shutDown(signal) {
+  for (const stop of stops) {
+    try {
+      stop();
+    } catch (e) {
+      core.error(`Shutdown on ${signal}: a stop step threw (${e.message}); continuing to the rest of shutdown.`);
+    }
+  }
+  // [LAW:no-silent-failure] A finalizer that throws is named, and one that outlives the ceiling is named,
+  // so a run that exits without recording what it meant to record says so in its last log lines.
+  const finished = Promise.all([...finalizers].map(finalize => Promise.resolve()
+    .then(() => finalize(signal))
+    .catch(e => core.error(`Shutdown on ${signal}: a finalizer failed: ${e.message}`))));
+  if (!(await within(finished, SHUTDOWN_CEILING_MS))) {
+    core.error(`Shutdown on ${signal}: finalizers did not finish within ${SHUTDOWN_CEILING_MS}ms; exiting without them.`);
+  }
+  process.exit(SIGNAL_EXIT_CODES[signal]);
+}
+
+function install() {
+  if (installed) return;
+  installed = true;
+  for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.on(signal, () => {
+      // The runner follows SIGINT with SIGTERM while the first shutdown may still be recording. That
+      // shutdown already owns the exit; a second would exit before the first finished.
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void shutDown(signal);
+    });
+  }
+}
+
+// Register a synchronous step that must run the moment a signal lands, before any finalizer.
+function onSignalStop(stop) {
+  install();
+  stops.add(stop);
+}
+
+// Register an async finalizer, called with the signal's name. Returns the function that unregisters it.
+function onSignalFinalize(finalize) {
+  install();
+  finalizers.add(finalize);
+  return () => finalizers.delete(finalize);
+}
+
+module.exports = { SHUTDOWN_CEILING_MS, SIGNAL_EXIT_CODES, within, onSignalStop, onSignalFinalize };
+
+
+/***/ }),
+
+/***/ 6185:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { within, onSignalFinalize } = __nccwpck_require__(2507);
+
+// [FRAMING:parts-and-seams] What one run has SPENT: the usage record of every engine spawn attempt it
+// made — the scout, every worker and sweep, every spawn-level retry, every pass a failover discarded, and
+// every config a failover reached. It is minted ONCE at the run boundary, beside the token cap, and read by
+// whichever exit the run takes: the posted review's footer, the notice a failed or cancelled run leaves,
+// and the daily ledger.
+//
+// Before it existed the pass owned its spawn records, so three exits took their spend with them: a pass
+// that threw, a pass failover retried, and a run a signal killed. [LAW:no-silent-failure]
+//
+// [LAW:no-shared-mutable-globals] Spend accrues while engines run, in several lanes at once, so this is
+// OWNED mutable state with one API, like the token cap. attempt() is the only writer, and it records
+// whichever way the attempt settles, from the usage the adapter seam stamps on its result or its error.
+//
+// [LAW:no-ambient-temporal-coupling] close() is the one phase change: it refuses every attempt not yet
+// started and resolves once every started attempt has settled and been recorded, so "all the spend is
+// in" is a state a reader awaits, never a sleep it hopes was long enough.
+function mintSpendMeter() {
+  const spent = [];
+  let inFlight = 0;
+  let closed = false;
+  const settledWaiters = [];
+  return {
+    async attempt(config, run) {
+      if (closed) throw new Error('Engine spawn refused: this run is ending, and its spend is being recorded.');
+      inFlight++;
+      try {
+        const result = await run();
+        spent.push({ config, usage: result.usage });
+        return result;
+      } catch (err) {
+        // The adapter seam stamps every error with what the attempt spent: null when nothing ran.
+        spent.push({ config, usage: err.usage });
+        throw err;
+      } finally {
+        inFlight--;
+        if (inFlight === 0) settledWaiters.splice(0).forEach(resolve => resolve());
+      }
+    },
+    close() {
+      closed = true;
+      return inFlight === 0 ? Promise.resolve() : new Promise(resolve => settledWaiters.push(resolve));
+    },
+    // One usage record per settled attempt, in the order they settled; sumUsage folds them.
+    usages: () => spent.map(s => s.usage),
+    // The configs the recorded attempts ran on, each once, in first-use order.
+    configs: () => [...new Set(spent.map(s => s.config))],
+  };
+}
+
+// [LAW:types-are-the-program] The config a cost MARKER attributes a spend to. A marker records one model and
+// one endpoint, and a later audit reprices the recorded tokens at that model's card. Spend that ran on
+// configs sharing a model and an endpoint is attributed to the last of them. Spend a failover spread across
+// models or endpoints has no single answer, so the marker states neither rather than repricing one config's
+// tokens at another's rates; the figure itself is unaffected, since every spawn was priced by its own config.
+// A run that recorded no attempt spent nothing on any config, so its marker is attributed to `fallback`,
+// the config the run would have reported anyway.
+function attributedConfig(configs, fallback) {
+  if (configs.length === 0) return fallback;
+  const last = configs[configs.length - 1];
+  const baseUrl = c => c.endpoint && c.endpoint.baseUrl;
+  const shared = configs.every(c => c.model === last.model && baseUrl(c) === baseUrl(last));
+  return shared ? last : { ...last, model: undefined, endpoint: undefined };
+}
+
+// A reaped engine settles within milliseconds of its SIGKILL. This ceiling exists only so an adapter that
+// never settles cannot cost the run its record: past it, whatever has settled is recorded.
+const SPAWN_SETTLE_CEILING_MS = 2_000;
+
+// [LAW:single-enforcer] The ONE place a run's spend is recorded when no posted review carries it. A run's
+// review path is wrapped from its first spawn until its review has been delivered, and
+// whichever exit comes first — a throw or a signal — claims the record. There is exactly one record:
+// the claim is a promise, so a signal landing while a throw is still posting awaits that same post
+// rather than starting a second one, and a throw that follows a signal-killed pass does the same.
+//
+// [LAW:no-ambient-temporal-coupling] DELIVERY is the other claim, and it is a promise too, so the two
+// exits exclude each other as states rather than by timing. deliver(send) hands the review to the host
+// and is refused once a record is claimed: a signal that killed the engines lets the pass resolve with the
+// findings its workers recorded, and delivering that review as well would put two markers for one spend
+// on the PR. A signal that lands once delivery has begun returns the delivery itself, so shutdown awaits
+// the post rather than exiting under it; a delivery the host refuses records the spend as a failure,
+// inside that same awaited promise. `send` covers everything the delivered run still owes, the ledger
+// entry included, because the process exits as soon as the promise a signal returned settles.
+//
+// `record(cause)` is the mode's own sink (a PR notice plus the ledger, or a log line in repo mode).
+// `onSignal` is the registration seam, injected so the signal arm is testable without signalling the
+// test process. [LAW:effects-at-boundaries]
+function guardSpend({ spend, record, onSignal = onSignalFinalize }) {
+  let recording = null;
+  let delivery = null;
+  const claim = (cause) => {
+    recording ??= within(spend.close(), SPAWN_SETTLE_CEILING_MS).then(() => record(cause));
+    return recording;
+  };
+  const failed = (err) => claim(`The run failed: ${err.message}`);
+  const unregister = onSignal((signal) => delivery
+    ?? claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`));
+  return {
+    deliver(send) {
+      if (recording !== null) {
+        return Promise.reject(new Error('The review was not delivered: the run is ending, and its spend is being recorded as unfinished.'));
+      }
+      delivery = Promise.resolve().then(send).catch(err => failed(err).then(() => { throw err; }));
+      return delivery;
+    },
+    failed,
+    done: unregister,
+  };
+}
+
+module.exports = { mintSpendMeter, attributedConfig, guardSpend, SPAWN_SETTLE_CEILING_MS };
+
+
+/***/ }),
+
 /***/ 7889:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -38990,7 +39252,7 @@ const { parseUnifiedDiff, parseReviewableFiles, reconcileChangedSet } = __nccwpc
 // flattenBody is imported for the pairPushbacks BOUNDARY (stamping author-written comment text), not
 // for any sink in this file — the sinks below receive values already stamped. [LAW:parse-dont-validate]
 const { severityTag, findingLineText, flattenBody, codeSpan } = __nccwpck_require__(1565);
-const { parseCostRecord, emptyTallies, tallyCost, emptyTally, tallyQuantity } = __nccwpck_require__(9614);
+const { parseCostRecord, tallyCost, emptyTally, tallyQuantity } = __nccwpck_require__(9614);
 
 const REVIEW_MARKER = '<!-- copirate-code-review-agent -->';
 
@@ -39013,12 +39275,23 @@ const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed
 // the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
 // a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a bound (the time
 // budget or the token cap) reached before any scope completes, is deliberately NOT here: it already
-// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already. What it spent
+// is recorded by the unfinished notice below, which every throwing run that spent leaves.
 //
 // [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
 // list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
 // than a string that survives to the marker boundary and fails there.
 const NOT_REVIEWED_REASONS = Object.freeze({ FORK: 'fork', ROUND_CAP: 'round-cap' });
+// [LAW:types-are-the-program] The THIRD thing this action can leave on a PR: a run that SPENT and posted no
+// review, because it threw or was stopped by a signal. It is neither of the other two. It is not a round (no
+// review of this commit exists), and unlike a not-reviewed notice it carries a cost marker, because its whole
+// job is to put the spend where spend is read — the PR's running total, which summarizePriorReviews folds
+// from these bodies. A failing run was already loud; what it was not was COUNTED. [LAW:no-silent-failure]
+//
+// Disjoint from both markers by construction: it does not end with REVIEW_MARKER, and it carries no
+// `:not-reviewed:` segment for NOT_REVIEWED_MARKER_RE to match.
+const UNFINISHED_MARKER = '<!-- copirate-code-review-agent:unfinished -->';
+const UNFINISHED_MESSAGE = '⚠️ **REVIEW DID NOT FINISH** — this run spent tokens and posted no review.';
 // The headline is fixed prose, identical for every reason, so a reader (or a grep) recognizes the state
 // before parsing the cause. It deliberately shares no vocabulary with APPROVED_MESSAGE.
 const NOT_REVIEWED_MESSAGE = '⚠️ **NOT REVIEWED** — this action did not review this pull request.';
@@ -39356,6 +39629,7 @@ const NOT_REVIEWED_MARKER_RE = new RegExp(
 function parseAgentArtifact(rawBody) {
   const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
   if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
+  if (body.endsWith(UNFINISHED_MARKER)) return { kind: 'unfinished' };
   const m = NOT_REVIEWED_MARKER_RE.exec(body);
   // The notice arm carries its BODY, because that is what announceNotReviewed de-duplicates on: "the
   // newest artifact says byte-for-byte what I am about to say". Keying on the reason alone let a notice
@@ -39678,11 +39952,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
   // fifty. Inland, isOwnArtifact re-asks nothing: it receives a set that could not be empty.
   const owners = requireIdentities(identities);
   let count = 0;
-  // [LAW:one-type-per-behavior] Two tallies of one shape — dollars actually spent, and Anthropic
-  // list price for the rounds billed to subscription quota. They are reported side by side and
-  // NEVER added: a PR whose early rounds ran on a paid API and whose later rounds ran on the
-  // subscription must not report one blended number that is true of neither.
-  const tallies = emptyTallies();
+  const cost = emptyTally();
   // [LAW:one-source-of-truth] The PR's CUMULATIVE AGENT TIME (zai-timing-31d.3), tallied on this same
   // pass and inside this same marker gate — so "which rounds count toward the total" has exactly one
   // definition, the one that already decides the round count and the cost. A second walk of the
@@ -39766,23 +40036,27 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
         // match an equally-absent trusted id. [LAW:one-source-of-truth]
         latestArtifact = { ...artifact, postedBy: { id: r.user?.id, login: r.user?.login } };
       }
-      // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
-      // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
-      // counting it would push a PR past its cap using a review that never happened.
-      if (artifact.kind !== 'review') continue;
-      count++;
-      reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      // [LAW:dataflow-not-control-flow] The branches are the artifact type's own discriminator. A
+      // not-reviewed notice contributes to `latestArtifact` alone: it recorded no round and spent no
+      // money, so counting it would push a PR past its cap using a review that never happened. An
+      // unfinished notice is not a round either, but it SPENT, so it is folded into the cost and time
+      // below exactly as a round is — that fold is the reason it was posted.
+      if (artifact.kind === 'not-reviewed') continue;
+      if (artifact.kind === 'review') {
+        count++;
+        reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      }
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
-      // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
+      // [LAW:no-silent-failure] An agent round with a numeric figure is summed;
       // any other case — an explicit 'unknown' marker, a pre-feature review with no marker, or a
       // malformed value that won't parse — is a round whose cost we don't have, counted as unknown so
-      // that basis's total is an honest lower bound (+), never silently omitted.
+      // the total is an honest lower bound (+), never silently omitted.
       // ONE parse of the body feeding BOTH folds — the record carries the cost and the round's wall
       // clock together (they ride one marker), so reading it twice would be two chances to disagree
       // about what this body says. [LAW:one-source-of-truth]
       const record = parseCostRecord(body);
-      tallyCost(tallies, record === null ? null : record.cost);
+      tallyCost(cost, record === null ? null : record.cost);
       // [LAW:no-silent-failure] A round whose marker predates duration recording reports null and is
       // counted as UNRECORDED, never as zero: it happened, and its time is unknown. The renderer
       // (renderPrTime) states the count so the total reads as the lower bound it is.
@@ -39791,7 +40065,7 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
     if (data.length < 100) break;
     page++;
   }
-  return { count, cost: tallies, duration, reviews, latestArtifact, releaseFailureBodies };
+  return { count, cost, duration, reviews, latestArtifact, releaseFailureBodies };
 }
 
 // [LAW:effects-at-boundaries] Pure, split from the fetch below so it is testable without a fake API:
@@ -40178,6 +40452,30 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   return 'posted';
 }
 
+// [LAW:effects-at-boundaries] Pure: the body of an unfinished-run notice. `footer` is the run's spend footer
+// (cost line, timing, cost marker) from the same builder a review's footer comes from, so the marker this
+// body carries is one summarizePriorReviews already folds. [LAW:one-source-of-truth]
+function renderUnfinishedBody(reviewerName, { cause, footer }) {
+  return `## ${reviewerName}\n\n${UNFINISHED_MESSAGE}\n\n${cause}\n\n`
+    + 'This is not a review: no findings were posted, and the head commit stands unreviewed. This notice '
+    + "records what the run spent, so it counts in this pull request's running total and, when a cost "
+    + `ledger is configured, in the day's ledger.\n\n${footer}\n\n${UNFINISHED_MARKER}`;
+}
+
+// Post the notice as a COMMENT review: the channel this action's other artifacts use, so the one
+// listReviews pass that counts rounds also folds this spend. Never REQUEST_CHANGES, since nothing was
+// reviewed. A host error propagates to the run boundary, which names it. [LAW:no-silent-failure]
+async function announceUnfinished(octokit, { owner, repo, pullNumber, commitId, body }) {
+  await octokit.rest.pulls.createReview({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    commit_id: commitId,
+    event: 'COMMENT',
+    body,
+  });
+}
+
 // [LAW:effects-at-boundaries] Pure: the dismissal message, which is the only place a reader learns why a
 // blocking verdict stopped blocking. It carries the SAME cap sentence the not-reviewed notice carries,
 // passed in rather than recomposed, so the PR cannot state two different remedies. [LAW:one-source-of-truth]
@@ -40439,6 +40737,10 @@ module.exports = {
   parseReviewerName,
   DEFAULT_REVIEWER_NAME,
   REVIEW_MARKER,
+  UNFINISHED_MARKER,
+  UNFINISHED_MESSAGE,
+  renderUnfinishedBody,
+  announceUnfinished,
 };
 
 
@@ -41070,34 +41372,16 @@ function priceFromTable(spawn, model) {
   return Number.isFinite(usd) ? { basis: 'dollars', usd } : { basis: 'unpriced', reason: 'schedule-gap' };
 }
 
-// [LAW:types-are-the-program] THE COST VALUE. A review's cost is discriminated by its BASIS — the
-// question "was this paid in dollars at all?" — because a subscription run's figure is a real,
-// exactly-known number that is nonetheless NOT spend:
+// [LAW:types-are-the-program] THE COST VALUE: what a run's API usage costs at API price, or why that
+// figure cannot be known.
 //
-//   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
-//   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
-//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported' }   dollars, but the figure is unrecoverable
+//   { basis: 'dollars',  usd }                                         the API-price cost of the usage
+//   { basis: 'unpriced', reason: 'no-price'|'schedule-gap'|'not-reported' }   the figure is unrecoverable
 //
-// The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
-// subscription run at all: `available:false` says "we do not know", when in fact we know the number
-// exactly and it simply is not a charge — so the figure landed in `usd` and every fold downstream
-// (PR total, daily ledger, the DAILY_BUDGET_USD gate) added notional dollars to real spend.
-//
-// The exclusion is STRUCTURAL, not a rule. The notional figure lives under a DIFFERENT NAME on a
-// DIFFERENT arm, so a spend fold has no `usd` to read on a subscription cost and cannot pick it up
-// even by mistake. One `usd` field shared by both bases plus "remember to check the basis first"
-// would be a rule, and a rule gets forgotten exactly once, silently, inside a total.
-// [LAW:no-silent-failure] `notionalUsd: null` is the honest fourth state — billed to quota, list
-// price not reported — never a fabricated 0.00, which would read as "this was free AND we know it".
-
-// [LAW:single-enforcer] The one predicate answering "does this config pay in plan quota rather than
-// dollars?", derived from the credential KIND — never from the hostname. PRESETS pins every oauth
-// credential to Anthropic's own baseUrl (assertPresetsSafe, src/provider.js), so an oauth run IS an
-// Anthropic run by construction; that is why this decides the basis BEFORE isAnthropicEndpoint's
-// whitelist rather than beside it, and why the whitelist below needs no subscription special case.
-function isSubscription(config) {
-  return config.endpoint?.credential?.kind === 'oauth';
-}
+// How the usage was paid for does not enter it. A run authenticated by a Claude subscription token
+// costs what the same tokens cost through the API, so it is a dollars cost like any other.
+// [LAW:no-silent-failure] An unrecoverable figure is `unpriced` with its reason, never a fabricated
+// 0.00, which would read as "this was free AND we know it".
 
 // Claude Code self-reports total_cost_usd using Anthropic's price table, so that figure is this
 // run's billing basis ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE
@@ -41182,8 +41466,7 @@ function reviewerTag(config) {
 // The RECORD alternative admits no '>' at all, which is what makes it safe to embed in an HTML
 // comment: '-->' contains '>', so an encoded payload CANNOT terminate the comment early. That is a
 // property of the grammar rather than a rule the writer must remember — see encodePayload.
-// [LAW:one-source-of-truth] ONE value grammar, shared by both marker names below, so a marker that
-// the notional reader accepts can never be one the spend reader would have rejected.
+// [LAW:one-source-of-truth] ONE value grammar, shared by every marker name the reader accepts.
 const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown|\\{[^>]*\\})';
 
 // [LAW:parse-dont-validate] The one crossing between a cost record and marker text, in both
@@ -41219,86 +41502,29 @@ function decodePayload(raw) {
   }
 }
 
-// [LAW:types-are-the-program] THE SPEND EXCLUSION, MADE STRUCTURAL. A subscription review writes a
-// DIFFERENTLY NAMED marker carrying a DIFFERENTLY NAMED figure field, so every spend reader —
-// parseCostMarker here, sumCostToday in ledger.js, summarizePriorReviews in transport.js — has
-// literally nothing to read on it: no `usd` under either name. The notional dollars are kept out of
-// the daily spend by the shape, not by a guard someone must remember to write, and a future reader
-// who adds a fourth spend fold inherits the exclusion for free.
-//
-// [LAW:one-source-of-truth] ONE table of what each basis IS, for accounting purposes: which marker
-// name carries it, which tally bucket it lands in, and where its figure lives. A separate table per
-// consumer could drift — a basis marked notional by the writer and billed by the tally would put
-// notional dollars straight back into spend, which is the whole bug. One row, one answer.
-// [LAW:dataflow-not-control-flow] The basis selects data (a name, a key, an accessor); the same
-// render and the same fold then run for every basis. No arm skips writing a marker, so every review
-// round stays countable — a subscription round is a round whose SPEND is known to be zero, not a
-// missing one. An absent cost (no usage at all) is accounted as an unpriced one.
-//
-// `field` is the record key the figure is written under, and it carries THE SPEND EXCLUSION one
-// level deeper than the marker name does: inside the payload the notional dollars are `notionalUsd`,
-// so even a reader that decoded a record and went looking for `usd` finds nothing on a subscription
-// round. Same discipline as the two marker names, applied to the two field names.
-//
-// THE AUTH KIND IS THIS COLUMN, NOT A FIELD. zai-billing-xl0.3 needs to bucket spend by auth method
-// (api-key vs subscription), and the basis already answers it exactly: costFromEnvelope resolves
-// `subscription` from, and only from, an oauth credential, so subscription ⟺ oauth and
-// dollars|unpriced ⟺ api-key, with no third case. Storing an `auth` field beside the basis would be
-// a second clock for one fact — free to drift, and the direction it drifts is a review attributed to
-// the wrong payment method inside a total. [LAW:one-source-of-truth] Read it off the parsed basis.
-//
-// `toCost` is the read-side inverse of `figure`: a decoded figure (or null) back into the same
-// discriminated Cost the writer held. It lives in the table for the reason every other column does —
-// so "which basis is this" is answered once, and the answer carries everything that follows from it.
-//
-// `restate` is what a parsed record's own facts reprice to under today's table (restatedCost), and
-// it is a column for the same reason: a subscription round records real tokens and an Anthropic
-// model id, so a restatement that consulted the table regardless of basis would answer `no-price`
-// and send a maintainer to add a model the table can never price — the misattribution this file
-// exists to prevent, one arm over. The basis selects the restatement as it selects everything else.
-const BASIS = {
-  dollars: {
-    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: c => c.usd,
-    toCost: f => (f === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: f }),
-    restate: record => restatedFromTable(record),
-  },
-  subscription: {
-    marker: 'agent-review-notional-usd', bucket: 'notional', field: 'notionalUsd', figure: c => c.notionalUsd,
-    toCost: f => ({ basis: 'subscription', notionalUsd: f }),
-    // The list price is Claude Code's own figure, which no row of this table can move: the
-    // restatement is the record's cost, never a table reason. [LAW:one-source-of-truth]
-    restate: record => record.cost,
-  },
-  // Shares the dollars marker NAME, which keeps an unpriced round inside the spend accounting as a
-  // round of unknown cost. No marker name reads back to this row (the dollars row's toCost yields
-  // this basis for a figureless marker), but a parsed unpriced cost restates through it — as
-  // dollars does, since a card the table has gained since the run is what an audit should find.
-  unpriced: {
-    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: () => null,
-    toCost: f => BASIS.dollars.toCost(f),
-    restate: record => BASIS.dollars.restate(record),
-  },
-};
-
-function basisOf(cost) {
-  return BASIS[cost && cost.basis] || BASIS.unpriced;
+// The figure a cost carries: its dollars, or null when it has none. An absent cost (no usage at all)
+// has none either. The writer records it and the tallies fold it, through this one accessor.
+function costFigure(cost) {
+  return cost && cost.basis === 'dollars' ? cost.usd : null;
 }
 
-// [LAW:one-source-of-truth] The reader's inverse of the writer's marker-name choice, derived from
-// the same table rather than restated, so a name the writer emits is always a name the reader knows.
-const BASIS_BY_MARKER = {
-  [BASIS.dollars.marker]: BASIS.dollars,
-  [BASIS.subscription.marker]: BASIS.subscription,
+const COST_MARKER = 'agent-review-cost-usd';
+
+// [LAW:parse-dont-validate] The marker names a reader accepts, each with the record key its figure is
+// written under. Reviews and ledger entries posted before 1.69.0 recorded a Claude subscription run
+// under `agent-review-notional-usd` / `notionalUsd`. That figure is Claude Code's own API-price cost for
+// the run's tokens, so it reads back as the dollars it is: those bodies are permanent, and ignoring
+// them would drop real cost from every PR total and from the day's ledger. The writer emits only
+// COST_MARKER.
+const FIGURE_FIELD_BY_MARKER = {
+  [COST_MARKER]: 'usd',
+  'agent-review-notional-usd': 'notionalUsd',
 };
 
-// [LAW:one-source-of-truth] Both marker names in ONE alternation, built from the BASIS table the
-// writer picks them from — so the reader can never recognize a name the writer stopped emitting.
-// One scan over both names is what makes the last-match rule hold ACROSS them: asking "is there a
-// notional marker anywhere?" before looking at the spend marker reintroduced exactly the bug
-// lastMatch exists to prevent — a dollars review whose prose quoted a notional marker was read as a
-// subscription review, and its real spend silently left every fold. Position decides, not precedence.
+// [LAW:single-enforcer] Every accepted marker name in ONE alternation, so the last-match rule holds
+// across names: a review whose prose quotes one marker cannot hijack the footer's own.
 const ANY_MARKER_RE = new RegExp(
-  `<!-- (${BASIS.dollars.marker}|${BASIS.subscription.marker}):${MARKER_VALUE} -->`, 'g');
+  `<!-- (${Object.keys(FIGURE_FIELD_BY_MARKER).join('|')}):${MARKER_VALUE} -->`, 'g');
 
 // [LAW:parse-dont-validate] THE COST RECORD — the crossing from a live run's values into the durable
 // facts a marker carries, and the one place absence is recorded AS absence. A fact that was never
@@ -41331,12 +41557,10 @@ const ANY_MARKER_RE = new RegExp(
 // prose, and a second last-match rule — for a fact that is recorded at the same instant, by the same
 // writer, about the same round. [LAW:one-type-per-behavior] One marker, one payload, N facts.
 function costRecord(usage, config, totalMs) {
-  const cost = usage && usage.cost;
-  const basis = basisOf(cost);
-  const figure = recordedQuantity(basis.figure(cost));
+  const figure = recordedQuantity(costFigure(usage && usage.cost));
   const span = recordedSpan(usage && usage.span);
   return {
-    [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
+    usd: recorded(figure === null ? null : Number(figure.toFixed(6))),
     parts: recorded(usage ? partsOf(usage, PRICES_PER_MILLION[config.model]) : null),
     model: recorded(recordedString(config.model)),
     provider: recorded(recordedString(providerIdentity(config))),
@@ -41441,7 +41665,7 @@ function coalesceParts(parts, entry) {
 // sink that stops recording a duration it has says so in its own source, instead of losing the fact
 // to an argument nobody wrote. [LAW:no-silent-failure]
 function costMarker(usage, config, totalMs) {
-  return `<!-- ${basisOf(usage && usage.cost).marker}:${encodePayload(costRecord(usage, config, totalMs))} -->`;
+  return `<!-- ${COST_MARKER}:${encodePayload(costRecord(usage, config, totalMs))} -->`;
 }
 
 // [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
@@ -41562,14 +41786,14 @@ function parseCostRecord(body) {
   const m = lastMatch(body, ANY_MARKER_RE);
   if (m === null) return null;
   const [, name, raw] = m;
-  const basis = BASIS_BY_MARKER[name];
-  const facts = payloadFacts(raw, basis.field);
-  const figure = facts[basis.field];
+  const field = FIGURE_FIELD_BY_MARKER[name];
+  const facts = payloadFacts(raw, field);
+  const figure = recordedQuantity(facts[field]);
   // The wire form is the discriminator: a record carrying `parts` is read as parts and nothing else;
   // one that predates them carries `tokens`, the sum, and is read as the one part that sum proved.
   const parts = facts.parts === undefined ? legacyParts(facts.tokens) : recordedParts(facts.parts);
   return {
-    cost: basis.toCost(recordedQuantity(figure)),
+    cost: figure === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: figure },
     parts,
     // DERIVED from the parts, never read off the wire beside them: a token total stored next to the
     // parts it sums is the second clock. Null when nothing repriceable was recorded, exactly as
@@ -41613,47 +41837,28 @@ function restatedFromTable(record) {
 }
 
 function restatedCost(record) {
-  return basisOf(record.cost).restate(record);
+  return restatedFromTable(record);
 }
 
-// The spend reader: the dollars figure alone, 'unknown' when a spend-basis marker recorded none, and
-// null when the body carries no spend marker at all. A subscription review is invisible to it by
-// construction — its record lands on the notional basis, which has no `usd` — see THE SPEND
-// EXCLUSION above.
+// The figure reader: the dollars alone, 'unknown' when the marker recorded none, and null when the
+// body carries no cost marker at all.
 function parseCostMarker(body) {
   const record = parseCostRecord(body);
-  if (record === null || record.cost.basis === 'subscription') return null;
+  if (record === null) return null;
   return record.cost.basis === 'dollars' ? record.cost.usd : 'unknown';
 }
 
-// [LAW:one-source-of-truth] SUMMING IS THE ONE PLACE the "never add across bases" rule lives. A
-// dollar of spend and a notional list-price dollar are different UNITS; adding them yields a number
-// that means nothing, which is exactly the bug this ticket exists to kill. [LAW:no-silent-failure]
-// A mixed-basis sum resolves to 'unpriced' — an honest "we cannot give you one number" — never a
-// silent blend. Within one multi-scope pass the basis is uniform by construction (every spawn runs
-// on ONE config), so the mixed arm is unreachable there; it is resolved as a VALUE anyway rather
-// than assumed away, because the sum is a pure function and must total whatever it is handed.
-// One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's reason, exactly as before.
-// A subscription sum with any unreported notional is wholly unreported: a partial list price summed
-// as if it were the total would understate the run, which is the same lie in a smaller font.
+// [LAW:no-silent-failure] One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's
+// reason: a partial figure summed as if it were the total would understate the run.
 function sumCost(costs) {
   const unpriced = costs.find(c => c.basis === 'unpriced');
   if (unpriced) return unpriced;
-  const bases = new Set(costs.map(c => c.basis));
-  if (bases.size !== 1) return { basis: 'unpriced', reason: 'not-reported' };
-  if (costs[0].basis === 'subscription') {
-    const notionals = costs.map(c => c.notionalUsd);
-    return {
-      basis: 'subscription',
-      notionalUsd: notionals.every(n => Number.isFinite(n)) ? notionals.reduce((sum, n) => sum + n, 0) : null,
-    };
-  }
   return { basis: 'dollars', usd: costs.reduce((sum, c) => sum + c.usd, 0) };
 }
 
 // [LAW:one-type-per-behavior] A TALLY — {total, count, unknownCount} — is ONE accounting shape,
-// instantiated over every unit this action sums across a PR's rounds: dollars actually spent,
-// Anthropic list price, and (zai-timing-31d.3) milliseconds of agent time. The field is named for
+// instantiated over every unit this action sums across a PR's rounds: dollars of cost and
+// (zai-timing-31d.3) milliseconds of agent time. The field is named for
 // its ROLE and not for a unit, because there is one rule here and it is unit-blind; each render
 // site supplies the unit it means ('$' below, formatMs for time). A second copy of this rule per
 // unit is how "how do you count a round whose figure is missing" would come to have two answers.
@@ -41690,61 +41895,27 @@ function tallyQuantity(tally, n) {
   return tally;
 }
 
-// The per-basis pair the two COST folds share (the PR total in transport.js, the daily ledger in
-// ledger.js). The two bases are never added together: a dollar of spend and a notional list-price
-// dollar are different units. A body with no marker at all (a pre-feature round) is a dollars-basis
-// round of unknown cost — never a free one.
-function emptyTallies() {
-  return { billed: emptyTally(), notional: emptyTally() };
+// The cost fold the PR total (transport.js) and the daily ledger (ledger.js) share. A body with no
+// marker at all (a pre-feature round) is a round of unknown cost — never a free one.
+function tallyCost(tally, cost) {
+  return tallyQuantity(tally, costFigure(cost));
 }
-
-function tallyCost(tallies, cost) {
-  const basis = basisOf(cost);
-  tallyQuantity(tallies[basis.bucket], basis.figure(cost));
-  return tallies;
-}
-
-// A DURATION is a single tally where a cost is a pair: time has one unit, so there is no basis to
-// select and the primitive above is folded directly. The rounds it counts are defined by whoever
-// folds it (transport.js), not here. [LAW:one-source-of-truth]
 
 function tallyRounds(tally) {
   return tally.count + tally.unknownCount;
 }
 
-// [LAW:effects-at-boundaries] Pure: render one basis's running total, or null when that basis saw no
-// rounds — so a PR that only ever ran on dollars renders exactly one clause, byte-identical to before
-// this feature existed, and a PR that only ever ran on the subscription renders exactly one too.
-function renderTally(label, tally) {
-  const rounds = tallyRounds(tally);
-  if (rounds === 0) return null;
-  const approx = tally.unknownCount > 0 ? '+' : '';
-  const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
-}
-
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
 // there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
 // clause is a VALUE keyed on the prior-round count, not a second footer format.
-// The two bases are rendered SIDE BY SIDE and never added: a PR whose early rounds ran on a paid API
-// and whose later rounds ran on the subscription reports "$1.20 across 2 rounds · $40.00 list price
-// across 2 subscription rounds", not a meaningless $41.20.
 function renderPrTotal(thisCost, priorCost) {
-  if (!priorCost) return '';
-  const priorRounds = tallyRounds(priorCost.billed) + tallyRounds(priorCost.notional);
-  if (priorRounds === 0) return '';
-  const totals = tallyCost(
-    {
-      billed: { ...priorCost.billed },
-      notional: { ...priorCost.notional },
-    },
-    thisCost,
-  );
-  const clauses = [
-    renderTally('total', totals.billed),
-    renderTally('list-price total', totals.notional),
-  ].filter(Boolean);
-  return clauses.length === 0 ? '' : ` · ${clauses.join(' · ')}`;
+  if (!priorCost || tallyRounds(priorCost) === 0) return '';
+  const total = tallyCost({ ...priorCost }, thisCost);
+  const approx = total.unknownCount > 0 ? '+' : '';
+  const note = total.unknownCount > 0 ? `, ${total.unknownCount} with unknown cost` : '';
+  // "runs", not "rounds": the tally folds every run that spent — a run that failed or was cancelled
+  // leaves an unfinished notice carrying its cost — and a round is only the runs that posted a review.
+  return ` · PR total $${total.total.toFixed(4)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the "PR time ..." clause the timing line carries, or '' when
@@ -41771,7 +41942,7 @@ function renderPrTime(thisMs, priorDuration) {
   const total = tallyQuantity({ ...priorDuration }, thisMs);
   const approx = total.unknownCount > 0 ? '+' : '';
   const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
-  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
@@ -41779,21 +41950,14 @@ function renderPrTime(thisMs, priorDuration) {
 // [FRAMING:representation] Every figure this action renders is an ESTIMATE, never a billed charge: a
 // table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine Anthropic run is
 // Claude Code's own client-side total_cost_usd. So every priced line is marked "est.".
-// The subscription phrase leads with what is TRUE — the review was not billed — and then reports the
-// list price as the separate, clearly-labelled thing it is. That figure is the deliverable, not the
-// hazard: it is how "is the subscription cheaper than the API bill, and how much of the plan am I
-// using?" gets answered. It is emitted everywhere a cost is emitted, and summed into nothing.
 const COST_PHRASE = {
   dollars: c => `Cost: $${c.usd.toFixed(4)}`,
-  subscription: c => Number.isFinite(c.notionalUsd)
-    ? `Not billed (Claude subscription) · $${c.notionalUsd.toFixed(4)} at Anthropic list price`
-    : 'Not billed (Claude subscription) · list price not reported',
   unpriced: () => 'Cost: unknown',
 };
 
-// 'est.' qualifies a figure, so it rides with the bases that HAVE one. An unpriced line has nothing
+// 'est.' qualifies a figure, so it rides with the basis that HAS one. An unpriced line has nothing
 // to qualify, and its absence of the marker is the pre-existing behavior, preserved.
-const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
+const COST_IS_ESTIMATE = { dollars: true, unpriced: false };
 
 // [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
 // there is no usage to report. The "loud" warning for missing usage/price is an effect and belongs
@@ -41823,13 +41987,9 @@ function renderCostLine(usage, config, priorCost = null) {
 // is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
 // basis and reason VALUES the adapter carried — never re-derived by branching on engine at the
 // boundary. This is why they live in usage.cost: run.js stays ignorant of which engines are
-// table-priced. A subscription run whose notional is missing still warns: its SPEND is known to be
-// zero either way, but losing the list price loses the one number that judges the subscription.
+// table-priced.
 const COST_WARNING = {
   dollars: () => null,
-  subscription: (cost, tag, config) => Number.isFinite(cost.notionalUsd) ? null
-    : `${config.engine} reported no cost for ${tag}; this review was billed to Claude subscription `
-      + 'quota (so it cost $0 either way), but its Anthropic list-price figure is unavailable.',
   unpriced: (cost, tag, config) => {
     const remedy = UNPRICED_REMEDY[cost.reason];
     // [LAW:no-silent-failure] An unlisted reason THROWS rather than falling through to whichever
@@ -41852,8 +42012,7 @@ const UNPRICED_REMEDY = {
     + 'usage only as a turn total too large for its per-request context length to be proven. Nothing is '
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
-    + 'the review footer shows cost as "unknown".',
-};
+    + 'the review footer shows cost as "unknown".',};
 
 function costWarning(usage, config) {
   // Tokens and cost go absent together when the engine reported nothing; the usage record itself
@@ -41888,14 +42047,12 @@ module.exports = {
   restatedCost,
   providerIdentity,
   sumCost,
-  emptyTallies,
   tallyCost,
   emptyTally,
   tallyQuantity,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,
-  isSubscription,
 };
 
 
@@ -52437,7 +52594,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.68.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.69.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

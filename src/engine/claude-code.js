@@ -5,7 +5,7 @@ const os = require('os');
 const { parseRetryAfterMs, classifyTransient } = require('../failover');
 const { parseJsonEnvelope, formatOutputTail, promptOnStdin } = require('./run');
 const { makeCliAdapter } = require('./cli');
-const { isAnthropicEndpoint, isSubscription, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = require('../usage');
+const { isAnthropicEndpoint, priceFromTable, spawnFromTokens, emptyTokens, addTokens } = require('../usage');
 const { resolveReasoningTier } = require('../effort');
 
 const CLAUDE_CODE_PACKAGE = '@anthropic-ai/claude-code';
@@ -271,33 +271,22 @@ function meterUsage() {
 }
 
 // [LAW:types-are-the-program] cost is a discriminated value (see THE COST VALUE in src/usage.js),
-// and this is the ONE place its basis is resolved — every consumer downstream reads the basis rather
-// than re-deriving it from the config. Two facts decide it, in this order:
-//
-//   1. Does this config pay in plan QUOTA? An oauth credential is pinned to Anthropic's own baseUrl
-//      by PRESETS, so the run is genuinely Anthropic and total_cost_usd is the right Anthropic-priced
-//      number — but it is a LIST PRICE for tokens nobody was charged for. Tag it notional; never
-//      recompute it, and never let it reach a spend fold. Asking this first is what keeps
-//      isAnthropicEndpoint a plain hostname whitelist with no subscription special case.
-//   2. Otherwise, is the endpoint genuinely Anthropic? If so total_cost_usd is real spend (or
-//      'not-reported' when absent). If not (z.ai, deepseek, …) that figure is the WRONG VENDOR's, so
-//      it is ignored entirely and the cost comes from the provider's own price-table entry —
-//      'no-price' when the model is not yet listed. [LAW:no-silent-failure]
+// and this is the ONE place it is resolved — every consumer downstream reads it rather than
+// re-deriving it from the config. One fact decides it: is the endpoint genuinely Anthropic? If so
+// total_cost_usd is Claude Code's own API-price figure (or 'not-reported' when absent), whichever
+// credential paid — a subscription token is pinned to Anthropic's host by PRESETS, so it takes this
+// arm too. If not (z.ai, deepseek, …) that figure is the WRONG VENDOR's, so it is ignored entirely and
+// the cost comes from the provider's own price-table entry — 'no-price' when the model is not yet
+// listed. [LAW:no-silent-failure]
 //
 // [LAW:types-are-the-program] Every figure this returns is checked with Number.isFinite, not
 // typeof==='number' (which accepts NaN), so a garbage total_cost_usd becomes an unreported figure and
 // never a NaN that later renders "$NaN" or poisons a total. The invariant is enforced here at the
 // source so no downstream consumer needs its own guard.
 // `startedAt` reaches only the price-table arm, and that is the whole story of which figures vary with
-// time: the two arms above take Claude Code's own Anthropic-priced number, which already knows when it
-// was computed. Only the arm that prices from OUR table needs to say when the tokens were spent.
+// time: the Anthropic arm takes Claude Code's own number, which already knows when it was computed.
+// Only the arm that prices from OUR table needs to say when the tokens were spent.
 function costFromEnvelope(env, config, buckets, startedAt) {
-  if (isSubscription(config)) {
-    return {
-      basis: 'subscription',
-      notionalUsd: Number.isFinite(env.total_cost_usd) ? env.total_cost_usd : null,
-    };
-  }
   if (isAnthropicEndpoint(config)) {
     return Number.isFinite(env.total_cost_usd)
       ? { basis: 'dollars', usd: env.total_cost_usd }
@@ -310,8 +299,8 @@ function costFromEnvelope(env, config, buckets, startedAt) {
 
 // [LAW:one-source-of-truth] The price of the tokens a live meter read from a spawn that died before its
 // result envelope: costFromEnvelope's own resolution, handed no envelope. A table-priced endpoint (z.ai,
-// DeepSeek) prices them exactly as a report would be priced; a subscription's list price and a genuine
-// Anthropic endpoint's figure exist only in the envelope, so they resolve as unreported.
+// DeepSeek) prices them exactly as a report would be priced; a genuine Anthropic endpoint's figure
+// exists only in the envelope, so it resolves as unreported.
 function priceMetered(tokens, config, startedAt) {
   return costFromEnvelope({}, config, tokens, startedAt);
 }

@@ -620,34 +620,16 @@ function priceFromTable(spawn, model) {
   return Number.isFinite(usd) ? { basis: 'dollars', usd } : { basis: 'unpriced', reason: 'schedule-gap' };
 }
 
-// [LAW:types-are-the-program] THE COST VALUE. A review's cost is discriminated by its BASIS — the
-// question "was this paid in dollars at all?" — because a subscription run's figure is a real,
-// exactly-known number that is nonetheless NOT spend:
+// [LAW:types-are-the-program] THE COST VALUE: what a run's API usage costs at API price, or why that
+// figure cannot be known.
 //
-//   { basis: 'dollars',      usd }                                 real money; the ONLY arm a spend fold reads
-//   { basis: 'subscription', notionalUsd: number | null }          plan quota; Anthropic LIST PRICE, never spend
-//   { basis: 'unpriced',     reason: 'no-price'|'schedule-gap'|'not-reported' }   dollars, but the figure is unrecoverable
+//   { basis: 'dollars',  usd }                                         the API-price cost of the usage
+//   { basis: 'unpriced', reason: 'no-price'|'schedule-gap'|'not-reported' }   the figure is unrecoverable
 //
-// The old two-arm shape ({available:true,usd} | {available:false,reason}) could not express a
-// subscription run at all: `available:false` says "we do not know", when in fact we know the number
-// exactly and it simply is not a charge — so the figure landed in `usd` and every fold downstream
-// (PR total, daily ledger, the DAILY_BUDGET_USD gate) added notional dollars to real spend.
-//
-// The exclusion is STRUCTURAL, not a rule. The notional figure lives under a DIFFERENT NAME on a
-// DIFFERENT arm, so a spend fold has no `usd` to read on a subscription cost and cannot pick it up
-// even by mistake. One `usd` field shared by both bases plus "remember to check the basis first"
-// would be a rule, and a rule gets forgotten exactly once, silently, inside a total.
-// [LAW:no-silent-failure] `notionalUsd: null` is the honest fourth state — billed to quota, list
-// price not reported — never a fabricated 0.00, which would read as "this was free AND we know it".
-
-// [LAW:single-enforcer] The one predicate answering "does this config pay in plan quota rather than
-// dollars?", derived from the credential KIND — never from the hostname. PRESETS pins every oauth
-// credential to Anthropic's own baseUrl (assertPresetsSafe, src/provider.js), so an oauth run IS an
-// Anthropic run by construction; that is why this decides the basis BEFORE isAnthropicEndpoint's
-// whitelist rather than beside it, and why the whitelist below needs no subscription special case.
-function isSubscription(config) {
-  return config.endpoint?.credential?.kind === 'oauth';
-}
+// How the usage was paid for does not enter it. A run authenticated by a Claude subscription token
+// costs what the same tokens cost through the API, so it is a dollars cost like any other.
+// [LAW:no-silent-failure] An unrecoverable figure is `unpriced` with its reason, never a fabricated
+// 0.00, which would read as "this was free AND we know it".
 
 // Claude Code self-reports total_cost_usd using Anthropic's price table, so that figure is this
 // run's billing basis ONLY when the engine truly talks to Anthropic. Against an Anthropic-COMPATIBLE
@@ -732,8 +714,7 @@ function reviewerTag(config) {
 // The RECORD alternative admits no '>' at all, which is what makes it safe to embed in an HTML
 // comment: '-->' contains '>', so an encoded payload CANNOT terminate the comment early. That is a
 // property of the grammar rather than a rule the writer must remember — see encodePayload.
-// [LAW:one-source-of-truth] ONE value grammar, shared by both marker names below, so a marker that
-// the notional reader accepts can never be one the spend reader would have rejected.
+// [LAW:one-source-of-truth] ONE value grammar, shared by every marker name the reader accepts.
 const MARKER_VALUE = '([0-9]+(?:\\.[0-9]+)?|unknown|\\{[^>]*\\})';
 
 // [LAW:parse-dont-validate] The one crossing between a cost record and marker text, in both
@@ -769,86 +750,29 @@ function decodePayload(raw) {
   }
 }
 
-// [LAW:types-are-the-program] THE SPEND EXCLUSION, MADE STRUCTURAL. A subscription review writes a
-// DIFFERENTLY NAMED marker carrying a DIFFERENTLY NAMED figure field, so every spend reader —
-// parseCostMarker here, sumCostToday in ledger.js, summarizePriorReviews in transport.js — has
-// literally nothing to read on it: no `usd` under either name. The notional dollars are kept out of
-// the daily spend by the shape, not by a guard someone must remember to write, and a future reader
-// who adds a fourth spend fold inherits the exclusion for free.
-//
-// [LAW:one-source-of-truth] ONE table of what each basis IS, for accounting purposes: which marker
-// name carries it, which tally bucket it lands in, and where its figure lives. A separate table per
-// consumer could drift — a basis marked notional by the writer and billed by the tally would put
-// notional dollars straight back into spend, which is the whole bug. One row, one answer.
-// [LAW:dataflow-not-control-flow] The basis selects data (a name, a key, an accessor); the same
-// render and the same fold then run for every basis. No arm skips writing a marker, so every review
-// round stays countable — a subscription round is a round whose SPEND is known to be zero, not a
-// missing one. An absent cost (no usage at all) is accounted as an unpriced one.
-//
-// `field` is the record key the figure is written under, and it carries THE SPEND EXCLUSION one
-// level deeper than the marker name does: inside the payload the notional dollars are `notionalUsd`,
-// so even a reader that decoded a record and went looking for `usd` finds nothing on a subscription
-// round. Same discipline as the two marker names, applied to the two field names.
-//
-// THE AUTH KIND IS THIS COLUMN, NOT A FIELD. zai-billing-xl0.3 needs to bucket spend by auth method
-// (api-key vs subscription), and the basis already answers it exactly: costFromEnvelope resolves
-// `subscription` from, and only from, an oauth credential, so subscription ⟺ oauth and
-// dollars|unpriced ⟺ api-key, with no third case. Storing an `auth` field beside the basis would be
-// a second clock for one fact — free to drift, and the direction it drifts is a review attributed to
-// the wrong payment method inside a total. [LAW:one-source-of-truth] Read it off the parsed basis.
-//
-// `toCost` is the read-side inverse of `figure`: a decoded figure (or null) back into the same
-// discriminated Cost the writer held. It lives in the table for the reason every other column does —
-// so "which basis is this" is answered once, and the answer carries everything that follows from it.
-//
-// `restate` is what a parsed record's own facts reprice to under today's table (restatedCost), and
-// it is a column for the same reason: a subscription round records real tokens and an Anthropic
-// model id, so a restatement that consulted the table regardless of basis would answer `no-price`
-// and send a maintainer to add a model the table can never price — the misattribution this file
-// exists to prevent, one arm over. The basis selects the restatement as it selects everything else.
-const BASIS = {
-  dollars: {
-    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: c => c.usd,
-    toCost: f => (f === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: f }),
-    restate: record => restatedFromTable(record),
-  },
-  subscription: {
-    marker: 'agent-review-notional-usd', bucket: 'notional', field: 'notionalUsd', figure: c => c.notionalUsd,
-    toCost: f => ({ basis: 'subscription', notionalUsd: f }),
-    // The list price is Claude Code's own figure, which no row of this table can move: the
-    // restatement is the record's cost, never a table reason. [LAW:one-source-of-truth]
-    restate: record => record.cost,
-  },
-  // Shares the dollars marker NAME, which keeps an unpriced round inside the spend accounting as a
-  // round of unknown cost. No marker name reads back to this row (the dollars row's toCost yields
-  // this basis for a figureless marker), but a parsed unpriced cost restates through it — as
-  // dollars does, since a card the table has gained since the run is what an audit should find.
-  unpriced: {
-    marker: 'agent-review-cost-usd', bucket: 'billed', field: 'usd', figure: () => null,
-    toCost: f => BASIS.dollars.toCost(f),
-    restate: record => BASIS.dollars.restate(record),
-  },
-};
-
-function basisOf(cost) {
-  return BASIS[cost && cost.basis] || BASIS.unpriced;
+// The figure a cost carries: its dollars, or null when it has none. An absent cost (no usage at all)
+// has none either. The writer records it and the tallies fold it, through this one accessor.
+function costFigure(cost) {
+  return cost && cost.basis === 'dollars' ? cost.usd : null;
 }
 
-// [LAW:one-source-of-truth] The reader's inverse of the writer's marker-name choice, derived from
-// the same table rather than restated, so a name the writer emits is always a name the reader knows.
-const BASIS_BY_MARKER = {
-  [BASIS.dollars.marker]: BASIS.dollars,
-  [BASIS.subscription.marker]: BASIS.subscription,
+const COST_MARKER = 'agent-review-cost-usd';
+
+// [LAW:parse-dont-validate] The marker names a reader accepts, each with the record key its figure is
+// written under. Reviews and ledger entries posted before 1.69.0 recorded a Claude subscription run
+// under `agent-review-notional-usd` / `notionalUsd`. That figure is Claude Code's own API-price cost for
+// the run's tokens, so it reads back as the dollars it is: those bodies are permanent, and ignoring
+// them would drop real cost from every PR total and from the day's ledger. The writer emits only
+// COST_MARKER.
+const FIGURE_FIELD_BY_MARKER = {
+  [COST_MARKER]: 'usd',
+  'agent-review-notional-usd': 'notionalUsd',
 };
 
-// [LAW:one-source-of-truth] Both marker names in ONE alternation, built from the BASIS table the
-// writer picks them from — so the reader can never recognize a name the writer stopped emitting.
-// One scan over both names is what makes the last-match rule hold ACROSS them: asking "is there a
-// notional marker anywhere?" before looking at the spend marker reintroduced exactly the bug
-// lastMatch exists to prevent — a dollars review whose prose quoted a notional marker was read as a
-// subscription review, and its real spend silently left every fold. Position decides, not precedence.
+// [LAW:single-enforcer] Every accepted marker name in ONE alternation, so the last-match rule holds
+// across names: a review whose prose quotes one marker cannot hijack the footer's own.
 const ANY_MARKER_RE = new RegExp(
-  `<!-- (${BASIS.dollars.marker}|${BASIS.subscription.marker}):${MARKER_VALUE} -->`, 'g');
+  `<!-- (${Object.keys(FIGURE_FIELD_BY_MARKER).join('|')}):${MARKER_VALUE} -->`, 'g');
 
 // [LAW:parse-dont-validate] THE COST RECORD — the crossing from a live run's values into the durable
 // facts a marker carries, and the one place absence is recorded AS absence. A fact that was never
@@ -881,12 +805,10 @@ const ANY_MARKER_RE = new RegExp(
 // prose, and a second last-match rule — for a fact that is recorded at the same instant, by the same
 // writer, about the same round. [LAW:one-type-per-behavior] One marker, one payload, N facts.
 function costRecord(usage, config, totalMs) {
-  const cost = usage && usage.cost;
-  const basis = basisOf(cost);
-  const figure = recordedQuantity(basis.figure(cost));
+  const figure = recordedQuantity(costFigure(usage && usage.cost));
   const span = recordedSpan(usage && usage.span);
   return {
-    [basis.field]: recorded(figure === null ? null : Number(figure.toFixed(6))),
+    usd: recorded(figure === null ? null : Number(figure.toFixed(6))),
     parts: recorded(usage ? partsOf(usage, PRICES_PER_MILLION[config.model]) : null),
     model: recorded(recordedString(config.model)),
     provider: recorded(recordedString(providerIdentity(config))),
@@ -991,7 +913,7 @@ function coalesceParts(parts, entry) {
 // sink that stops recording a duration it has says so in its own source, instead of losing the fact
 // to an argument nobody wrote. [LAW:no-silent-failure]
 function costMarker(usage, config, totalMs) {
-  return `<!-- ${basisOf(usage && usage.cost).marker}:${encodePayload(costRecord(usage, config, totalMs))} -->`;
+  return `<!-- ${COST_MARKER}:${encodePayload(costRecord(usage, config, totalMs))} -->`;
 }
 
 // [LAW:single-enforcer] ONE rule for which marker in a body is authoritative: the LAST one. It lives
@@ -1112,14 +1034,14 @@ function parseCostRecord(body) {
   const m = lastMatch(body, ANY_MARKER_RE);
   if (m === null) return null;
   const [, name, raw] = m;
-  const basis = BASIS_BY_MARKER[name];
-  const facts = payloadFacts(raw, basis.field);
-  const figure = facts[basis.field];
+  const field = FIGURE_FIELD_BY_MARKER[name];
+  const facts = payloadFacts(raw, field);
+  const figure = recordedQuantity(facts[field]);
   // The wire form is the discriminator: a record carrying `parts` is read as parts and nothing else;
   // one that predates them carries `tokens`, the sum, and is read as the one part that sum proved.
   const parts = facts.parts === undefined ? legacyParts(facts.tokens) : recordedParts(facts.parts);
   return {
-    cost: basis.toCost(recordedQuantity(figure)),
+    cost: figure === null ? { basis: 'unpriced', reason: 'not-reported' } : { basis: 'dollars', usd: figure },
     parts,
     // DERIVED from the parts, never read off the wire beside them: a token total stored next to the
     // parts it sums is the second clock. Null when nothing repriceable was recorded, exactly as
@@ -1163,47 +1085,28 @@ function restatedFromTable(record) {
 }
 
 function restatedCost(record) {
-  return basisOf(record.cost).restate(record);
+  return restatedFromTable(record);
 }
 
-// The spend reader: the dollars figure alone, 'unknown' when a spend-basis marker recorded none, and
-// null when the body carries no spend marker at all. A subscription review is invisible to it by
-// construction — its record lands on the notional basis, which has no `usd` — see THE SPEND
-// EXCLUSION above.
+// The figure reader: the dollars alone, 'unknown' when the marker recorded none, and null when the
+// body carries no cost marker at all.
 function parseCostMarker(body) {
   const record = parseCostRecord(body);
-  if (record === null || record.cost.basis === 'subscription') return null;
+  if (record === null) return null;
   return record.cost.basis === 'dollars' ? record.cost.usd : 'unknown';
 }
 
-// [LAW:one-source-of-truth] SUMMING IS THE ONE PLACE the "never add across bases" rule lives. A
-// dollar of spend and a notional list-price dollar are different UNITS; adding them yields a number
-// that means nothing, which is exactly the bug this ticket exists to kill. [LAW:no-silent-failure]
-// A mixed-basis sum resolves to 'unpriced' — an honest "we cannot give you one number" — never a
-// silent blend. Within one multi-scope pass the basis is uniform by construction (every spawn runs
-// on ONE config), so the mixed arm is unreachable there; it is resolved as a VALUE anyway rather
-// than assumed away, because the sum is a pure function and must total whatever it is handed.
-// One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's reason, exactly as before.
-// A subscription sum with any unreported notional is wholly unreported: a partial list price summed
-// as if it were the total would understate the run, which is the same lie in a smaller font.
+// [LAW:no-silent-failure] One unpriced spawn makes the whole sum unpriced, carrying THAT spawn's
+// reason: a partial figure summed as if it were the total would understate the run.
 function sumCost(costs) {
   const unpriced = costs.find(c => c.basis === 'unpriced');
   if (unpriced) return unpriced;
-  const bases = new Set(costs.map(c => c.basis));
-  if (bases.size !== 1) return { basis: 'unpriced', reason: 'not-reported' };
-  if (costs[0].basis === 'subscription') {
-    const notionals = costs.map(c => c.notionalUsd);
-    return {
-      basis: 'subscription',
-      notionalUsd: notionals.every(n => Number.isFinite(n)) ? notionals.reduce((sum, n) => sum + n, 0) : null,
-    };
-  }
   return { basis: 'dollars', usd: costs.reduce((sum, c) => sum + c.usd, 0) };
 }
 
 // [LAW:one-type-per-behavior] A TALLY — {total, count, unknownCount} — is ONE accounting shape,
-// instantiated over every unit this action sums across a PR's rounds: dollars actually spent,
-// Anthropic list price, and (zai-timing-31d.3) milliseconds of agent time. The field is named for
+// instantiated over every unit this action sums across a PR's rounds: dollars of cost and
+// (zai-timing-31d.3) milliseconds of agent time. The field is named for
 // its ROLE and not for a unit, because there is one rule here and it is unit-blind; each render
 // site supplies the unit it means ('$' below, formatMs for time). A second copy of this rule per
 // unit is how "how do you count a round whose figure is missing" would come to have two answers.
@@ -1240,61 +1143,27 @@ function tallyQuantity(tally, n) {
   return tally;
 }
 
-// The per-basis pair the two COST folds share (the PR total in transport.js, the daily ledger in
-// ledger.js). The two bases are never added together: a dollar of spend and a notional list-price
-// dollar are different units. A body with no marker at all (a pre-feature round) is a dollars-basis
-// round of unknown cost — never a free one.
-function emptyTallies() {
-  return { billed: emptyTally(), notional: emptyTally() };
+// The cost fold the PR total (transport.js) and the daily ledger (ledger.js) share. A body with no
+// marker at all (a pre-feature round) is a round of unknown cost — never a free one.
+function tallyCost(tally, cost) {
+  return tallyQuantity(tally, costFigure(cost));
 }
-
-function tallyCost(tallies, cost) {
-  const basis = basisOf(cost);
-  tallyQuantity(tallies[basis.bucket], basis.figure(cost));
-  return tallies;
-}
-
-// A DURATION is a single tally where a cost is a pair: time has one unit, so there is no basis to
-// select and the primitive above is folded directly. The rounds it counts are defined by whoever
-// folds it (transport.js), not here. [LAW:one-source-of-truth]
 
 function tallyRounds(tally) {
   return tally.count + tally.unknownCount;
 }
 
-// [LAW:effects-at-boundaries] Pure: render one basis's running total, or null when that basis saw no
-// rounds — so a PR that only ever ran on dollars renders exactly one clause, byte-identical to before
-// this feature existed, and a PR that only ever ran on the subscription renders exactly one too.
-function renderTally(label, tally) {
-  const rounds = tallyRounds(tally);
-  if (rounds === 0) return null;
-  const approx = tally.unknownCount > 0 ? '+' : '';
-  const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
-}
-
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
 // there are no prior rounds (the first review — its single-round line stands alone, unchanged). The
 // clause is a VALUE keyed on the prior-round count, not a second footer format.
-// The two bases are rendered SIDE BY SIDE and never added: a PR whose early rounds ran on a paid API
-// and whose later rounds ran on the subscription reports "$1.20 across 2 rounds · $40.00 list price
-// across 2 subscription rounds", not a meaningless $41.20.
 function renderPrTotal(thisCost, priorCost) {
-  if (!priorCost) return '';
-  const priorRounds = tallyRounds(priorCost.billed) + tallyRounds(priorCost.notional);
-  if (priorRounds === 0) return '';
-  const totals = tallyCost(
-    {
-      billed: { ...priorCost.billed },
-      notional: { ...priorCost.notional },
-    },
-    thisCost,
-  );
-  const clauses = [
-    renderTally('total', totals.billed),
-    renderTally('list-price total', totals.notional),
-  ].filter(Boolean);
-  return clauses.length === 0 ? '' : ` · ${clauses.join(' · ')}`;
+  if (!priorCost || tallyRounds(priorCost) === 0) return '';
+  const total = tallyCost({ ...priorCost }, thisCost);
+  const approx = total.unknownCount > 0 ? '+' : '';
+  const note = total.unknownCount > 0 ? `, ${total.unknownCount} with unknown cost` : '';
+  // "runs", not "rounds": the tally folds every run that spent — a run that failed or was cancelled
+  // leaves an unfinished notice carrying its cost — and a round is only the runs that posted a review.
+  return ` · PR total $${total.total.toFixed(4)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the "PR time ..." clause the timing line carries, or '' when
@@ -1321,7 +1190,7 @@ function renderPrTime(thisMs, priorDuration) {
   const total = tallyQuantity({ ...priorDuration }, thisMs);
   const approx = total.unknownCount > 0 ? '+' : '';
   const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
-  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
@@ -1329,21 +1198,14 @@ function renderPrTime(thisMs, priorDuration) {
 // [FRAMING:representation] Every figure this action renders is an ESTIMATE, never a billed charge: a
 // table-priced provider (codex, deepseek, z.ai) is price-table × tokens; a genuine Anthropic run is
 // Claude Code's own client-side total_cost_usd. So every priced line is marked "est.".
-// The subscription phrase leads with what is TRUE — the review was not billed — and then reports the
-// list price as the separate, clearly-labelled thing it is. That figure is the deliverable, not the
-// hazard: it is how "is the subscription cheaper than the API bill, and how much of the plan am I
-// using?" gets answered. It is emitted everywhere a cost is emitted, and summed into nothing.
 const COST_PHRASE = {
   dollars: c => `Cost: $${c.usd.toFixed(4)}`,
-  subscription: c => Number.isFinite(c.notionalUsd)
-    ? `Not billed (Claude subscription) · $${c.notionalUsd.toFixed(4)} at Anthropic list price`
-    : 'Not billed (Claude subscription) · list price not reported',
   unpriced: () => 'Cost: unknown',
 };
 
-// 'est.' qualifies a figure, so it rides with the bases that HAVE one. An unpriced line has nothing
+// 'est.' qualifies a figure, so it rides with the basis that HAS one. An unpriced line has nothing
 // to qualify, and its absence of the marker is the pre-existing behavior, preserved.
-const COST_IS_ESTIMATE = { dollars: true, subscription: true, unpriced: false };
+const COST_IS_ESTIMATE = { dollars: true, unpriced: false };
 
 // [LAW:effects-at-boundaries] Pure: render the cost footer line from a Usage value, or '' when
 // there is no usage to report. The "loud" warning for missing usage/price is an effect and belongs
@@ -1373,13 +1235,9 @@ function renderCostLine(usage, config, priorCost = null) {
 // is fully reported. [LAW:no-silent-failure] the message names the ACTUAL cause, dispatched on the
 // basis and reason VALUES the adapter carried — never re-derived by branching on engine at the
 // boundary. This is why they live in usage.cost: run.js stays ignorant of which engines are
-// table-priced. A subscription run whose notional is missing still warns: its SPEND is known to be
-// zero either way, but losing the list price loses the one number that judges the subscription.
+// table-priced.
 const COST_WARNING = {
   dollars: () => null,
-  subscription: (cost, tag, config) => Number.isFinite(cost.notionalUsd) ? null
-    : `${config.engine} reported no cost for ${tag}; this review was billed to Claude subscription `
-      + 'quota (so it cost $0 either way), but its Anthropic list-price figure is unavailable.',
   unpriced: (cost, tag, config) => {
     const remedy = UNPRICED_REMEDY[cost.reason];
     // [LAW:no-silent-failure] An unlisted reason THROWS rather than falling through to whichever
@@ -1402,8 +1260,7 @@ const UNPRICED_REMEDY = {
     + 'usage only as a turn total too large for its per-request context length to be proven. Nothing is '
     + 'wrong with the table: a rate that cannot be shown to apply is reported unknown rather than guessed.',
   'not-reported': (tag, config) => `${config.engine} reported no cost (no USD in its output) for ${tag}; `
-    + 'the review footer shows cost as "unknown".',
-};
+    + 'the review footer shows cost as "unknown".',};
 
 function costWarning(usage, config) {
   // Tokens and cost go absent together when the engine reported nothing; the usage record itself
@@ -1438,12 +1295,10 @@ module.exports = {
   restatedCost,
   providerIdentity,
   sumCost,
-  emptyTallies,
   tallyCost,
   emptyTally,
   tallyQuantity,
   costWarning,
   formatTokenCount,
   isAnthropicEndpoint,
-  isSubscription,
 };

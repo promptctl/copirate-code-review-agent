@@ -53,11 +53,8 @@ const ANTHROPIC_CONFIG = {
   endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'api-key', value: 'k' } },
 };
 
-// The SAME Anthropic host, paid for differently: an oauth credential means plan quota, not dollars.
-// The only difference from ANTHROPIC_CONFIG is credential.kind — which is exactly the fact that
-// decides the cost basis, so this pair is what proves the basis follows the credential and not the
-// hostname. PRESETS pins every oauth row to this baseUrl (assertPresetsSafe), so no other host can
-// reach this shape.
+// The SAME Anthropic host, paid for by a subscription token. The only difference from ANTHROPIC_CONFIG
+// is credential.kind, so this pair proves the cost does not follow the credential.
 const SUBSCRIPTION_CONFIG = {
   name: 'claude-subscription',
   engine: 'claude-code',
@@ -65,12 +62,9 @@ const SUBSCRIPTION_CONFIG = {
   endpoint: { apiType: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', credential: { kind: 'oauth', value: 'sk-ant-oat01-x' } },
 };
 
-// The prior-round tallies summarizePriorReviews returns: one tally per basis, reported side by side
-// and never added. Defaults are all-zero so each test names only the numbers it is actually about.
-const prior = ({ usd = 0, count = 0, unknownCount = 0, notionalUsd = 0, notionalCount = 0, notionalUnknownCount = 0 } = {}) => ({
-  billed: { total: usd, count, unknownCount },
-  notional: { total: notionalUsd, count: notionalCount, unknownCount: notionalUnknownCount },
-});
+// The prior-round tally summarizePriorReviews returns. Defaults are all-zero so each test names only
+// the numbers it is actually about.
+const prior = ({ usd = 0, count = 0, unknownCount = 0 } = {}) => ({ total: usd, count, unknownCount });
 
 // The two instants the fixtures below are priced at. DeepSeek's schedule is 01:00-04:00 and
 // 06:00-10:00 UTC, Monday through Friday, so these sit on opposite tiers of the same week — and
@@ -470,30 +464,18 @@ describe('claudeExtractUsage', () => {
     assert.deepEqual(claudeExtractUsage(stdout, sub, OFF_PEAK).cost, { basis: 'dollars', usd: 0.5 });
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2: a subscription run's figure is Anthropic LIST
-  // PRICE for tokens billed to plan quota. It is EMITTED — the figure is the deliverable, it answers
-  // "is the subscription cheaper than the API bill?" — under a distinctly-named field on a distinct
-  // variant, so no spend fold has a `usd` here to pick up.
-  test('a subscription run reports its list price as NOTIONAL, never as spend', () => {
+  // The cost is the API price of the usage, whatever paid for it: a subscription-token run reports
+  // Claude Code's own API-price figure exactly as an API-key run against the same host does.
+  test('a subscription run reports its API-price cost as dollars, like an API-key run', () => {
     const stdout = JSON.stringify({ type: 'result', total_cost_usd: 0.42, usage: { input_tokens: 10, output_tokens: 5 } });
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: 0.42 });
-    // the structural exclusion: there is no `usd` field for a spend fold to read, at all.
-    assert.equal('usd' in claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, false);
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'dollars', usd: 0.42 });
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, claudeExtractUsage(stdout, ANTHROPIC_CONFIG, OFF_PEAK).cost);
   });
 
-  // [LAW:no-silent-failure] AC for zai-billing-xl0.2: an omitted total_cost_usd under a subscription
-  // is an unavailable NOTIONAL, never 0.00 — "we don't know the list price" and "the list price was
-  // zero" are different facts and must not collapse. The basis stays subscription either way: what
-  // the run cost in DOLLARS is known exactly (nothing); only its list price is missing.
-  test('a subscription run with no total_cost_usd reports the notional as unavailable, not as zero', () => {
+  // [LAW:no-silent-failure] "we don't know the cost" and "the cost was zero" are different facts.
+  test('a subscription run with no total_cost_usd reports the cost as unreported, not as zero', () => {
     const stdout = JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 5 } });
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: null });
-  });
-
-  // A garbage total_cost_usd must not become a NaN notional that later renders "$NaN".
-  test('a non-finite total_cost_usd under a subscription is an unavailable notional', () => {
-    const stdout = '{"type":"result","total_cost_usd":"lots","usage":{"input_tokens":10,"output_tokens":5}}';
-    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'subscription', notionalUsd: null });
+    assert.deepEqual(claudeExtractUsage(stdout, SUBSCRIPTION_CONFIG, OFF_PEAK).cost, { basis: 'unpriced', reason: 'not-reported' });
   });
 
   test('returns null when the envelope has no usage', () => {
@@ -565,33 +547,21 @@ describe('renderCostLine', () => {
     const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'dollars', usd: 0.03 } };
     const line = renderCostLine(usage, CODEX_CONFIG, prior({ usd: 0.09, count: 2 }));
     assert.match(line, /\$0\.0300/);                          // this round
-    assert.match(line, /PR total \$0\.1200 across 3 rounds/); // 0.09 prior + 0.03 this
+    assert.match(line, /PR total \$0\.1200 across 3 runs/); // 0.09 prior + 0.03 this
   });
 
   test('an unknown-cost round makes the PR total a lower bound (+) and names the unpriced count', () => {
     const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'unpriced', reason: 'no-price' } };
     const line = renderCostLine(usage, CODEX_CONFIG, prior({ usd: 0.09, count: 2, unknownCount: 1 }));
-    assert.match(line, /PR total \$0\.0900\+ across 4 rounds, 2 with unknown cost/);
+    assert.match(line, /PR total \$0\.0900\+ across 4 runs, 2 with unknown cost/);
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2: the notional figure IS present in the footer —
-  // it is the deliverable, not the hazard — but it is labelled as list price and the line leads with
-  // the truth that nothing was billed.
-  test('a subscription run renders its list price, labelled as not billed', () => {
-    const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'subscription', notionalUsd: 63.59 } };
-    const line = renderCostLine(usage, SUBSCRIPTION_CONFIG);
-    assert.match(line, /Not billed \(Claude subscription\)/);
-    assert.match(line, /\$63\.5900 at Anthropic list price/);
-    assert.match(line, /100 in \(0 cached\) \/ 50 out tokens/);
-    assert.match(line, /· est\._$/);
-  });
-
-  test('a subscription run with no list price says so — never "$0.0000"', () => {
-    const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'subscription', notionalUsd: null } };
-    const line = renderCostLine(usage, SUBSCRIPTION_CONFIG);
-    assert.match(line, /Not billed \(Claude subscription\)/);
-    assert.match(line, /list price not reported/);
-    assert.doesNotMatch(line, /\$0\.0000/);
+  test('a subscription run renders its API-price cost like any other run', () => {
+    const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'dollars', usd: 63.59 } };
+    assert.equal(
+      renderCostLine(usage, SUBSCRIPTION_CONFIG),
+      '_Cost: $63.5900 · 100 in (0 cached) / 50 out tokens · claude-code/claude-sonnet-5 · est._',
+    );
   });
 });
 
@@ -632,53 +602,41 @@ describe('cost marker (machine-readable per-round cost)', () => {
     assert.equal(parseCostMarker(body), 0.42); // the real trailing marker, not the quoted 9.99
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2, the STRUCTURAL half. Every spend fold in this
-  // codebase reads markers through parseCostMarker; a subscription review writes a differently-named
-  // marker carrying a differently-named figure field, so the spend readers have nothing to match.
-  // This is the property that makes the exclusion impossible to forget rather than merely documented.
-  test('a subscription cost writes a NOTIONAL marker that no spend reader can see', () => {
-    const marker = costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG);
-    assert.match(marker, /^<!-- agent-review-notional-usd:\{/);
-    assert.ok(!marker.includes('"usd"'), 'notional dollars must never be written under the spend field name');
-    assert.equal(parseCostMarker(marker), null); // invisible to every spend fold, by construction
-    assert.deepEqual(parseCost(marker), { basis: 'subscription', notionalUsd: 63.59 });
+  test('a subscription run writes the one cost marker, carrying its API-price figure', () => {
+    const marker = costMarker(usageOf({ basis: 'dollars', usd: 63.59 }), SUBSCRIPTION_CONFIG);
+    assert.match(marker, /^<!-- agent-review-cost-usd:\{"usd":63\.59,/);
+    assert.equal(parseCostMarker(marker), 63.59);
   });
 
-  test('a subscription cost with no list price still writes a notional marker, valued unknown', () => {
-    const marker = costMarker(usageOf({ basis: 'subscription', notionalUsd: null }), SUBSCRIPTION_CONFIG);
-    assert.match(marker, /^<!-- agent-review-notional-usd:\{/);
-    assert.equal(parseCostMarker(marker), null);
-    assert.deepEqual(parseCost(marker), { basis: 'subscription', notionalUsd: null });
-  });
-
-  test('parseCost round-trips every basis back to the value that wrote it', () => {
+  test('parseCost round-trips every cost back to the value that wrote it', () => {
     const mk = cost => costMarker(usageOf(cost), DEEPSEEK_CONFIG);
     assert.deepEqual(parseCost(mk({ basis: 'dollars', usd: 0.1234 })), { basis: 'dollars', usd: 0.1234 });
-    assert.deepEqual(parseCost(mk({ basis: 'subscription', notionalUsd: 63.59 })), { basis: 'subscription', notionalUsd: 63.59 });
-    assert.deepEqual(parseCost(mk({ basis: 'subscription', notionalUsd: null })), { basis: 'subscription', notionalUsd: null });
     assert.deepEqual(parseCost(mk({ basis: 'unpriced', reason: 'no-price' })), { basis: 'unpriced', reason: 'not-reported' });
     assert.equal(parseCost('a human review with no marker'), null);
   });
 
-  // The last-match rule has to hold ACROSS the two marker names, not just within each. Deciding the
-  // basis by "is there a notional marker anywhere?" before looking at the spend marker read a real
-  // DOLLARS round as subscription — and a subscription-basis cost has no `usd` for any spend fold to
-  // find, so that round's actual spend left the daily ledger and the PR total silently. A review OF
-  // this feature quotes both marker names in its prose, so this is the ordinary case, not a stunt.
-  test('a dollars review that QUOTES a notional marker in its prose is still dollars', () => {
-    const body = [
-      'The subscription arm writes <!-- agent-review-notional-usd:63.590000 --> instead.',
-      costMarker(usageOf({ basis: 'dollars', usd: 0.4200 }), DEEPSEEK_CONFIG),
-    ].join('\n');
-    assert.deepEqual(parseCost(body), { basis: 'dollars', usd: 0.42 });
+  // Reviews and ledger entries posted before 1.69.0 recorded a subscription run under the legacy
+  // notional marker. Its figure is that run's API-price cost, so it reads back as dollars — in both
+  // payload forms — and never drops out of a PR total or the day's ledger.
+  test('a legacy notional marker reads back as the dollars it recorded', () => {
+    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:{"notionalUsd":63.59} -->'), { basis: 'dollars', usd: 63.59 });
+    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:63.590000 -->'), { basis: 'dollars', usd: 63.59 });
+    assert.equal(parseCostMarker('<!-- agent-review-notional-usd:{"notionalUsd":63.59} -->'), 63.59);
   });
 
-  test('a subscription review that QUOTES a spend marker in its prose is still subscription', () => {
-    const body = [
-      'A paid round writes <!-- agent-review-cost-usd:0.420000 --> instead.',
-      costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG),
+  // The last-match rule holds ACROSS marker names: a review OF this feature quotes one name in its
+  // prose, and the footer's own marker still decides the round's cost.
+  test('a review that QUOTES the other marker name in its prose is read from its own footer marker', () => {
+    const quotesLegacy = [
+      'An old subscription round wrote <!-- agent-review-notional-usd:63.590000 --> instead.',
+      costMarker(usageOf({ basis: 'dollars', usd: 0.4200 }), DEEPSEEK_CONFIG),
     ].join('\n');
-    assert.deepEqual(parseCost(body), { basis: 'subscription', notionalUsd: 63.59 });
+    assert.deepEqual(parseCost(quotesLegacy), { basis: 'dollars', usd: 0.42 });
+    const legacyQuotesCurrent = [
+      'A paid round writes <!-- agent-review-cost-usd:0.420000 --> instead.',
+      '<!-- agent-review-notional-usd:{"notionalUsd":63.59} -->',
+    ].join('\n');
+    assert.deepEqual(parseCost(legacyQuotesCurrent), { basis: 'dollars', usd: 63.59 });
   });
 });
 
@@ -735,7 +693,7 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
 
   test('a legacy unknown marker is still an unknown-cost round, never a free one', () => {
     assert.deepEqual(parseCost('<!-- agent-review-cost-usd:unknown -->'), { basis: 'unpriced', reason: 'not-reported' });
-    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:unknown -->'), { basis: 'subscription', notionalUsd: null });
+    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:unknown -->'), { basis: 'unpriced', reason: 'not-reported' });
   });
 
   // [LAW:types-are-the-program] The payload cannot terminate its own HTML comment: the grammar admits
@@ -758,24 +716,18 @@ describe('cost marker — the recorded facts re-derive the cost (zai-cost-truth-
     const negative = '<!-- agent-review-cost-usd:{"usd":-999999} -->';
     assert.deepEqual(parseCost(negative), { basis: 'unpriced', reason: 'not-reported' });
     assert.equal(parseCostMarker(negative), 'unknown');
-    // and it cannot come back as a negative list price either
-    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:{"notionalUsd":-5} -->'), { basis: 'subscription', notionalUsd: null });
+    // and a legacy notional marker is screened by the same predicate
+    assert.deepEqual(parseCost('<!-- agent-review-notional-usd:{"notionalUsd":-5} -->'), { basis: 'unpriced', reason: 'not-reported' });
   });
 
   // [LAW:single-enforcer] The writer screens through the same predicate the reader does, so the set
   // of figures costMarker can emit IS the set parseCostRecord accepts. Applied on one side only, a
   // marker would round-trip to a different value than it was written from.
-  test('the writer cannot emit a figure the reader would refuse — on either basis', () => {
+  test('the writer cannot emit a figure the reader would refuse', () => {
     for (const bad of [-1, -0.000001, NaN, Infinity, -Infinity]) {
       const dollars = costMarker(usageOf({ basis: 'dollars', usd: bad }), DEEPSEEK_CONFIG);
       assert.ok(!dollars.includes('"usd"'), `${bad} must not be written as a figure: ${dollars}`);
       assert.deepEqual(parseCost(dollars), { basis: 'unpriced', reason: 'not-reported' });
-
-      // The notional arm carries the SAME guarantee. Screening one basis and not the other would be
-      // the asymmetry this test exists to forbid, one arm over.
-      const notional = costMarker(usageOf({ basis: 'subscription', notionalUsd: bad }), SUBSCRIPTION_CONFIG);
-      assert.ok(!notional.includes('"notionalUsd"'), `${bad} must not be written as a list price: ${notional}`);
-      assert.deepEqual(parseCost(notional), { basis: 'subscription', notionalUsd: null });
     }
   });
 
@@ -954,17 +906,6 @@ describe('cost marker — the parts reprice a context-tiered review (zai-cost-tr
     assert.deepEqual(restatedCost(parseCostRecord(body)), { basis: 'unpriced', reason: 'schedule-gap' });
   });
 
-  // [LAW:one-source-of-truth] The basis selects the restatement. A subscription round records real
-  // tokens and an Anthropic model id the table never prices; restating it through the table would
-  // answer no-price and send a maintainer to PRICE_SOURCES for a model that cannot go there. Its
-  // list price is Claude Code's own figure, which nothing here can move, so the restatement IS the
-  // recorded cost — never null, which on this arm means the list price was not reported.
-  test('a subscription record restates as its own recorded cost, never as no-price and never as unreported', () => {
-    const record = parseCostRecord(costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG));
-    assert.deepEqual(record.tokens, SAMPLE_TOKENS);
-    assert.deepEqual(restatedCost(record), { basis: 'subscription', notionalUsd: 63.59 });
-  });
-
   // A round the run could not price still recorded its parts; if the table has since gained the
   // card, the audit finds a figure — which is the whole point of restating.
   test('an unpriced dollars record with parts restates through the table', () => {
@@ -1067,12 +1008,6 @@ describe('duration record (zai-timing-31d.2)', () => {
     assert.deepEqual(record.span, SAMPLE_SPAN);
   });
 
-  // A subscription round is timed like any other — agent time is spent whether or not it is billed.
-  test('a subscription round records its duration too', () => {
-    const marker = costMarker(usageOf({ basis: 'subscription', notionalUsd: 63.59 }), SUBSCRIPTION_CONFIG, 90_000);
-    assert.equal(parseCostRecord(marker).totalMs, 90_000);
-  });
-
   // [LAW:no-silent-failure] The three shapes of "no duration recorded" — a sink with no round to
   // time (the ledger), a review posted before this feature, and a body carrying no marker at all.
   // Each reads as an explicit absence. A zero would assert the round was instantaneous, and a throw
@@ -1109,33 +1044,11 @@ describe('sumCost', () => {
     assert.deepEqual(sumCost([{ basis: 'dollars', usd: 0.1 }, { basis: 'dollars', usd: 0.2 }]), { basis: 'dollars', usd: 0.1 + 0.2 });
   });
 
-  test('adds notional to notional, under the notional name', () => {
-    assert.deepEqual(
-      sumCost([{ basis: 'subscription', notionalUsd: 18.86 }, { basis: 'subscription', notionalUsd: 7.28 }]),
-      { basis: 'subscription', notionalUsd: 18.86 + 7.28 },
-    );
-  });
-
-  // [LAW:no-silent-failure] A partial list price summed as if it were the total understates the run.
-  test('one unreported notional makes the whole notional sum unreported, not a partial total', () => {
-    assert.deepEqual(
-      sumCost([{ basis: 'subscription', notionalUsd: 18.86 }, { basis: 'subscription', notionalUsd: null }]),
-      { basis: 'subscription', notionalUsd: null },
-    );
-  });
-
   test('one unpriced spawn makes the whole sum unpriced, carrying that spawn\'s reason', () => {
     assert.deepEqual(
       sumCost([{ basis: 'dollars', usd: 0.1 }, { basis: 'unpriced', reason: 'no-price' }]),
       { basis: 'unpriced', reason: 'no-price' },
     );
-  });
-
-  test('REFUSES to add across bases — a mixed sum is unpriced, never a blended number', () => {
-    const mixed = sumCost([{ basis: 'dollars', usd: 1.2 }, { basis: 'subscription', notionalUsd: 40 }]);
-    assert.equal(mixed.basis, 'unpriced');
-    assert.equal('usd' in mixed, false);
-    assert.equal('notionalUsd' in mixed, false);
   });
 });
 
@@ -1148,31 +1061,11 @@ describe('renderPrTotal', () => {
   });
   test('priced this-round + mixed known/unknown prior → total plus a "+" and the unpriced count', () => {
     const clause = renderPrTotal({ basis: 'dollars', usd: 0.03 }, prior({ usd: 0.10, count: 2, unknownCount: 1 }));
-    assert.match(clause, /PR total \$0\.1300\+ across 4 rounds, 1 with unknown cost/); // 0.10 + 0.03, 1 unpriced
+    assert.match(clause, /PR total \$0\.1300\+ across 4 runs, 1 with unknown cost/); // 0.10 + 0.03, 1 unpriced
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2 (the evidence on the ticket: PR #113 reported a
-  // $63.59 "PR total" across 4 rounds, every dollar of it notional). The two bases are reported side
-  // by side and NEVER added: a blended number would be true of neither.
-  test('a subscription PR totals list price under its own label, never as spend', () => {
-    const clause = renderPrTotal({ basis: 'subscription', notionalUsd: 18.41 }, prior({ notionalUsd: 45.18, notionalCount: 3 }));
-    assert.match(clause, /PR list-price total \$63\.5900 across 4 rounds/);
-    assert.doesNotMatch(clause, /PR total/); // no billed rounds ⇒ no spend clause at all
-  });
-
-  test('a PR that switched providers mid-flight reports TWO totals and never sums across bases', () => {
-    const clause = renderPrTotal(
-      { basis: 'subscription', notionalUsd: 20 },
-      prior({ usd: 1.20, count: 2, notionalUsd: 20, notionalCount: 1 }),
-    );
-    assert.match(clause, /PR total \$1\.2000 across 2 rounds/);
-    assert.match(clause, /PR list-price total \$40\.0000 across 2 rounds/);
-    assert.doesNotMatch(clause, /41\.2000/); // the blended number that must never exist
-  });
-
-  test('a subscription round with no list price makes the notional total an honest lower bound', () => {
-    const clause = renderPrTotal({ basis: 'subscription', notionalUsd: null }, prior({ notionalUsd: 10, notionalCount: 1 }));
-    assert.match(clause, /PR list-price total \$10\.0000\+ across 2 rounds, 1 with unknown cost/);
+  test('a fully priced PR renders one exact total', () => {
+    assert.equal(renderPrTotal({ basis: 'dollars', usd: 18.41 }, prior({ usd: 45.18, count: 3 })), ' · PR total $63.5900 across 4 runs');
   });
 });
 
@@ -1217,21 +1110,6 @@ describe('costWarning', () => {
   test('not-reported names the engine, never the price table — the codex/claude causes do not conflate', () => {
     const w = costWarning({ tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'unpriced', reason: 'not-reported' } }, ANTHROPIC_CONFIG);
     assert.match(w, /claude-code reported no cost/);
-    assert.doesNotMatch(w, /price-table|PRICES_PER_MILLION/);
-  });
-
-  test('a fully-reported subscription run does not warn — its figure is present, it is simply not spend', () => {
-    const usage = { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'subscription', notionalUsd: 63.59 } };
-    assert.equal(costWarning(usage, SUBSCRIPTION_CONFIG), null);
-  });
-
-  // [LAW:no-silent-failure] The spend is known ($0) either way, but losing the list price loses the
-  // one number that answers "is the subscription worth it?" — so it is operator news, not silence.
-  test('a subscription run with no list price warns, and says the spend is zero regardless', () => {
-    const usage = { tokens: { inputCacheMiss: 1, inputCacheHit: 0, output: 1 }, cost: { basis: 'subscription', notionalUsd: null } };
-    const w = costWarning(usage, SUBSCRIPTION_CONFIG);
-    assert.match(w, /subscription/);
-    assert.match(w, /list-price figure is unavailable/);
     assert.doesNotMatch(w, /price-table|PRICES_PER_MILLION/);
   });
 

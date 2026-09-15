@@ -459,21 +459,15 @@ The transcript dumps the engine's own raw streams verbatim — it is not a recon
 
 Every review reports its estimated USD cost in the attribution footer and the run log (tokens × a hand-maintained price table). A model with no table entry renders cost as `unknown` (tokens still shown) and logs a warning. Costs are estimates, never billed charges.
 
-**A review is paid for in one of two ways, and the two are never added together.** A per-token API provider (`codex`, `zai`, `deepseek`) costs real dollars. `PROVIDER: claude-subscription` costs plan quota — no money changes hands — but Claude Code still reports what those tokens *would* have cost at Anthropic list price, and that figure is worth having: it is how you answer "is the subscription cheaper than the API bill, and how much of the plan am I using?"
+**Every run's spend is counted, including runs that post no review.** The footer's cost covers every engine spawn the run made, including a pass that failed and was retried. A run that spends and then fails (a rate limit, a prompt too long, a crash) or is cancelled (a newer push, or the job's `timeout-minutes`) posts a `COMMENT` review that opens `⚠️ **REVIEW DID NOT FINISH**`. It names the cause and carries the run's cost line and cost marker. The PR's running total and the daily ledger include that spend, and the round cap does not count the run as a round. The failure also names what it spent in the run log. A run that stops before any engine starts spent nothing and posts nothing.
 
-So a subscription review reports its list price everywhere a cost is reported, labelled as what it is:
+**The cost is what the run's API usage costs at API price, whatever paid for it.** A `claude-subscription` review reports the figure Claude Code computes for its tokens at Anthropic's API price, exactly as an API-key run does. That figure goes into the PR total, the daily ledger, and `DAILY_BUDGET_USD` like any other:
 
 ```
-Not billed (Claude subscription) · $18.4100 at Anthropic list price · 12,231,000 in (11,290,000 cached) / 82,000 out tokens · claude-code/claude-sonnet-5 · est. · PR list-price total $63.5900 across 4 rounds
+Cost: $18.4100 · 12,231,000 in (11,290,000 cached) / 82,000 out tokens · claude-code/claude-sonnet-5 · est. · PR total $63.5900 across 4 runs
 ```
 
-and it contributes **$0.00** to spend. Concretely:
-
-- `DAILY_BUDGET_USD` rations dollars only. A day of subscription reviews leaves the whole budget available — the gradient never throttles against money nobody spent.
-- The daily ledger still records every subscription review (its consumption stays visible), under a separate list-price roll-up that the spend total cannot read.
-- A PR that ran some rounds on an API key and some on the subscription reports **two** totals side by side, never one blended number.
-
-If Claude Code reports no list price for a subscription run, that is stated as unavailable and logged — never as `$0.00`, which would read as "we know it was free."
+If an engine reports no cost, the footer shows `unknown` and the run logs a warning, never `$0.00`, which would read as "we know it was free."
 
 ## Architecture
 

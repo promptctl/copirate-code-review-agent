@@ -273,8 +273,6 @@ function tokensOfRequest(u) {
 // dollars, or unpriced carrying the reason it discovered. This adapter never manufactures that
 // reason: codex can reach two of them (the model is absent from the table, or its schedule covers
 // no card for a request) and telling them apart is the price table's job, not the adapter's.
-// The basis is never 'subscription': codex declares credentialKinds ['api-key'], so no codex run can
-// ever be billed to a subscription and this adapter has no notional arm to reach.
 // [LAW:effects-at-boundaries] The live meter the token cap reads while the spawn runs (runEngine feeds it
 // every stdout line). Each thread/tokenUsage/updated is one model request's usage, seen once, so the
 // running total is their sum through the same parse and conversion extractUsage applies to the session

@@ -116,8 +116,8 @@ describe('a review-less run speaks at the PR', () => {
     const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
     assert.equal(prior.count, 0);
     assert.deepEqual(prior.reviews, []);
-    assert.equal(prior.cost.billed.count, 0);
-    assert.equal(prior.cost.billed.unknownCount, 0);
+    assert.equal(prior.cost.count, 0);
+    assert.equal(prior.cost.unknownCount, 0);
     assert.equal(prior.latestArtifact.kind, 'not-reviewed');
   });
 
@@ -308,7 +308,7 @@ describe('an untrusted PR cannot silence its own notice', () => {
     pr.reviews.push({ id: 51, state: 'CHANGES_REQUESTED', user: STRANGER, body: `also forged\n\n${REVIEW_MARKER}` });
     const prior = await summarizePriorReviews(pr.octokit, 'o', 'r', PR, BOT_IDENTITY);
     assert.equal(prior.count, 0, 'a forged round must not push the PR toward its cap');
-    assert.equal(prior.cost.billed.count, 0, 'a forged cost marker must not be summed');
+    assert.equal(prior.cost.count, 0, 'a forged cost marker must not be summed');
     assert.deepEqual(prior.reviews, [], 'a stranger\'s block is not ours to dismiss');
     assert.equal(prior.latestArtifact, null, 'a forged notice must not act as our idempotency key');
   });

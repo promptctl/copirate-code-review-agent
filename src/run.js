@@ -5,11 +5,12 @@ const fs = require('fs');
 const path = require('path');
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = require('./diff');
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = require('./transport');
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName, announceUnfinished, renderUnfinishedBody } = require('./transport');
 const { writeDiffFiles } = require('./diff-files');
 const { partitionFindings } = require('./review');
 const { buildAttributionFooter } = require('./failover');
-const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = require('./multiscope');
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName, sumUsage } = require('./multiscope');
+const { mintSpendMeter, attributedConfig, guardSpend } = require('./spend');
 const { defaultEffortProfile } = require('./effort');
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = require('./budget');
 const { assessDifficulty } = require('./difficulty');
@@ -159,7 +160,16 @@ async function preflightChain(chain) {
 // diagnostics, findings are the product. Named here, an absent envelope is an absent schedule, an
 // absent total and an absent prior duration — three values the renderer already knows how to report
 // as gaps, the last of them as no cumulative clause at all. [LAW:no-silent-failure]
-function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
+// `spentOn` is the config the cost MARKER attributes the spend to (attributedConfig, src/spend.js), which
+// differs from `configUsed` only when a failover spread the run's spend across models or endpoints.
+function buildReviewFooter(usage, configUsed, priorCost, timing = {}) {
+  return `${buildAttributionFooter(configUsed)}\n\n${buildSpendFooter(usage, configUsed, priorCost, timing)}`;
+}
+
+// [LAW:decomposition] What a run SPENT, as the footer states it: the cost line, the timing block and the
+// cost marker. A posted review carries it under its attribution line; an unfinished-run notice carries it
+// alone, since no config reviewed anything. One builder, so the two bodies cannot record spend differently.
+function buildSpendFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null, spentOn = configUsed } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -189,8 +199,61 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
   // Recording is outside the try above on purpose — the render is the fragile part (formatting a
   // schedule), while `totalMs` is a number the run's own clock minted, and a failed BLOCK must not
   // also cost the next round its summand.
-  const marker = costMarker(usage, configUsed, totalMs);
-  return [buildAttributionFooter(configUsed), costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+  const marker = costMarker(usage, spentOn, totalMs);
+  return [costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+}
+
+// The failure output's statement of what a run spent before it stopped. [LAW:no-silent-failure] A run that
+// dies after spending must never read as a $0 run in its own log.
+function unfinishedSpendLine(cause, usage, config) {
+  const costLine = renderCostLine(usage, config);
+  return `${cause} It posted no review, and spent: ${costLine ? costLine.replace(/^_|_$/g, '') : 'an amount its engine did not report'}`;
+}
+
+// [LAW:effects-at-boundaries] Append a run's actual cost to the daily ledger, once its cost is known — after
+// a review submits, or when an unfinished run is recorded. Only when the budget gradient is active
+// (ledgerIssue set). [LAW:no-silent-failure] a failed append warns and continues: the day's ledger becomes a
+// known LOWER bound, never a run aborted for a bookkeeping write. The cost VALUE is the one the footer
+// already reported, never re-estimated.
+async function appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config }) {
+  if (ledgerIssue === null) return;
+  try {
+    await appendCost(octokit, owner, repo, ledgerIssue, usage, config);
+  } catch (e) {
+    core.warning(
+      `Budget: failed to append this run's cost to ledger issue #${ledgerIssue} (${e.message}) — `
+      + "the day's ledger now UNDER-counts by this run (a known lower bound). Verify issues:write access.",
+    );
+  }
+}
+
+// The PR sink for a run that spent and posted no review: guardSpend's `record` (src/spend.js), reached by a
+// throw or a signal. It names the spend in the run log, posts the unfinished notice whose cost marker the
+// PR's running total folds, and appends the ledger entry. A run whose attempts recorded no usage at all
+// ended before any engine ran; it spent nothing, so there is nothing to count.
+async function recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  const config = configs[configs.length - 1];
+  const spentOn = attributedConfig(configs, config);
+  core.error(unfinishedSpendLine(cause, usage, config));
+  const footer = buildSpendFooter(usage, config, prior.cost, { totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+  try {
+    await announceUnfinished(reviewOctokit, { owner, repo, pullNumber, commitId: headSha, body: renderUnfinishedBody(reviewerName, { cause, footer }) });
+    core.info(`Posted an unfinished-run notice to PR #${pullNumber}, recording this run's spend.`);
+  } catch (e) {
+    core.error(`Could not post the unfinished-run notice to PR #${pullNumber} (${e.message}); this PR's running total does not include this run's spend.`);
+  }
+  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config: spentOn });
+}
+
+// The repo-mode sink for the same exit: no PR and no ledger, so the run log is where the spend is named.
+async function logUnfinishedRepoRun({ spend, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  core.error(unfinishedSpendLine(cause, usage, configs[configs.length - 1]));
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
@@ -286,36 +349,11 @@ async function resolveBudgetedEffort({ octokit, owner, repo, issueNumber, now, c
   let spentToday = 0;
   try {
     const ledger = await readSpentToday(octokit, owner, repo, issueNumber, now);
-    // [LAW:types-are-the-program] The gradient rations DOLLARS, so it reads the `billed` tally and
-    // nothing else. A subscription round's marker lands it in `notional`, a tally this line never
-    // reads — it cannot throttle a budget against money that was never spent. The tally shape is
-    // unit-blind (see emptyTally in src/usage.js); the unit is whatever the BUCKET means, which is
-    // why the bucket and not a field name is what keeps list price out of the day's spend.
-    spentToday = ledger.billed.total;
-    if (ledger.billed.unknownCount > 0) {
+    spentToday = ledger.total;
+    if (ledger.unknownCount > 0) {
       core.warning(
-        `Budget: ledger issue #${issueNumber} has ${ledger.billed.unknownCount} entr(ies) with unknown cost — `
+        `Budget: ledger issue #${issueNumber} has ${ledger.unknownCount} entr(ies) with unknown cost — `
         + `today's spend ($${spentToday.toFixed(4)}) is a LOWER bound; the gradient rations at least this cautiously.`,
-      );
-    }
-    // [LAW:no-silent-failure] Subscription consumption is reported, not hidden: the operator sees what
-    // the day's quota-billed reviews would have cost at list price, stated as the separate figure it
-    // is. It is emitted here and summed into nothing.
-    const notionalRounds = ledger.notional.count + ledger.notional.unknownCount;
-    if (notionalRounds > 0) {
-      // [LAW:no-silent-failure] The rounds counted and the dollars summed come from DIFFERENT
-      // populations: every notional round is counted, but only the ones that reported a list price
-      // are summed. Printing the figure bare would pass a partial total off as complete — the exact
-      // accounting lie this change exists to kill — so an unreported remainder is named, the same
-      // honesty the billed tally gets above. [LAW:dataflow-not-control-flow] the remainder selects a
-      // string; one unconditional render consumes it.
-      const unreported = ledger.notional.unknownCount > 0
-        ? `, a LOWER bound — ${ledger.notional.unknownCount} of them reported no list price`
-        : '';
-      core.info(
-        `Budget: ${notionalRounds} of today's review(s) were billed to Claude subscription quota, not `
-        + `dollars — $${ledger.notional.total.toFixed(4)} at Anthropic list price${unreported}. It is `
-        + "excluded from the day's dollar spend and summed into nothing.",
       );
     }
   } catch (e) {
@@ -430,7 +468,7 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -771,51 +809,69 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
+  // [LAW:single-enforcer] From the first spawn until the review carrying its cost marker is handed to the
+  // host, the run's spend is guarded: a throw or a signal records it as an unfinished-run notice plus the
+  // ledger entry, so a run that dies after spending is still counted (guardSpend, src/spend.js).
+  const guard = guardSpend({
+    spend,
+    record: cause => recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }),
   });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  try {
+    const { review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    });
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
-  // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
-  // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
-  // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
-  // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
-  const { anchored, unanchored } = partitionFindings(review.findings, anchors);
-  for (const f of unanchored) {
-    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-  }
-
-  // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
-  // structured summaries the prompt note derived from — now enriched by the workers' per-module
-  // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
-  const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-  // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
-  // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration });
-  await submitReview(
-    reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
-    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
-    // and the sink alone decides what they mean for approval.
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
-    Boolean(reviewToken), transport, footer,
-  );
-
-  // [LAW:effects-at-boundaries] Append THIS review's actual cost to the daily ledger, AFTER submit — the
-  // cost is known only now. Only when the budget gradient is active (ledgerIssue set). [LAW:no-silent-failure]
-  // a failed append warns and continues: the day's ledger becomes a known LOWER bound, never a review
-  // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
-  if (ledgerIssue !== null) {
-    try {
-      await appendCost(octokit, owner, repo, ledgerIssue, review.usage, configUsed);
-    } catch (e) {
-      core.warning(
-        `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `
-        + "the day's ledger now UNDER-counts by this review (a known lower bound). Verify issues:write access.",
-      );
+    // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
+    // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
+    // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
+    // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
+    // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
+    const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+    for (const f of unanchored) {
+      core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
     }
+
+    // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
+    // structured summaries the prompt note derived from — now enriched by the workers' per-module
+    // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
+    const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
+    const spentOn = attributedConfig(spend.configs(), configUsed);
+    // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
+    // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
+    const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+    // [LAW:one-source-of-truth] A rejected post does not prove the review is absent: GitHub can commit it and
+    // still answer with a timeout or a 5xx. Delivering is not idempotent, so the host is asked instead of
+    // guessed at, through the same author-gated round count that produced `prior`. A round that appeared
+    // since this run read the PR is this run's review, and its marker already carries the spend; an
+    // unfinished notice on top of it would count the run twice. A read that fails too leaves the question
+    // unanswered, and the original error stands.
+    const landedDespite = async (err) => {
+      const after = await summarizePriorReviews(octokit, owner, repo, pullNumber, identities).catch((readErr) => {
+        core.warning(`Could not confirm whether the review reached PR #${pullNumber} after posting failed (${readErr.message}).`);
+        throw err;
+      });
+      if (after.count === prior.count) throw err;
+      core.warning(`Posting the review reported an error (${err.message}), but the review is on PR #${pullNumber}; its spend is recorded there.`);
+    };
+    // The ledger append is part of delivery, so a signal landing mid-post waits for it too.
+    await guard.deliver(async () => {
+      await submitReview(
+        reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+        // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+        // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+        // and the sink alone decides what they mean for approval.
+        { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
+        Boolean(reviewToken), transport, footer,
+      ).catch(landedDespite);
+      await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
+    });
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
   }
 }
 
@@ -823,7 +879,7 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
 // `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
 // at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -846,21 +902,32 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     `Running multi-scope whole-repo review with ${chain.length} config(s) in chain`
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
-  });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  // The same spend guard runPrReview holds, with the run log as its sink: this mode has no PR and no ledger.
+  const guard = guardSpend({ spend, record: cause => logUnfinishedRepoRun({ spend, cause }) });
+  let report;
+  let review;
+  try {
+    let configUsed;
+    ({ review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    }));
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
-  const report = renderRepoReport({ reviewerName, scope, review, footer });
-
-  // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
-  // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
-  // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
-  // is written first so findings are never lost if the Step Summary write fails (e.g. an
-  // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
-  core.info(report);
+    const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt, spentOn: attributedConfig(spend.configs(), configUsed) });
+    report = renderRepoReport({ reviewerName, scope, review, footer });
+    // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
+    // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
+    // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
+    // is written first so findings are never lost if the Step Summary write fails (e.g. an
+    // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
+    await guard.deliver(() => core.info(report));
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
+  }
   core.info(`Whole-repo review complete: ${review.findings.length} finding(s).`);
   await core.summary.addRaw(report).write();
 }
@@ -921,11 +988,14 @@ async function run() {
     return;
   }
   const effort = defaultEffortProfile({ roundCap });
+  // The run's spend meter, minted at the same boundary as the token cap and threaded the same way: every
+  // spawn attempt of whichever mode runs is recorded in it, and every exit reads it (src/spend.js).
+  const spend = mintSpendMeter();
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }

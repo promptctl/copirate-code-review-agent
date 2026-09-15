@@ -168,11 +168,12 @@ describe('summarizePriorReviews', () => {
   const usageOf = (cost) => ({ tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 5 }, cost });
   const withCost = (usd) => `verdict\n\n${costMarker(usageOf({ basis: 'dollars', usd }), CONFIG)}\n\n${REVIEW_MARKER}`;
   const unknownCost = () => `verdict\n\n${costMarker(null, CONFIG)}\n\n${REVIEW_MARKER}`;
-  const withNotionalCost = (notionalUsd) => `verdict\n\n${costMarker(usageOf({ basis: 'subscription', notionalUsd }), CONFIG)}\n\n${REVIEW_MARKER}`;
+  // A round posted before 1.69.0 for a Claude subscription run, under the legacy notional marker.
+  const withLegacyNotionalCost = (notionalUsd) => `verdict\n\n<!-- agent-review-notional-usd:{"notionalUsd":${notionalUsd}} -->\n\n${REVIEW_MARKER}`;
   // zai-timing-31d.3 — a round that recorded its wall clock. Every other helper above passes no
   // duration, which is exactly what every round posted before zai-timing-31d.2 looks like.
   const withDuration = (usd, ms) => `verdict\n\n${costMarker(usageOf({ basis: 'dollars', usd }), CONFIG, ms)}\n\n${REVIEW_MARKER}`;
-  const ZERO_TALLIES = { billed: { total: 0, count: 0, unknownCount: 0 }, notional: { total: 0, count: 0, unknownCount: 0 } };
+  const ZERO_TALLY = { total: 0, count: 0, unknownCount: 0 };
 
   test('counts only reviews whose body ENDS with the marker (the trailing sentinel)', async () => {
     const octokit = fakeOctokit([[
@@ -192,6 +193,27 @@ describe('summarizePriorReviews', () => {
     assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY)).count, 1);
   });
 
+  // zai-billing-g04: a run that spent and posted no review leaves an unfinished notice. It is not a round —
+  // the round cap must not move — but it spent, so its cost and time are folded like a round's.
+  test("an unfinished run's notice is folded into the cost and time totals without counting as a round", async () => {
+    const { renderUnfinishedBody, UNFINISHED_MARKER } = require('../src/transport');
+    const footer = `_Cost: $0.2500_\n\n${costMarker(usageOf({ basis: 'dollars', usd: 0.25 }), CONFIG, 90_000)}`;
+    const unfinished = renderUnfinishedBody('Review Agent', { cause: 'The run failed: write EPIPE', footer });
+    assert.ok(unfinished.endsWith(UNFINISHED_MARKER));
+    assert.ok(!unfinished.endsWith(REVIEW_MARKER));
+    const octokit = fakeOctokit([[
+      { id: 1, body: withDuration(0.05, 100_000) },
+      { id: 2, body: unfinished },
+    ]]);
+    const { count, cost, duration, reviews, latestArtifact } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(count, 1);
+    assert.deepEqual(reviews.map(r => r.id), [1]);
+    assert.equal(Number(cost.total.toFixed(2)), 0.30);
+    assert.equal(cost.count, 2);
+    assert.equal(duration.total, 190_000);
+    assert.equal(latestArtifact.kind, 'unfinished');
+  });
+
   test('sums the per-round cost markers into the PR cost total', async () => {
     const octokit = fakeOctokit([[
       { body: withCost(0.05) },
@@ -201,9 +223,9 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 3); // three marker-bearing reviews
-    assert.equal(Number(cost.billed.total.toFixed(2)), 0.08);
-    assert.equal(cost.billed.count, 2);
-    assert.equal(cost.billed.unknownCount, 1);
+    assert.equal(Number(cost.total.toFixed(2)), 0.08);
+    assert.equal(cost.count, 2);
+    assert.equal(cost.unknownCount, 1);
   });
 
   test('a human review that QUOTES a cost marker is excluded from BOTH count and cost (one gate)', async () => {
@@ -213,8 +235,8 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 1);                 // only the real agent round
-    assert.equal(Number(cost.billed.total.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
-    assert.equal(cost.billed.count, 1);
+    assert.equal(Number(cost.total.toFixed(2)), 0.04); // the human's $999 marker is NOT summed
+    assert.equal(cost.count, 1);
   });
 
   test('an agent round with no cost marker (pre-feature review) counts as unknown, not omitted', async () => {
@@ -224,27 +246,23 @@ describe('summarizePriorReviews', () => {
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 2);
-    assert.equal(cost.billed.count, 1);
-    assert.equal(cost.billed.unknownCount, 1); // the markerless agent round is an honest unknown
+    assert.equal(cost.count, 1);
+    assert.equal(cost.unknownCount, 1); // the markerless agent round is an honest unknown
   });
 
-  // [LAW:verifiable-goals] AC for zai-billing-xl0.2: the PR total must refuse to add across bases.
-  // Reviewing PR #113 reported "$63.59 across 4 rounds" as though it were spend; every dollar was
-  // Anthropic list price for tokens billed to plan quota. Both rounds are still COUNTED — the
-  // subscription's consumption stays visible — but the two figures never merge into one.
-  test('subscription rounds tally as notional and never enter the billed total', async () => {
+  // A round posted before 1.69.0 on a Claude subscription recorded its API-price cost under the legacy
+  // notional marker. That is the round's cost, so it sums into the PR total with every other round.
+  test('a legacy subscription round sums into the PR total as the API-price cost it records', async () => {
     const octokit = fakeOctokit([[
       { body: withCost(1.20) },
-      { body: withNotionalCost(40) },
-      { body: withNotionalCost(23.59) },
+      { body: withLegacyNotionalCost(40) },
+      { body: withLegacyNotionalCost(23.59) },
     ]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
-    assert.equal(count, 3);                                  // every round counted, whatever paid for it
-    assert.equal(Number(cost.billed.total.toFixed(2)), 1.20);  // the $63.59 of list price is NOT in here
-    assert.equal(cost.billed.count, 1);
-    assert.equal(cost.billed.unknownCount, 0);               // notional rounds are not "unknown" spend
-    assert.equal(Number(cost.notional.total.toFixed(2)), 63.59);
-    assert.equal(cost.notional.count, 2);
+    assert.equal(count, 3);
+    assert.equal(Number(cost.total.toFixed(2)), 64.79);
+    assert.equal(cost.count, 3);
+    assert.equal(cost.unknownCount, 0);
   });
 
   // zai-timing-31d.3 — cumulative agent time is tallied on the SAME pass, inside the SAME marker
@@ -310,14 +328,14 @@ describe('summarizePriorReviews', () => {
     assert.equal(duration.unknownCount, 1);   // and the forged round is still COUNTED, as unknown
     // The same body's cost DID parse: the marker matched and only the negative field was refused.
     // Without this, a name typo would make the test pass for the wrong reason.
-    assert.equal(Number(cost.billed.total.toFixed(2)), 0.06);
-    assert.equal(cost.billed.count, 2);
+    assert.equal(Number(cost.total.toFixed(2)), 0.06);
+    assert.equal(cost.count, 2);
   });
 
   test('returns zeroes when the PR has no reviews', async () => {
     const { count, cost, reviews } = await summarizePriorReviews(fakeOctokit([[]]), 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 0);
-    assert.deepEqual(cost, ZERO_TALLIES);
+    assert.deepEqual(cost, ZERO_TALLY);
     assert.deepEqual(reviews, []);
   });
 
@@ -356,8 +374,8 @@ describe('summarizePriorReviews', () => {
     const octokit = fakeOctokit([full, [{ body: withCost(0.01) }, { body: 'no marker' }]]);
     const { count, cost } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
     assert.equal(count, 101);
-    assert.equal(cost.billed.count, 101);              // cost summed across BOTH pages, not just page 1
-    assert.equal(Number(cost.billed.total.toFixed(2)), 1.01);  // 101 × $0.01
+    assert.equal(cost.count, 101);              // cost summed across BOTH pages, not just page 1
+    assert.equal(Number(cost.total.toFixed(2)), 1.01);  // 101 × $0.01
   });
 });
 

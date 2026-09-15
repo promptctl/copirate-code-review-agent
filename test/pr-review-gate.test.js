@@ -114,7 +114,7 @@ function fakeOctokit(tokenValue) {
 beforeEach(() => {
   host = {
     files: [], unifiedDiff: '', reviews: [], priorReviews: [],
-    patTokens: new Set(), brokenIdentityTokens: new Set(),
+    patTokens: new Set(), brokenIdentityTokens: new Set(), engine: null,
   };
   engineSpawns = [];
   engineFindings = [];
@@ -129,8 +129,12 @@ preflightModule.preflight = async () => ({ ok: true, results: [] });
 // prompt this run would have sent can be built from it — the real buildReviewInput, via the real
 // buildPrMaterial, exactly as an engine would receive it.
 // The run writes each patched file's diff to a real temp directory (writeDiffFiles); nothing here stubs it.
-multiscope.runMultiScope = async ({ material, chain }) => {
+// `host.engine`, when a test sets one, replaces the pass outright — the spend tests below use it to spend
+// through the run's meter and then die, as a real engine does.
+multiscope.runMultiScope = async (args) => {
+  const { material, chain } = args;
   engineSpawns.push(material);
+  if (host.engine) return host.engine(args);
   return {
     review: { summary: 'Reviewed.', findings: engineFindings, unreviewedScopes: [], scopeFailures: [], exhaustedBounds: [], assessments: [], usage: null },
     configUsed: chain[0],
@@ -314,5 +318,97 @@ describe('a run holding both GITHUB_TOKEN and GITHUB_REVIEW_TOKEN', () => {
     assert.equal(host.reviews.length, 0, 'a review was posted by a run with no resolvable identity');
     assert.equal(failures.length, 1);
     assert.match(failures[0], /identity|Bad credentials|attributed/i);
+  });
+});
+
+// ── zai-billing-g04: a run that spends and then fails still records what it spent ──────────────────────
+// The engine layer is replaced by one that spends through the run's meter, exactly as a real pass does,
+// and then dies. What must reach the PR is the spend — the only sink this PR's running total is folded
+// from — and the run must still red with its real cause.
+describe('a run that spends and then fails', () => {
+  const { UNFINISHED_MARKER } = require('../src/transport');
+  const { parseCostRecord } = require('../src/usage');
+  const spent = { tokens: { inputCacheMiss: 1_000, inputCacheHit: 4_000, output: 50 }, cost: { basis: 'dollars', usd: 0.25 }, span: { from: '2026-09-14T03:00:00.000Z', to: '2026-09-14T03:04:00.000Z' } };
+  const patched = [{ filename: 'src/a.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const a = 1;' }];
+  const dies = (message, usage) => async ({ spend, chain }) => spend.attempt(chain[0], async () => {
+    throw Object.assign(new Error(message), { usage });
+  });
+
+  test('posts an unfinished-run notice carrying the spend, then rethrows the real cause', async () => {
+    host.files = patched;
+    host.engine = dies('API Error: Rate limit reached', spent);
+    await assert.rejects(review(), /Rate limit reached/);
+    assert.equal(host.reviews.length, 1);
+    const posted = host.reviews[0];
+    assert.equal(posted.event, 'COMMENT');
+    assert.ok(posted.body.trimEnd().endsWith(UNFINISHED_MARKER));
+    assert.match(posted.body, /REVIEW DID NOT FINISH/);
+    assert.match(posted.body, /The run failed: API Error: Rate limit reached/);
+    // The marker records the spend itself, so the PR total can fold it.
+    const record = parseCostRecord(posted.body);
+    assert.equal(record.cost.usd, 0.25);
+    assert.deepEqual(record.tokens, spent.tokens);
+  });
+
+  test('a run that died before any engine spent posts nothing and still rethrows', async () => {
+    host.files = patched;
+    host.engine = dies('spawn ENOENT', null);
+    await assert.rejects(review(), /spawn ENOENT/);
+    assert.equal(host.reviews.length, 0);
+  });
+
+  test('a host that refuses the review itself still leaves the spend recorded', async () => {
+    host.files = patched;
+    let posts = 0;
+    host.engine = async ({ spend, chain }) => {
+      await spend.attempt(chain[0], async () => ({ usage: spent }));
+      return { review: { summary: 'Reviewed.', findings: [], unreviewedScopes: [], scopeFailures: [], exhaustedBounds: [], assessments: [], usage: spent }, configUsed: chain[0] };
+    };
+    const original = github.getOctokit;
+    github.getOctokit = (token) => {
+      const octokit = fakeOctokit(token);
+      const create = octokit.rest.pulls.createReview;
+      octokit.rest.pulls.createReview = async (args) => {
+        if (posts++ === 0) throw new Error('HttpError: Validation Failed');
+        return create(args);
+      };
+      return octokit;
+    };
+    try {
+      await assert.rejects(review(), /Validation Failed/);
+    } finally {
+      github.getOctokit = original;
+    }
+    assert.equal(host.reviews.length, 1);
+    assert.ok(host.reviews[0].body.trimEnd().endsWith(UNFINISHED_MARKER));
+    assert.equal(parseCostRecord(host.reviews[0].body).cost.usd, 0.25);
+  });
+
+  // The other half of an errored post: GitHub committed the review and the response was lost. The review's
+  // own marker already carries the spend, so a second, unfinished marker would count this run twice.
+  test('a review the host committed despite answering with an error is not recorded a second time', async () => {
+    host.files = patched;
+    host.engine = async ({ spend, chain }) => {
+      await spend.attempt(chain[0], async () => ({ usage: spent }));
+      return { review: { summary: 'Reviewed.', findings: [], unreviewedScopes: [], scopeFailures: [], exhaustedBounds: [], assessments: [], usage: spent }, configUsed: chain[0] };
+    };
+    const original = github.getOctokit;
+    github.getOctokit = (token) => {
+      const octokit = fakeOctokit(token);
+      octokit.rest.pulls.createReview = async (args) => {
+        host.reviews.push(args);
+        host.priorReviews = [...host.priorReviews, { id: 90 + host.reviews.length, state: 'COMMENTED', user: { login: 'github-actions[bot]', type: 'Bot' }, body: args.body }];
+        throw Object.assign(new Error('Server Error'), { status: 502 });
+      };
+      return octokit;
+    };
+    try {
+      await review();
+    } finally {
+      github.getOctokit = original;
+    }
+    assert.equal(host.reviews.length, 1);
+    assert.ok(!host.reviews[0].body.trimEnd().endsWith(UNFINISHED_MARKER));
+    assert.equal(parseCostRecord(host.reviews[0].body).cost.usd, 0.25);
   });
 });

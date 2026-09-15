@@ -4,6 +4,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, Tr
 const { remainingMs } = require('./deadline');
 const { BOUNDS, BudgetExhaustedError } = require('./bounds');
 const { mintTokenCap } = require('./token-cap');
+const { mintSpendMeter } = require('./spend');
 const { defaultEffortProfile, maxTier } = require('./effort');
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = require('./review');
 const { sumCost, emptyTokens, addTokens } = require('./usage');
@@ -582,9 +583,10 @@ function pinnedProposal({ plan, changedPaths, log }) {
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
-// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return —
-// plus `schedule`, the pass's recorded shape (zai-timing-31d.5) — so every downstream sink stays
-// unchanged. [LAW:decomposition]
+// unit. Returns the {summary, findings} a single engine spawn used to return — plus `schedule`, the
+// pass's recorded shape (zai-timing-31d.5). What the pass SPENT is not on its return value: every
+// attempt is recorded in `spend`, the run's meter, as it settles, so a pass that throws or that
+// failover discards still leaves its spend with the run (runMultiScope folds it). [LAW:decomposition]
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
@@ -594,7 +596,7 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -620,17 +622,19 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // spawn ATTEMPT settles here, so every attempt leaves a tagged record — the successful spawn with
   // its full usage, a transiently-failed-then-retried attempt with the span it burned (err.span,
   // stamped by runEngine; the gap PR #134 deferred), and the settling failure (a deadline kill, an
-  // exhausted retry) with its span before the error escapes to whoever absorbs it. The pass total
-  // AND the schedule both derive from this one list, so no phase can appear in one and be forgotten
-  // by the other. [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
+  // exhausted retry) with its span before the error escapes to whoever absorbs it. The schedule
+  // derives from this one list, so no phase can appear in the run and be forgotten by the breakdown.
+  // [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
   // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label. Every
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
+  // Each attempt also settles through `spend.attempt`, the run's meter: the schedule is this pass's
+  // shape, the meter is the run's spend, and both read the one usage value the adapter stamped.
   const spawnRecords = [];
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
-        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap }),
+        () => spend.attempt(config, () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap })),
         {
           sleepFn,
           // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
@@ -753,11 +757,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // the go.mod-owning worker records any; dedupeAssessments (keyed by module) collapses the multi-go.mod
     // case — and the sweep-pass re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(outcomes.flatMap(o => o.assessments)),
-    // [LAW:one-source-of-truth] The pass total folds from the SAME record list the schedule reports,
-    // so "what this pass consumed" has one owner: a spawn in the schedule is in the total, and a
-    // spawn in the total is in the schedule — including retried attempts and deadline-killed scopes,
-    // whose span-only records widen the envelope exactly as a reviewed spawn's does.
-    usage: sumUsage(spawnRecords.map(r => r.usage)),
     // The pass's recorded shape (zai-timing-31d.5): the scheduling facts as actually used, plus one
     // record per spawn attempt. laneCount is the count the pool RAN — the plan's width under the
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
@@ -822,7 +821,11 @@ const SWEEP_LOG_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, BOUNDS[b]
 // [LAW:one-source-of-truth] `tokenCap` is the run's one token cap, and every config the chain fails over to
 // spends from it: failover restarts the pass, never the count. A caller that sets no cap gets an uncapped
 // one — the same code path with a limit that is never reached.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+// [LAW:one-source-of-truth] `spend` is the run's meter, shared the same way: the review's `usage` is folded
+// from it once the chain settles, so a pass failover retried is in the footer beside the pass that posted.
+// A caller that must read the spend of a run that THROWS (run.js) mints the meter and passes it in; a
+// caller that only reads a returned review gets its own.
+async function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
@@ -833,7 +836,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, spend, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -845,7 +848,8 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
   // byte-identical (remainingMs is Infinity there).
   const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  const result = await produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  return { ...result, review: { ...result.review, usage: sumUsage(spend.usages()) } };
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
