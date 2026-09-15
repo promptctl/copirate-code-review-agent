@@ -7,6 +7,7 @@ const { remainingMs } = require('../deadline');
 const { BOUNDS, BudgetExhaustedError } = require('../bounds');
 const { mintTokenCap } = require('../token-cap');
 const { totalTokens } = require('../usage');
+const { onSignalStop } = require('../shutdown');
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
@@ -42,8 +43,9 @@ function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
 // from the ACTION's group: if the action dies first (workflow cancel, TIME_BUDGET_MINUTES 0, a
 // budget above the job's timeout-minutes), a group-based job kill no longer reaches the engine and
 // it can orphan on a persistent self-hosted/act_runner host, burning provider credits. The reaper
-// SIGKILLs every live group on process 'exit' and on SIGINT/SIGTERM (re-exiting with the
-// conventional code), so the engine dies with the action on every path the action can observe.
+// SIGKILLs every live group on process 'exit' and, as a shutdown STOP, the instant SIGINT/SIGTERM
+// lands (src/shutdown.js owns the exit that follows, after the run records what it spent), so the
+// engine dies with the action on every path the action can observe.
 // GitHub-hosted runners additionally evaporate the VM at job end — the reaper is what closes the
 // self-hosted gap. ESRCH is the goal state, never an error.
 const liveEngineGroups = new Set();
@@ -58,12 +60,7 @@ function installShutdownReaper() {
   if (reaperInstalled) return;
   reaperInstalled = true;
   process.on('exit', reapLiveEngineGroups);
-  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
-    process.on(signal, () => {
-      reapLiveEngineGroups();
-      process.exit(code);
-    });
-  }
+  onSignalStop(reapLiveEngineGroups);
 }
 
 function parseJsonEnvelope(stdout) {

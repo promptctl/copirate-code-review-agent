@@ -125,7 +125,7 @@ describe("the PR's cumulative agent time", () => {
     const prior = priorRounds(round(3 * MIN), round(5 * MIN), round(4 * MIN));
     const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 2 * MIN, priorDuration: prior });
     // 3 + 5 + 4 prior, plus this run's 2 — every round recorded, so no '+' and nothing unrecorded.
-    assert.match(footer, /_Timing: 2m00s total · PR time 14m00s across 4 rounds · spawns/);
+    assert.match(footer, /_Timing: 2m00s total · PR time 14m00s across 4 runs · spawns/);
     assert.doesNotMatch(footer, /unrecorded/);
   });
 
@@ -143,7 +143,7 @@ describe("the PR's cumulative agent time", () => {
     assert.equal(parseCostRecord(legacy).totalMs, null);
     const prior = priorRounds(round(6 * MIN), legacy, legacy);
     const footer = buildReviewFooter(null, CONFIG, null, { schedule: SCHEDULE, totalMs: 4 * MIN, priorDuration: prior });
-    assert.match(footer, /PR time 10m00s\+ across 4 rounds, 2 unrecorded/);
+    assert.match(footer, /PR time 10m00s\+ across 4 runs, 2 unrecorded/);
   });
 
   // THE TRAP. The record carries BOTH a spawn span (from/to) and the run's wall clock, and they look
@@ -173,7 +173,7 @@ describe("the PR's cumulative agent time", () => {
   test('the cumulative total survives a run that recorded no schedule', () => {
     const prior = priorRounds(round(9 * MIN));
     const footer = buildReviewFooter(null, CONFIG, null, { schedule: null, totalMs: 1 * MIN, priorDuration: prior });
-    assert.match(footer, /_Timing: 1m00s total · PR time 10m00s across 2 rounds · spawn breakdown unavailable/);
+    assert.match(footer, /_Timing: 1m00s total · PR time 10m00s across 2 runs · spawn breakdown unavailable/);
   });
 
   // Time is diagnostics; findings are the product. A cumulative figure never becomes a reason a

@@ -1270,7 +1270,9 @@ function renderTally(label, tally) {
   if (rounds === 0) return null;
   const approx = tally.unknownCount > 0 ? '+' : '';
   const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+  // "runs", not "rounds": the tally folds every run that spent — a run that failed or was cancelled
+  // leaves an unfinished notice carrying its cost — and a round is only the runs that posted a review.
+  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} runs${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
@@ -1321,7 +1323,7 @@ function renderPrTime(thisMs, priorDuration) {
   const total = tallyQuantity({ ...priorDuration }, thisMs);
   const approx = total.unknownCount > 0 ? '+' : '';
   const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
-  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by

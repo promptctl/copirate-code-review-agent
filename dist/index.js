@@ -33805,6 +33805,7 @@ const { remainingMs } = __nccwpck_require__(6757);
 const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
 const { mintTokenCap } = __nccwpck_require__(7889);
 const { totalTokens } = __nccwpck_require__(9614);
+const { onSignalStop } = __nccwpck_require__(2507);
 
 // [LAW:no-ambient-temporal-coupling] An engine may legitimately emit an arbitrarily large
 // stream — codex's app-server streams every reasoning delta and tool call as a JSON-RPC line,
@@ -33840,8 +33841,9 @@ function appendBounded(buffer, chunk, max = MAX_RETAINED_OUTPUT) {
 // from the ACTION's group: if the action dies first (workflow cancel, TIME_BUDGET_MINUTES 0, a
 // budget above the job's timeout-minutes), a group-based job kill no longer reaches the engine and
 // it can orphan on a persistent self-hosted/act_runner host, burning provider credits. The reaper
-// SIGKILLs every live group on process 'exit' and on SIGINT/SIGTERM (re-exiting with the
-// conventional code), so the engine dies with the action on every path the action can observe.
+// SIGKILLs every live group on process 'exit' and, as a shutdown STOP, the instant SIGINT/SIGTERM
+// lands (src/shutdown.js owns the exit that follows, after the run records what it spent), so the
+// engine dies with the action on every path the action can observe.
 // GitHub-hosted runners additionally evaporate the VM at job end — the reaper is what closes the
 // self-hosted gap. ESRCH is the goal state, never an error.
 const liveEngineGroups = new Set();
@@ -33856,12 +33858,7 @@ function installShutdownReaper() {
   if (reaperInstalled) return;
   reaperInstalled = true;
   process.on('exit', reapLiveEngineGroups);
-  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
-    process.on(signal, () => {
-      reapLiveEngineGroups();
-      process.exit(code);
-    });
-  }
+  onSignalStop(reapLiveEngineGroups);
 }
 
 function parseJsonEnvelope(stdout) {
@@ -34741,6 +34738,7 @@ const { produceReview, retryTransientSpawn, sleep, TRANSIENT_RETRY_BUDGET_MS, Tr
 const { remainingMs } = __nccwpck_require__(6757);
 const { BOUNDS, BudgetExhaustedError } = __nccwpck_require__(3752);
 const { mintTokenCap } = __nccwpck_require__(7889);
+const { mintSpendMeter } = __nccwpck_require__(6185);
 const { defaultEffortProfile, maxTier } = __nccwpck_require__(4652);
 const { dedupeFindings, dedupeAssessments, parseScopeValue, firstLine } = __nccwpck_require__(1565);
 const { sumCost, emptyTokens, addTokens } = __nccwpck_require__(9614);
@@ -35319,9 +35317,10 @@ function pinnedProposal({ plan, changedPaths, log }) {
 
 // One full multi-scope pass for ONE config: scout → workers → aggregate. This is the produceOnce that
 // failover.produceReview drives, so the whole pass is one attempt and retry/failover wraps it as a
-// unit. Returns the same {summary, findings, usage} shape a single engine spawn used to return —
-// plus `schedule`, the pass's recorded shape (zai-timing-31d.5) — so every downstream sink stays
-// unchanged. [LAW:decomposition]
+// unit. Returns the {summary, findings} a single engine spawn used to return — plus `schedule`, the
+// pass's recorded shape (zai-timing-31d.5). What the pass SPENT is not on its return value: every
+// attempt is recorded in `spend`, the run's meter, as it settles, so a pass that throws or that
+// failover discards still leaves its spend with the run (runMultiScope folds it). [LAW:decomposition]
 // `deadline` (epoch ms, null = no budget) and `now` (the injected clock, matching the sleepFn
 // convention) are the wall-clock budget: the pass stops STARTING work — scope workers and sweeps —
 // once the budget is spent, delivers everything already collected, and reports the coverage gap as
@@ -35331,7 +35330,7 @@ function pinnedProposal({ plan, changedPaths, log }) {
 // log's running totals count from it, so they agree with the footer's total by construction. A
 // caller without one (null) logs 'elapsed unclocked' rather than minting a second start here:
 // timing is diagnostics and never invents a clock. [LAW:one-source-of-truth]
-async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+async function runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   // [LAW:no-silent-failure] A missing/malformed sweep bound must not decide anything by accident: an
   // undefined cap would make every chain's `pass <= sweepCap` false on pass 0 and the review would
   // "succeed" having run NO workers at all. The bound comes from the effort profile (its one
@@ -35357,17 +35356,19 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
   // spawn ATTEMPT settles here, so every attempt leaves a tagged record — the successful spawn with
   // its full usage, a transiently-failed-then-retried attempt with the span it burned (err.span,
   // stamped by runEngine; the gap PR #134 deferred), and the settling failure (a deadline kill, an
-  // exhausted retry) with its span before the error escapes to whoever absorbs it. The pass total
-  // AND the schedule both derive from this one list, so no phase can appear in one and be forgotten
-  // by the other. [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
+  // exhausted retry) with its span before the error escapes to whoever absorbs it. The schedule
+  // derives from this one list, so no phase can appear in the run and be forgotten by the breakdown.
+  // [LAW:one-source-of-truth] `tag` is the record's identity — { phase: 'scout' } or
   // { phase: 'worker', scope, pass } — a value, never re-parsed from the human-facing label. Every
   // record is minted through spawnRecord (src/schedule.js), the one owner of the record shape, so a
   // drifted tag or outcome fails loudly here rather than silently corrupting the derived breakdown.
+  // Each attempt also settles through `spend.attempt`, the run's meter: the schedule is this pass's
+  // shape, the meter is the run's spend, and both read the one usage value the adapter stamped.
   const spawnRecords = [];
   const spawn = async (buildPromptFor, label, tag) => {
     try {
       const result = await retryTransientSpawn(
-        () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap }),
+        () => spend.attempt(config, () => adapter.produceReview({ config, buildPromptFor, instructionsPath, deadline, tokenCap })),
         {
           sleepFn,
           // The same deadline bounds the spawn AND its retry sleeps: an uncapped Retry-After near
@@ -35490,11 +35491,6 @@ async function runMultiScopePass({ config, material, registry, instructionsPath,
     // the go.mod-owning worker records any; dedupeAssessments (keyed by module) collapses the multi-go.mod
     // case — and the sweep-pass re-assessments, which collapse by the same module key. Non-dependency PR → [].
     assessments: dedupeAssessments(outcomes.flatMap(o => o.assessments)),
-    // [LAW:one-source-of-truth] The pass total folds from the SAME record list the schedule reports,
-    // so "what this pass consumed" has one owner: a spawn in the schedule is in the total, and a
-    // spawn in the total is in the schedule — including retried attempts and deadline-killed scopes,
-    // whose span-only records widen the envelope exactly as a reviewed spawn's does.
-    usage: sumUsage(spawnRecords.map(r => r.usage)),
     // The pass's recorded shape (zai-timing-31d.5): the scheduling facts as actually used, plus one
     // record per spawn attempt. laneCount is the count the pool RAN — the plan's width under the
     // machine's ceiling — so the record cannot claim a parallelism the pass did not have.
@@ -35559,7 +35555,11 @@ const SWEEP_LOG_BY = { ...Object.fromEntries(BOUND_CAUSES.map(b => [b, BOUNDS[b]
 // [LAW:one-source-of-truth] `tokenCap` is the run's one token cap, and every config the chain fails over to
 // spends from it: failover restarts the pass, never the count. A caller that sets no cap gets an uncapped
 // one — the same code path with a limit that is never reached.
-function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), now = Date.now, startedAt = null }) {
+// [LAW:one-source-of-truth] `spend` is the run's meter, shared the same way: the review's `usage` is folded
+// from it once the chain settles, so a pass failover retried is in the footer beside the pass that posted.
+// A caller that must read the spend of a run that THROWS (run.js) mints the meter and passes it in; a
+// caller that only reads a returned review gets its own.
+async function runMultiScope({ chain, material, registry, instructionsPath, effort = defaultEffortProfile(), laneCeiling = laneCeilingFromMemory(os.totalmem()), log = () => {}, plan = null, sleepFn = sleep, deadline = null, tokenCap = mintTokenCap(0), spend = mintSpendMeter(), now = Date.now, startedAt = null }) {
   const sweepCap = effort.sweepCap;
   const effectiveChain = chain.map(config => ({
     ...config,
@@ -35570,7 +35570,7 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // gets the scouted path byte-identically, and no seam between here and the producer knows there are
   // two of them. It is NOT on the effort profile — a plan is not a dial an arm turns, it is the
   // structure an arm is held constant against (copirate-determinism-5od.w2r).
-  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, now, startedAt });
+  const produceOnce = (config) => runMultiScopePass({ config, material, registry, instructionsPath, laneCeiling, sweepCap, log, plan, sleepFn, deadline, tokenCap, spend, now, startedAt });
   // [LAW:no-ambient-temporal-coupling] ONE sleepFn and ONE clock own the whole pass's retry timing:
   // both are forwarded to produceReview, so the pass-level gates, the spawn-level retry clamp, and
   // config-level failover all measure the budget on the same injected `now` — a fake clock in a test
@@ -35582,7 +35582,8 @@ function runMultiScope({ chain, material, registry, instructionsPath, effort = d
   // longer sleep the run past its own deadline. min() with the default keeps the no-deadline path
   // byte-identical (remainingMs is Infinity there).
   const budgetMs = Math.min(TRANSIENT_RETRY_BUDGET_MS, remainingMs(deadline, now()));
-  return produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  const result = await produceReview(effectiveChain, null, null, produceOnce, sleepFn, budgetMs, now);
+  return { ...result, review: { ...result.review, usage: sumUsage(spend.usages()) } };
 }
 
 // [LAW:decomposition] The two MATERIALS, built once each. A material knows how to build the scout
@@ -37545,11 +37546,12 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 
 const { filterFiles, buildReviewAnchors, diffChurn, excludedPathList } = __nccwpck_require__(9898);
-const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName } = __nccwpck_require__(7228);
+const { selectTransport, submitReview, resolveReviewTarget, prIsFromFork, summarizePriorReviews, resolveReviewerIdentities, announceNotReviewed, releaseUnrevisitableBlocks, forkNotice, roundCapNotice, fetchPriorPushbacks, roundCapReached, parseMaxRounds, parseReviewerName, announceUnfinished, renderUnfinishedBody } = __nccwpck_require__(7228);
 const { writeDiffFiles } = __nccwpck_require__(1352);
 const { partitionFindings } = __nccwpck_require__(1565);
 const { buildAttributionFooter } = __nccwpck_require__(2887);
-const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName } = __nccwpck_require__(3746);
+const { runMultiScope, buildPrMaterial, buildRepoMaterial, unreviewedByCause, unreviewedName, sumUsage } = __nccwpck_require__(3746);
+const { mintSpendMeter, attributedConfig, guardSpend } = __nccwpck_require__(6185);
 const { defaultEffortProfile } = __nccwpck_require__(4652);
 const { parseDailyBudgetUsd, defaultBudgetCandidates, chooseProfile, effectiveRounds } = __nccwpck_require__(5120);
 const { assessDifficulty } = __nccwpck_require__(4260);
@@ -37699,7 +37701,16 @@ async function preflightChain(chain) {
 // diagnostics, findings are the product. Named here, an absent envelope is an absent schedule, an
 // absent total and an absent prior duration — three values the renderer already knows how to report
 // as gaps, the last of them as no cumulative clause at all. [LAW:no-silent-failure]
-function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null } = {}) {
+// `spentOn` is the config the cost MARKER attributes the spend to (attributedConfig, src/spend.js), which
+// differs from `configUsed` only when a failover spread the run's spend across models or endpoints.
+function buildReviewFooter(usage, configUsed, priorCost, timing = {}) {
+  return `${buildAttributionFooter(configUsed)}\n\n${buildSpendFooter(usage, configUsed, priorCost, timing)}`;
+}
+
+// [LAW:decomposition] What a run SPENT, as the footer states it: the cost line, the timing block and the
+// cost marker. A posted review carries it under its attribution line; an unfinished-run notice carries it
+// alone, since no config reviewed anything. One builder, so the two bodies cannot record spend differently.
+function buildSpendFooter(usage, configUsed, priorCost, { schedule = null, totalMs, priorDuration = null, spentOn = configUsed } = {}) {
   const warning = costWarning(usage, configUsed);
   if (warning) core.warning(warning);
   const costLine = renderCostLine(usage, configUsed, priorCost);
@@ -37729,8 +37740,61 @@ function buildReviewFooter(usage, configUsed, priorCost, { schedule = null, tota
   // Recording is outside the try above on purpose — the render is the fragile part (formatting a
   // schedule), while `totalMs` is a number the run's own clock minted, and a failed BLOCK must not
   // also cost the next round its summand.
-  const marker = costMarker(usage, configUsed, totalMs);
-  return [buildAttributionFooter(configUsed), costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+  const marker = costMarker(usage, spentOn, totalMs);
+  return [costLine, timingBlock, marker].filter(Boolean).join('\n\n');
+}
+
+// The failure output's statement of what a run spent before it stopped. [LAW:no-silent-failure] A run that
+// dies after spending must never read as a $0 run in its own log.
+function unfinishedSpendLine(cause, usage, config) {
+  const costLine = renderCostLine(usage, config);
+  return `${cause} It posted no review, and spent: ${costLine ? costLine.replace(/^_|_$/g, '') : 'an amount its engine did not report'}`;
+}
+
+// [LAW:effects-at-boundaries] Append a run's actual cost to the daily ledger, once its cost is known — after
+// a review submits, or when an unfinished run is recorded. Only when the budget gradient is active
+// (ledgerIssue set). [LAW:no-silent-failure] a failed append warns and continues: the day's ledger becomes a
+// known LOWER bound, never a run aborted for a bookkeeping write. The cost VALUE is the one the footer
+// already reported, never re-estimated.
+async function appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config }) {
+  if (ledgerIssue === null) return;
+  try {
+    await appendCost(octokit, owner, repo, ledgerIssue, usage, config);
+  } catch (e) {
+    core.warning(
+      `Budget: failed to append this run's cost to ledger issue #${ledgerIssue} (${e.message}) — `
+      + "the day's ledger now UNDER-counts by this run (a known lower bound). Verify issues:write access.",
+    );
+  }
+}
+
+// The PR sink for a run that spent and posted no review: guardSpend's `record` (src/spend.js), reached by a
+// throw or a signal. It names the spend in the run log, posts the unfinished notice whose cost marker the
+// PR's running total folds, and appends the ledger entry. A run whose attempts recorded no usage at all
+// ended before any engine ran; it spent nothing, so there is nothing to count.
+async function recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  const config = configs[configs.length - 1];
+  const spentOn = attributedConfig(configs, config);
+  core.error(unfinishedSpendLine(cause, usage, config));
+  const footer = buildSpendFooter(usage, config, prior.cost, { totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+  try {
+    await announceUnfinished(reviewOctokit, { owner, repo, pullNumber, commitId: headSha, body: renderUnfinishedBody(reviewerName, { cause, footer }) });
+    core.info(`Posted an unfinished-run notice to PR #${pullNumber}, recording this run's spend.`);
+  } catch (e) {
+    core.error(`Could not post the unfinished-run notice to PR #${pullNumber} (${e.message}); this PR's running total does not include this run's spend.`);
+  }
+  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage, config: spentOn });
+}
+
+// The repo-mode sink for the same exit: no PR and no ledger, so the run log is where the spend is named.
+async function logUnfinishedRepoRun({ spend, cause }) {
+  const usage = sumUsage(spend.usages());
+  if (usage === null) return;
+  const configs = spend.configs();
+  core.error(unfinishedSpendLine(cause, usage, configs[configs.length - 1]));
 }
 
 // [LAW:one-source-of-truth] The budget-exhaustion warning, composed ONCE for both review modes from
@@ -37970,7 +38034,7 @@ async function resolveDependencySummaries(octokit, filteredFiles, dependencyDiff
 // The entry default covers direct callers (tests, embedding): for them THIS boundary is the
 // run boundary, so the mint moves here rather than a second clock appearing anywhere inland.
 // [LAW:no-ambient-temporal-coupling]
-async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
   const reviewToken = core.getInput('GITHUB_REVIEW_TOKEN');
@@ -38311,59 +38375,64 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
 
   // [LAW:one-source-of-truth] The engine owns review judgment; the action owns GitHub transport.
   core.info(`Running multi-scope PR review for ${filteredFiles.length} file(s) with ${chain.length} config(s) in chain...`);
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
+  // [LAW:single-enforcer] From the first spawn until the review carrying its cost marker is handed to the
+  // host, the run's spend is guarded: a throw or a signal records it as an unfinished-run notice plus the
+  // ledger entry, so a run that dies after spending is still counted (guardSpend, src/spend.js).
+  const guard = guardSpend({
+    spend,
+    record: cause => recordUnfinishedPrRun({ octokit, reviewOctokit, owner, repo, pullNumber, headSha, reviewerName, spend, prior, startedAt, ledgerIssue, cause }),
   });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  let review;
+  let spentOn;
+  try {
+    let configUsed;
+    ({ review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    }));
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
-  // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
-  // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
-  // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
-  // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
-  const { anchored, unanchored } = partitionFindings(review.findings, anchors);
-  for (const f of unanchored) {
-    core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
-  }
-
-  // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
-  // structured summaries the prompt note derived from — now enriched by the workers' per-module
-  // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
-  const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
-  // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
-  // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
-  const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration });
-  await submitReview(
-    reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
-    // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
-    // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
-    // and the sink alone decides what they mean for approval.
-    { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
-    Boolean(reviewToken), transport, footer,
-  );
-
-  // [LAW:effects-at-boundaries] Append THIS review's actual cost to the daily ledger, AFTER submit — the
-  // cost is known only now. Only when the budget gradient is active (ledgerIssue set). [LAW:no-silent-failure]
-  // a failed append warns and continues: the day's ledger becomes a known LOWER bound, never a review
-  // aborted for a bookkeeping write. The cost VALUE is the one the footer already reported — never re-estimated.
-  if (ledgerIssue !== null) {
-    try {
-      await appendCost(octokit, owner, repo, ledgerIssue, review.usage, configUsed);
-    } catch (e) {
-      core.warning(
-        `Budget: failed to append this review's cost to ledger issue #${ledgerIssue} (${e.message}) — `
-        + "the day's ledger now UNDER-counts by this review (a known lower bound). Verify issues:write access.",
-      );
+    // [LAW:single-enforcer] The PR sink reconciles the MERGED findings with the diff anchors exactly
+    // once, here at the boundary: anchored (incl. snapped) post inline; unanchored surface in the
+    // summary. [LAW:dataflow-not-control-flow] a finding the model anchored outside the diff is a value
+    // routed to the summary, never a fatal that aborts the review. [LAW:no-silent-failure] each
+    // unanchored finding is logged, never dropped — and still counts toward the verdict in submitReview.
+    const { anchored, unanchored } = partitionFindings(review.findings, anchors);
+    for (const f of unanchored) {
+      core.warning(`Finding references ${f.path}:${f.line}, outside the reviewed diff — surfaced in the review summary instead of inline.`);
     }
+
+    // [LAW:one-source-of-truth] The dependency section is assembled once here, at the sink, from the SAME
+    // structured summaries the prompt note derived from — now enriched by the workers' per-module
+    // assessments. '' for a non-dependency PR, so the posted body is byte-identical to before. [LAW:dataflow-not-control-flow]
+    const dependencySection = renderDependencyReviewSection(dependencySummaries, review.assessments);
+    spentOn = attributedConfig(spend.configs(), configUsed);
+    // totalMs is read HERE, at the last instant before the sink, so the total covers everything the
+    // run did up to submission — the same clock startedAt came from, read once. [LAW:one-source-of-truth]
+    const footer = buildReviewFooter(review.usage, configUsed, prior.cost, { schedule: review.schedule, totalMs: Date.now() - startedAt, priorDuration: prior.duration, spentOn });
+    guard.delivering();
+    await submitReview(
+      reviewOctokit, owner, repo, pullNumber, headSha, reviewerName,
+      // [LAW:dataflow-not-control-flow] Coverage is stated, never inferred: the engine's own gap
+      // (unreviewedScopes) and the diff boundary's (transport.unreviewable) both reach the sink as values,
+      // and the sink alone decides what they mean for approval.
+      { summary: review.summary, findings: anchored, unanchored, dependencySection, unreviewedScopes: review.unreviewedScopes, unreviewableFiles: transport.unreviewable },
+      Boolean(reviewToken), transport, footer,
+    );
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
   }
+  await appendLedgerCost({ octokit, owner, repo, ledgerIssue, usage: review.usage, config: spentOn });
 }
 
 // Whole-repo review: no PR, no fork gate, no host transport. Build a repo-exploration prompt
 // (optionally scoped), run the same engine chain, and print the report to the Step Summary + logs.
 // `startedAt` carries the same contract as runPrReview's: the run's one start instant, defaulted
 // at this entry only for direct callers whose run boundary this is. [LAW:no-ambient-temporal-coupling]
-async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0)) {
+async function runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt = Date.now(), tokenCap = mintTokenCap(0), spend = mintSpendMeter()) {
   const scope = core.getInput('SCOPE').trim();
 
   let chain;
@@ -38386,21 +38455,33 @@ async function runRepoReview(reviewerName, excludePatterns, effort, deadline, st
     `Running multi-scope whole-repo review with ${chain.length} config(s) in chain`
     + `${scope ? ` (scope: ${scope})` : ' (whole repository)'}...`,
   );
-  const { review, configUsed } = await runMultiScope({
-    chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, startedAt,
-  });
-  warnBudgetExhausted(review);
-  warnScopeFailures(review);
+  // The same spend guard runPrReview holds, with the run log as its sink: this mode has no PR and no ledger.
+  const guard = guardSpend({ spend, record: cause => logUnfinishedRepoRun({ spend, cause }) });
+  let report;
+  let review;
+  try {
+    let configUsed;
+    ({ review, configUsed } = await runMultiScope({
+      chain, material, registry, instructionsPath: REVIEW_AGENT_INSTRUCTIONS_PATH, effort, log: core.info, deadline, tokenCap, spend, startedAt,
+    }));
+    warnBudgetExhausted(review);
+    warnScopeFailures(review);
 
-  const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt });
-  const report = renderRepoReport({ reviewerName, scope, review, footer });
-
-  // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
-  // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
-  // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
-  // is written first so findings are never lost if the Step Summary write fails (e.g. an
-  // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
-  core.info(report);
+    const footer = buildReviewFooter(review.usage, configUsed, null, { schedule: review.schedule, totalMs: Date.now() - startedAt, spentOn: attributedConfig(spend.configs(), configUsed) });
+    report = renderRepoReport({ reviewerName, scope, review, footer });
+    guard.delivering();
+    // [LAW:effects-at-boundaries] The printed sink: the report goes to the run log and the Step
+    // Summary (the maintainer-facing output for a manual run). [LAW:no-silent-failure] findings are
+    // surfaced loudly here; there is no PR to mark, so the run stays informational (exit 0). The log
+    // is written first so findings are never lost if the Step Summary write fails (e.g. an
+    // environment with GITHUB_STEP_SUMMARY unset surfaces its error loudly, after the log is on record).
+    core.info(report);
+  } catch (err) {
+    await guard.failed(err);
+    throw err;
+  } finally {
+    guard.done();
+  }
   core.info(`Whole-repo review complete: ${review.findings.length} finding(s).`);
   await core.summary.addRaw(report).write();
 }
@@ -38461,11 +38542,14 @@ async function run() {
     return;
   }
   const effort = defaultEffortProfile({ roundCap });
+  // The run's spend meter, minted at the same boundary as the token cap and threaded the same way: every
+  // spawn attempt of whichever mode runs is recorded in it, and every exit reads it (src/spend.js).
+  const spend = mintSpendMeter();
 
   if (mode === 'pr') {
-    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runPrReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else if (mode === 'repo') {
-    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap);
+    await runRepoReview(reviewerName, excludePatterns, effort, deadline, startedAt, tokenCap, spend);
   } else {
     core.setFailed(`Invalid MODE '${mode}'. Valid values: 'pr' (review a pull request) or 'repo' (whole-repo review).`);
   }
@@ -38877,6 +38961,209 @@ module.exports = { selectConfig, BODY_DIRECTIVE_RE };
 
 /***/ }),
 
+/***/ 2507:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const core = __nccwpck_require__(7484);
+
+// [LAW:no-ambient-temporal-coupling] The ONE owner of how this process ends on a signal. Two kinds of
+// work run, in an order that is a property of this module and never of who happened to register first:
+// STOPS run synchronously the instant the signal lands (killing engine process groups, so nothing keeps
+// spending), then FINALIZERS run concurrently to record what the run can still record, and then the
+// process exits with the signal's conventional code.
+//
+// It exists because the order used to be luck. Signal listeners fire in registration order, and the
+// engine reaper's listener called process.exit synchronously, so any later listener that needed an
+// await — posting what a cancelled run spent — was killed before its request left.
+//
+// The bound is the runner's, not a tuning knob: a cancelled GitHub Actions step (a newer push under
+// cancel-in-progress, or timeout-minutes) is sent SIGINT, then SIGTERM 7.5s later, then SIGKILL 2.5s
+// after that. SHUTDOWN_CEILING_MS sits under the first gap, so a shutdown the SIGINT starts exits on its
+// own terms before the runner escalates. It is a termination ceiling: finalizers that finish sooner exit
+// sooner, and a finalizer that hangs cannot hold the process past it.
+const SHUTDOWN_CEILING_MS = 7_000;
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+
+// [LAW:no-shared-mutable-globals] Both registries are owned here and changed only through the two
+// registration functions below; nothing else reads them.
+const stops = new Set();
+const finalizers = new Set();
+let installed = false;
+let shuttingDown = false;
+
+// Resolves once `promise` settles or `ms` passes, whichever is first, to whether it settled in time.
+// Never rejects: a rejection is the promise's own caller's to report.
+function within(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    const settle = () => { clearTimeout(timer); resolve(true); };
+    promise.then(settle, settle);
+  });
+}
+
+async function shutDown(signal) {
+  for (const stop of stops) {
+    try {
+      stop();
+    } catch (e) {
+      core.error(`Shutdown on ${signal}: a stop step threw (${e.message}); continuing to the rest of shutdown.`);
+    }
+  }
+  // [LAW:no-silent-failure] A finalizer that throws is named, and one that outlives the ceiling is named,
+  // so a run that exits without recording what it meant to record says so in its last log lines.
+  const finished = Promise.all([...finalizers].map(finalize => Promise.resolve()
+    .then(() => finalize(signal))
+    .catch(e => core.error(`Shutdown on ${signal}: a finalizer failed: ${e.message}`))));
+  if (!(await within(finished, SHUTDOWN_CEILING_MS))) {
+    core.error(`Shutdown on ${signal}: finalizers did not finish within ${SHUTDOWN_CEILING_MS}ms; exiting without them.`);
+  }
+  process.exit(SIGNAL_EXIT_CODES[signal]);
+}
+
+function install() {
+  if (installed) return;
+  installed = true;
+  for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.on(signal, () => {
+      // The runner follows SIGINT with SIGTERM while the first shutdown may still be recording. That
+      // shutdown already owns the exit; a second would exit before the first finished.
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void shutDown(signal);
+    });
+  }
+}
+
+// Register a synchronous step that must run the moment a signal lands, before any finalizer.
+function onSignalStop(stop) {
+  install();
+  stops.add(stop);
+}
+
+// Register an async finalizer, called with the signal's name. Returns the function that unregisters it.
+function onSignalFinalize(finalize) {
+  install();
+  finalizers.add(finalize);
+  return () => finalizers.delete(finalize);
+}
+
+module.exports = { SHUTDOWN_CEILING_MS, SIGNAL_EXIT_CODES, within, onSignalStop, onSignalFinalize };
+
+
+/***/ }),
+
+/***/ 6185:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { within, onSignalFinalize } = __nccwpck_require__(2507);
+
+// [FRAMING:parts-and-seams] What one run has SPENT: the usage record of every engine spawn attempt it
+// made — the scout, every worker and sweep, every spawn-level retry, every pass a failover discarded, and
+// every config a failover reached. It is minted ONCE at the run boundary, beside the token cap, and read by
+// whichever exit the run takes: the posted review's footer, the notice a failed or cancelled run leaves,
+// and the daily ledger.
+//
+// Before it existed the pass owned its spawn records, so three exits took their spend with them: a pass
+// that threw, a pass failover retried, and a run a signal killed. [LAW:no-silent-failure]
+//
+// [LAW:no-shared-mutable-globals] Spend accrues while engines run, in several lanes at once, so this is
+// OWNED mutable state with one API, like the token cap. attempt() is the only writer, and it records
+// whichever way the attempt settles, from the usage the adapter seam stamps on its result or its error.
+//
+// [LAW:no-ambient-temporal-coupling] close() is the one phase change: it refuses every attempt not yet
+// started and resolves once every started attempt has settled and been recorded, so "all the spend is
+// in" is a state a reader awaits, never a sleep it hopes was long enough.
+function mintSpendMeter() {
+  const spent = [];
+  let inFlight = 0;
+  let closed = false;
+  const settledWaiters = [];
+  return {
+    async attempt(config, run) {
+      if (closed) throw new Error('Engine spawn refused: this run is ending, and its spend is being recorded.');
+      inFlight++;
+      try {
+        const result = await run();
+        spent.push({ config, usage: result.usage });
+        return result;
+      } catch (err) {
+        // The adapter seam stamps every error with what the attempt spent: null when nothing ran.
+        spent.push({ config, usage: err.usage });
+        throw err;
+      } finally {
+        inFlight--;
+        if (inFlight === 0) settledWaiters.splice(0).forEach(resolve => resolve());
+      }
+    },
+    close() {
+      closed = true;
+      return inFlight === 0 ? Promise.resolve() : new Promise(resolve => settledWaiters.push(resolve));
+    },
+    // One usage record per settled attempt, in the order they settled; sumUsage folds them.
+    usages: () => spent.map(s => s.usage),
+    // The configs the recorded attempts ran on, each once, in first-use order.
+    configs: () => [...new Set(spent.map(s => s.config))],
+  };
+}
+
+// [LAW:types-are-the-program] The config a cost MARKER attributes a spend to. A marker records one model and
+// one endpoint, and a later audit reprices the recorded tokens at that model's card. Spend that ran on
+// configs sharing a model and an endpoint is attributed to the last of them. Spend a failover spread across
+// models or endpoints has no single answer, so the marker states neither rather than repricing one config's
+// tokens at another's rates; the figure itself is unaffected, since every spawn was priced by its own config.
+// A run that recorded no attempt spent nothing on any config, so its marker is attributed to `fallback`,
+// the config the run would have reported anyway.
+function attributedConfig(configs, fallback) {
+  if (configs.length === 0) return fallback;
+  const last = configs[configs.length - 1];
+  const baseUrl = c => c.endpoint && c.endpoint.baseUrl;
+  const shared = configs.every(c => c.model === last.model && baseUrl(c) === baseUrl(last));
+  return shared ? last : { ...last, model: undefined, endpoint: undefined };
+}
+
+// A reaped engine settles within milliseconds of its SIGKILL. This ceiling exists only so an adapter that
+// never settles cannot cost the run its record: past it, whatever has settled is recorded.
+const SPAWN_SETTLE_CEILING_MS = 2_000;
+
+// [LAW:single-enforcer] The ONE place a run's spend is recorded when no posted review carries it. A run's
+// review path is wrapped between its first spawn and the moment its review is handed to the host, and
+// whichever exit comes first — a throw or a signal — claims the record. There is exactly one record:
+// the claim is a promise, so a signal landing while a throw is still posting awaits that same post
+// rather than starting a second one, and a throw that follows a signal-killed pass does the same.
+//
+// Once the review is being DELIVERED its marker is on its way to the host, so a signal records nothing:
+// the run cannot know whether the post landed, and a duplicate would double-count the PR total. A throw
+// while delivering means the host refused the review, so the spend is recorded then.
+//
+// `record(cause)` is the mode's own sink (a PR notice plus the ledger, or a log line in repo mode).
+// `onSignal` is the registration seam, injected so the signal arm is testable without signalling the
+// test process. [LAW:effects-at-boundaries]
+function guardSpend({ spend, record, onSignal = onSignalFinalize }) {
+  let recording = null;
+  let delivering = false;
+  const claim = (cause) => {
+    recording ??= within(spend.close(), SPAWN_SETTLE_CEILING_MS).then(() => record(cause));
+    return recording;
+  };
+  const unregister = onSignal((signal) => (delivering && recording === null
+    ? undefined
+    : claim(`The run was stopped by ${signal} before it finished: a newer push cancels the in-flight review of an older one, and the job's timeout-minutes stops a run that outlives it.`)));
+  return {
+    delivering() { delivering = true; },
+    failed: (err) => claim(`The run failed: ${err.message}`),
+    done: unregister,
+  };
+}
+
+module.exports = { mintSpendMeter, attributedConfig, guardSpend, SPAWN_SETTLE_CEILING_MS };
+
+
+/***/ }),
+
 /***/ 7889:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -39013,12 +39300,23 @@ const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed
 // the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
 // a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a bound (the time
 // budget or the token cap) reached before any scope completes, is deliberately NOT here: it already
-// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already. What it spent
+// is recorded by the unfinished notice below, which every throwing run that spent leaves.
 //
 // [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
 // list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
 // than a string that survives to the marker boundary and fails there.
 const NOT_REVIEWED_REASONS = Object.freeze({ FORK: 'fork', ROUND_CAP: 'round-cap' });
+// [LAW:types-are-the-program] The THIRD thing this action can leave on a PR: a run that SPENT and posted no
+// review, because it threw or was stopped by a signal. It is neither of the other two. It is not a round (no
+// review of this commit exists), and unlike a not-reviewed notice it carries a cost marker, because its whole
+// job is to put the spend where spend is read — the PR's running total, which summarizePriorReviews folds
+// from these bodies. A failing run was already loud; what it was not was COUNTED. [LAW:no-silent-failure]
+//
+// Disjoint from both markers by construction: it does not end with REVIEW_MARKER, and it carries no
+// `:not-reviewed:` segment for NOT_REVIEWED_MARKER_RE to match.
+const UNFINISHED_MARKER = '<!-- copirate-code-review-agent:unfinished -->';
+const UNFINISHED_MESSAGE = '⚠️ **REVIEW DID NOT FINISH** — this run spent tokens and posted no review.';
 // The headline is fixed prose, identical for every reason, so a reader (or a grep) recognizes the state
 // before parsing the cause. It deliberately shares no vocabulary with APPROVED_MESSAGE.
 const NOT_REVIEWED_MESSAGE = '⚠️ **NOT REVIEWED** — this action did not review this pull request.';
@@ -39356,6 +39654,7 @@ const NOT_REVIEWED_MARKER_RE = new RegExp(
 function parseAgentArtifact(rawBody) {
   const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
   if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
+  if (body.endsWith(UNFINISHED_MARKER)) return { kind: 'unfinished' };
   const m = NOT_REVIEWED_MARKER_RE.exec(body);
   // The notice arm carries its BODY, because that is what announceNotReviewed de-duplicates on: "the
   // newest artifact says byte-for-byte what I am about to say". Keying on the reason alone let a notice
@@ -39766,12 +40065,16 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
         // match an equally-absent trusted id. [LAW:one-source-of-truth]
         latestArtifact = { ...artifact, postedBy: { id: r.user?.id, login: r.user?.login } };
       }
-      // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
-      // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
-      // counting it would push a PR past its cap using a review that never happened.
-      if (artifact.kind !== 'review') continue;
-      count++;
-      reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      // [LAW:dataflow-not-control-flow] The branches are the artifact type's own discriminator. A
+      // not-reviewed notice contributes to `latestArtifact` alone: it recorded no round and spent no
+      // money, so counting it would push a PR past its cap using a review that never happened. An
+      // unfinished notice is not a round either, but it SPENT, so it is folded into the cost and time
+      // below exactly as a round is — that fold is the reason it was posted.
+      if (artifact.kind === 'not-reviewed') continue;
+      if (artifact.kind === 'review') {
+        count++;
+        reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      }
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
       // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
@@ -40178,6 +40481,30 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   return 'posted';
 }
 
+// [LAW:effects-at-boundaries] Pure: the body of an unfinished-run notice. `footer` is the run's spend footer
+// (cost line, timing, cost marker) from the same builder a review's footer comes from, so the marker this
+// body carries is one summarizePriorReviews already folds. [LAW:one-source-of-truth]
+function renderUnfinishedBody(reviewerName, { cause, footer }) {
+  return `## ${reviewerName}\n\n${UNFINISHED_MESSAGE}\n\n${cause}\n\n`
+    + 'This is not a review: no findings were posted, and the head commit stands unreviewed. This notice '
+    + "records what the run spent, so it counts in this pull request's running total and, when a cost "
+    + `ledger is configured, in the day's ledger.\n\n${footer}\n\n${UNFINISHED_MARKER}`;
+}
+
+// Post the notice as a COMMENT review: the channel this action's other artifacts use, so the one
+// listReviews pass that counts rounds also folds this spend. Never REQUEST_CHANGES, since nothing was
+// reviewed. A host error propagates to the run boundary, which names it. [LAW:no-silent-failure]
+async function announceUnfinished(octokit, { owner, repo, pullNumber, commitId, body }) {
+  await octokit.rest.pulls.createReview({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    commit_id: commitId,
+    event: 'COMMENT',
+    body,
+  });
+}
+
 // [LAW:effects-at-boundaries] Pure: the dismissal message, which is the only place a reader learns why a
 // blocking verdict stopped blocking. It carries the SAME cap sentence the not-reviewed notice carries,
 // passed in rather than recomposed, so the PR cannot state two different remedies. [LAW:one-source-of-truth]
@@ -40439,6 +40766,10 @@ module.exports = {
   parseReviewerName,
   DEFAULT_REVIEWER_NAME,
   REVIEW_MARKER,
+  UNFINISHED_MARKER,
+  UNFINISHED_MESSAGE,
+  renderUnfinishedBody,
+  announceUnfinished,
 };
 
 
@@ -41720,7 +42051,9 @@ function renderTally(label, tally) {
   if (rounds === 0) return null;
   const approx = tally.unknownCount > 0 ? '+' : '';
   const note = tally.unknownCount > 0 ? `, ${tally.unknownCount} with unknown cost` : '';
-  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} rounds${note}`;
+  // "runs", not "rounds": the tally folds every run that spent — a run that failed or was cancelled
+  // leaves an unfinished notice carrying its cost — and a round is only the runs that posted a review.
+  return `PR ${label} $${tally.total.toFixed(4)}${approx} across ${rounds} runs${note}`;
 }
 
 // [LAW:effects-at-boundaries] Pure: the " · PR total ..." clause appended to the cost line, or '' when
@@ -41771,7 +42104,7 @@ function renderPrTime(thisMs, priorDuration) {
   const total = tallyQuantity({ ...priorDuration }, thisMs);
   const approx = total.unknownCount > 0 ? '+' : '';
   const note = total.unknownCount > 0 ? `, ${total.unknownCount} unrecorded` : '';
-  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} rounds${note}`;
+  return `PR time ${formatMs(total.total)}${approx} across ${tallyRounds(total)} runs${note}`;
 }
 
 // [LAW:dataflow-not-control-flow] The basis selects a PHRASE; every cost line is then assembled by
@@ -52437,7 +52770,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.68.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"copirate-code-review-agent","version":"1.69.0","description":"AI-powered code review GitHub Action — multi-engine (Codex/OpenAI, Claude Code, OpenCode), selected explicitly via PROVIDER","license":"MIT","repository":{"type":"git","url":"git+https://github.com/promptctl/copirate-code-review-agent.git"},"author":"Brandon Fryslie","main":"dist/index.js","engines":{"node":">=24"},"scripts":{"build":"ncc build src/index.js -o dist --license licenses.txt && ncc build src/dismiss-index.js -o dismiss-block/dist --license licenses.txt","test":"node --test","review:local":"node scripts/local-review.js","review:case":"node eval/run-case.js","review:suite":"node eval/freeze-suite.js","review:score":"node eval/score.js","review:baseline":"node eval/baseline.js","review:compare":"node eval/compare.js","review:paired":"node eval/paired.js"},"dependencies":{"@actions/core":"^1.10.1","@actions/github":"^6.0.0","yaml":"^2.9.0"},"devDependencies":{"@vercel/ncc":"^0.38.1"}}');
 
 /***/ })
 

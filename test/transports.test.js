@@ -192,6 +192,27 @@ describe('summarizePriorReviews', () => {
     assert.equal((await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY)).count, 1);
   });
 
+  // zai-billing-g04: a run that spent and posted no review leaves an unfinished notice. It is not a round —
+  // the round cap must not move — but it spent, so its cost and time are folded like a round's.
+  test("an unfinished run's notice is folded into the cost and time totals without counting as a round", async () => {
+    const { renderUnfinishedBody, UNFINISHED_MARKER } = require('../src/transport');
+    const footer = `_Cost: $0.2500_\n\n${costMarker(usageOf({ basis: 'dollars', usd: 0.25 }), CONFIG, 90_000)}`;
+    const unfinished = renderUnfinishedBody('Review Agent', { cause: 'The run failed: write EPIPE', footer });
+    assert.ok(unfinished.endsWith(UNFINISHED_MARKER));
+    assert.ok(!unfinished.endsWith(REVIEW_MARKER));
+    const octokit = fakeOctokit([[
+      { id: 1, body: withDuration(0.05, 100_000) },
+      { id: 2, body: unfinished },
+    ]]);
+    const { count, cost, duration, reviews, latestArtifact } = await summarizePriorReviews(octokit, 'o', 'r', 1, BOT_IDENTITY);
+    assert.equal(count, 1);
+    assert.deepEqual(reviews.map(r => r.id), [1]);
+    assert.equal(Number(cost.billed.total.toFixed(2)), 0.30);
+    assert.equal(cost.billed.count, 2);
+    assert.equal(duration.total, 190_000);
+    assert.equal(latestArtifact.kind, 'unfinished');
+  });
+
   test('sums the per-round cost markers into the PR cost total', async () => {
     const octokit = fakeOctokit([[
       { body: withCost(0.05) },

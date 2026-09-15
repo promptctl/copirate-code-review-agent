@@ -28,6 +28,10 @@ const { fileChurn } = require('../src/diff');
 const { TransientError } = require('../src/failover');
 const { BudgetExhaustedError } = require('../src/bounds');
 const { mintTokenCap } = require('../src/token-cap');
+const { mintSpendMeter } = require('../src/spend');
+// What a pass left in the run's meter: the pass no longer carries its spend on its return value, so a
+// test reads it where every exit of the run reads it. [LAW:behavior-not-structure]
+const spentBy = spend => sumUsage(spend.usages());
 
 // The spawn seam's stamp (src/engine/cli.js): every error out of produceReview carries what the worker
 // RECORDED before it died, and what the spawn spent (its usage record, null when nothing ran). A fake
@@ -860,10 +864,11 @@ describe('runMultiScopePass — convergence sweeps', () => {
   test('usage sums across every sweep spawn — the footer covers the whole convergence loop', async () => {
     const usage = { tokens: { inputCacheMiss: 10, inputCacheHit: 0, output: 1 }, cost: { basis: 'dollars', usd: 0.01 } };
     const { registry } = sweepRegistry((name) => oneBug(name), usage);
-    const review = await runMultiScopePass(args(registry, 3));
+    const spend = mintSpendMeter();
+    await runMultiScopePass({ ...args(registry, 3), spend });
     // 1 scout + 2 scopes × 2 layers (initial + the converging sweep) = 5 spawns.
-    assert.equal(totalInputTokens(review.usage.tokens), 50);
-    assert.ok(Math.abs(review.usage.cost.usd - 0.05) < 1e-9);
+    assert.equal(totalInputTokens(spentBy(spend).tokens), 50);
+    assert.ok(Math.abs(spentBy(spend).cost.usd - 0.05) < 1e-9);
   });
 
   test('the aggregate summary names each sweep; sweepCap 0 restores the single-pass shape', async () => {
@@ -1421,11 +1426,12 @@ describe('runMultiScopePass — wall-clock time budget', () => {
         return okResult(scope);
       },
     });
-    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    const spend = mintSpendMeter();
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000, spend }));
     assert.deepEqual(review.unreviewedScopes, [gap('b', 'time')]);
     // Every reviewed spawn reported usage:null here, so the killed spawn's span IS the envelope.
-    assert.deepEqual(review.usage.span, span);
-    assert.equal(review.usage.tokens, null);
+    assert.deepEqual(spentBy(spend).span, span);
+    assert.equal(spentBy(spend).tokens, null);
   });
 
   test('the budget expiring before ANY scope completes fails fast, naming the knob', async () => {
@@ -1640,11 +1646,12 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
     assert.ok(workers.every(w => w.pass === 0 && w.outcome === 'completed' && w.usage.span));
   });
 
-  test('the pass total usage folds from the schedule records — one list feeds both', async () => {
-    const review = await runMultiScopePass(passArgs(makeRegistry()));
+  test('the run meter and the pass schedule record the same usage for every spawn', async () => {
+    const spend = mintSpendMeter();
+    const review = await runMultiScopePass(passArgs(makeRegistry(), { spend }));
     // Envelope: earliest start is the scout (min 0), latest end the slowest worker (scope c, min 13).
-    assert.deepEqual(review.usage.span, { from: at(0), to: at(13) });
-    assert.deepEqual(review.usage.span, sumUsage(review.schedule.spawns.map(r => r.usage)).span);
+    assert.deepEqual(spentBy(spend).span, { from: at(0), to: at(13) });
+    assert.deepEqual(spentBy(spend), sumUsage(review.schedule.spawns.map(r => r.usage)));
   });
 
   test("the lane count is the plan's width under the ceiling, recorded and logged as used", async () => {
@@ -1679,13 +1686,14 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
         return null;
       },
     });
-    const review = await runMultiScopePass(passArgs(registry));
+    const spend = mintSpendMeter();
+    const review = await runMultiScopePass(passArgs(registry, { spend }));
     const retried = review.schedule.spawns.filter(s => s.outcome === 'retried');
     assert.deepEqual(retried, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'retried', usage: { span: span(30, 45) } }]);
     // Scope b also settled successfully — two records for one scope, attempt count derivable.
     assert.equal(review.schedule.spawns.filter(s => s.phase === 'worker' && s.scope === 'b').length, 2);
-    // The failed attempt's burned time reaches the pass envelope: its end is the latest instant.
-    assert.equal(review.usage.span.to, at(45));
+    // The failed attempt's burned time reaches the run's spend: its end is the latest instant.
+    assert.equal(spentBy(spend).span.to, at(45));
   });
 
   // Accept (zai-timing-31d.5): a deadline-killed scope still contributes its elapsed time.
@@ -1699,11 +1707,12 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
         return null;
       },
     });
-    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000 }));
+    const spend = mintSpendMeter();
+    const review = await runMultiScopePass(passArgs(registry, { deadline: Date.now() + 3_600_000, spend }));
     assert.deepEqual(review.unreviewedScopes, [gap('b', 'time')]);
     const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
     assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage: { span: span(10, 50) } }]);
-    assert.equal(review.usage.span.to, at(50));
+    assert.equal(spentBy(spend).span.to, at(50));
   });
 
   // zai-token-cap-zya: a spawn the cap killed spent real tokens, and the pass total is the figure an
@@ -1717,13 +1726,65 @@ describe('runMultiScopePass — the pass records its phase and schedule', () => 
         return null;
       },
     });
-    const review = await runMultiScopePass(passArgs(registry));
+    const spend = mintSpendMeter();
+    const review = await runMultiScopePass(passArgs(registry, { spend }));
     assert.deepEqual(review.unreviewedScopes, [gap('b', 'tokens')]);
     const failed = review.schedule.spawns.filter(s => s.outcome === 'failed');
     assert.deepEqual(failed, [{ phase: 'worker', scope: 'b', pass: 0, outcome: 'failed', usage }]);
-    // Every completed spawn here reported a span and no tokens, so the pass's tokens ARE the killed spawn's.
-    assert.deepEqual(review.usage.tokens, usage.tokens);
-    assert.equal(review.usage.cost.basis, 'unpriced');
+    // Every completed spawn here reported a span and no tokens, so the run's tokens ARE the killed spawn's.
+    assert.deepEqual(spentBy(spend).tokens, usage.tokens);
+    assert.equal(spentBy(spend).cost.basis, 'unpriced');
+  });
+
+  // zai-billing-g04: the two exits that used to take their spend with them. A pass failover retries is
+  // discarded, and a pass that throws never returns — yet both spawned engines that spent real tokens.
+  const tokens = (n) => ({ inputCacheMiss: n, inputCacheHit: 0, output: 0 });
+  const spentUsage = (n, fromMin) => ({ tokens: tokens(n), cost: { basis: 'dollars', usd: n / 1000 }, span: span(fromMin, fromMin + 1) });
+  // `worker(scope, passNumber)` answers a worker spawn; passNumber counts scouts, so it names the pass.
+  const scoutThenWorkers = (worker) => {
+    let scouts = 0;
+    const adapter = {
+      async produceReview({ buildPromptFor }) {
+        const prompt = buildPromptFor({});
+        if (prompt === 'SCOUT') {
+          scouts++;
+          return { summary: 'ctx', findings: [], scopes: SCOPES, assessments: [], usage: spentUsage(10, 0) };
+        }
+        return worker(SCOPES.find(s => prompt.includes(`${s.name} — ${s.focus}`)), scouts);
+      },
+    };
+    return { get: () => adapter, scouts: () => scouts };
+  };
+
+  test('a pass failover retries leaves its spend in the review footer beside the pass that posted', async () => {
+    // Pass 1: every worker attempt dies transiently, so the pass throws a TransientError and produceReview
+    // re-runs the whole pass. Pass 2 succeeds. The footer's usage must include BOTH passes' spawns.
+    const registry = scoutThenWorkers((scope, passNumber) => {
+      if (passNumber === 1) throw died(new TransientError('API Error: 529 overloaded'), undefined, spentUsage(100, 3));
+      return { summary: `sum-${scope.name}`, findings: [], assessments: [], usage: spentUsage(1, 20) };
+    });
+    const { review } = await runMultiScope({
+      chain: [config], material, registry, instructionsPath: 'x', laneCeiling: 3, sleepFn: async () => {},
+      effort: { ...defaultEffortProfile(), sweepCap: 0 },
+    });
+    assert.equal(registry.scouts(), 2);
+    // Pass 1: scout 10 + 3 scopes × 3 spawn attempts × 100. Pass 2: scout 10 + 3 scopes × 1.
+    assert.equal(totalInputTokens(review.usage.tokens), 10 + 900 + 10 + 3);
+  });
+
+  test('a run whose pass throws still leaves every attempt it spent in the meter its caller holds', async () => {
+    const spend = mintSpendMeter();
+    const registry = scoutThenWorkers(() => { throw died(new Error('write EPIPE'), undefined, spentUsage(100, 5)); });
+    await assert.rejects(
+      runMultiScope({
+        chain: [config], material, registry, instructionsPath: 'x', laneCeiling: 3, sleepFn: async () => {},
+        effort: { ...defaultEffortProfile(), sweepCap: 0 }, spend,
+      }),
+      /write EPIPE/,
+    );
+    // The scout and every worker's single (non-retryable) attempt: nothing the run spent is missing.
+    assert.equal(totalInputTokens(spentBy(spend).tokens), 10 + 300);
+    assert.deepEqual(spend.configs().map(c => c.name), ['c1']);
   });
 
   test('a spawn the deadline gate refused outright (nothing ran) records a usage-less failure', async () => {

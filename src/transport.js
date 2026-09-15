@@ -27,12 +27,23 @@ const NOT_REVIEWED_MARKER_PREFIX = '<!-- copirate-code-review-agent:not-reviewed
 // the path is a VALUE in this enumeration, never a second mechanism. Today that is exactly two paths —
 // a fork PR (never reviewed, by design) and a spent round cap. The third candidate, a bound (the time
 // budget or the token cap) reached before any scope completes, is deliberately NOT here: it already
-// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already and needs no notice.
+// throws BudgetExhaustedError and reds the run (src/multiscope.js), so it is loud already. What it spent
+// is recorded by the unfinished notice below, which every throwing run that spent leaves.
 //
 // [LAW:one-source-of-truth] Reasons are reached BY NAME, never by re-typing the string or indexing the
 // list: `run.js` writes `NOT_REVIEWED_REASONS.FORK`, so a typo is `undefined` at the call site rather
 // than a string that survives to the marker boundary and fails there.
 const NOT_REVIEWED_REASONS = Object.freeze({ FORK: 'fork', ROUND_CAP: 'round-cap' });
+// [LAW:types-are-the-program] The THIRD thing this action can leave on a PR: a run that SPENT and posted no
+// review, because it threw or was stopped by a signal. It is neither of the other two. It is not a round (no
+// review of this commit exists), and unlike a not-reviewed notice it carries a cost marker, because its whole
+// job is to put the spend where spend is read — the PR's running total, which summarizePriorReviews folds
+// from these bodies. A failing run was already loud; what it was not was COUNTED. [LAW:no-silent-failure]
+//
+// Disjoint from both markers by construction: it does not end with REVIEW_MARKER, and it carries no
+// `:not-reviewed:` segment for NOT_REVIEWED_MARKER_RE to match.
+const UNFINISHED_MARKER = '<!-- copirate-code-review-agent:unfinished -->';
+const UNFINISHED_MESSAGE = '⚠️ **REVIEW DID NOT FINISH** — this run spent tokens and posted no review.';
 // The headline is fixed prose, identical for every reason, so a reader (or a grep) recognizes the state
 // before parsing the cause. It deliberately shares no vocabulary with APPROVED_MESSAGE.
 const NOT_REVIEWED_MESSAGE = '⚠️ **NOT REVIEWED** — this action did not review this pull request.';
@@ -370,6 +381,7 @@ const NOT_REVIEWED_MARKER_RE = new RegExp(
 function parseAgentArtifact(rawBody) {
   const body = (typeof rawBody === 'string' ? rawBody : '').trimEnd();
   if (body.endsWith(REVIEW_MARKER)) return { kind: 'review' };
+  if (body.endsWith(UNFINISHED_MARKER)) return { kind: 'unfinished' };
   const m = NOT_REVIEWED_MARKER_RE.exec(body);
   // The notice arm carries its BODY, because that is what announceNotReviewed de-duplicates on: "the
   // newest artifact says byte-for-byte what I am about to say". Keying on the reason alone let a notice
@@ -780,12 +792,16 @@ async function summarizePriorReviews(octokit, owner, repo, pullNumber, identitie
         // match an equally-absent trusted id. [LAW:one-source-of-truth]
         latestArtifact = { ...artifact, postedBy: { id: r.user?.id, login: r.user?.login } };
       }
-      // [LAW:dataflow-not-control-flow] The one branch is the artifact type's own discriminator. A
-      // notice contributes to `latestArtifact` alone: it recorded no round and spent no money, so
-      // counting it would push a PR past its cap using a review that never happened.
-      if (artifact.kind !== 'review') continue;
-      count++;
-      reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      // [LAW:dataflow-not-control-flow] The branches are the artifact type's own discriminator. A
+      // not-reviewed notice contributes to `latestArtifact` alone: it recorded no round and spent no
+      // money, so counting it would push a PR past its cap using a review that never happened. An
+      // unfinished notice is not a round either, but it SPENT, so it is folded into the cost and time
+      // below exactly as a round is — that fold is the reason it was posted.
+      if (artifact.kind === 'not-reviewed') continue;
+      if (artifact.kind === 'review') {
+        count++;
+        reviews.push({ id: r.id, ...reviewReleaseFacts(r) });
+      }
       // [LAW:parse-dont-validate] The body's marker is parsed back into the Cost value that wrote it,
       // then folded by the one tally rule — this module never re-decides what a marker string means.
       // [LAW:no-silent-failure] An agent round with a numeric figure is summed into its own basis;
@@ -1192,6 +1208,30 @@ async function announceNotReviewed(octokit, { owner, repo, pullNumber, commitId,
   return 'posted';
 }
 
+// [LAW:effects-at-boundaries] Pure: the body of an unfinished-run notice. `footer` is the run's spend footer
+// (cost line, timing, cost marker) from the same builder a review's footer comes from, so the marker this
+// body carries is one summarizePriorReviews already folds. [LAW:one-source-of-truth]
+function renderUnfinishedBody(reviewerName, { cause, footer }) {
+  return `## ${reviewerName}\n\n${UNFINISHED_MESSAGE}\n\n${cause}\n\n`
+    + 'This is not a review: no findings were posted, and the head commit stands unreviewed. This notice '
+    + "records what the run spent, so it counts in this pull request's running total and, when a cost "
+    + `ledger is configured, in the day's ledger.\n\n${footer}\n\n${UNFINISHED_MARKER}`;
+}
+
+// Post the notice as a COMMENT review: the channel this action's other artifacts use, so the one
+// listReviews pass that counts rounds also folds this spend. Never REQUEST_CHANGES, since nothing was
+// reviewed. A host error propagates to the run boundary, which names it. [LAW:no-silent-failure]
+async function announceUnfinished(octokit, { owner, repo, pullNumber, commitId, body }) {
+  await octokit.rest.pulls.createReview({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    commit_id: commitId,
+    event: 'COMMENT',
+    body,
+  });
+}
+
 // [LAW:effects-at-boundaries] Pure: the dismissal message, which is the only place a reader learns why a
 // blocking verdict stopped blocking. It carries the SAME cap sentence the not-reviewed notice carries,
 // passed in rather than recomposed, so the PR cannot state two different remedies. [LAW:one-source-of-truth]
@@ -1453,4 +1493,8 @@ module.exports = {
   parseReviewerName,
   DEFAULT_REVIEWER_NAME,
   REVIEW_MARKER,
+  UNFINISHED_MARKER,
+  UNFINISHED_MESSAGE,
+  renderUnfinishedBody,
+  announceUnfinished,
 };

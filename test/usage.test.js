@@ -565,13 +565,13 @@ describe('renderCostLine', () => {
     const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'dollars', usd: 0.03 } };
     const line = renderCostLine(usage, CODEX_CONFIG, prior({ usd: 0.09, count: 2 }));
     assert.match(line, /\$0\.0300/);                          // this round
-    assert.match(line, /PR total \$0\.1200 across 3 rounds/); // 0.09 prior + 0.03 this
+    assert.match(line, /PR total \$0\.1200 across 3 runs/); // 0.09 prior + 0.03 this
   });
 
   test('an unknown-cost round makes the PR total a lower bound (+) and names the unpriced count', () => {
     const usage = { tokens: { inputCacheMiss: 100, inputCacheHit: 0, output: 50 }, cost: { basis: 'unpriced', reason: 'no-price' } };
     const line = renderCostLine(usage, CODEX_CONFIG, prior({ usd: 0.09, count: 2, unknownCount: 1 }));
-    assert.match(line, /PR total \$0\.0900\+ across 4 rounds, 2 with unknown cost/);
+    assert.match(line, /PR total \$0\.0900\+ across 4 runs, 2 with unknown cost/);
   });
 
   // [LAW:verifiable-goals] AC for zai-billing-xl0.2: the notional figure IS present in the footer —
@@ -1148,7 +1148,7 @@ describe('renderPrTotal', () => {
   });
   test('priced this-round + mixed known/unknown prior → total plus a "+" and the unpriced count', () => {
     const clause = renderPrTotal({ basis: 'dollars', usd: 0.03 }, prior({ usd: 0.10, count: 2, unknownCount: 1 }));
-    assert.match(clause, /PR total \$0\.1300\+ across 4 rounds, 1 with unknown cost/); // 0.10 + 0.03, 1 unpriced
+    assert.match(clause, /PR total \$0\.1300\+ across 4 runs, 1 with unknown cost/); // 0.10 + 0.03, 1 unpriced
   });
 
   // [LAW:verifiable-goals] AC for zai-billing-xl0.2 (the evidence on the ticket: PR #113 reported a
@@ -1156,7 +1156,7 @@ describe('renderPrTotal', () => {
   // by side and NEVER added: a blended number would be true of neither.
   test('a subscription PR totals list price under its own label, never as spend', () => {
     const clause = renderPrTotal({ basis: 'subscription', notionalUsd: 18.41 }, prior({ notionalUsd: 45.18, notionalCount: 3 }));
-    assert.match(clause, /PR list-price total \$63\.5900 across 4 rounds/);
+    assert.match(clause, /PR list-price total \$63\.5900 across 4 runs/);
     assert.doesNotMatch(clause, /PR total/); // no billed rounds ⇒ no spend clause at all
   });
 
@@ -1165,14 +1165,14 @@ describe('renderPrTotal', () => {
       { basis: 'subscription', notionalUsd: 20 },
       prior({ usd: 1.20, count: 2, notionalUsd: 20, notionalCount: 1 }),
     );
-    assert.match(clause, /PR total \$1\.2000 across 2 rounds/);
-    assert.match(clause, /PR list-price total \$40\.0000 across 2 rounds/);
+    assert.match(clause, /PR total \$1\.2000 across 2 runs/);
+    assert.match(clause, /PR list-price total \$40\.0000 across 2 runs/);
     assert.doesNotMatch(clause, /41\.2000/); // the blended number that must never exist
   });
 
   test('a subscription round with no list price makes the notional total an honest lower bound', () => {
     const clause = renderPrTotal({ basis: 'subscription', notionalUsd: null }, prior({ notionalUsd: 10, notionalCount: 1 }));
-    assert.match(clause, /PR list-price total \$10\.0000\+ across 2 rounds, 1 with unknown cost/);
+    assert.match(clause, /PR list-price total \$10\.0000\+ across 2 runs, 1 with unknown cost/);
   });
 });
 
