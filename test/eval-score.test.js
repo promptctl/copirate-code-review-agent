@@ -13,7 +13,7 @@ const {
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { EFFORT_SCHEMA } = require('../src/effort');
+const { EFFORT_SCHEMA, UNVERSIONED_EFFORT_SCHEMA } = require('../src/effort');
 
 // [LAW:verifiable-goals] AC: the scorer reduces a run's findings.json + a case's expected.json to
 // must-find recall (primary), nice-to-find recall, and noise — deterministically, via an injected
@@ -566,8 +566,11 @@ describe('the arm a run was produced under', () => {
   const recorded = effort => ({ effort, effortSchema: EFFORT_SCHEMA });
 
   test('parseEffort keeps the whole profile — every axis is a lever some A/B varies', () => {
-    assert.deepEqual(parseEffort(recorded(profile), 'meta.json'), profile);
-    assert.deepEqual(parseEffort(recorded({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }), 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high' });
+    // The parsed profile carries the ARM it belongs to, stamped from the record's schema: score.js
+    // persists the profile ALONE into scorecard-summary.json, so a profile that did not carry its own arm
+    // would re-read as whichever arm the reader guessed. [LAW:parse-dont-validate]
+    assert.deepEqual(parseEffort(recorded(profile), 'meta.json'), { ...profile, effortSchema: EFFORT_SCHEMA });
+    assert.deepEqual(parseEffort(recorded({ roundCap: 5, sweepCap: 0, reasoningTier: 'high' }), 'x'), { roundCap: 5, sweepCap: 0, reasoningTier: 'high', effortSchema: EFFORT_SCHEMA });
   });
 
   test('an absent arm is a typed absence, NOT the default — nothing proves what a pre-provenance run ran at', () => {
@@ -617,7 +620,9 @@ describe('the arm a run was produced under', () => {
       assert.throws(() => readPriorRuns(root, ['case-a', 'case-b']), /names case 'case-a' but lives under 'case-b'/);
       fs.rmSync(misplaced, { recursive: true, force: true });
       assert.deepEqual(prior, [
-        { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } },
+        // The stamp names the era the record was written in: this meta.json carries no effortSchema, which
+        // is itself a fact about when it was written, not an absence. [FRAMING:representation]
+        { case: 'case-a', dir: a1, candidate: { sha: 'abc', dirty: false }, effort: { roundCap: 0, sweepCap: 2, reasoningTier: null, effortSchema: UNVERSIONED_EFFORT_SCHEMA } },
         // The arm rides through beside the tree, and a run recorded before either existed reads as null for
         // both — the census the arm check below consumes.
         { case: 'case-a', dir: a2, candidate: null, effort: null },
@@ -640,7 +645,7 @@ describe('the arm a run was produced under', () => {
   });
 
   test('parseMeta carries the arm through, and tolerates a run recorded before it existed', () => {
-    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', ...recorded(profile) }), 'm').effort, profile);
+    assert.deepEqual(parseMeta(JSON.stringify({ case: 'alpha', ...recorded(profile) }), 'm').effort, { ...profile, effortSchema: EFFORT_SCHEMA });
     assert.equal(parseMeta(JSON.stringify({ case: 'alpha' }), 'm').effort, null);
   });
 
@@ -656,7 +661,9 @@ describe('the arm a run was produced under', () => {
   // version, and must still pool with a current record at the same axes.
   test('a record written before the schema version pools with a current record at the same arm', () => {
     const legacy = parseEffort({ effort: { roundCap: 0, sweepCap: 2, reasoningTier: null } }, 'meta.json');
-    assert.deepEqual(legacy, parseEffort(recorded(profile), 'meta.json'));
+    // The two records name different ERAS, so they carry different stamps — and pool anyway, because
+    // pooling is decided by the arm's one rendering, never by object identity. [LAW:one-source-of-truth]
+    assert.equal(describeEffort(legacy), describeEffort(parseEffort(recorded(profile), 'meta.json')));
     assert.equal(describeEffort(legacy), describeEffort(profile));
   });
 

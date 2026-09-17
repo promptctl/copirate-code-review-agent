@@ -28,6 +28,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+
+// The run-dir contract — file names, the present() guard, the atomic findings rename — lives in
+// eval/run-record.js, shared with every other producer that writes a scorable run. [LAW:one-source-of-truth]
+const { writeRunRecord } = require('./run-record');
 // [LAW:one-source-of-truth] The sweep bound's owner is src/effort.js, so --sweep-cap's default is read
 // from it rather than copied here. This is the one src require at module load: effort.js has an EMPTY
 // require graph (no debug, no engine), so it is a pure helper under this file's load-purity rule and
@@ -275,59 +279,6 @@ function foreignRuns(current, runs) {
     .map(({ dir, candidate }) => ({ dir, reason: `was replayed on ${describeTree(candidate)}; this tree is ${describeTree(current)}` }));
 }
 
-// [LAW:parse-dont-validate] The crossing between a live value and a durable artifact. `JSON.stringify` answers
-// the VALUE `undefined` for an absent input, and `undefined + '\n'` coerces to the literal text "undefined" —
-// a file that reports as an artifact and parses as nothing. Every field of a run record is a fact the replay
-// observed, so an absent one is a broken producer and fails HERE, named, rather than as a parse crash in
-// whatever reads the artifact months later. Substituting `null` would be worse than either: a reader could no
-// longer tell a pass that genuinely recorded nothing from a producer that broke. [LAW:no-silent-failure]
-//
-// The check is lifted out of the rendering because summary.txt is raw text, cannot go through `jsonBytes`,
-// and corrupts identically — so the rule is stated once for every field the record carries, in both
-// renderings. [LAW:single-enforcer]
-function present(field, value) {
-  if (value === undefined) {
-    throw new Error(`writeRunRecord: ${field} is undefined — a run record cannot record a fact the replay never produced.`);
-  }
-  return value;
-}
-
-function jsonBytes(field, value) {
-  return JSON.stringify(present(field, value), null, 2) + '\n';
-}
-
-// One run's record on disk. findings.json is what makes a run dir COMPLETE to every reader (score.js's
-// listRunDirs, the suite census, the gate's resume), so it lands last and atomically — written beside,
-// then renamed — after every file those readers go on to open. A replay killed or failing at any instant
-// leaves a dir that is either complete or ignored, never one that is counted and then unreadable.
-// [LAW:no-ambient-temporal-coupling]
-//
-// schedule.json is the replay's WALL CLOCK, and it is the engine's own host-stamped record (src/schedule.js's
-// scheduleRecord, reached here as review.schedule) rather than a second clock this instrument starts — the
-// same value run.js posts in the PR footer, so a replay and a production review can only agree or disagree
-// about ONE timing fact. [LAW:one-source-of-truth]
-//
-// plan.json is the review's STRUCTURE — the partition the workers actually ran (src/plan.js's planRecord,
-// reached here as review.plan), which the engine decides per invocation and which nothing durable used to
-// record. It lands with the other artifacts and BEFORE the findings rename, so a dir that counts as
-// complete always carries the plan that produced its findings. [LAW:no-ambient-temporal-coupling]
-//
-// It is an ARTIFACT and not a printed line because wall clock is what the eval gate is now bound by: the
-// suite has always measured per-replay duration and only ever written it to stdout, where CI log truncation
-// eats it, so the per-replay figure the gate sizes itself against had to be re-derived by archaeology and
-// went stale across #148 unnoticed. A measured fact with no durable map is a fact the next reader must
-// guess at. [FRAMING:representation]
-function writeRunRecord(runDir, { meta, summary, usage, schedule, plan, findings }) {
-  fs.writeFileSync(path.join(runDir, 'meta.json'), jsonBytes('meta', meta));
-  fs.writeFileSync(path.join(runDir, 'summary.txt'), `${present('summary', summary)}\n`);
-  fs.writeFileSync(path.join(runDir, 'usage.json'), jsonBytes('usage', usage));
-  fs.writeFileSync(path.join(runDir, 'schedule.json'), jsonBytes('schedule', schedule));
-  fs.writeFileSync(path.join(runDir, 'plan.json'), jsonBytes('plan', plan));
-  const findingsPath = path.join(runDir, 'findings.json');
-  fs.writeFileSync(`${findingsPath}.partial`, jsonBytes('findings', findings));
-  fs.renameSync(`${findingsPath}.partial`, findingsPath);
-}
-
 // The effectful helpers below lazily require their src deps, so importing this module never loads the
 // engine stack — only main() (or a helper it calls) does, after the run boundary is established.
 
@@ -521,9 +472,20 @@ async function main() {
         },
         summary: review.summary || '',
         usage: review.usage,
-        schedule: review.schedule,
-        plan: review.plan,
         findings: review.findings,
+        // The engine's OWN records, beside the contract every producer shares: schedule.json is the
+        // replay's host-stamped wall clock (src/schedule.js's scheduleRecord — the same value run.js
+        // posts in the PR footer, so a replay and a production review can only agree or disagree about
+        // ONE timing fact), and plan.json is the partition the workers actually ran (src/plan.js's
+        // planRecord), which the engine decides per invocation and which nothing durable used to record.
+        // [LAW:one-source-of-truth]
+        //
+        // Wall clock is what the eval gate is now bound by: the suite has always measured per-replay
+        // duration and only ever written it to stdout, where CI log truncation eats it, so the per-replay
+        // figure the gate sizes itself against had to be re-derived by archaeology and went stale across
+        // #148 unnoticed. A measured fact with no durable map is a fact the next reader must guess at.
+        // [FRAMING:representation]
+        artifacts: { 'schedule.json': review.schedule, 'plan.json': review.plan },
       });
       const transcripts = drainTranscripts(TRANSCRIPT_DIR, path.join(runDir, 'transcripts'));
 
@@ -549,4 +511,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord };
+module.exports = { parseArgs, parseCaseManifest, resolvePinnedConfig, assertConfigMatchesPin, runDirName, buildCaseMaterial, workingTree, treeIdentity, describeTree, foreignRuns, writeRunRecord, extractTree };

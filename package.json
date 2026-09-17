@@ -17,11 +17,13 @@
     "test": "node --test",
     "review:local": "node scripts/local-review.js",
     "review:case": "node eval/run-case.js",
+    "review:case:cc": "node eval/run-case-cc.js",
     "review:suite": "node eval/freeze-suite.js",
     "review:score": "node eval/score.js",
     "review:baseline": "node eval/baseline.js",
     "review:compare": "node eval/compare.js",
-    "review:paired": "node eval/paired.js"
+    "review:paired": "node eval/paired.js",
+    "review:arms": "node eval/arms.js"
   },
   "dependencies": {
     "@actions/core": "^1.10.1",
