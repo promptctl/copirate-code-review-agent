@@ -334,12 +334,17 @@ function readPriorRuns(root, caseNames) {
 }
 
 // The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
-// <boolean>}`. Absent on runs replayed before provenance was kept — a typed absence (null), which
-// compare.js reads as "cannot be proven anyone's". Anything else is a malformed record, refused.
-// [LAW:parse-dont-validate]
+// <boolean>}`. A typed absence (null) means "no tree of this repo can be proven to have produced this
+// run", which compare.js reads as foreign. TWO facts spell themselves that way and both are real: a run
+// replayed before provenance was kept (a missing key, in a legacy meta.json), and a run produced by a
+// DIFFERENT REVIEWER entirely (an explicit null, which eval/run-case-cc.js writes because no tree of
+// this repo produced it and JSON has no `undefined`). One absence, one meaning, both spellings — the
+// same rule parseEffort applies to its own. A reader that took only the first would refuse the record
+// its sibling producer emits. Anything else is a malformed record, refused.
+// [LAW:parse-dont-validate] [LAW:one-source-of-truth]
 function parseCandidate(raw, label) {
-  if (raw === undefined) return null;
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.sha !== 'string' || raw.sha.trim() === '' || typeof raw.dirty !== 'boolean') {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw) || typeof raw.sha !== 'string' || raw.sha.trim() === '' || typeof raw.dirty !== 'boolean') {
     throw new Error(`${label} 'candidate' must be {sha: <commit>, dirty: <boolean>}, got ${JSON.stringify(raw)}.`);
   }
   return { sha: raw.sha, dirty: raw.dirty };

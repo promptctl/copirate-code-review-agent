@@ -13,22 +13,38 @@ const { CC_REVIEW_SCHEMA } = require('../eval/effort-record');
 const { EFFORT_SCHEMA } = require('../src/effort');
 
 describe('a rate carries how much of it is real', () => {
-  test('the half-width narrows as opportunities accumulate', () => {
+  test('the interval narrows as opportunities accumulate', () => {
     const shallow = pooledRate(10, 20);
     const deep = pooledRate(100, 200);
     assert.equal(shallow.rate, 0.5);
     assert.equal(deep.rate, 0.5);
-    assert.ok(deep.halfWidth < shallow.halfWidth, 'more opportunities must buy a tighter band');
-    // With 20 must-find opportunities a single pass is worth about ±22 points — the number that decides
-    // whether a gap between two arms is a result or noise, so it is asserted rather than assumed.
-    assert.ok(shallow.halfWidth > 0.2 && shallow.halfWidth < 0.25, `±${shallow.halfWidth}`);
+    assert.ok((deep.high - deep.low) < (shallow.high - shallow.low), 'more opportunities must buy a tighter interval');
+    // With 20 must-find opportunities a single pass spans roughly 30–70% — the width that decides whether
+    // a gap between two arms is a result or noise, so it is asserted rather than assumed.
+    assert.ok(shallow.low > 0.25 && shallow.high < 0.75, `${shallow.low}–${shallow.high}`);
+  });
+
+  // THE DEFECT THIS REPLACED, caught by the table's first real run: the textbook normal approximation is
+  // p ± z·sqrt(p(1-p)/n), which is exactly 0 at p=0 and p=1 — so a 0-for-2 arm rendered "0% ±0", the
+  // least certain measurement in the table claiming to be the most certain one.
+  test('a rate at either extreme still carries an interval, never a claim of certainty', () => {
+    const none = pooledRate(0, 2);
+    assert.equal(none.rate, 0);
+    assert.ok(none.high > 0.3, `0/2 must stay wide, got up to ${none.high}`);
+    const all = pooledRate(20, 20);
+    assert.equal(all.rate, 1);
+    assert.ok(all.low < 0.95, `20/20 must stay wide, got from ${all.low}`);
+    // The interval never leaves the unit range, whatever the approximation would have done.
+    for (const band of [none, all, pooledRate(1, 1)]) {
+      assert.ok(band.low >= 0 && band.high <= 1, `${band.low}–${band.high}`);
+    }
   });
 
   // "Nothing was asked" and "nothing was found" are different facts, and a rate of 0 would be the second
   // wearing the first's clothes. [LAW:parse-dont-validate]
   test('a rate over zero opportunities is absent, never zero', () => {
     assert.equal(pooledRate(0, 0).rate, null);
-    assert.equal(pooledRate(0, 0).halfWidth, null);
+    assert.equal(pooledRate(0, 0).low, null);
     assert.equal(pooledRate(0, 5).rate, 0);
   });
 });
@@ -80,7 +96,7 @@ describe('an arm row pools every opportunity once', () => {
     const table = renderArmsTable([shallow, deep]);
     assert.match(table, /\| `engine` \| 1 \|/);
     assert.match(table, /\| `cc` \| 3 \|/);
-    assert.ok(deep.mustFind.halfWidth < shallow.mustFind.halfWidth);
+    assert.ok((deep.mustFind.high - deep.mustFind.low) < (shallow.mustFind.high - shallow.mustFind.low));
   });
 
   // A reader scanning a cost column must be able to see that a run was unpriced rather than free.

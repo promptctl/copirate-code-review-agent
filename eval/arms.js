@@ -33,16 +33,29 @@ const MS_PER_MINUTE = 60_000;
 // half-width and a number nobody can check. [LAW:one-source-of-truth]
 const Z_95 = 1.96;
 
-// [LAW:effects-at-boundaries] Pure. A pooled rate and the 95% half-width that says how much of it is
-// real. With 20 must-find opportunities per replicate, a single pass carries a half-width near ±20 points
-// — so a recall gap narrower than that is not a result, and the column exists so nobody reports it as one.
+// [LAW:effects-at-boundaries] Pure. A pooled rate and the 95% interval that says how much of it is real.
+//
+// WILSON, not the textbook normal approximation, and the difference is not academic here. The normal
+// form is p ± z·sqrt(p(1-p)/n), which COLLAPSES TO ZERO at p=0 and p=1 — so the first real run of this
+// table rendered "0% ±0 (0/2)", claiming perfect certainty from two observations. An instrument whose
+// whole job is to say whether a gap between two arms is decisive cannot report its least certain
+// measurements as its most certain ones. [FRAMING:representation] Wilson stays finite at both ends and
+// is well behaved at the small n this eval deliberately runs at.
+//
+// The interval is reported as its BOUNDS. A single ± would have to be symmetric about the observed rate,
+// and Wilson's is not — so a half-width here would be a number that does not describe the interval it
+// was derived from.
 //
 // A rate over zero opportunities is `null`, never 0: "nothing was asked" and "nothing was found" are
 // different facts, and collapsing them onto 0 is the answer-shaped void. [LAW:parse-dont-validate]
 function pooledRate(found, total) {
-  if (total === 0) return { found, total, rate: null, halfWidth: null };
+  if (total === 0) return { found, total, rate: null, low: null, high: null };
   const rate = found / total;
-  return { found, total, rate, halfWidth: Z_95 * Math.sqrt((rate * (1 - rate)) / total) };
+  const z2 = Z_95 * Z_95;
+  const denom = 1 + z2 / total;
+  const center = (rate + z2 / (2 * total)) / denom;
+  const spread = (Z_95 / denom) * Math.sqrt((rate * (1 - rate)) / total + z2 / (4 * total * total));
+  return { found, total, rate, low: Math.max(0, center - spread), high: Math.min(1, center + spread) };
 }
 
 // [LAW:effects-at-boundaries] Pure. The mean of the figures that are RECORDED, and how many were not —
@@ -82,13 +95,13 @@ function reduceArm({ label, cases, runs }) {
 const DASH = '—';
 const num = (v, digits) => (v === null ? DASH : v.toFixed(digits));
 const thousands = v => (v === null ? DASH : Math.round(v).toLocaleString('en-US'));
-const pct = band => (band.rate === null ? DASH : `${(band.rate * 100).toFixed(0)}% ±${(band.halfWidth * 100).toFixed(0)} (${band.found}/${band.total})`);
+const pct = band => (band.rate === null ? DASH : `${(band.rate * 100).toFixed(0)}% (${band.found}/${band.total}) · ${(band.low * 100).toFixed(0)}–${(band.high * 100).toFixed(0)}%`);
 
 // [LAW:effects-at-boundaries] Pure: rows in, markdown out. One table, because the whole point is a
 // side-by-side a reader takes in at once.
 function renderArmsTable(rows) {
   const header = [
-    '| Arm | Runs | Inventory must-find recall | Nice-to-find recall | Noise/run | Cache-miss tok/run | Cache-hit tok/run | Output tok/run | Wall min/run | $/run |',
+    '| Arm | Runs | Inventory must-find recall (95% CI) | Nice-to-find recall (95% CI) | Noise/run | Cache-miss tok/run | Cache-hit tok/run | Output tok/run | Wall min/run | $/run |',
     '| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   const body = rows.map(r => `| \`${r.label}\` | ${r.runs} | ${pct(r.mustFind)} | ${pct(r.niceToFind)} | ${num(r.noise.mean, 1)} | ${thousands(r.inputCacheMiss.mean)} | ${thousands(r.inputCacheHit.mean)} | ${thousands(r.output.mean)} | ${num(r.wallMinutes.mean, 1)} | ${r.costUsd.mean === null ? DASH : `$${r.costUsd.mean.toFixed(2)}`} |`);

@@ -121,8 +121,12 @@ test('parseMeta reads the case name and rejects a path-shaped one', () => {
 
 test('parseMeta keeps the candidate identity a run recorded, reads its absence as null, and refuses a malformed one', () => {
   assert.equal(parseMeta(JSON.stringify({ case: 'demo' }), 'm').candidate, null);
+  // The same absence in its other spelling — what a producer writes when no tree of this repo made the
+  // run (eval/run-case-cc.js). JSON has no `undefined`, so a reader that took only the missing key would
+  // refuse the record its sibling producer emits.
+  assert.equal(parseMeta(JSON.stringify({ case: 'demo', candidate: null }), 'm').candidate, null);
   assert.deepEqual(parseMeta(JSON.stringify({ case: 'demo', candidate: { sha: 'abc', dirty: false } }), 'm').candidate, { sha: 'abc', dirty: false });
-  for (const bad of [null, 'abc', [], { sha: 'abc' }, { sha: '', dirty: false }, { sha: 'abc', dirty: 'yes' }, { sha: null, dirty: false }, { sha: 'abc', dirty: null }]) {
+  for (const bad of ['abc', [], { sha: 'abc' }, { sha: '', dirty: false }, { sha: 'abc', dirty: 'yes' }, { sha: null, dirty: false }, { sha: 'abc', dirty: null }]) {
     assert.throws(() => parseMeta(JSON.stringify({ case: 'demo', candidate: bad }), 'm'), /'candidate' must be/);
   }
   // `null` is valid JSON but not an object — rejected at the boundary, not a `null.case` crash.

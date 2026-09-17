@@ -5,8 +5,9 @@
 //
 // WHAT THE LIVE PROBE SHOWED (2026-09-17, CLI 2.1.267) — this file is written against an observed
 // transcript, never against documentation:
-//   - Findings arrive as `ReportFindings` TOOL CALLS, whose input is already typed:
-//     `{file, line, category, summary, failure_scenario, short_summary, verdict}`.
+//   - Findings arrive as a typed payload — `{file, line, category, summary, failure_scenario, …}` — over
+//     either of TWO transports: a `ReportFindings` tool call, or a fenced ```json block in the closing
+//     message. Which one the skill picks varies run to run at the SAME level.
 //   - The `result` event's text is PROSE ABOUT the review — a ranked recap at `high`, and at `low` a
 //     narrative in which one of the two findings named no line at all. It is a second rendering of the
 //     findings, not the findings, and reading it as the record is how a two-finding review gets recorded
@@ -20,12 +21,47 @@
 
 const FINDINGS_TOOL = 'ReportFindings';
 
-// [LAW:effects-at-boundaries] Pure. Every call the session made to the findings tool, in order.
-function findingsCalls(events) {
-  return events
-    .filter(e => e && e.type === 'assistant' && e.message && Array.isArray(e.message.content))
-    .flatMap(e => e.message.content)
-    .filter(block => block && block.type === 'tool_use' && block.name === FINDINGS_TOOL);
+// [LAW:one-type-per-behavior] ONE findings payload, TWO TRANSPORTS. The skill emits the same typed value
+// — `{file, line, summary, failure_scenario, …}` — either as a `ReportFindings` tool call or as a fenced
+// JSON block in its closing message, and which one it picks varies run to run at the SAME level (both
+// were observed at `medium`, minutes apart). They are two encodings of one value, not two sources of
+// truth, so they are read by one parser through two readers rather than becoming two code paths with two
+// notions of what a finding is. [LAW:dataflow-not-control-flow]
+//
+// This is emphatically NOT scraping prose. Both transports carry `file` and `line` explicitly; nothing is
+// inferred from wording. A run that reports only in prose still refuses — see the two zeros, below.
+
+// A fenced ```json block, as the closing message writes one.
+const JSON_BLOCK = /```json\s*\n([\s\S]*?)```/g;
+
+// [LAW:effects-at-boundaries] Pure. Is this a findings payload? The discriminator is the SHAPE the skill
+// declares, so any other JSON the message happens to carry is passed over rather than half-read.
+function isFindingsPayload(value) {
+  return Array.isArray(value) && value.every(f => f && typeof f === 'object' && typeof f.file === 'string' && Number.isInteger(f.line));
+}
+
+// [LAW:effects-at-boundaries] Pure. Every findings payload the session emitted, in order, from either
+// transport — so "the last report wins" is one rule over one list, not a precedence between channels.
+function findingsPayloads(events) {
+  const payloads = [];
+  for (const event of events) {
+    if (!event || !event.message || !Array.isArray(event.message.content)) continue;
+    for (const block of event.message.content) {
+      if (block && block.type === 'tool_use' && block.name === FINDINGS_TOOL && isFindingsPayload(block.input && block.input.findings)) {
+        payloads.push(block.input.findings);
+      }
+      if (block && block.type === 'text' && typeof block.text === 'string') {
+        for (const [, body] of block.text.matchAll(JSON_BLOCK)) {
+          // A block that does not parse is not a findings payload — it is a code sample in the prose, and
+          // this reader is not entitled to an opinion about it.
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch { parsed = null; }
+          if (isFindingsPayload(parsed)) payloads.push(parsed);
+        }
+      }
+    }
+  }
+  return payloads;
 }
 
 // [LAW:parse-dont-validate] In goes a recorded session, out come findings in the shape score.js's
@@ -36,39 +72,37 @@ function findingsCalls(events) {
 // it wears the identical shape: an empty array, a scorecard reading 0% recall, a table column that looks
 // like a damning verdict on the arm. Nothing downstream could tell them apart — the answer-shaped void
 // the laws name. So they are told apart HERE, where the evidence still exists: the skill reports an empty
-// array when it found nothing, so a session that called the tool with `[]` scores as a clean review,
-// while a session that never called it at all did not produce a measurement and says so.
+// array when it found nothing, so a session that emitted `[]` scores as a clean review, while a session
+// that emitted no payload at all did not produce a measurement and says so. A `low` probe reported
+// entirely in prose, and one of its two findings named no line — unmatchable against a located ground
+// truth, and exactly what this refusal keeps out of the table.
 //
-// LAST CALL WINS. The probe's `high` session called the tool twice with the same eight findings; the
-// skill also re-reports after applying fixes. The final call is the review's conclusion, and taking the
-// union instead would count a re-report as a second set of findings. [LAW:one-source-of-truth]
+// LAST PAYLOAD WINS. The probe's `high` session reported twice with the same eight findings, and the
+// skill also re-reports after applying fixes. The final payload is the review's conclusion; taking the
+// union would count a re-report as a second set of findings. [LAW:one-source-of-truth]
 function parseFindings(events, label) {
-  const calls = findingsCalls(events);
-  if (calls.length === 0) {
+  const payloads = findingsPayloads(events);
+  if (payloads.length === 0) {
     throw new Error(
-      `${label}: the review never called ${FINDINGS_TOOL}, so it reported no findings in the one form that ` +
-      `carries a file and a line. Its prose is not a substitute — a finding with no line cannot be matched ` +
-      `against expected.json, and recording zero here would be indistinguishable from a clean review.`,
+      `${label}: the review reported no findings payload — neither a ${FINDINGS_TOOL} call nor a fenced ` +
+      `JSON block carrying file and line. Its prose is not a substitute: a finding with no line cannot be ` +
+      `matched against expected.json, and recording zero here would be indistinguishable from a clean review.`,
     );
   }
-  const raw = calls[calls.length - 1].input;
-  if (!raw || !Array.isArray(raw.findings)) {
-    throw new Error(`${label}: the final ${FINDINGS_TOOL} call carries no 'findings' array, got ${JSON.stringify(raw).slice(0, 200)}.`);
-  }
-  return raw.findings.map((f, i) => {
-    const at = `${label} ${FINDINGS_TOOL}.findings[${i}]`;
-    if (typeof f.file !== 'string' || f.file.trim() === '') throw new Error(`${at} has no 'file'.`);
-    if (!Number.isInteger(f.line) || f.line <= 0) throw new Error(`${at} has no positive integer 'line', got ${JSON.stringify(f.line)}.`);
+  return payloads[payloads.length - 1].map((f, i) => {
+    const at = `${label} findings[${i}]`;
+    if (f.file.trim() === '') throw new Error(`${at} has no 'file'.`);
+    if (f.line <= 0) throw new Error(`${at} has no positive integer 'line', got ${JSON.stringify(f.line)}.`);
     if (typeof f.summary !== 'string' || f.summary.trim() === '') throw new Error(`${at} has no 'summary'.`);
     return {
       path: f.file.trim(),
       line: f.line,
-      // The judge matches on CONTENT, so the body carries both halves the tool separates: what is wrong,
-      // and the concrete way it breaks. `failure_scenario` is where this reviewer puts the detail an
-      // expected.json finding is written in, so dropping it would understate the arm.
+      // The judge matches on CONTENT, so the body carries both halves the payload separates: what is
+      // wrong, and the concrete way it breaks. `failure_scenario` is where this reviewer puts the detail
+      // an expected.json finding is written in, so dropping it would understate the arm.
       body: [f.summary, f.failure_scenario].filter(part => typeof part === 'string' && part.trim() !== '').join('\n\n'),
-      // The tool's `category` is a KIND ('correctness', 'efficiency'), never a severity, and the two are
-      // not the same axis. Recording a kind in the severity slot would put a word there that means
+      // The payload's `category` is a KIND ('correctness', 'efficiency'), never a severity, and the two
+      // are not the same axis. Recording a kind in the severity slot would put a word there that means
       // something else to every reader of the scorecard. [LAW:no-silent-failure]
       severity: null,
     };
@@ -90,7 +124,26 @@ function parseResultEvent(events, label) {
   if (failed) {
     throw new Error(`${label}: the review ended as ${JSON.stringify(failed.subtype)}${failed.is_error ? ' (is_error)' : ''} — a failed review is not a review that found nothing.`);
   }
-  return results[results.length - 1];
+  const result = results[results.length - 1];
+  // A REVIEW THAT NEVER RAN, observed in the field: a credential at its weekly usage wall returns
+  // `subtype: "success"`, `is_error: false`, zero tokens, `$0`, and the text "You've hit your weekly
+  // limit". Every arm above passes it. Read on and it becomes an arm that reviewed four cases and found
+  // nothing — the most damaging possible reading of this table, produced by a billing state rather than
+  // by a reviewer. [LAW:no-silent-failure]
+  //
+  // The discriminator is mechanical, not a phrase match: a review that happened SPENT TOKENS. Anything
+  // that keeps the session from working — a wall, a rejected key, a refusal to start — lands here, and
+  // the result's own text is quoted so the operator reads the real cause instead of hunting a parser bug.
+  const spent = Object.values(result.modelUsage ?? {}).reduce(
+    (n, m) => n + (m.inputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.outputTokens ?? 0), 0,
+  );
+  if (spent === 0) {
+    throw new Error(
+      `${label}: the session reported success but spent NO tokens, so no review ran — the credential is ` +
+      `walled, rejected, or the CLI refused to start. It says: ${JSON.stringify(String(result.result ?? '').trim().slice(0, 300))}`,
+    );
+  }
+  return result;
 }
 
 // [LAW:one-source-of-truth] The tokens, the model, and the cost all come from `modelUsage` and the CLI's
@@ -131,4 +184,4 @@ function modelOf(result) {
   return [...new Set(canonical)].sort().join('+');
 }
 
-module.exports = { parseFindings, parseResultEvent, usageFromResult, modelOf, findingsCalls, FINDINGS_TOOL };
+module.exports = { parseFindings, parseResultEvent, usageFromResult, modelOf, findingsPayloads, isFindingsPayload, FINDINGS_TOOL };
