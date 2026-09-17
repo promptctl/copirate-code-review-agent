@@ -271,6 +271,118 @@ eval/out/<case-name>/<timestamp>-run<i>/
 `eval/out/` is git-ignored — run artifacts are never committed. Like everything under
 `eval/`, `run-case.js` is dev-only tooling and does **not** bump the version.
 
+## Pricing an arm against Claude Code's built-in `/code-review`
+
+One production review of a PR in this repo is roughly **12M input tokens and fifteen
+minutes**, up to five rounds per PR, against four Max subscriptions — about **$500 a
+month of real money**. That spend only makes sense if this repo's engine actually beats
+running Claude Code's own `/code-review` skill on the same diff. This section is the
+instrument that asks, and it is built to be re-run — after any engine change, against
+any level — rather than as a one-off bake-off.
+
+It is **not a new harness**. The four frozen cases and `eval/score.js` are the ones
+already described above; what was added is a **second producer**. A producer turns a
+frozen case into a run dir; the scorer reduces run dirs and never learns which producer
+wrote one. That seam already existed implicitly inside `run-case.js` and is now explicit:
+
+- `eval/run-record.js` — the run-dir contract, lifted out of `run-case.js` unchanged:
+  the file names, the absent-fact guard (a field the producer never recorded **refuses
+  the whole record** — `JSON.stringify(undefined)` would otherwise land a file that
+  reports as an artifact and parses as nothing), and the atomic rename that makes
+  `findings.json` appear whole or not at all. A
+  producer's own extra artifacts travel as data in an `artifacts` map, so
+  `schedule.json` and `plan.json` are **values the engine passes**, not parameters the
+  writer knows about — a producer with no scope plan simply passes none.
+- `eval/effort-record.js` — the **arm**, as a union keyed on the `effortSchema` already
+  written beside every effort profile. Two members today: the engine's own profile
+  (`copirate-effort/*`, rendered `roundCap=0 sweepCap=2 reasoningTier=none`) and
+  `claude-code-review/v1` (`{level, model}`, rendered
+  `/code-review level=medium model=claude-sonnet-5`). `score.js` re-exports
+  `parseEffort`/`describeEffort` from here, so every existing reader was unchanged.
+- `eval/materialize-case.js` — turns a frozen case into a real git repo with two commits
+  and two branches (`main` and `change`), so a reviewer that takes a git revision range
+  can be aimed at it. It **proves the repo reproduces `change.diff`** before anyone
+  reviews it.
+- `eval/cc-review.js` — the pure reader: stream-json events in, findings and usage out.
+- `eval/run-case-cc.js` — the second producer (`npm run review:case:cc`).
+- `eval/arms.js` — the reducer (`npm run review:arms`).
+
+```bash
+# one case, three runs, through the built-in reviewer
+CLAUDE_CODE_OAUTH_TOKEN=… node eval/run-case-cc.js eval/cases/laws-4-eval-tasks --level medium -n 3 --out eval/out/cc-medium
+# options: --level <low|medium|high|xhigh|max> (REQUIRED), -n <repeats> (default 1),
+#          --model <id> (default: the CLI's own default, recorded either way),
+#          --out <dir> (default eval/out), --timeout <minutes> (default 30)
+
+# score it exactly like any other run root
+node eval/score.js eval/out/cc-medium/laws-4-eval-tasks --matcher lexical
+
+# reduce any number of scored roots into one table
+node eval/arms.js eval/out/engine eval/out/cc-medium
+```
+
+### What the live probe showed
+
+Every one of these was found by running the thing, and every one of them would have put
+a **wrong number in the table rather than an error on the screen**.
+
+**The base must be the change's parent commit.** `main...change` is three-dot syntax —
+the diff from the merge base. Branch `main` off the change commit and the merge base
+*is* `change`, so the range is empty, the review finds nothing, and that is
+indistinguishable from a review that found nothing. This is why `materialize-case.js`
+asserts the repo reproduces `change.diff` rather than trusting its own recipe. All four
+frozen cases reproduce exactly.
+
+**The result envelope's top-level `usage` is all zeros.** The real token figures live in
+`modelUsage`, keyed by model id. A producer reading `usage` would record a free review.
+
+**A credential at its weekly usage wall returns `subtype: "success"`, `is_error: false`,
+zero tokens and $0**, with the text "You've hit your weekly limit" in the body. Every
+ordinary check passes it, and it would enter the table as an arm that reviewed every
+case and found nothing — a verdict produced by a billing state rather than by a
+reviewer. The producer refuses any session that spent no tokens; the discriminator is
+the tokens, not the wording.
+
+**The skill emits its findings payload over two transports** — a `ReportFindings` tool
+call, or a fenced JSON block in its closing message — and which one it picks
+varies run to run at the *same* level. Both were observed at `medium` minutes apart.
+Both carry `file` and `line` explicitly, so both are read; nothing is scraped from prose.
+
+**At `low` the skill reported entirely in prose, and one of its two findings named no
+line at all.** A finding with no line cannot be matched against a located ground truth,
+so the producer refuses rather than recording a zero that would read as a clean review.
+Stated plainly: **`low` is not reliably measurable by this instrument; `medium` and
+`high` are.**
+
+**A review that dispatches background agents emits several `result` events**, each
+carrying the same cumulative usage — so the reader takes the last.
+
+**The default model under a throwaway `HOME` is `claude-sonnet-5`**, the same model the
+frozen cases pin for the engine, so the two arms are not confounded by model choice. The
+throwaway `HOME` is deliberate: inheriting the operator's `HOME` pulls their global
+`CLAUDE.md`, settings and SessionStart hooks into the arm — the first probe fired three
+of them — which would make the measurement a measurement of one machine.
+
+### Where a cc run may and may not go
+
+`candidate: null` in a cc run's `meta.json` is **truthful**: no tree of this repo
+produced the run. That is also exactly what makes `compare.js` and
+`measurement-index.js` classify it as **foreign** rather than blend it into a gate for
+the engine. A cc root can never become an engine baseline.
+
+Arms may have **different `n`**. Deepening the cheap arm never requires deepening the
+expensive one; the table carries `n` per row and a 95% **Wilson** interval beside each
+recall, so a shallow arm cannot be read as a precise one. Wilson specifically, because
+the textbook normal approximation collapses to exactly zero at a rate of 0 or 1 — the
+table's first real row rendered `0% ±0`, its least certain measurement claiming to be
+its most certain.
+
+`arms.js` is a **reducer, not a gate**: it reports and decides nothing. This section is
+not the moratorium'd gate, and the N=5 gate machinery
+(`freeze-suite`/`baseline`/`compare`/`paired`) is untouched. Like everything under
+`eval/`, all of this is dev-only tooling — it does **not** bump the shipped action
+version and needs no `dist/` rebuild.
+
 ## Varying a lever: A/B arms
 
 The engine is **pinned by the case** and cannot be overridden — a replay on a different
