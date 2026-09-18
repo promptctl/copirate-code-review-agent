@@ -383,6 +383,60 @@ not the moratorium'd gate, and the N=5 gate machinery
 `eval/`, all of this is dev-only tooling — it does **not** bump the shipped action
 version and needs no `dist/` rebuild.
 
+### The first measurement (2026-09-17)
+
+The instrument has now been run, and the verdict is decisive at this spend — in the
+direction opposite to the cheap-arm hypothesis. Output of `node eval/arms.js`:
+
+```
+| Arm | Runs | Inventory must-find recall (95% CI) | Nice-to-find recall (95% CI) | Noise/run | Cache-miss tok/run | Cache-hit tok/run | Output tok/run | Wall min/run | $/run |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `roundCap=0 sweepCap=2 reasoningTier=none` | 4 | 40% (8/20) · 22–61% | 17% (3/18) · 6–39% | 12.8 | 958,057 | 10,026,036 | 250,084 | 14.6 | $10.95 |
+| `/code-review level=medium model=claude-sonnet-5` | 11 | 4% (2/56) · 1–12% | 8% (4/51) · 3–19% | 3.9 | 307,325 | 2,631,083 | 68,600 | 7.5 | $2.03 |
+```
+
+The conditions. The engine arm is `freeze-suite.js -n 1` over all four cases — 4
+replays, 58m28s, $43.81 total at API price. The cc arm is `run-case-cc.js --level
+medium -n 3` over the same four cases — 11 completed runs, $22.36 total. Both arms were
+scored by the same pinned Haiku judge through the same `score.js`, both ran on one
+credential lane, and both had their reviews served by `claude-sonnet-5`.
+
+The two 95% intervals do not overlap — 22–61% against 1–12% — which is the
+pre-registered decision rule being met, so there is no reason to deepen the engine arm.
+The engine finds about ten times the share of known must-finds for about five times the
+per-run cost. **Per unit of recall bought, the engine is the cheaper instrument**, which
+is the opposite of what a cost-per-run column alone would suggest.
+
+Inventory must-find, per case (found/opportunities):
+
+```
+| Case | `roundCap=0 sweepCap=2 reasoningTier=none` | `/code-review level=medium model=claude-sonnet-5` |
+| --- | --- | --- |
+| cc-candybar-150-transcript-perf | 2/10 | 1/30 |
+| copirate-93-dependency-diff | 2/4 | 1/12 |
+| laws-4-eval-tasks | 1/2 | 0/6 |
+| links-317-dolt-telemetry | 3/4 | 0/8 |
+```
+
+The engine wins every case, including the two where the cc arm found nothing at all, so
+the pooled gap is not one case carrying the result.
+
+The engine is also **noisier**: 12.8 findings per run matched nothing in the inventory,
+against 3.9. Finding more of the real defects and reporting more noise are not in
+tension here — both follow from the engine reporting far more findings per run.
+
+**n=11, not 12.** One `links-317-dolt-telemetry` run reported only in prose and was
+refused rather than recorded as a zero. That refusal is the instrument working: a
+prose-only review is unmeasurable, and scoring it as zero findings would have
+understated the cc arm.
+
+What this does **not** establish. There is only one replicate of the engine arm per
+case, so its interval is wide (22–61%) and a re-run could move it several points. Only
+`medium` was measured on the cc side; `high` dispatches background agents and was not
+run at N=3. And the recall figures are against this repo's own hand-annotated
+inventory — the ground truth being matched, not a neutral measure of how useful a
+review is.
+
 ## Varying a lever: A/B arms
 
 The engine is **pinned by the case** and cannot be overridden — a replay on a different
