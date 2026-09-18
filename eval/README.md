@@ -304,8 +304,15 @@ wrote one. That seam already existed implicitly inside `run-case.js` and is now 
   can be aimed at it. It **proves the repo reproduces `change.diff`** before anyone
   reviews it.
 - `eval/cc-review.js` — the pure reader: stream-json events in, findings and usage out.
-- `eval/run-case-cc.js` — the second producer (`npm run review:case:cc`).
-- `eval/arms.js` — the reducer (`npm run review:arms`).
+- `eval/run-case-cc.js` — the second producer.
+- `eval/arms.js` — the reducer.
+
+Both are invoked as `node eval/…` rather than through an `npm run` alias, unlike their
+six `review:*` siblings. That is deliberate: `npm run build` inlines `package.json`
+wholesale into `dist/index.js`, so adding a script — however dev-only its subject —
+changes the shipped bundle, and `dist` is in the version gate's shipped surface. A
+convenience alias would cost a released version bump of the action, which is precisely
+what "`eval/` changes do not bump the version" is meant to prevent.
 
 ```bash
 # one case, three runs, through the built-in reviewer
