@@ -25,8 +25,8 @@ const diffOf = (filename, added, removed) => [
 ].join('\n');
 
 describe('the comparable projection of a diff', () => {
-  test('counts the lines a change adds and removes, per file', () => {
-    assert.deepEqual(diffShape(diffOf('a.js', 2, 1)).get('a.js'), { added: 2, removed: 1 });
+  test('carries the text of every line a change adds and removes, per file', () => {
+    assert.deepEqual(diffShape(diffOf('a.js', 2, 1)).get('a.js'), { added: ['added 0', 'added 1'], removed: ['removed 0'] });
   });
 
   // `git diff` re-renders what it is asked for — different context width, different blob hashes — and
@@ -51,6 +51,17 @@ describe('a materialized repo must reproduce the frozen change, or say so by nam
       () => assertReproducesDiff(`${diffOf('a.js', 2, 1)}\n${diffOf('b.js', 1, 0)}`, diffOf('a.js', 2, 1), 'case'),
       /b\.js: in the materialized repo, absent from the frozen diff/,
     );
+  });
+
+  // THE GAP THIS CLOSED: counts are preserved by exactly the corruptions this check exists to catch — a
+  // fuzzy or offset hunk match, two equal-length hunks landing in each other's place. A count-only check
+  // passes the failure it was written for, and the harness prices a run against a different change.
+  test('a change with the same line counts but different lines is refused, and says so', () => {
+    const frozen = diffOf('a.js', 2, 1);
+    const swapped = frozen.replace('+added 0', '+added ZERO');
+    assert.throws(() => assertReproducesDiff(swapped, frozen, 'case'), /same line counts, different lines/);
+    // …and the identical change still passes, so the stricter check did not become one that cries wolf.
+    assert.doesNotThrow(() => assertReproducesDiff(frozen, frozen, 'case'));
   });
 
   test('a file whose content differs is named with both counts', () => {

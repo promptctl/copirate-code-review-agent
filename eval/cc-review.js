@@ -46,6 +46,18 @@ function findingsPayloads(events) {
   const payloads = [];
   for (const event of events) {
     if (!event || !event.message || !Array.isArray(event.message.content)) continue;
+    // TOP-LEVEL ONLY. A review that dispatches background agents interleaves their transcripts into this
+    // same stream, tagged with the tool call that spawned them — in the `high` probe, 66 of 87 assistant
+    // events belonged to three subagents. Those agents emit findings-shaped payloads of their own while
+    // investigating: across the first real arm, 9 fenced-JSON payload blocks came from subagents against
+    // 6 from the top level. Since the LAST payload wins, one emitted after the real report would become
+    // the review's findings. It did not happen in that arm — the winner was top-level in all eleven runs
+    // — which is ordering luck, not a property of this code. [LAW:no-silent-failure]
+    //
+    // The boundary is the agent, not the content: a subagent's output is an INPUT to the reviewing agent,
+    // not the review. The review is the top-level agent's conclusion — the same principle that makes the
+    // terminal `result` event speak for the session.
+    if (event.parent_tool_use_id != null) continue;
     for (const block of event.message.content) {
       if (block && block.type === 'tool_use' && block.name === FINDINGS_TOOL && isFindingsPayload(block.input && block.input.findings)) {
         payloads.push(block.input.findings);

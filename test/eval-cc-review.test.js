@@ -68,6 +68,21 @@ describe('findings come from the typed payload, over either transport', () => {
     assert.throws(() => parseFindings([broken], 'run'), /reported no findings payload/);
   });
 
+  // The ordering that luck spared in the first real arm: a subagent emits a well-formed payload AFTER the
+  // top-level report. Last-wins would hand the run a background agent's working notes as its findings.
+  test('a subagent payload never becomes the review, even when it comes last', () => {
+    const subagent = { ...jsonBlock([finding({ line: 999 })]), parent_tool_use_id: 'toolu_01CGxmusKdZE68ybCC2LWaH7' };
+    const findings = parseFindings([toolUse([finding({ line: 34 })]), subagent], 'run');
+    assert.deepEqual(findings.map(f => f.line), [34]);
+  });
+
+  // …and a session with ONLY subagent payloads reported nothing itself, which is a refusal rather than a
+  // clean review — the same two-zeros rule, applied to the agent boundary.
+  test('a session whose only payloads came from subagents refuses', () => {
+    const subagent = { ...jsonBlock([finding()]), parent_tool_use_id: 'toolu_01TJHGnmzCaQLJh3kvTqSuMT' };
+    assert.throws(() => parseFindings([subagent], 'run'), /reported no findings payload/);
+  });
+
   test('a review that found nothing scores as a clean review, not as a broken one', () => {
     assert.deepEqual(parseFindings([toolUse([])], 'run'), []);
     assert.deepEqual(parseFindings([jsonBlock([])], 'run'), []);

@@ -27,15 +27,21 @@ const { execFileSync } = require('child_process');
 const BASE_REF = 'main';
 const HEAD_REF = 'change';
 
-// [LAW:effects-at-boundaries] Pure. The COMPARABLE PROJECTION of a diff: which files it touches and how
-// many lines it adds and removes in each.
+// [LAW:effects-at-boundaries] Pure. The COMPARABLE PROJECTION of a diff: which files it touches, and the
+// text of every line it adds and removes in each.
 //
 // Deliberately not a byte comparison of the two diff texts. `git diff` is free to re-render what it is
 // asked for — different context width, different blob hashes, a `similarity index` line where the frozen
 // capture had none — and none of that changes WHICH CHANGE a reviewer sees. A byte check would refuse
 // correct materializations for cosmetic reasons, and a harness that cries wolf gets its check deleted.
-// What must not differ is the content: a missing file, an extra file, or a file whose hunks do not carry
-// the same lines is a DIFFERENT change, and every one of those moves this projection.
+//
+// But the projection has to be the CHANGED TEXT, not a count of it. Counts are preserved by exactly the
+// corruptions this check exists to catch — a fuzzy or offset hunk match, two equal-length hunks landing
+// in each other's place — so a count-only check passes the failure it was written for and the harness
+// goes on to price a run against a silently different change. [LAW:no-silent-failure]
+//
+// Comparing the +/- lines and not the context keeps the cosmetic immunity: context width and blob hashes
+// live entirely in the parts this does not look at.
 function diffShape(diffText) {
   const { parseUnifiedDiff } = require('../src/diff');
   const { files } = parseUnifiedDiff(diffText);
@@ -43,11 +49,23 @@ function diffShape(diffText) {
   for (const { filename, patch } of files) {
     const lines = patch.split('\n');
     shape.set(filename, {
-      added: lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length,
-      removed: lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length,
+      added: lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1)),
+      removed: lines.filter(l => l.startsWith('-') && !l.startsWith('---')).map(l => l.slice(1)),
     });
   }
   return shape;
+}
+
+// The one rendering of a file's changed text, used to COMPARE two diffs and to NAME the difference — so a
+// refusal can never describe a mismatch the comparison did not make. [LAW:one-source-of-truth]
+function describeChange({ added, removed }) {
+  return `+${added.length}/-${removed.length}`;
+}
+
+function sameChange(a, b) {
+  return a.added.length === b.added.length && a.removed.length === b.removed.length
+    && a.added.every((line, i) => line === b.added[i])
+    && a.removed.every((line, i) => line === b.removed[i]);
 }
 
 // [LAW:parse-dont-validate] [LAW:no-silent-failure] The checkpoint between "we ran some git commands" and
@@ -63,8 +81,9 @@ function assertReproducesDiff(gitDiffText, changeDiffText, label) {
     const mine = got.get(filename);
     if (!mine) {
       problems.push(`${filename}: in the frozen diff, absent from the materialized repo`);
-    } else if (mine.added !== counts.added || mine.removed !== counts.removed) {
-      problems.push(`${filename}: frozen diff has +${counts.added}/-${counts.removed}, materialized repo has +${mine.added}/-${mine.removed}`);
+    } else if (!sameChange(mine, counts)) {
+      const how = describeChange(mine) === describeChange(counts) ? ' (same line counts, different lines)' : '';
+      problems.push(`${filename}: frozen diff has ${describeChange(counts)}, materialized repo has ${describeChange(mine)}${how}`);
     }
   }
   for (const filename of got.keys()) {
@@ -115,6 +134,16 @@ function materializeCase({ caseDir, destDir, extractTree }) {
   extractTree(path.resolve(caseDir, 'repo.tar.gz'), destDir);
 
   git(destDir, ['init', '-q', '-b', BASE_REF, '.']);
+  // The FROZEN TREE's identity, taken before anything is applied to it. `change` below is not the
+  // extracted tree — it is that tree reverse-applied to a base and then forward-applied back — and
+  // nothing asserted the round trip returned to where it started. A hunk that reverse-applies at an
+  // offset can forward-apply to a tree that is not the frozen one, and every later check looks at the
+  // DIFF rather than the tree, so the head side went unchecked entirely. A tree hash settles it exactly,
+  // and is untouched by the rendering objection above: a tree is content, not a rendering of content.
+  // [LAW:no-silent-failure] [FRAMING:representation]
+  git(destDir, ['add', '-A']);
+  const frozenTree = git(destDir, ['write-tree']).trim();
+
   // Reverse-apply FIRST and commit that as the base, so `change` lands as its CHILD — see the three-dot
   // note at the top of this file.
   git(destDir, ['apply', '-R', diffPath]);
@@ -125,8 +154,19 @@ function materializeCase({ caseDir, destDir, extractTree }) {
   git(destDir, ['add', '-A']);
   git(destDir, ['commit', '-q', '-m', 'change: the frozen tree as the case captured it']);
 
+  // The two ends of the range, checked by the two strongest things available for each. The head is the
+  // frozen tree exactly; the base is recovered rather than stored, so it is pinned by the change it
+  // produces — which is why `diffShape` must compare the changed TEXT and not a count of it.
+  const materializedTree = git(destDir, ['rev-parse', `${HEAD_REF}^{tree}`]).trim();
+  if (materializedTree !== frozenTree) {
+    throw new Error(
+      `${path.basename(caseDir)}: reverse-applying and re-applying change.diff did not return to the frozen ` +
+      `tree (${frozenTree.slice(0, 10)} became ${materializedTree.slice(0, 10)}), so '${HEAD_REF}' is not the ` +
+      `commit the case froze and a review of it would measure a different change.`,
+    );
+  }
   assertReproducesDiff(git(destDir, ['diff', `${BASE_REF}...${HEAD_REF}`]), changeDiff, path.basename(caseDir));
   return { repoDir: destDir, base: BASE_REF, head: HEAD_REF, range: `${BASE_REF}...${HEAD_REF}` };
 }
 
-module.exports = { diffShape, assertReproducesDiff, materializeCase, BASE_REF, HEAD_REF };
+module.exports = { diffShape, sameChange, assertReproducesDiff, materializeCase, BASE_REF, HEAD_REF };
