@@ -140,6 +140,23 @@ describe('the session envelope', () => {
     assert.throws(() => parseResultEvent([resultEvent({ subtype: 'error_max_turns' })], 'run'), /error_max_turns/);
     assert.throws(() => parseResultEvent([resultEvent({ is_error: true })], 'run'), /is_error/);
   });
+
+  // A segment that ended at its turn limit is not the session's outcome. What establishes a review is a
+  // CONCLUSION — this terminal envelope, the tokens, and the findings payload — so a session that
+  // recovered and went on to conclude is a real, fully-priced measurement. Scanning every event for a
+  // failure marker discarded it, which is a rule the rest of this function does not follow.
+  test('an intermediate failure the session recovered from does not discard the run', () => {
+    const recovered = resultEvent({ num_turns: 12 });
+    const events = [resultEvent({ subtype: 'error_max_turns', num_turns: 0 }), toolUse([finding()]), recovered];
+    assert.equal(parseResultEvent(events, 'run'), recovered);
+  });
+
+  // The mirror, so "last wins" is not mistaken for "any success anywhere wins": a session whose TERMINAL
+  // event failed is refused however well it was going beforehand.
+  test('a session that ended badly is still refused, whatever preceded it', () => {
+    const events = [resultEvent({ num_turns: 1 }), resultEvent({ subtype: 'error_during_execution' })];
+    assert.throws(() => parseResultEvent(events, 'run'), /error_during_execution/);
+  });
 });
 
 describe('what the review cost', () => {

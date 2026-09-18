@@ -120,11 +120,17 @@ function parseResultEvent(events, label) {
   if (results.length === 0) {
     throw new Error(`${label}: the session emitted no 'result' event — it was killed or never finished, so nothing about it is a measurement.`);
   }
-  const failed = results.find(r => r.is_error === true || r.subtype !== 'success');
-  if (failed) {
-    throw new Error(`${label}: the review ended as ${JSON.stringify(failed.subtype)}${failed.is_error ? ' (is_error)' : ''} — a failed review is not a review that found nothing.`);
-  }
+  // The TERMINAL result, and only it — the same value every other read in this function takes. A session
+  // that dispatches background agents emits one result per resumption, and a segment that ended at its
+  // turn limit is not the session's outcome: what establishes that a review happened is a CONCLUSION, and
+  // this file checks that three ways — this terminal envelope, the tokens below, and the findings payload
+  // `parseFindings` demands. A session that recovered and went on to conclude is a real, fully-priced
+  // measurement, and scanning every event for a failure marker threw it away. [LAW:one-source-of-truth]
+  // one rule for which event speaks for the session, applied to every fact read off it.
   const result = results[results.length - 1];
+  if (result.is_error === true || result.subtype !== 'success') {
+    throw new Error(`${label}: the review ended as ${JSON.stringify(result.subtype)}${result.is_error ? ' (is_error)' : ''} — a failed review is not a review that found nothing.`);
+  }
   // A REVIEW THAT NEVER RAN, observed in the field: a credential at its weekly usage wall returns
   // `subtype: "success"`, `is_error: false`, zero tokens, `$0`, and the text "You've hit your weekly
   // limit". Every arm above passes it. Read on and it becomes an arm that reviewed four cases and found
