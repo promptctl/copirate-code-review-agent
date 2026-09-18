@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { pooledRate, meanOf, reduceArm, renderArmsTable, readArm } = require('../eval/arms');
+const { pooledRate, meanOf, reduceArm, renderArmsTable, readArm, assertComparableCases } = require('../eval/arms');
 const { CC_REVIEW_SCHEMA } = require('../eval/effort-record');
 const { EFFORT_SCHEMA } = require('../src/effort');
 
@@ -190,5 +190,30 @@ describe('a root that cannot be read honestly is refused, not reduced', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// [LAW:verifiable-goals] The refusal this file's header promised and the code did not perform. The
+// headline row pools every opportunity a root holds, so arms over different case sets produce two numbers
+// that are set side by side and are not comparable — while the per-case table renders a dash and makes
+// the output look like it handled it.
+describe('two arms are comparable only over the same cases', () => {
+  const arm = (root, ...names) => ({ root, cases: names.map(name => ({ name, perRun: [] })) });
+
+  test('a root missing a case the other holds is refused, naming the root and the case', () => {
+    const arms = [arm('/out/engine', 'alpha', 'beta'), arm('/out/cc', 'alpha')];
+    assert.throws(() => assertComparableCases(arms), /Root \/out\/cc holds a different case set/);
+    assert.throws(() => assertComparableCases(arms), /missing beta/);
+    // The remedy travels with the refusal — "these differ" leaves a reader guessing.
+    assert.throws(() => assertComparableCases(arms), /re-score|same cases/);
+  });
+
+  test('a root holding a case the other lacks is refused too — an extra case is the same mismatch', () => {
+    assert.throws(() => assertComparableCases([arm('/out/engine', 'alpha'), arm('/out/cc', 'alpha', 'gamma')]), /extra gamma/);
+  });
+
+  test('the same cases in any order compare fine, and a single arm has nothing to disagree with', () => {
+    assert.doesNotThrow(() => assertComparableCases([arm('/out/a', 'alpha', 'beta'), arm('/out/b', 'beta', 'alpha')]));
+    assert.doesNotThrow(() => assertComparableCases([arm('/out/a', 'alpha')]));
   });
 });

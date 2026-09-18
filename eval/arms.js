@@ -196,12 +196,46 @@ function readArm(root) {
   return { label: labels[0], root: resolved, cases, runs };
 }
 
+// [LAW:parse-dont-validate] [LAW:no-silent-failure] The third refusal this file's header promises, and the
+// one that was documented without being built. Two arms are comparable only over the SAME cases: the
+// headline row pools every opportunity a root holds, so a root missing one of the four frozen cases
+// renders a recall over three cases beside another over four, in a table whose entire purpose is that the
+// two numbers can be set side by side.
+//
+// The per-case table below does show the hole as a dash, which makes this worse rather than better — the
+// output looks like it handled the situation while the deliverable row, the one a reader acts on, quietly
+// describes a different population. Reachable by ordinary use, not only by mistake: the cheap arm is the
+// one that gets deepened and re-run, and a credential walling mid-suite leaves exactly this shape.
+//
+// Refused rather than reconciled. Pooling over the intersection would make the numbers comparable by
+// silently changing what they measure, and warning-and-continuing would put the untrustworthy table on
+// screen anyway — which is the one thing every other check here exists to prevent.
+// [LAW:effects-at-boundaries] Pure: arms in, a refusal or nothing out.
+function assertComparableCases(arms) {
+  const [first, ...rest] = arms;
+  const wanted = first.cases.map(c => c.name).sort();
+  for (const arm of rest) {
+    const held = arm.cases.map(c => c.name).sort();
+    const missing = wanted.filter(name => !held.includes(name));
+    const extra = held.filter(name => !wanted.includes(name));
+    if (missing.length > 0 || extra.length > 0) {
+      throw new Error(
+        `Root ${arm.root} holds a different case set than ${first.root}: ` +
+        `${[missing.length > 0 ? `missing ${missing.join(', ')}` : null, extra.length > 0 ? `extra ${extra.join(', ')}` : null].filter(Boolean).join('; ')}. ` +
+        'Two arms are comparable only over the same cases — the pooled recalls would describe different ' +
+        'populations. Run the missing case(s) into the root and re-score, or pass roots that hold the same cases.',
+      );
+    }
+  }
+}
+
 function main(argv) {
   if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
     process.stdout.write('Compare scored arms against the same frozen cases.\n\n  node eval/arms.js <scored-root> <scored-root> [...]\n\nEach root is a directory of <case>/ dirs already scored by eval/score.js.\n');
     return argv.length === 0 ? 2 : 0;
   }
   const arms = argv.map(readArm);
+  assertComparableCases(arms);
   const rows = arms.map(reduceArm);
   process.stdout.write(`${renderArmsTable(rows)}\n\n`);
   process.stdout.write(`Inventory must-find, per case (found/opportunities):\n\n${renderPerCaseTable(arms)}\n`);
@@ -228,4 +262,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { pooledRate, meanOf, reduceArm, renderArmsTable, renderPerCaseTable, readArm, Z_95 };
+module.exports = { pooledRate, meanOf, reduceArm, renderArmsTable, renderPerCaseTable, readArm, assertComparableCases, Z_95 };
