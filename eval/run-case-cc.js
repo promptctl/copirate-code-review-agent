@@ -146,15 +146,26 @@ function superviseReview({ command, args, cwd, env, transcriptPath, timeoutMinut
       escalation.unref();
     }, timeoutMinutes * 60_000);
 
-    child.on('error', err => {
+    // [LAW:no-ambient-temporal-coupling] The child exiting and the transcript being ON DISK are two
+    // different completions, and the record is not whole until both have happened. `stream.end()` only
+    // QUEUES the final flush, so resolving in the same tick lets main() read a truncated transcript —
+    // and a truncated transcript does not crash, it REFUSES: `parseResultEvent` reports "no result
+    // event", or `parseFindings` reports "no findings payload", for a review that succeeded and was
+    // paid for. That launders a good run into the same signal as a walled credential, and since
+    // transcript size grows with review depth it would drop the deepest runs preferentially — a bias
+    // in exactly the arm a reader is comparing. So the settle waits for 'finish'. [LAW:no-silent-failure]
+    const closed = new Promise(done => stream.on('finish', done));
+    const settle = async outcome => {
       finish();
       stream.end();
-      resolve({ exitCode: -1, timedOut, startedAt, endedAt: new Date().toISOString(), stderr: err.message });
+      await closed;
+      resolve(outcome);
+    };
+    child.on('error', err => {
+      settle({ exitCode: -1, timedOut, startedAt, endedAt: new Date().toISOString(), stderr: err.message });
     });
     child.on('close', exitCode => {
-      finish();
-      stream.end();
-      resolve({ exitCode, timedOut, startedAt, endedAt: new Date().toISOString(), stderr: Buffer.concat(stderr).toString('utf8') });
+      settle({ exitCode, timedOut, startedAt, endedAt: new Date().toISOString(), stderr: Buffer.concat(stderr).toString('utf8') });
     });
   });
 }
@@ -208,12 +219,22 @@ async function main(argv) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-review-'));
   const runDirs = [];
   try {
-    // ONE materialization for every repeat of this case: the repo is frozen inputs, identical across
-    // repeats by construction, so re-deriving it per run would add work and a second chance to differ.
-    const repoDir = path.join(scratch, 'repo');
-    const { range } = materializeCase({ caseDir, destDir: repoDir, extractTree });
-
     for (let i = 1; i <= opts.repeats; i += 1) {
+      // A FRESH REPO PER REPEAT, and this is not caution — the reviewer WRITES. Across the 11 runs of the
+      // first real arm, `copirate-93-dependency-diff` run 2 ran `npm run build` inside the materialized
+      // tree and run 3 ran it twice, so run 3 reviewed a `dist/` that run 2 had rebuilt. Reusing one repo
+      // makes repeat N's input depend on what repeat N-1 happened to do, which is the one assumption every
+      // number in the table rests on: the repeats are replicates of ONE frozen change, and an interval
+      // over runs that reviewed different trees describes nothing. [LAW:no-ambient-temporal-coupling]
+      //
+      // Re-materializing rather than cleaning between runs: a `git checkout -- . && git clean -fd` repairs
+      // contamination instead of making it unrepresentable, and it only sees what git sees — a rebuilt
+      // `dist/` that the tree gitignores survives it. Materialization is deterministic (fixed identity and
+      // dates, asserted by a test that materializes twice and compares both shas), so a fresh repo is
+      // byte-identical to the last one and costs a tar extract against a review that takes minutes.
+      const repoDir = path.join(scratch, `repo-${i}`);
+      const { range } = materializeCase({ caseDir, destDir: repoDir, extractTree });
+
       const label = `${manifest.name} run ${i}/${opts.repeats}`;
       const runDir = path.join(caseOutRoot, runDirName(new Date(), i));
       fs.mkdirSync(path.join(runDir, 'transcripts'), { recursive: true });

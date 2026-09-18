@@ -98,3 +98,36 @@ describe('a frozen case becomes a repo a git-shaped reviewer can be aimed at', (
     }
   });
 });
+
+// [LAW:verifiable-goals] The property every number in the arms table rests on: N repeats of a case are
+// replicates of ONE frozen change. The reviewer WRITES — across the first real arm, one case's run 2 ran
+// `npm run build` inside the materialized tree and run 3 ran it twice — so a producer that reuses one
+// repo across repeats hands repeat N whatever repeat N-1 left behind, and an interval over runs that
+// reviewed different trees describes nothing.
+//
+// Asserted as a property of materialization rather than by reaching into the producer's loop: a repeat
+// gets a repo indistinguishable from a fresh one EVEN IF the previous repeat modified its tree.
+// [LAW:behavior-not-structure]
+test('a repeat is unaffected by whatever the previous repeat did to its tree', () => {
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'materialize-iid-'));
+  try {
+    const first = materializeCase({ caseDir: CASE_DIR, destDir: path.join(dest, 'repo-1'), extractTree });
+    // The reviewer's own observed mutation: a build artefact written into the tree, plus a tracked file
+    // edited underneath it.
+    fs.writeFileSync(path.join(first.repoDir, 'dist-rebuilt.js'), 'module.exports = 1;\n');
+    fs.appendFileSync(path.join(first.repoDir, 'README.md'), '\nmutated by a previous run\n');
+
+    const second = materializeCase({ caseDir: CASE_DIR, destDir: path.join(dest, 'repo-2'), extractTree });
+    assert.equal(fs.existsSync(path.join(second.repoDir, 'dist-rebuilt.js')), false, 'a fresh repeat must not inherit the previous one\'s build artefacts');
+    assert.equal(
+      execFileSync('git', ['status', '--porcelain'], { cwd: second.repoDir, encoding: 'utf8' }).trim(), '',
+      'a fresh repeat must start from a clean tree',
+    );
+    // And it is the SAME change, not merely a clean one — same two commits, so the replicates are
+    // comparable rather than just independent.
+    const shas = [first, second].map(r => execFileSync('git', ['rev-parse', 'main', 'change'], { cwd: r.repoDir, encoding: 'utf8' }));
+    assert.equal(shas[0], shas[1]);
+  } finally {
+    fs.rmSync(dest, { recursive: true, force: true });
+  }
+});

@@ -160,14 +160,38 @@ function readArm(root) {
 
   // Tokens and wall clock come from each RUN's usage.json: the scorecard summary reduces cost but not
   // tokens or duration, and those are two of the columns this table exists for.
-  const runs = caseNames.flatMap(name => listRunDirs(path.join(resolved, name)).map(dir => {
+  //
+  // [LAW:no-silent-failure] Which makes one row read from TWO populations — the scored runs the summary
+  // reduced, and the run dirs on disk right now — and nothing but this check says they are the same runs.
+  // They come apart the moment a root is extended after scoring, which is the documented workflow: run
+  // dirs are named by timestamp, so re-running into an existing --out ADDS dirs rather than replacing
+  // them, and scoring is a separate step. The row would then render recall over N runs beside tokens
+  // over M, with no mark on the table saying so — the one population mismatch this reducer did not
+  // refuse while refusing every other kind. Named per case, with the remedy, because "the root is
+  // inconsistent" sends a reader searching.
+  const scoredRunCount = new Map(cases.map(c => [c.name, c.perRun.length]));
+
+  const runsOf = name => listRunDirs(path.join(resolved, name)).map(dir => {
     const usagePath = path.join(dir, 'usage.json');
     if (!fs.existsSync(usagePath)) return { tokens: null, wallMinutes: null };
     const usage = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
     const span = usage.span;
     const wallMinutes = span && span.from && span.to ? (new Date(span.to) - new Date(span.from)) / MS_PER_MINUTE : null;
     return { tokens: usage.tokens ?? null, wallMinutes: Number.isFinite(wallMinutes) ? wallMinutes : null };
-  }));
+  });
+
+  const runs = caseNames.flatMap(name => {
+    const found = runsOf(name);
+    const scored = scoredRunCount.get(name);
+    if (found.length !== scored) {
+      throw new Error(
+        `Root ${root}: case '${name}' holds ${found.length} run dir(s) on disk but its scorecard-summary.json ` +
+        `reduced ${scored} — the recall and cost columns would describe one population and the token and ` +
+        `wall-clock columns another. Re-score the root (node eval/score.js ${path.join(root, name)}).`,
+      );
+    }
+    return found;
+  });
 
   return { label: labels[0], root: resolved, cases, runs };
 }

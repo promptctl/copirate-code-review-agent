@@ -430,6 +430,17 @@ refused rather than recorded as a zero. That refusal is the instrument working: 
 prose-only review is unmeasurable, and scoring it as zero findings would have
 understated the cc arm.
 
+**One contamination, disclosed.** These runs were produced before `run-case-cc.js`
+materialized a fresh repo per repeat, and the reviewer writes: in
+`copirate-93-dependency-diff`, run 2 ran `npm run build` inside the materialized tree and
+run 3 ran it twice, so run 3 reviewed a `dist/` that run 2 had rebuilt. The committed
+`main...change` range is unaffected — an uncommitted rebuild does not change a
+commit-to-commit diff — but what the reviewer read was not the frozen tree, so that run
+is not an independent replicate. It is one of eleven, and the case's three runs scored
+0/4, 1/4 and 0/4, so excluding it moves the pooled cc figure from 2/56 to 2/52; the
+verdict does not turn on it. The producer now re-materializes per repeat, and a test
+asserts a repeat cannot inherit the previous one's tree.
+
 What this does **not** establish. There is only one replicate of the engine arm per
 case, so its interval is wide (22–61%) and a re-run could move it several points. Only
 `medium` was measured on the cc side; `high` dispatches background agents and was not

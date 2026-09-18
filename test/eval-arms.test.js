@@ -122,11 +122,22 @@ describe('a root that cannot be read honestly is refused, not reduced', () => {
   const ccEffort = { level: 'medium', model: 'claude-sonnet-5', effortSchema: CC_REVIEW_SCHEMA };
   const engineEffort = { roundCap: 0, sweepCap: 2, reasoningTier: null, effortSchema: EFFORT_SCHEMA };
 
+  // A run dir as a producer leaves one: findings.json is what makes it count as a run, usage.json is
+  // where the token and wall-clock columns come from.
+  const writeRunDir = (dir, caseName, stamp) => {
+    const runDir = path.join(dir, caseName, stamp);
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'findings.json'), '[]\n');
+    fs.writeFileSync(path.join(runDir, 'usage.json'), JSON.stringify({ tokens: { inputCacheMiss: 1, inputCacheHit: 1, output: 1 } }));
+  };
+
+  // The summary above reduces exactly one run, so a consistent root holds exactly one run dir per case.
   const root = (cases) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arms-root-'));
     for (const [name, effort] of cases) {
       fs.mkdirSync(path.join(dir, name), { recursive: true });
       fs.writeFileSync(path.join(dir, name, 'scorecard-summary.json'), summary(name, effort));
+      writeRunDir(dir, name, '2026-01-01T00-00-00-000Z-run1');
     }
     return dir;
   };
@@ -149,6 +160,22 @@ describe('a root that cannot be read honestly is refused, not reduced', () => {
       fs.mkdirSync(path.join(dir, 'alpha'));
       assert.throws(() => readArm(dir), /no scorecard-summary\.json/);
       assert.throws(() => readArm(dir), /eval\/score\.js/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // THE MISMATCH: recall and cost come from scorecard-summary.json, tokens and wall clock from a live
+  // directory scan. A root extended after scoring — the documented workflow, since run dirs are named by
+  // timestamp and scoring is a separate step — renders one row whose left half means N runs and whose
+  // right half means M, with no mark on the table saying so. [LAW:no-silent-failure]
+  test('a root scored before it was extended refuses, naming the case and both counts', () => {
+    const dir = root([['alpha', ccEffort]]);
+    try {
+      // The summary reduced one run; a second is produced into the root before it is re-scored.
+      writeRunDir(dir, 'alpha', '2026-01-01T00-00-01-000Z-run2');
+      assert.throws(() => readArm(dir), /holds 2 run dir\(s\) on disk but its scorecard-summary\.json reduced 1/);
+      assert.throws(() => readArm(dir), /Re-score the root/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
