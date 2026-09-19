@@ -14,9 +14,9 @@ import pytest
 from copirate_review.config import Config
 from copirate_review.ghops import Repo
 from copirate_review.gitops import (
-    UPSTREAM,
     blob_at,
     current_branch,
+    push,
     push_remote,
     remote_url,
     upstream_ref,
@@ -42,7 +42,8 @@ def write(root: Path, text: str = TEXT) -> None:
 
 def snap(root: Path, text: str = TEXT):
     """Take the snapshot the way a real run does, upstream and all."""
-    return snapshot(root, rendered(text), upstream_ref(root, current_branch(root)))
+    branch = current_branch(root)
+    return snapshot(root, rendered(text), upstream_ref(root, branch, push_remote(root, branch)))
 
 
 def plan_for(root: Path, *changes) -> Plan:
@@ -52,7 +53,7 @@ def plan_for(root: Path, *changes) -> Plan:
         repo=Repo(name_with_owner="o/r", default_branch="main"),
         branch=branch,
         remote="origin",
-        upstream=upstream_ref(root, branch),
+        upstream=upstream_ref(root, branch, push_remote(root, branch)),
         landing=landing_for(branch, "not-the-default-branch"),
         config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
         action_ref="o/r@v1",
@@ -77,11 +78,12 @@ def test_a_committed_path_reads_back_byte_for_byte_including_its_last_newline(re
     assert blob_at(repo, "HEAD", WORKFLOW) == TEXT
 
 
-def test_a_branch_that_was_never_pushed_has_no_upstream_content(repo):
+def test_a_branch_that_was_never_pushed_has_no_upstream_ref_to_read(repo):
     write(repo)
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "add")
-    assert blob_at(repo, UPSTREAM, WORKFLOW) is None
+    branch = current_branch(repo)
+    assert upstream_ref(repo, branch, push_remote(repo, branch)) is None
 
 
 # --- the three snapshots ----------------------------------------------------------
@@ -185,6 +187,32 @@ def test_a_private_branch_is_never_published_just_because_it_has_no_upstream(pus
     assert plan_for(pushed_repo, change).unlanded_paths == [], "nothing to land, nothing to push"
 
 
+def test_a_branch_cut_from_the_remote_default_branch_is_still_not_published(pushed_repo):
+    """The upstream ref must name the branch we would PUSH, not the one we pull from.
+
+    `git checkout -b trunk origin/main` is the ordinary way to start work, and it sets
+    `branch.trunk.merge` to `refs/heads/main` — so `@{u}` resolves to `origin/main`, a
+    ref that very much exists. Reading published-ness off it got both halves wrong at
+    once: the branch read as published, so `needs_push` compared the render against a
+    DIFFERENT branch's copy of the file, and the push that followed created
+    `origin/trunk` out of nothing — from a tool that promises never to publish a branch
+    the remote does not already have. [LAW:one-source-of-truth]
+    """
+    write(pushed_repo)
+    git(pushed_repo, "add", "-A")
+    git(pushed_repo, "commit", "-qm", "converge on the default branch")
+    git(pushed_repo, "push", "-q")
+
+    git(pushed_repo, "checkout", "-q", "-b", "trunk", "origin/main")
+    assert current_branch(pushed_repo) == "trunk"
+    assert push_remote(pushed_repo, "trunk") == "origin", "so `push` would write origin/trunk"
+
+    change = snap(pushed_repo, "name: Changed on trunk alone\non: pull_request\n")
+    assert isinstance(change.remote, Unpublished), "origin/trunk does not exist"
+    assert change.needs_push is False, "this was answered from origin/main's copy of the file"
+    assert plan_for(pushed_repo, change).upstream is None, "so _land has nothing to push"
+
+
 def test_a_workflow_committed_onto_an_unpublished_branch_waits_for_its_own_push(pushed_repo):
     """There IS something to land, and it still is not ours to publish.
 
@@ -200,6 +228,33 @@ def test_a_workflow_committed_onto_an_unpublished_branch_waits_for_its_own_push(
     plan = plan_for(pushed_repo, change)
     assert plan.commit_paths == [WORKFLOW]
     assert plan.upstream is None, "and _land refuses to push on that"
+
+
+def test_a_push_rejected_against_a_stale_ref_says_so_instead_of_only_relaying_git(
+    pushed_repo, tmp_path
+):
+    """The one failure this tool can cause and not explain.
+
+    Nothing here fetches, so `needs_push` is read off the copy the last fetch left
+    behind. A teammate pushing in the meantime turns work-to-pull into what looks like
+    work-to-push, and git's rejection never mentions that this tool did not look.
+    [LAW:no-silent-failure]
+    """
+    other = tmp_path / "teammate"
+    git(tmp_path, "clone", "-q", str(tmp_path / "remote.git"), str(other))
+    git(other, "config", "user.email", "them@example.com")
+    git(other, "config", "user.name", "Them")
+    git(other, "commit", "-q", "--allow-empty", "-m", "landed while we were not looking")
+    git(other, "push", "-q")
+
+    write(pushed_repo)
+    git(pushed_repo, "add", "-A")
+    git(pushed_repo, "commit", "-qm", "converge")
+
+    with pytest.raises(EffectError) as refusal:
+        push(pushed_repo, "main", "origin")
+    assert "git pull --rebase" in str(refusal.value)
+    assert "already committed" in str(refusal.value), "so nobody re-runs the whole install"
 
 
 # --- which remote we are talking about --------------------------------------------

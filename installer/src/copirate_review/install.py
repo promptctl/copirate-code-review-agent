@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import ghops, gitops
 from .config import Config, load
-from .credentials import Credential
+from .credentials import Credential, is_empty
 from .ghops import Repo
 from .render import Rendered, render, resolve_action_ref
 from .shell import EffectError
@@ -284,10 +284,26 @@ def plan_secret(repo: str, name: str, credential: Credential) -> SecretPlan:
     would review unauthenticated; neither → the reviewer cannot authenticate at all, and
     a later "clean review" would be a lie. [LAW:one-source-of-truth]
     [LAW:no-silent-failure]
+
+    "Holds it" means holds a VALUE. An exported-but-empty variable, or a keychain item
+    stored empty, passes `present()` and is refused at the write — so the plan said
+    `sync` and exited 0 while the run it was predicting exited 1. A dry run may be
+    wrong about the network; it may not be wrong about this machine. Asking here also
+    lets a repo whose stores already hold a good secret report `keep` rather than
+    failing the whole run over a local source that has gone empty.
     """
-    if credential.present():
+    present = credential.present()
+    empty = present and is_empty(credential)
+    if present and not empty:
         return SyncSecret(name, credential)
 
+    # Named for what is actually wrong, because "provide that credential" is the wrong
+    # instruction for one that is sitting right there, empty. [LAW:no-silent-failure]
+    unusable = (
+        f"{credential.description} holds an empty value"
+        if empty
+        else f"{credential.description} is not available"
+    )
     missing = ghops.stores_missing(repo, name)
     if not missing:
         return KeepSecret(name, credential)
@@ -296,15 +312,15 @@ def plan_secret(repo: str, name: str, credential: Credential) -> SecretPlan:
             name,
             credential,
             f"{name} is missing from the {', '.join(missing)} secret store on {repo}, and "
-            f"{credential.description} is not available to set it — reviews on "
+            f"{unusable} to set it — reviews on "
             f"{'/'.join(missing)}-triggered PRs would run unauthenticated. Provide that "
             f"credential and re-run.",
         )
     return MissingSecret(
         name,
         credential,
-        f"{name} is not set on {repo} and {credential.description} is not available to "
-        f"set it — the reviewer cannot authenticate. Provide that credential and re-run.",
+        f"{name} is not set on {repo} and {unusable} to set it — the reviewer cannot "
+        f"authenticate. Provide that credential and re-run.",
     )
 
 
@@ -312,7 +328,7 @@ def build_plan(cwd: Path, home: Path) -> Plan:
     root, repo, branch, remote = preflight(cwd)
     config, layers = load(root, home)
     action_ref = resolve_action_ref(config, repo.name_with_owner)
-    upstream = gitops.upstream_ref(root, branch)
+    upstream = gitops.upstream_ref(root, branch, remote)
 
     changes = [
         snapshot(root, render(config, spec, action_ref, root, home), upstream)

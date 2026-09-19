@@ -31,9 +31,18 @@ ITEM = KeychainCredential(item="TOKEN_ITEM")
 def world(monkeypatch):
     """Stand in for a credential's source and for the repo's two secret stores."""
 
-    def configure(*, on_this_machine: bool, missing: tuple[str, ...] = ()) -> None:
+    def configure(
+        *, on_this_machine: bool, holds: str = "a-real-token", missing: tuple[str, ...] = ()
+    ) -> None:
         for source in (KeychainCredential, EnvCredential):
             monkeypatch.setattr(source, "present", lambda self: on_this_machine)
+            # The VALUE is stood in for too, not just its existence: the plan now reads
+            # it to decide, so a fixture that stubs only `present` leaves the real
+            # `security` to answer the other half. Substituting the reader keeps the
+            # pipeline that measures it the genuine one. [LAW:behavior-not-structure]
+            monkeypatch.setattr(
+                source, "stages", property(lambda self: [["printf", "%s", holds]])
+            )
         monkeypatch.setattr(ghops, "stores_missing", lambda repo, name: missing)
 
     return configure
@@ -64,6 +73,25 @@ def test_a_credential_nowhere_at_all_fails_rather_than_promising_a_clean_review(
     verdict = plan_secret("o/r", "TOKEN", ITEM)
     assert isinstance(verdict, MissingSecret)
     assert "cannot authenticate" in verdict.reason
+
+
+def test_a_source_that_is_there_but_empty_is_not_a_credential(world):
+    """`present()` is not the question; holding a VALUE is.
+
+    An exported-but-empty variable, or an item stored empty, passed `present()` and was
+    refused at the write — so the dry run printed `sync` and exited 0 while the run it
+    claimed to predict exited 1. Nothing about that is knowable only over the network.
+    """
+    world(on_this_machine=True, holds="", missing=tuple(ghops.SECRET_STORES))
+    verdict = plan_secret("o/r", "TOKEN", ITEM)
+    assert isinstance(verdict, MissingSecret)
+    assert "holds an empty value" in verdict.reason, "and not 'is not available'"
+
+
+def test_an_empty_local_source_does_not_fail_a_repo_whose_stores_are_already_good(world):
+    """The run used to abort here. There is nothing to repair and nothing to break."""
+    world(on_this_machine=True, holds="", missing=())
+    assert plan_secret("o/r", "TOKEN", ITEM) == KeepSecret("TOKEN", ITEM)
 
 
 def test_the_dry_run_reports_the_verdict_the_real_run_will_act_on(capsys):

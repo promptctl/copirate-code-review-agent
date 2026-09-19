@@ -9,14 +9,6 @@ from .shell import EffectError, output_or_none, require, run, succeeds
 #: The remote a branch pushes to when it has no upstream configured yet.
 DEFAULT_REMOTE = "origin"
 
-#: The revision naming the current branch's upstream — the last state of the remote
-#: branch that git itself recorded. It is a machine-maintained map of what has been
-#: pushed, which is why it is read instead of remembered: a note this installer kept
-#: about its own last push would be a second map, free to disagree the moment anyone
-#: pushes from anywhere else. [FRAMING:representation]
-UPSTREAM = "@{u}"
-
-
 def repo_root(cwd: Path) -> Path:
     require("git", "https://git-scm.com")
     try:
@@ -71,8 +63,8 @@ def remote_url(root: Path, remote: str) -> str:
         ) from exc
 
 
-def upstream_ref(root: Path, branch: str | None) -> str | None:
-    """This branch's remote-tracking ref, or None when it has never been pushed.
+def upstream_ref(root: Path, branch: str | None, remote: str) -> str | None:
+    """The remote-tracking ref for the branch `push` writes, or None when it has none.
 
     Asked as its own question because "the remote branch does not have this file" and
     "there is no remote branch" are different facts, and only the first is a reason to
@@ -80,13 +72,26 @@ def upstream_ref(root: Path, branch: str | None) -> str | None:
     behind — so a developer who cut a branch from a converged default branch and stacked
     private commits on it would have the whole branch published by a tool documented as
     safe to run before every review. [LAW:types-are-the-program]
+
+    The ref is DERIVED from the same two facts `push` is given, because it has to name
+    the branch `push` would create. `@{u}` does not: it is built from `branch.<b>.merge`,
+    the branch we PULL from, and the two part company the moment anyone runs
+    `git checkout -b trunk origin/main` — a completely ordinary way to start work.
+    There `@{u}` is `origin/main`, which exists, so this branch reads as published; the
+    file is then compared against a DIFFERENT branch's copy, and the push that follows
+    creates `origin/trunk` out of nothing. Both halves of the guarantee above, defeated
+    by the same wrong ref. `@{push}` is no better — it answers for a bare `git push`
+    under `push.default`, a command this module never runs. [LAW:one-source-of-truth]
     """
     if branch is None:
         return None
-    ref = output_or_none(
-        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", UPSTREAM], cwd=root
-    )
-    return ref.strip() if ref else None
+    # Full `refs/remotes/...` rather than `<remote>/<branch>`: the short form is
+    # resolved against every namespace git knows, so a TAG sharing the branch's name
+    # would answer this question with a ref no push will ever move.
+    ref = f"refs/remotes/{remote}/{branch}"
+    if not succeeds(["git", "rev-parse", "--verify", "--quiet", ref], cwd=root):
+        return None
+    return ref
 
 
 def blob_at(root: Path, ref: str, path: str) -> str | None:
@@ -129,4 +134,21 @@ def push(root: Path, branch: str, remote: str) -> None:
     holds, so the "first push" and "every later push" cases are the same call rather
     than a branch on a condition. [LAW:no-mode-explosion]
     """
-    run(["git", "push", "--set-upstream", remote, branch], cwd=root)
+    try:
+        run(["git", "push", "--set-upstream", remote, branch], cwd=root)
+    except EffectError as exc:
+        # Nothing here fetches, deliberately — a network round-trip on every run, to
+        # refresh a ref that is almost always current, buys a race it still cannot win.
+        # The cost of not fetching is paid HERE instead, as an explanation: a stale
+        # remote-tracking ref makes this run see work to push that is really work to
+        # pull, and git's own rejection does not mention that this tool never looked.
+        # A loud failure nobody can act on is only half of [LAW:no-silent-failure].
+        raise EffectError(
+            f"could not push {branch} to {remote} — git said: {exc}\n"
+            f"  If that is a rejected non-fast-forward: this installer never fetches, so "
+            f"it read {remote}/{branch} from whatever your last fetch recorded. Someone "
+            f"pushing since then leaves that copy behind, and the run reports work to "
+            f"push that is really work to pull. Run `git pull --rebase` and re-run.\n"
+            f"  The workflow is already committed on {branch} either way; only the push "
+            f"is outstanding."
+        ) from exc
