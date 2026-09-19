@@ -48,7 +48,16 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    # Checked here, where the value came from, rather than left to fail at the first
+    # subprocess that tries to run in it — `subprocess` raises FileNotFoundError for a
+    # missing cwd, which is neither of the two errors below and so reaches the operator
+    # as a traceback with an exit code the contract above does not describe. argparse's
+    # own channel is the right one: this is a bad invocation, and it exits 2 with the
+    # usage that shows how to fix it. [LAW:parse-dont-validate]
+    if not args.directory.is_dir():
+        parser.error(f"-C {args.directory}: no such directory")
     try:
         current = build_plan(args.directory.resolve(), Path.home())
         describe(current)

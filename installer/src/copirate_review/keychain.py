@@ -9,15 +9,39 @@ here. This module orchestrates the pipe; it cannot observe what travels through 
 from __future__ import annotations
 
 import subprocess
+import tempfile
 
-from .shell import EffectError, succeeds
+from .shell import EffectError
 
 _FIND = ["security", "find-generic-password", "-s"]
 
+#: `security`'s exit status for errSecItemNotFound, and the ONLY nonzero one that means
+#: the item is absent. Measured, not assumed: `security find-generic-password -s <no
+#: such item>` exits 44.
+ITEM_NOT_FOUND = 44
+
 
 def has_item(item: str) -> bool:
-    """Whether this machine holds the named generic-password item."""
-    return succeeds([*_FIND, item])
+    """Whether this machine holds the named generic-password item.
+
+    Three answers, not two: found, absent, and *could not tell* — a locked keychain, a
+    denied ACL, a cancelled authorization prompt. Only the second is a `False`. Reading
+    the exit status as a mere boolean folds the third into "absent", and the caller then
+    reports a credential MISSING and tells the operator to add a keychain item they are
+    looking at right now, while the real cause — a locked keychain — goes unnamed.
+    [LAW:types-are-the-program] [LAW:no-silent-failure]
+    """
+    result = subprocess.run([*_FIND, item], capture_output=True, text=True)
+    if result.returncode == 0:
+        return True
+    if result.returncode == ITEM_NOT_FOUND:
+        return False
+    detail = (result.stderr or result.stdout).strip()
+    raise EffectError(
+        f"could not read keychain item {item!r}: `security` exited {result.returncode}"
+        f"{f' — {detail}' if detail else ''}. If the keychain is locked, unlock it and "
+        f"re-run; this is not the same as the item being absent."
+    )
 
 
 def pipe_into(item: str, argv: list[str]) -> str:
@@ -31,23 +55,36 @@ def pipe_into(item: str, argv: list[str]) -> str:
 
     `tr` is a separate process for the same reason the whole chain is: stripping the
     newline in Python would mean reading the credential into this process's memory.
-    """
-    find = subprocess.Popen([*_FIND, item, "-w"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert find.stdout is not None
-    strip = subprocess.Popen(
-        ["tr", "-d", "\n"], stdin=find.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    find.stdout.close()
-    assert strip.stdout is not None
-    consumer = subprocess.Popen(
-        argv, stdin=strip.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    strip.stdout.close()
 
-    consumer_out, consumer_err = consumer.communicate()
-    strip.wait()
-    find_err = find.stderr.read().decode() if find.stderr else ""
-    find.wait()
+    Only ONE pipe in the chain is ever read by this process, and it is read last. So
+    every other stream the chain produces goes somewhere that cannot fill and block: the
+    reader's stderr to a temporary file, `tr`'s to /dev/null. A pipe nobody drains until
+    the chain finishes is a pipe the chain can deadlock on — `security` cannot exit
+    until its stderr is drained, `tr` cannot see end-of-input until `security` exits,
+    and the consumer cannot exit until `tr` does, so the one read we do would wait
+    forever on a process waiting on us. [LAW:no-ambient-temporal-coupling]
+    """
+    with tempfile.TemporaryFile() as find_errors:
+        find = subprocess.Popen([*_FIND, item, "-w"], stdout=subprocess.PIPE, stderr=find_errors)
+        assert find.stdout is not None
+        strip = subprocess.Popen(
+            ["tr", "-d", "\n"],
+            stdin=find.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        find.stdout.close()
+        assert strip.stdout is not None
+        consumer = subprocess.Popen(
+            argv, stdin=strip.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        strip.stdout.close()
+
+        consumer_out, consumer_err = consumer.communicate()
+        strip.wait()
+        find.wait()
+        find_errors.seek(0)
+        find_err = find_errors.read().decode(errors="replace")
 
     # Checked reader-first so the most specific cause wins: a consumer that died because
     # its input never arrived reports a closed pipe, which says nothing about the locked

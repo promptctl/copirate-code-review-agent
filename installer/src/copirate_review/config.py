@@ -39,6 +39,13 @@ EXCLUDE_INPUT = "EXCLUDE_PATTERNS"
 
 KEYCHAIN_SCHEME = "keychain:"
 
+#: Keys the MERGED document must carry. Deliberately NOT in schema.json's own
+#: `required`, because that is checked against each LAYER and a layer is a patch — a
+#: repo overriding one input must not have to restate the action ref it inherits.
+#: Completeness is a property of the whole, so it is asserted once, against the whole.
+#: [LAW:single-enforcer]
+REQUIRED = ("action_ref", "commit_message", "secrets", "workflows")
+
 
 class ConfigError(Exception):
     """A configuration the installer refuses to act on, with the file named."""
@@ -100,8 +107,8 @@ def _read_layer(path: Path) -> dict[str, Any]:
     return loaded
 
 
-def _validate(doc: Mapping[str, Any], source: str) -> None:
-    """Check one layer against the schema, reporting every violation at once.
+def _validate(doc: Mapping[str, Any], source: str, *, required: tuple[str, ...] = ()) -> None:
+    """Check a document against the schema, reporting every violation at once.
 
     Every error is reported rather than the first, because the operator's next act is to
     open the file and fix it — handing back one of four typos costs four round trips.
@@ -109,7 +116,8 @@ def _validate(doc: Mapping[str, Any], source: str) -> None:
     for reviews it meant to stop paying for, with nothing anywhere to say so.
     [LAW:no-silent-failure]
     """
-    errors = sorted(Draft202012Validator(_schema()).iter_errors(doc), key=lambda e: list(e.path))
+    schema = {**_schema(), "required": list(required)} if required else _schema()
+    errors = sorted(Draft202012Validator(schema).iter_errors(doc), key=lambda e: list(e.path))
     if not errors:
         return
     detail = "\n".join(
@@ -142,16 +150,6 @@ def merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
         else:
             merged[key] = value
     return merged
-
-
-def _require(doc: Mapping[str, Any], key: str, source: str) -> Any:
-    value = doc.get(key)
-    if value is None:
-        raise ConfigError(
-            f"{source}: '{key}' is not set. It ships with a default, so a layer deleted "
-            f"it with an explicit null; restore it or drop that line."
-        )
-    return value
 
 
 def _credential(source_uri: str, secret_name: str) -> KeychainCredential:
@@ -205,14 +203,16 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
     Returns a type that could not have existed before the check ran, so nothing
     downstream re-inspects any of it. [LAW:parse-dont-validate]
     """
-    _validate(merged, source)
+    # The merged document is checked with `required` on, which is the one place it
+    # means anything. Every layer was already checked without it on the way in, so a
+    # missing key here can only mean the shipped defaults are incomplete — an assertion
+    # the schema now carries rather than a hand-written guard whose message had to guess
+    # at a cause. [LAW:polishing-by-subtraction]
+    _validate(merged, source, required=REQUIRED)
 
-    secrets = {
-        name: _credential(uri, name)
-        for name, uri in _require(merged, "secrets", source).items()
-    }
+    secrets = {name: _credential(uri, name) for name, uri in merged["secrets"].items()}
 
-    raw_workflows: Mapping[str, Any] = _require(merged, "workflows", source)
+    raw_workflows: Mapping[str, Any] = merged["workflows"]
     if not raw_workflows:
         raise ConfigError(
             f"{source}: 'workflows' is empty — there is nothing to install. Declare one, "
@@ -258,8 +258,8 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
         )
 
     return Config(
-        action_ref=_require(merged, "action_ref", source),
-        commit_message=_require(merged, "commit_message", source),
+        action_ref=merged["action_ref"],
+        commit_message=merged["commit_message"],
         secrets=secrets,
         workflows=tuple(workflows),
     )

@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .shell import EffectError, require, run, succeeds
+from .shell import EffectError, output_or_none, require, run, succeeds
+
+#: The remote a branch pushes to when it has no upstream configured yet.
+DEFAULT_REMOTE = "origin"
+
+#: The revision naming the current branch's upstream — the last state of the remote
+#: branch that git itself recorded. It is a machine-maintained map of what has been
+#: pushed, which is why it is read instead of remembered: a note this installer kept
+#: about its own last push would be a second map, free to disagree the moment anyone
+#: pushes from anywhere else. [FRAMING:representation]
+UPSTREAM = "@{u}"
 
 
 def repo_root(cwd: Path) -> Path:
@@ -30,6 +40,48 @@ def current_branch(root: Path) -> str | None:
     return run(["git", "symbolic-ref", "--short", "HEAD"], cwd=root)
 
 
+def push_remote(root: Path, branch: str | None) -> str:
+    """The remote this branch pushes to: its upstream's, or `origin`.
+
+    ONE answer to "which remote is this repository", used both to name the GitHub repo
+    the secrets are written to and to push the commit. Letting `gh` resolve the repo on
+    its own is a second map of that fact, and the two disagree exactly where it hurts:
+    in a fork clone carrying both `origin` and `upstream`, gh answers with the PARENT,
+    so the reviewer's credential is written to a repository the pull request will never
+    run in — while the commit goes to the fork. Measured, not assumed: gh resolves
+    `upstream` over `origin`. [LAW:one-source-of-truth]
+
+    `--default` makes "no upstream configured yet" a value rather than a nonzero exit,
+    so a brand-new branch takes the same path as every other one.
+    """
+    if branch is None:
+        return DEFAULT_REMOTE
+    key = f"branch.{branch}.remote"
+    return run(["git", "config", "--get", "--default", DEFAULT_REMOTE, key], cwd=root)
+
+
+def remote_url(root: Path, remote: str) -> str:
+    """The URL of the remote we push to, which is what identifies the GitHub repo."""
+    try:
+        return run(["git", "remote", "get-url", remote], cwd=root)
+    except EffectError as exc:
+        raise EffectError(
+            f"no git remote named {remote!r} in {root}. The installer provisions the "
+            f"repository it pushes to, so it needs one: git remote add {remote} <url>"
+        ) from exc
+
+
+def blob_at(root: Path, ref: str, path: str) -> str | None:
+    """This path's content at a revision, or None where that revision does not have it.
+
+    None is a state, not a failure, and it arrives three legitimate ways: the workflow
+    is new and absent from HEAD, the branch has never been pushed so `@{u}` names
+    nothing, or the repository has no commits at all. All three mean "not there yet" and
+    must drive a write rather than an error. [LAW:types-are-the-program]
+    """
+    return output_or_none(["git", "cat-file", "blob", f"{ref}:{path}"], cwd=root)
+
+
 def commit(root: Path, paths: list[str], message: str) -> str:
     """Commit exactly these paths as their own commit, and return its short SHA.
 
@@ -47,15 +99,16 @@ def commit(root: Path, paths: list[str], message: str) -> str:
     return run(["git", "rev-parse", "--short", "HEAD"], cwd=root)
 
 
-def push(root: Path, branch: str) -> None:
-    """Push the current branch, establishing its upstream the first time.
+def push(root: Path, branch: str, remote: str) -> None:
+    """Push this branch to the named remote, establishing its upstream.
 
-    An unset upstream is a domain value — a branch that has not been pushed yet — not a
-    failure, so it selects which push to run rather than aborting.
-    [LAW:dataflow-not-control-flow]
+    One command, not two. The branch this pushes and the remote it pushes to are both
+    named explicitly, so the push cannot land somewhere other than the repository whose
+    secrets this run just provisioned — a bare `git push` re-derives both from config
+    and, on a branch tracking a fork's parent, sends the commit to the parent.
+
+    `--set-upstream` on a branch that already has one re-sets it to the value it already
+    holds, so the "first push" and "every later push" cases are the same call rather
+    than a branch on a condition. [LAW:no-mode-explosion]
     """
-    has_upstream = succeeds(
-        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=root
-    )
-    argv = ["git", "push"] if has_upstream else ["git", "push", "--set-upstream", "origin", branch]
-    run(argv, cwd=root)
+    run(["git", "push", "--set-upstream", remote, branch], cwd=root)

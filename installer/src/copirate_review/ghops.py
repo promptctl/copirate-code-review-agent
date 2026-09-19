@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 
 from . import keychain
 from .shell import EffectError, require, run, succeeds
@@ -42,22 +41,37 @@ def require_auth() -> None:
         raise EffectError("gh is not authenticated. Run: gh auth login")
 
 
-def resolve(cwd: Path) -> Repo:
-    """Resolve the repo from this directory's remote, confirming gh can reach it."""
+def resolve(url: str) -> Repo:
+    """Resolve the repo at this remote URL, confirming gh can reach it.
+
+    The URL is passed IN rather than letting gh resolve a repo from the directory's
+    remotes. Asked without one, gh picks among the remotes by its own rules and prefers
+    `upstream` over `origin` — so in a fork clone it answers with the parent repository
+    while the commit goes to the fork. The caller already knows which remote it pushes
+    to; naming it here is what makes the two the same repository by construction.
+    [LAW:one-source-of-truth]
+    """
     try:
-        payload = run(
-            ["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"], cwd=cwd
-        )
+        payload = run(["gh", "repo", "view", url, "--json", "nameWithOwner,defaultBranchRef"])
     except EffectError as exc:
         raise EffectError(
-            f"gh could not resolve a GitHub repo for {cwd} (no GitHub remote, or no access): {exc}"
+            f"gh could not resolve a GitHub repo at {url} (not a GitHub repo, or no access): {exc}"
         ) from exc
-    data = json.loads(payload)
-    ref = data["defaultBranchRef"]
-    return Repo(
-        name_with_owner=data["nameWithOwner"],
-        default_branch=ref["name"] if ref else None,
-    )
+    # gh's output is another program's, so it is parsed at this boundary rather than
+    # indexed into downstream: a changed `--json` contract must surface here, naming gh,
+    # instead of as a KeyError traceback three frames away. [LAW:parse-dont-validate]
+    try:
+        data = json.loads(payload)
+        ref = data["defaultBranchRef"]
+        return Repo(
+            name_with_owner=data["nameWithOwner"],
+            default_branch=ref["name"] if ref else None,
+        )
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        raise EffectError(
+            f"gh returned an unexpected payload for {url} ({type(exc).__name__}: {exc}). "
+            f"Check that `gh repo view` works and that gh is up to date."
+        ) from exc
 
 
 def stores_missing(repo: str, name: str) -> tuple[str, ...]:
@@ -80,9 +94,10 @@ def stores_missing(repo: str, name: str) -> tuple[str, ...]:
 def sync_secret(repo: str, name: str, item: str) -> None:
     """Write one keychain item into both of the repo's secret stores.
 
-    `-R` pins the same repo the caller resolved. Without it gh re-resolves from the
-    remotes itself, which in a fork (origin + upstream) is a different repo — secrets
-    would land on upstream, or the call would abort as ambiguous.
+    `-R` pins the repo `resolve` was given, which is the one the branch pushes to.
+    Without it gh re-resolves from the remotes itself and prefers `upstream` over
+    `origin`, so in a fork clone the credential would be written to the parent — a repo
+    the pull request will never run in, and often one the operator cannot write to.
     """
     if keychain.is_empty(item):
         raise EffectError(

@@ -40,3 +40,20 @@ def succeeds(argv: list[str], *, cwd: Path | None = None) -> bool:
     anything that performs an action goes through `run`, where failure is loud.
     """
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True).returncode == 0
+
+
+def output_or_none(argv: list[str], *, cwd: Path | None = None) -> str | None:
+    """Stdout verbatim when the command succeeds, `None` when it does not.
+
+    `succeeds`' sibling, for the questions whose answer is CONTENT-or-absence rather
+    than yes-or-no: `git cat-file blob HEAD:<path>` against a path HEAD does not carry.
+    Absence is the answer, not a failure — the workflow is simply new here.
+
+    Stdout is returned UNTRIMMED, which is the whole reason this is not `run`. `run`
+    strips because its callers read a value — a branch name, a SHA — whose surrounding
+    whitespace is noise. A file's bytes are not a value: its trailing newline is data,
+    and stripping it turns a byte-for-byte comparison into one that silently ignores the
+    end of every file it compares. [LAW:one-type-per-behavior]
+    """
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else None

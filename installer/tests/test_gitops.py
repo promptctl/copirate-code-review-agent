@@ -18,18 +18,6 @@ from copirate_review.install import Hold, Land, landing_for
 WORKFLOW = ".github/workflows/code-review.yml"
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    def git(*args: str) -> None:
-        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
-
-    git("init", "-q", "-b", "main")
-    git("config", "user.email", "test@example.com")
-    git("config", "user.name", "Test")
-    git("commit", "-q", "--allow-empty", "-m", "base")
-    return tmp_path
-
-
 def tracked_in_head(repo: Path) -> list[str]:
     out = subprocess.run(
         ["git", "show", "--name-only", "--format=", "HEAD"],
@@ -121,6 +109,7 @@ def test_the_report_names_the_branch_we_are_actually_on_even_when_the_commit_is_
         root=Path("/tmp"),
         repo=Repo(name_with_owner="o/r", default_branch="main"),
         branch="main",
+        remote="origin",
         landing=landing_for("main", "main"),
         config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
         action_ref="o/r@v1",
@@ -128,4 +117,6 @@ def test_the_report_names_the_branch_we_are_actually_on_even_when_the_commit_is_
         changes=(),
     )
     describe(plan)
-    assert "o/r on main" in capsys.readouterr().out
+    reported = capsys.readouterr().out
+    assert "on main" in reported
+    assert "detached" not in reported

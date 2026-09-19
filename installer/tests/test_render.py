@@ -133,3 +133,13 @@ def test_a_template_with_a_syntax_error_is_a_config_error_not_a_traceback(tmp_pa
     (tmp_path / ".copirate-review/templates/pr-review.yml.j2").write_text("<% for x in %>")
     with pytest.raises(ConfigError, match="could not render"):
         rendered_for(tmp_path)
+
+
+def test_the_self_review_discriminator_ignores_case_as_github_itself_does():
+    """gh reports the canonical casing; `action_ref` carries whatever a human typed.
+
+    An exact comparison misses, and the miss is silent: the action's own repo would
+    review its pull requests with the RELEASED ref instead of the code under review.
+    """
+    config = parse(minimal(action_ref="PromptCtl/CoPirate-Code-Review-Agent@v1"), "t.yaml")
+    assert resolve_action_ref(config, "promptctl/copirate-code-review-agent") == "./"

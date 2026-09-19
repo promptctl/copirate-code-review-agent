@@ -22,18 +22,55 @@ from .shell import EffectError
 
 @dataclass(frozen=True)
 class WorkflowChange:
-    """One workflow's desired text beside what is deployed, if anything is."""
+    """One workflow's desired text beside each of the three places it has to reach.
+
+    Three snapshots, because "is this converged?" genuinely has three answers and only
+    one boolean was being kept — the one for the WORKING TREE, which is the single place
+    that does not determine what the repository runs. GitHub runs what is pushed.
+
+    Every path that writes the file without landing it produced a state the next run
+    could not repair: held on the default branch, or a secret sync failing after the
+    write, left the file on disk and nothing in git. A later run then compared the
+    rendered text to that file, found them equal, reported the workflow up to date, and
+    committed nothing — for as many runs as anyone cared to make. A repo with no
+    reviewer, and an installer saying it was fine. [LAW:types-are-the-program]
+
+    `None` means the content is absent from that place, which is ordinary: a new
+    workflow, an unpushed branch, a repo with no commits.
+    """
 
     rendered: Rendered
-    deployed: str | None
+    worktree: str | None
+    committed: str | None
+    pushed: str | None
 
     @property
-    def changed(self) -> bool:
-        return self.deployed != self.rendered.text
+    def needs_write(self) -> bool:
+        return self.worktree != self.rendered.text
+
+    @property
+    def needs_commit(self) -> bool:
+        return self.committed != self.rendered.text
+
+    @property
+    def needs_push(self) -> bool:
+        return self.pushed != self.rendered.text
 
     @property
     def verb(self) -> str:
-        return "unchanged" if not self.changed else ("create" if self.deployed is None else "update")
+        """How far the content has reached, for the plan the operator reads.
+
+        Named for what the REPOSITORY gets, not for what happens to the file on disk —
+        writing the file is not the deliverable, and a line saying "unchanged" about a
+        workflow that has never been committed is the exact lie this type now prevents.
+        """
+        if self.committed is None:
+            return "create"
+        if self.needs_commit:
+            return "update"
+        if self.needs_push:
+            return "push"
+        return "unchanged"
 
 
 @dataclass(frozen=True)
@@ -93,6 +130,7 @@ class Plan:
     root: Path
     repo: Repo
     branch: str | None
+    remote: str
     landing: Landing
     config: Config
     action_ref: str
@@ -100,8 +138,23 @@ class Plan:
     changes: tuple[WorkflowChange, ...]
 
     @property
-    def changed_paths(self) -> list[str]:
-        return [c.rendered.path for c in self.changes if c.changed]
+    def write_paths(self) -> list[str]:
+        return [c.rendered.path for c in self.changes if c.needs_write]
+
+    @property
+    def commit_paths(self) -> list[str]:
+        return [c.rendered.path for c in self.changes if c.needs_commit]
+
+    @property
+    def unlanded_paths(self) -> list[str]:
+        """Paths the remote branch does not yet carry, whatever is still missing.
+
+        One list for the landing step, because commit-then-push and push-alone are the
+        same errand with a different amount left to do: a run whose commit succeeded and
+        whose push failed has to push on the next run, and asking only "did anything
+        change?" is what made that run a no-op forever. [LAW:dataflow-not-control-flow]
+        """
+        return [c.rendered.path for c in self.changes if c.needs_commit or c.needs_push]
 
 
 def say(message: str) -> None:
@@ -112,7 +165,7 @@ def warn(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def preflight(cwd: Path) -> tuple[Path, Repo, str | None]:
+def preflight(cwd: Path) -> tuple[Path, Repo, str | None, str]:
     """Establish the preconditions both targets need, each failing with its own cause.
 
     The keychain is deliberately absent: it is an input to exactly one effect, and is
@@ -120,36 +173,57 @@ def preflight(cwd: Path) -> tuple[Path, Repo, str | None]:
     no credential and must not stop for one.
 
     `gh auth status` is resolved before the repo lookup even though the lookup subsumes
-    it — an unauthenticated gh makes every request fail, and "no GitHub remote, or no
+    it — an unauthenticated gh makes every request fail, and "not a GitHub repo, or no
     access" would send the operator hunting a remote that is fine.
     [LAW:no-silent-failure]
+
+    Branch and remote are read first and serially: they are local git reads costing
+    milliseconds, and the remote's URL is what the repo lookup is ABOUT, so the two
+    network calls cannot start until it is known. Only they are worth a pool.
     """
     root = gitops.repo_root(cwd)
     ghops.require_cli()
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    branch = gitops.current_branch(root)
+    remote = gitops.push_remote(root, branch)
+    url = gitops.remote_url(root, remote)
+    with ThreadPoolExecutor(max_workers=2) as pool:
         auth = pool.submit(ghops.require_auth)
-        repo = pool.submit(ghops.resolve, root)
-        branch = pool.submit(gitops.current_branch, root)
+        repo = pool.submit(ghops.resolve, url)
         auth.result()
-        return root, repo.result(), branch.result()
+        return root, repo.result(), branch, remote
+
+
+def snapshot(root: Path, rendered: Rendered) -> WorkflowChange:
+    """Read how far this rendered text has already reached, from each place in turn.
+
+    The three reads live together because they answer one question and are only ever
+    right together — the whole defect was one of them standing in for all three.
+    [LAW:one-source-of-truth]
+    """
+    worktree_path = root / rendered.path
+    return WorkflowChange(
+        rendered=rendered,
+        worktree=worktree_path.read_text() if worktree_path.is_file() else None,
+        committed=gitops.blob_at(root, "HEAD", rendered.path),
+        pushed=gitops.blob_at(root, gitops.UPSTREAM, rendered.path),
+    )
 
 
 def build_plan(cwd: Path, home: Path) -> Plan:
-    root, repo, branch = preflight(cwd)
+    root, repo, branch, remote = preflight(cwd)
     config, layers = load(root, home)
     action_ref = resolve_action_ref(config, repo.name_with_owner)
 
-    changes = []
-    for spec in config.workflows:
-        rendered = render(config, spec, action_ref, root, home)
-        deployed_path = root / spec.path
-        deployed = deployed_path.read_text() if deployed_path.is_file() else None
-        changes.append(WorkflowChange(rendered=rendered, deployed=deployed))
+    changes = [
+        snapshot(root, render(config, spec, action_ref, root, home))
+        for spec in config.workflows
+    ]
 
     return Plan(
         root=root,
         repo=repo,
         branch=branch,
+        remote=remote,
         landing=landing_for(branch, repo.default_branch),
         config=config,
         action_ref=action_ref,
@@ -160,7 +234,10 @@ def build_plan(cwd: Path, home: Path) -> Plan:
 
 def describe(plan: Plan) -> None:
     sources = ", ".join(str(p) for p in plan.layers) or "the shipped defaults only"
-    say(f"repo     {plan.repo.name_with_owner} on {plan.branch or 'a detached HEAD'}")
+    say(
+        f"repo     {plan.repo.name_with_owner} ({plan.remote}) on "
+        f"{plan.branch or 'a detached HEAD'}"
+    )
     say(f"config   {sources}")
     say(f"action   {plan.action_ref}")
     for change in plan.changes:
@@ -169,7 +246,7 @@ def describe(plan: Plan) -> None:
         say(f"secret   sync      {name}  (keychain item {credential.item})")
     # Said up front, not after the writes: a dry run has to be able to tell you it will
     # not commit, or its whole purpose — predicting the real run — is unmet.
-    if isinstance(plan.landing, Hold) and plan.changed_paths:
+    if isinstance(plan.landing, Hold) and plan.unlanded_paths:
         say(f"commit   held      {plan.landing.reason}")
 
 
@@ -238,14 +315,20 @@ def apply(plan: Plan) -> None:
 
 
 def _write_workflows(plan: Plan) -> None:
+    """Make each workflow file on disk match its template.
+
+    This step speaks only about the FILE. What the repository ends up running is the
+    landing step's sentence to say, and merging the two is how "wrote the file" came to
+    be reported as if it meant "the repo has it". [LAW:decomposition]
+    """
     for change in plan.changes:
-        if not change.changed:
-            say(f"✓ {change.rendered.path} is up to date")
+        if not change.needs_write:
+            say(f"✓ {change.rendered.path} matches its template")
             continue
         target = plan.root / change.rendered.path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(change.rendered.text)
-        say(f"✓ {change.verb}d {change.rendered.path} (uses {plan.action_ref})")
+        say(f"✓ wrote {change.rendered.path} (uses {plan.action_ref})")
 
 
 def _land(plan: Plan) -> None:
@@ -256,16 +339,26 @@ def _land(plan: Plan) -> None:
     cannot, the file is still written and the reason is reported — a hold is a fact
     about where we are, not a failure of the install. Which states hold is decided in
     `landing_for`, never here. [LAW:single-enforcer]
+
+    The push is NOT conditional on having just committed. A run that committed and then
+    failed to push leaves work whose only remaining step is a push, and gating that on a
+    fresh change means the next run — and every run after it — does nothing while the
+    pull request still has no workflow.
     """
-    paths = plan.changed_paths
-    if not paths:
+    unlanded = plan.unlanded_paths
+    if not unlanded:
         return
     if isinstance(plan.landing, Hold):
         warn(
-            f"! {', '.join(paths)} changed, but {plan.landing.reason} Not committing.\n"
+            f"! {', '.join(unlanded)} is not on {plan.remote} yet, but "
+            f"{plan.landing.reason} Not committing.\n"
             f"  Branch, then commit and push it with your own PR."
         )
         return
-    sha = gitops.commit(plan.root, paths, plan.config.commit_message)
-    gitops.push(plan.root, plan.landing.branch)
-    say(f"✓ committed {sha} and pushed to {plan.landing.branch}: {', '.join(paths)}")
+
+    to_commit = plan.commit_paths
+    if to_commit:
+        sha = gitops.commit(plan.root, to_commit, plan.config.commit_message)
+        say(f"✓ committed {sha}: {', '.join(to_commit)}")
+    gitops.push(plan.root, plan.landing.branch, plan.remote)
+    say(f"✓ pushed {plan.landing.branch} to {plan.remote}: {', '.join(unlanded)}")

@@ -26,23 +26,37 @@ copirate-review install
 ## What one run does
 
 ```
-repo     promptctl/copirate-code-review-agent on my-feature-branch
+repo     promptctl/copirate-code-review-agent (origin) on my-feature-branch
 config   /Users/you/.config/copirate-review/config.yaml, .copirate-review.yaml
 action   promptctl/copirate-code-review-agent@v1
 workflow update    .github/workflows/code-review.yml  (…/templates/pr-review.yml.j2)
 secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
 ✓ synced CLAUDE_CODE_OAUTH_TOKEN on promptctl/… (Actions + Dependabot) from keychain item …
-✓ updated .github/workflows/code-review.yml (uses ./)
-✓ committed 4a91c02 and pushed to my-feature-branch: .github/workflows/code-review.yml
+✓ wrote .github/workflows/code-review.yml (uses ./)
+✓ committed 4a91c02: .github/workflows/code-review.yml
+✓ pushed my-feature-branch to origin: .github/workflows/code-review.yml
 ```
 
 `copirate-review install --dry-run` prints the plan — everything above the `✓` lines — and performs none of it.
 `-C <dir>` runs as if started somewhere else.
 
+**GitHub runs what is pushed**, so that is what a workflow's verb reports — not what is
+on disk. `create` means the branch has never carried it, `update` that it carries an
+older render, `push` that it is committed and not yet on the remote, `unchanged` that
+all three agree. Asking only whether the *file* matched would call a workflow converged
+the moment it was written, and a run that writes and then holds, or writes and then
+fails on a secret, leaves exactly that: a file no commit ever picked up. Every later run
+would agree it was fine, and the repository would have no reviewer.
+
 Preconditions are checked first and each fails with its own cause: `git` and `gh`
 installed, a git repository, `gh` authenticated, a GitHub repo it can resolve and reach.
 The keychain is *not* among them — it is an input to one effect and is demanded only when
 that effect must write, so a run that changes nothing needs no credential.
+
+The repository it provisions is the one the **current branch pushes to** — its upstream's
+remote, or `origin`. That is a deliberate single answer: asked to work it out alone, `gh`
+prefers an `upstream` remote over `origin`, so in a fork clone it would write the reviewer's
+credential to the parent repository while the commit went to the fork.
 
 Exit codes are a contract: `0` converged, `1` the world did not cooperate (gh is down, the
 keychain is locked), `2` the configuration is wrong. A caller running this before every
@@ -113,6 +127,11 @@ the config still names the account you would read there.
 
 The value never enters the installer's memory: it flows keychain → `gh` over an OS pipe,
 never bound to a variable, never in `argv`, never printed.
+
+A keychain that cannot be *read* — locked, or an authorization prompt you dismissed — is
+its own error and says so. It is deliberately not folded into "the item is missing": that
+verdict sends you to create a credential you are already looking at, while the real cause
+goes unnamed. Only `security`'s own not-found status means absent.
 
 The keychain is reachable → re-sync, so a rotation propagates. Otherwise the repo's own
 two stores are the only evidence, and they answer three ways: present in **both** → warn

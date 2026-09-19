@@ -88,8 +88,15 @@ def resolve_action_ref(config: Config, repo: str) -> str:
 
     The discriminator derives from `action_ref`, so "which repo is the action" is not a
     second copy free to drift from it. [LAW:one-source-of-truth]
+
+    Compared case-insensitively, because GitHub owner/name are: gh reports the canonical
+    casing while `action_ref` carries whatever a human typed, and an exact comparison
+    misses on `PromptCtl/...` vs `promptctl/...`. The miss is silent and it is precisely
+    the failure above — the action's own repo would review its PRs with the RELEASED
+    ref, so a change to the reviewer ships having reviewed nothing with itself.
     """
-    return "./" if repo == config.action_ref.split("@")[0] else config.action_ref
+    owner_and_name = config.action_ref.split("@")[0]
+    return "./" if repo.casefold() == owner_and_name.casefold() else config.action_ref
 
 
 def render(config: Config, spec: WorkflowSpec, action_ref: str, repo_root: Path, home: Path) -> Rendered:
