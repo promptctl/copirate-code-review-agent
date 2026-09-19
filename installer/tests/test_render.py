@@ -124,5 +124,12 @@ def test_an_unknown_template_names_every_directory_that_was_searched(tmp_path):
 def test_a_template_asking_for_a_variable_that_does_not_exist_fails_loudly(tmp_path):
     (tmp_path / ".copirate-review/templates").mkdir(parents=True)
     (tmp_path / ".copirate-review/templates/pr-review.yml.j2").write_text("<<no_such_thing>>")
-    with pytest.raises(Exception, match="no_such_thing"):
+    with pytest.raises(ConfigError, match="no_such_thing"):
+        rendered_for(tmp_path)
+
+
+def test_a_template_with_a_syntax_error_is_a_config_error_not_a_traceback(tmp_path):
+    (tmp_path / ".copirate-review/templates").mkdir(parents=True)
+    (tmp_path / ".copirate-review/templates/pr-review.yml.j2").write_text("<% for x in %>")
+    with pytest.raises(ConfigError, match="could not render"):
         rendered_for(tmp_path)

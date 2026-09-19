@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jinja2 import ChoiceLoader, Environment, FileSystemLoader, PackageLoader, StrictUndefined
-from jinja2 import TemplateNotFound
+from jinja2 import TemplateError, TemplateNotFound
 
 from .config import HOME_TEMPLATE_DIR, REPO_TEMPLATE_DIR, Config, ConfigError, WorkflowSpec
 
@@ -96,8 +96,22 @@ def render(config: Config, spec: WorkflowSpec, action_ref: str, repo_root: Path,
     env = _environment(repo_root, home)
     env.filters["yaml_quote"] = _yaml_quote
     name = spec.template + TEMPLATE_SUFFIX
+
+    # Both stages under one arm, because a template is wrong in ways that surface at
+    # either: a syntax error is raised when it is COMPILED by get_template, and an
+    # undefined variable when it is rendered. Every one of them is the operator's file
+    # to fix, so all of them leave here as the same kind of error a malformed config
+    # does, and reach the same exit code. A Jinja traceback would report a configuration
+    # error as "the world did not cooperate". [LAW:parse-dont-validate]
     try:
         template = env.get_template(name)
+        text = template.render(
+            action_ref=action_ref,
+            workflow_path=spec.path,
+            template_name=spec.template,
+            inputs=dict(spec.inputs),
+            secrets=sorted(config.secrets),
+        )
     except TemplateNotFound as exc:
         searched = ", ".join(
             str(d) for d in (repo_root / REPO_TEMPLATE_DIR, home / HOME_TEMPLATE_DIR)
@@ -106,12 +120,10 @@ def render(config: Config, spec: WorkflowSpec, action_ref: str, repo_root: Path,
             f"workflows.{spec.path}: no template named {spec.template!r}. Looked for "
             f"{name} in {searched}, and in the templates shipped with this installer."
         ) from exc
+    except TemplateError as exc:
+        raise ConfigError(
+            f"workflows.{spec.path}: template {name} could not render — "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-    text = template.render(
-        action_ref=action_ref,
-        workflow_path=spec.path,
-        template_name=spec.template,
-        inputs=dict(spec.inputs),
-        secrets=sorted(config.secrets),
-    )
     return Rendered(path=spec.path, text=text, template_file=template.filename or name)

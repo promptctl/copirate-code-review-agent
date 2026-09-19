@@ -200,3 +200,29 @@ def test_a_null_input_in_a_later_layer_drops_it_from_the_rendered_step(tmp_path)
     )
     config, _ = load(tmp_path, tmp_path / "absent-home")
     assert "DEPENDENCY_DIFF" not in config.workflows[0].inputs
+
+
+def test_a_null_survives_into_no_layer_even_where_the_one_below_declared_nothing(tmp_path):
+    """The null rule holds at every depth, not only where both layers happen to agree."""
+    other = ".github/workflows/repo-review.yml"
+    (tmp_path / ".copirate-review.yaml").write_text(
+        f"workflows:\n  {other}:\n    template: pr-review\n"
+        f"    inputs:\n      MAX_REVIEW_ROUNDS: null\n"
+    )
+    config, _ = load(tmp_path, tmp_path / "absent-home")
+    added = next(w for w in config.workflows if w.path == other)
+    assert "MAX_REVIEW_ROUNDS" not in added.inputs
+
+
+def test_a_secret_colliding_with_the_injected_exclude_input_is_refused():
+    """The guard sees what will be RENDERED, not only what was declared."""
+    with pytest.raises(ConfigError, match="render the key twice"):
+        parse(
+            {
+                "action_ref": "owner/repo@v1",
+                "commit_message": "m",
+                "secrets": {"EXCLUDE_PATTERNS": "keychain:X"},
+                "workflows": {WORKFLOW: {"template": "pr-review"}},
+            },
+            "test.yaml",
+        )

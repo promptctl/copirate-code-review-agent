@@ -11,6 +11,11 @@ When a rendered workflow does change, the installer commits it to the branch you
 and pushes. The change rides the pull request you already have open; it never costs you a
 second PR to review and merge.
 
+It holds that commit — writing the file, reporting why, and exiting `0` — where committing
+would be wrong or impossible: on the default branch, on a detached `HEAD`, or in a
+repository with no commits on GitHub yet (whose current branch is about to *become* the
+default). A dry run tells you about the hold before you run for real.
+
 ```bash
 uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review
 
@@ -31,7 +36,7 @@ secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOK
 ✓ committed 4a91c02 and pushed to my-feature-branch: .github/workflows/code-review.yml
 ```
 
-`copirate-review install --dry-run` prints the first five lines and performs none of it.
+`copirate-review install --dry-run` prints the plan — everything above the `✓` lines — and performs none of it.
 `-C <dir>` runs as if started somewhere else.
 
 Preconditions are checked first and each fails with its own cause: `git` and `gh`
@@ -109,11 +114,12 @@ the config still names the account you would read there.
 The value never enters the installer's memory: it flows keychain → `gh` over an OS pipe,
 never bound to a variable, never in `argv`, never printed.
 
-Three states, three outcomes. The keychain is reachable → re-sync, so a rotation
-propagates. It is unreachable but the secret is already on the repo → warn that re-syncing
-is impossible from this machine and leave it. It is unreachable and the secret is absent →
-**fail**, because the reviewer cannot authenticate and a later "clean review" would be a
-lie.
+The keychain is reachable → re-sync, so a rotation propagates. Otherwise the repo's own
+two stores are the only evidence, and they answer three ways: present in **both** → warn
+that re-syncing is impossible from this machine and leave them; present in **one** → fail,
+because the state is broken in a way this machine cannot repair and the missing store's
+PRs would review unauthenticated; present in **neither** → fail, because the reviewer
+cannot authenticate at all and a later "clean review" would be a lie.
 
 ## Templates
 

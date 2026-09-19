@@ -20,30 +20,17 @@ def has_item(item: str) -> bool:
     return succeeds([*_FIND, item])
 
 
-def is_empty(item: str) -> bool:
-    """Whether the item holds nothing, measured without reading it here.
+def pipe_into(item: str, argv: list[str]) -> str:
+    """Stream the item's value, newline-stripped, into `argv`'s stdin; return its stdout.
 
-    An empty item reads back exit 0 and would set an empty secret — a repo whose
-    reviewer then fails to authenticate on every run, for a reason nothing in the
-    install said. The byte count crosses the boundary; the bytes do not.
-    [LAW:no-silent-failure]
-    """
-    find = subprocess.Popen([*_FIND, item, "-w"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert find.stdout is not None
-    counted = subprocess.run(["wc", "-c"], stdin=find.stdout, capture_output=True, text=True)
-    find.stdout.close()
-    detail = find.stderr.read().decode().strip() if find.stderr else ""
-    if find.wait() != 0:
-        raise EffectError(f"keychain item {item!r} could not be read: {detail}")
-    return int(counted.stdout.strip()) == 0
+    ONE pipeline, which every reader of a keychain item goes through. `security … -w`
+    appends a newline to whatever it prints, and that newline is the whole reason the
+    `tr` stage exists — a second pipeline built beside this one is a second place that
+    has to know, and the one that forgets reads an empty item as one byte of content.
+    [LAW:one-source-of-truth]
 
-
-def pipe_into(item: str, argv: list[str]) -> None:
-    """Stream the item's value, newline-stripped, into `argv`'s stdin.
-
-    The `tr` stage is a separate process for the same reason the whole chain is: doing
-    the strip in Python would mean reading the credential into this process's memory to
-    remove one byte from it.
+    `tr` is a separate process for the same reason the whole chain is: stripping the
+    newline in Python would mean reading the credential into this process's memory.
     """
     find = subprocess.Popen([*_FIND, item, "-w"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert find.stdout is not None
@@ -57,17 +44,29 @@ def pipe_into(item: str, argv: list[str]) -> None:
     )
     strip.stdout.close()
 
-    _, consumer_err = consumer.communicate()
+    consumer_out, consumer_err = consumer.communicate()
     strip.wait()
     find_err = find.stderr.read().decode() if find.stderr else ""
     find.wait()
 
-    # Checked downstream-last so the most specific cause wins: a consumer that rejected
-    # the value says more than "the pipe closed early", which is what the reader reports
-    # when the consumer dies first.
+    # Checked reader-first so the most specific cause wins: a consumer that died because
+    # its input never arrived reports a closed pipe, which says nothing about the locked
+    # keychain that actually caused it.
     if find.returncode != 0:
         raise EffectError(f"reading keychain item {item!r} failed: {find_err.strip()}")
     if consumer.returncode != 0:
         raise EffectError(
             f"`{' '.join(argv)}` failed (exit {consumer.returncode}): {consumer_err.strip()}"
         )
+    return consumer_out.strip()
+
+
+def is_empty(item: str) -> bool:
+    """Whether the item holds nothing, measured without reading it here.
+
+    An empty item reads back exit 0 and would set an empty secret — a repo whose
+    reviewer then fails to authenticate on every run, for a reason nothing in the
+    install said. The byte count crosses the boundary; the bytes do not.
+    [LAW:no-silent-failure]
+    """
+    return int(pipe_into(item, ["wc", "-c"])) == 0

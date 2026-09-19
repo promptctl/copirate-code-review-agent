@@ -131,8 +131,14 @@ def merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in over.items():
         if value is None:
             merged.pop(key, None)
-        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = merge(merged[key], value)
+        elif isinstance(value, dict):
+            # Recursed into unconditionally, against an empty mapping when the lower
+            # layer has nothing here. Recursing only where BOTH layers happen to hold a
+            # dict makes the null rule depend on a structural accident — a null inside a
+            # workflow the lower layer never declared would survive, and render as the
+            # literal string "None" into a consumer's workflow. One rule, at every depth.
+            below = merged[key] if isinstance(merged.get(key), dict) else {}
+            merged[key] = merge(below, value)
         else:
             merged[key] = value
     return merged
@@ -226,10 +232,13 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
                 f"{source}: workflows.{path} has no template. Every workflow names the "
                 f"template it renders from; add `template: <name>`."
             )
-        inputs = {
-            name: _render_value(value)
-            for name, value in (spec.get("inputs") or {}).items()
-        }
+        # Composed BEFORE the collision check, because the check has to see what will
+        # actually be rendered. Checking the declared inputs alone lets an injected name
+        # collide unnoticed. [LAW:no-silent-failure]
+        inputs = _with_generated_excluded(
+            {name: _render_value(value) for name, value in (spec.get("inputs") or {}).items()},
+            generated,
+        )
         # A name in both tables would render the `with:` key twice, and YAML's last-wins
         # would pick one with nothing to say which. Refuse the shape instead of resolving
         # it. [LAW:no-silent-failure]
@@ -244,7 +253,7 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
             WorkflowSpec(
                 path=path,
                 template=spec["template"],
-                inputs=_with_generated_excluded(inputs, generated),
+                inputs=inputs,
             )
         )
 
