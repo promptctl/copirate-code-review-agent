@@ -1,0 +1,283 @@
+# copirate-review
+
+Installs the CoPirate code review action into a repository and keeps it current.
+
+It is built to be run *before every review*, not once at setup. Each run re-renders every
+workflow from its base, re-syncs every declared credential, and writes only what differs
+— so a base change or a rotated token reaches a repo the next time anyone reviews in it,
+rather than whenever someone remembers to reinstall.
+
+When a rendered workflow does change, the installer commits it to the branch you are on
+and pushes. The change rides the pull request you already have open; it never costs you a
+second PR to review and merge.
+
+It holds that commit — writing the file, reporting why, and exiting `0` — where committing
+would be wrong or impossible: on the default branch, on a detached `HEAD`, or in a
+repository with no commits on GitHub yet (whose current branch is about to *become* the
+default). A dry run tells you about the hold before you run for real.
+
+It never pushes a branch that is not on the remote already. Converging a workflow is not
+a reason to publish someone's local branch, and a push is the one step here that cannot
+be taken back — so on an unpublished branch it commits, says so, and lets your own first
+push carry it.
+
+```bash
+uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review
+
+cd ~/code/your-repo
+copirate-review install
+```
+
+## What one run does
+
+```
+repo     promptctl/copirate-code-review-agent (origin) on my-feature-branch
+config   /Users/you/.config/copirate-review/config.yaml, .copirate-review.yaml
+action   promptctl/copirate-code-review-agent@v1
+workflow update    .github/workflows/code-review.yml  ((shipped) pr-review.yml)
+secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
+✓ synced CLAUDE_CODE_OAUTH_TOKEN on promptctl/… (Actions + Dependabot) from keychain item …
+✓ wrote .github/workflows/code-review.yml (uses ./)
+✓ committed 4a91c02: .github/workflows/code-review.yml
+✓ pushed my-feature-branch to origin: .github/workflows/code-review.yml
+```
+
+`copirate-review install --dry-run` prints the plan — everything above the `✓` lines — and performs none of it.
+`-C <dir>` runs as if started somewhere else.
+
+**GitHub runs what is pushed**, so that is what a workflow's verb reports — not what is
+on disk. `create` means the branch has never carried it, `update` that it carries an
+older render, `push` that it is committed and not yet on the remote, `unchanged` that
+all three agree. Asking only whether the *file* matched would call a workflow converged
+the moment it was written, and a run that writes and then holds, or writes and then
+fails on a secret, leaves exactly that: a file no commit ever picked up. Every later run
+would agree it was fine, and the repository would have no reviewer.
+
+Preconditions are checked first and each fails with its own cause: `git` and `gh`
+installed, a git repository, `gh` authenticated, a GitHub repo it can resolve and reach.
+
+Everything else — including each credential's verdict — is decided while the plan is
+built, not partway through performing it, so `--dry-run` reaches the same answer the real
+run will act on. A dry run that printed `sync` where the run exits `1` would predict
+nothing, which is the only thing a dry run is for. Reaching it costs one local read of
+each declared credential — a value is measured, never printed and never sent — because
+whether a source holds anything is a fact about this machine, and a dry run is allowed to
+be wrong about the network but not about that. The `secret` line says which it is:
+
+```
+secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
+secret   sync      ZAI_API_KEY  (environment variable $ZAI_API_KEY)
+secret   keep      SOME_OTHER_TOKEN  (keychain item … is unavailable here; both stores have it)
+secret   MISSING   A_THIRD_TOKEN  (keychain item … is unavailable here)
+```
+
+The repository it provisions is the one the **current branch pushes to** — its upstream's
+remote, or `origin`. That is a deliberate single answer: asked to work it out alone, `gh`
+prefers an `upstream` remote over `origin`, so in a fork clone it would write the reviewer's
+credential to the parent repository while the commit went to the fork.
+
+Exit codes are a contract: `0` converged, `1` the world did not cooperate (gh is down, the
+keychain is locked), `2` the configuration is wrong. A caller running this before every
+review can tell "fix a file and re-run" from "retry later" without reading prose.
+
+## Configuration
+
+**At least one credential must be declared somewhere**, or the install is refused: the
+rendered workflow would pass the review action nothing to authenticate with, install
+cleanly, and fail on the first pull request. Nothing ships one — see
+[Credentials](#credentials).
+
+Three layers, each deep-merged over the one before it:
+
+1. the defaults shipped in this package
+2. `~/.config/copirate-review/config.yaml` — fleet policy for this machine
+3. `.copirate-review.yaml`, or `.copirate-review/config.yaml` — the repository's own
+
+A repository declares only its differences. Declare your credential once in the fleet
+layer and a repo with no config file of its own needs nothing else — which is the whole
+point of that layer.
+
+Every file is validated against [`schema.json`](src/copirate_review/schema.json). An
+unknown key is fatal, not ignored: a silently-dropped typo leaves a repo paying for
+reviews it meant to stop paying for, with nothing anywhere to say so.
+
+```yaml
+# .copirate-review.yaml — everything here is optional
+action_ref: promptctl/copirate-code-review-agent@v1
+commit_message: "chore: converge the AI code review workflow"
+
+# SECRET_NAME: <credential source>. Each is written to BOTH the Actions and the
+# Dependabot store, and each is wired into every rendered workflow's `with:` block
+# under its own name — declaring a secret provisions it and passes it.
+secrets:
+  CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP
+  ZAI_API_KEY: env:ZAI_API_KEY
+
+# Keyed by the file each one writes.
+workflows:
+  .github/workflows/code-review.yml:
+    base: pr-review
+    inputs:
+      MAX_REVIEW_ROUNDS: 12
+```
+
+`inputs:` becomes the review step's `with:` block, replacing whatever the base carried
+there. It is deliberately open — every input [`action.yml`](../action.yml) accepts is
+reachable from here, and a new one needs no release of this installer. Values may be
+strings, numbers, or booleans; all three reach the action as the strings it reads, and
+all three are emitted quoted, so an input spelled `no` or `5` cannot arrive as a boolean
+or a number.
+
+**A null deletes the entry it names** — a secret, a workflow, or one of a workflow's
+inputs. It is how a repo opts out of something the fleet layer gave it:
+
+```yaml
+secrets:
+  CLAUDE_CODE_OAUTH_TOKEN: null     # this repo reviews on a different provider
+  ZAI_API_KEY: keychain:ZAI_KEY
+workflows:
+  .github/workflows/code-review.yml:
+    inputs:
+      DEPENDENCY_DIFF: null         # back to the action's own default
+```
+
+`EXCLUDE_PATTERNS` is the one input a null may not delete, and the installer refuses a
+config that tries. It always prepends the workflow paths it generates to that list, so
+the key is always rendered — and `action.yml` treats what it receives as a REPLACEMENT
+for its own default rather than an addition. A null therefore could not mean "back to the
+action's own default" here; it rendered a live key carrying only the generated paths, and
+`dist/**`, `build/**` and every lock file came back into review with nothing to say so.
+Write the full list you want, or `""` to exclude nothing beyond the generated paths.
+
+### Credentials
+
+**Every credential is declared in the configuration.** Nothing is hardcoded, nothing is
+inferred from a secret's name, and no default ships inside the installer — the layer that
+is identical on every machine in the world is the one layer that cannot name your keychain
+item. Both sides of each line are arbitrary and independent:
+
+```yaml
+secrets:
+  CLAUDE_CODE_OAUTH_TOKEN: keychain:reviewer-acct-b    # macOS keychain item, by service name
+  ZAI_API_KEY: env:ZAI_API_KEY                         # an exported environment variable
+  ANY_SECRET_NAME: keychain:any-item-name
+```
+
+The left side is the GitHub secret the action reads; the right side is where its value
+comes from on the machine running the installer. They are separate because which account's
+token stands behind `CLAUDE_CODE_OAUTH_TOKEN` changes when quota does — deriving one from
+the other would make that swap unexpressible.
+
+**Reading a keychain item fetches that item and nothing else.** The lookup is
+`security find-generic-password -s <item>`, by service name. The keychain is never listed,
+dumped, or searched by pattern, so a run cannot see — let alone forward — a credential it
+was not sent for.
+
+For `keychain:`, the value never enters the installer's memory at all: it flows keychain →
+`gh` over an OS pipe, never bound to a variable, never in `argv`, never printed. For
+`env:`, the honest statement is narrower, and it is stated rather than glossed: the value
+is already in this process's environment because you exported it there, and nothing here
+can undo that. What the installer still guarantees is that it never copies it into a
+variable, never puts it in `argv` where `ps` would show it, and never prints it.
+
+An `env:` name must be an environment variable name — letters, digits and underscores, not
+starting with a digit — and a config saying otherwise is refused. The name is interpolated
+into the reader's program, and `.copirate-review.yaml` is a file the repository under
+review controls, so a name that is not a name would be more program. A `keychain:` item
+name is unconstrained because it is `argv`: it is exec'd, never interpreted.
+
+A keychain that cannot be *read* — locked, or an authorization prompt you dismissed — is
+its own error and says so. It is deliberately not folded into "the item is missing": that
+verdict sends you to create a credential you are already looking at, while the real cause
+goes unnamed. Only `security`'s own not-found status means absent.
+
+The source is reachable → re-sync, so a rotation propagates. Otherwise the repo's own
+two stores are the only evidence, and they answer three ways: present in **both** → warn
+that re-syncing is impossible from this machine and leave them; present in **one** → fail,
+because the state is broken in a way this machine cannot repair and the missing store's
+PRs would review unauthenticated; present in **neither** → fail, because the reviewer
+cannot authenticate at all and a later "clean review" would be a lie.
+
+## Bases
+
+**There is no template language.** A base is a *complete, runnable GitHub Actions
+workflow* — you can copy it into `.github/workflows/` and it reviews pull requests as-is.
+The installer parses it into typed objects, rebinds the one step whose `id` is `review`,
+and serializes the result back to YAML.
+
+That is not a stylistic preference. A workflow is full of `${{ … }}`, which collides with
+every mainstream template engine's delimiters, so a template has to either move its
+delimiters or escape on every line. And a template renders *text*, which means a
+malformed one produces a malformed workflow that nothing notices until GitHub rejects it.
+Parsing and re-serializing makes the output well-formed by construction, and makes the
+base a file you can lint, run, and review like any other workflow.
+
+A workflow names the base it renders from. That name resolves to `<name>.yml` in the
+first of these that has it:
+
+```
+.copirate-review/bases/           # this repository
+~/.config/copirate-review/bases/  # this machine
+the bases shipped in this package
+```
+
+So a repo ships its own workflow shape by dropping a file in the first directory. It
+never forks the installer, and it keeps every other part of the configuration.
+
+### What the installer changes, and what it carries
+
+It rebinds exactly one step — the one with `id: review` — setting its `uses:` to the
+resolved `action_ref` and its `with:` to the declared secrets and inputs. A base with no
+such step, or with two, is refused rather than rendered into a workflow that reviews
+nothing.
+
+That id is not a marker invented for this tool. The base's own transcript-archiving step
+reads `steps.review.outputs.transcript-dir`, so the id is load-bearing inside the base
+whether or not the installer looks at it. (Matching the step by its `uses:` ref instead
+cannot work — rewriting that ref is the entire job.)
+
+The review step's `with:` block is **replaced**, not merged into. A base's `with:` is
+illustrative — it is what the base does standing alone — and merging would make it a
+second table of defaults competing with the configuration's, where the loser is invisible.
+
+Everything else is carried through: triggers, permissions, concurrency, other jobs, other
+steps, and keys this installer has never heard of. **Comments are carried too**, which is
+the reason this is not a two-line `yaml.safe_load`/`yaml.safe_dump`. A workflow's comments
+are the only place its security posture is written down — why the trigger is
+`pull_request` and not `pull_request_target`, why the untrusted checkout does not persist
+credentials — and a renderer that dropped them would pass every other test in the suite.
+
+**Key order is carried for the same reason**, and it is not cosmetic: a comment attaches
+to the node *before* it, so reordering keys moves comments onto the wrong lines. A base
+that writes `env:` above `jobs:`, with a paragraph explaining why the runner needs a
+proxy, would otherwise render with that paragraph sitting on `jobs:` — telling a reader
+that removing `jobs:` breaks the checkout. A base the installer only copies comes back
+byte for byte.
+
+The rendered file's own header is replaced with a generated banner naming the base and the
+search path. Nothing in it is machine-specific: a path like `/Users/you/...` in a
+committed workflow would make the file render differently for every developer and churn
+forever.
+
+### Two things the installer does to every render
+
+**The paths it generates lead each workflow's `EXCLUDE_PATTERNS`.** Every workflow it
+writes is a derived copy of a base — a finding against one targets the copy, not its
+source, and the fix would be silently reverted by the next install. So they are withheld
+from review, which is also why no workflow path is repeated in the defaults.
+
+**In the action's own repository, `action_ref` renders as `./`.** That repo must review
+each PR with *that PR's* code; a released `@v1` cannot do it. The accommodation selects a
+value and nothing else, so the same base converges there as everywhere and every future
+base change reaches it like any other consumer.
+
+## Development
+
+```bash
+cd installer
+uv sync
+uv run pytest
+```
+
+The decision layer — layering, schema refusal, base resolution, parsing, binding and
+rendering — is pure, so none of its tests touch a network, a keychain, or a repository.

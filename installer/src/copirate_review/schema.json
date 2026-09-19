@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/promptctl/copirate-code-review-agent/v1/installer/src/copirate_review/schema.json",
+  "title": "CoPirate code review installer configuration",
+  "description": "Bindings for the workflows `copirate-review install` renders from their bases. Layers: the shipped defaults, then ~/.config/copirate-review/config.yaml, then the repo's own file. A later layer deep-merges over an earlier one; a null value deletes the ENTRY it names — a secret, a workflow, or one of a workflow's inputs. The four top-level sections are not themselves deletable: every one of them is required of the merged document, so a layer nulling one could only ever produce a configuration that is refused. The single entry a null may not delete is EXCLUDE_PATTERNS, documented where it is declared.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action_ref": {
+      "description": "The `uses:` ref every rendered workflow points its review step at. A moving major tag (promptctl/copirate-code-review-agent@v1) so a consumer tracks releases with no edit here. Rendered as `./` in the action's own source repo, which must review each PR with that PR's code.",
+      "type": "string",
+      "minLength": 1
+    },
+    "commit_message": {
+      "description": "Subject of the commit the installer lands on the current branch when a rendered workflow changed.",
+      "type": "string",
+      "minLength": 1
+    },
+    "secrets": {
+      "description": "Repo secrets to provision, as `SECRET_NAME: <credential source>`. Each is written to BOTH the Actions and the Dependabot store, and each is wired into every rendered workflow's `with:` block under its own name — declaring a secret provisions it and passes it, one fact in one place. Null deletes an inherited entry.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$"
+      },
+      "additionalProperties": {
+        "description": "Where this secret's value comes from on the machine running the installer, as `<scheme>:<name>`, or null to delete an inherited entry. `keychain:<item>` reads one macOS keychain generic-password item by service name; `env:<VAR>` reads an environment variable the installer was started with. The source is declared, never derived from the secret name: which account's token CLAUDE_CODE_OAUTH_TOKEN holds varies by which account has quota, so the two sides are edited independently.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^(keychain|env):.+$"
+      }
+    },
+    "workflows": {
+      "description": "Workflow files to converge, keyed by their repo-relative path. Keyed rather than listed so a later layer can override one workflow's inputs, or add a second workflow, without restating either. Null deletes an inherited entry.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$"
+      },
+      "additionalProperties": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "description": "Base workflow name, resolved against .copirate-review/bases/, then ~/.config/copirate-review/bases/, then the bases shipped in this package — each as <name>.yml. A base is a complete, runnable GitHub Actions workflow; the installer parses it, rebinds the step whose id is `review`, and writes the result. A repo ships its own workflow shape by dropping a file with that name in the first directory; it never forks the installer.",
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "inputs": {
+            "description": "Emitted into the review step's `with:` block, replacing whatever the base carried there. Deliberately open: every input action.yml accepts is reachable from here, and a new one needs no installer release. A name declared in `secrets` may not be repeated here — the rendered block would carry the key twice.",
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[A-Z][A-Z0-9_]*$"
+            },
+            "properties": {
+              "EXCLUDE_PATTERNS": {
+                "description": "The one input a null may NOT delete. The installer prepends the workflow paths it generates to this list, so it always renders the key — and because action.yml treats EXCLUDE_PATTERNS as a REPLACEMENT for its own default rather than an addition, a rendered key carrying only those generated paths silently un-excludes every bundle and lock file the default was holding back. Deleting it therefore cannot mean what a null means everywhere else, so it is refused here instead of being half-honoured. Write the full list you want, or `\"\"` to exclude nothing but the generated paths.",
+                "type": "string"
+              }
+            },
+            "additionalProperties": {
+              "description": "A value the action reads as a string, or null to delete an inherited one.",
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

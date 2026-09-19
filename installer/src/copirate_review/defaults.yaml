@@ -1,0 +1,86 @@
+# The lowest configuration layer: what a repository that declares nothing gets.
+# ~/.config/copirate-review/config.yaml layers over this, and the repo's own
+# .copirate-review.yaml over that. This file is the ONE home of these defaults —
+# they are not restated in the schema, the README, or the code.
+# [LAW:one-source-of-truth]
+
+# The moving `v1` tag, deliberately — NOT a commit SHA. Every repo this installs into
+# tracks the action's latest release for free, and an upstream fix reaches all of them
+# the moment it is tagged. A SHA pin sounds safer until you count who pays: every
+# release would need a re-bump PR against EVERY consuming repo, forever, growing with
+# the fleet — and a fleet that expensive to update is a fleet that does not get updated,
+# so repos sit on stale builds carrying known bugs. That is not the safe state the pin
+# was bought for. The upstream is a repo we control and review; `@v1` is the single
+# moving tag it maintains for exactly this purpose.
+#
+# There is deliberately no version LABEL rendered beside the ref: under a moving tag a
+# label is a map that begins lying at the next release. [FRAMING:representation]
+action_ref: promptctl/copirate-code-review-agent@v1
+
+commit_message: "Converge the AI code review workflow"
+
+# EMPTY, deliberately. A credential belongs to whoever runs the installer, and the
+# shipped layer is the one layer that is the same on every machine in the world — so a
+# default here would be one person's keychain item name, inherited by every repository
+# that never asked for it, and silently wrong for all of them. Declare yours in
+# ~/.config/copirate-review/config.yaml to cover every repo on this machine, or in a
+# repository's own .copirate-review.yaml:
+#
+#   secrets:
+#     CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP
+#     ZAI_API_KEY: env:ZAI_API_KEY
+#
+# The left side is the repo secret's name, which the action reads; the right side names
+# where its value comes from on this machine. They are separate because which account's
+# token stands behind a name changes when quota does, and deriving one from the other
+# would make that swap unexpressible. [LAW:one-source-of-truth]
+secrets: {}
+
+workflows:
+  .github/workflows/code-review.yml:
+    base: pr-review
+    inputs:
+      # On for EVERY repo — a universal default, not a per-repo divergence that leaked in.
+      # On a PR that bumps a dependency the reviewer fetches the bumped module's upstream
+      # commits and changed files instead of reviewing a bare version string. Stated
+      # honestly: the action recognizes `go.mod` require-line bumps and nothing else, so in
+      # a repo without a go.mod this is INERT — it costs nothing and can never fire. It is
+      # on everywhere because a universally-safe default beats a per-repo question, not
+      # because it helps every repo.
+      DEPENDENCY_DIFF: true
+
+      # EXCLUDE_PATTERNS REPLACES action.yml's own default rather than appending to it, so
+      # the lock-file patterns are carried explicitly here; dropping one silently
+      # un-excludes it. The paths this installer generates are prepended to whatever stands
+      # here — see generated-output exclusion in config.py — so no workflow path is
+      # repeated in this file. [LAW:one-source-of-truth]
+      #
+      # Generated, committed build output is reviewed by NO repo. A bundle is mechanically
+      # derived from sources the reviewer already reads, so a finding against it either
+      # restates one made upstream or comments on machine output nobody edits — and the
+      # repo's own CI proves the bundle matches a fresh build far more exactly than a
+      # reader can. Measured: a review that read a 1.5 MB ncc bundle spent an entire scope
+      # concluding it was a "faithful, byte-consistent rebuild", at ~700K input tokens for
+      # that zero-signal confirmation.
+      #
+      # The directory patterns are DOUBLED on purpose — `dist/**` and `**/dist/**` are two
+      # different patterns, not one written twice. src/diff.js compiles each pattern to an
+      # anchored regex and tests it against the full path AND the basename. That basename
+      # fallback rescues every FILE pattern for free (`*.lock` catches
+      # `packages/app/src-tauri/Cargo.lock` with no `**/`), and can never rescue a DIRECTORY
+      # pattern, whose match spans separators the basename has already discarded. So the two
+      # anchorings cover disjoint sets: `dist/**` matches only at the root, `**/dist/**`
+      # only below a leading segment. Carrying one alone leaks every `packages/*/dist/**`
+      # bundle into the review — exactly the ~700K-token no-signal read above. Do not
+      # "simplify" this to `**/dist/**`; that is the regression, not the cleanup.
+      EXCLUDE_PATTERNS: "dist/**,**/dist/**,build/**,**/build/**,*.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
+
+      # The action stops reviewing a PR after this many rounds and posts a marked
+      # not-reviewed notice instead, which the address-pr-reviews loop reads as a halt,
+      # never as a clean pass — so a spent cap does not merge unread code, it stops the
+      # line. Per-repo because the cost is per PR and PRs are not the same size everywhere:
+      # a stack of PRs re-reviews each member on every rebase of the one below it, so a
+      # repo that works in stacks declares more headroom. 0 lifts the cap; nothing here
+      # defends against a loop that spends without bound, so a repo declaring 0 has chosen
+      # that.
+      MAX_REVIEW_ROUNDS: 5

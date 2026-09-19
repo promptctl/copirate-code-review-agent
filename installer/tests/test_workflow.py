@@ -1,0 +1,314 @@
+"""The workflow model and its codec: what survives a parse, a rebinding, and an emit.
+
+These are the tests that stand where the template engine used to. A template was text
+in and text out, so the only thing that could be asserted about it was the text; a base
+is parsed into an object, so what is asserted here is that the object is faithful to
+the file — including the parts no field of the model names. [LAW:behavior-not-structure]
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from importlib import resources
+
+import pytest
+from pydantic import ValidationError
+
+from copirate_review import workflow as wf
+from copirate_review import yamldoc
+from copirate_review.workflow import Binding, Workflow, WorkflowError, bind, parse, render
+from copirate_review.yamldoc import emit, load
+
+SHIPPED = resources.files("copirate_review").joinpath("bases", "pr-review.yml").read_text()
+
+MINIMAL = """\
+name: Review
+on:
+  pull_request: {}
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - id: review
+        uses: placeholder@v0
+        with:
+          OLD: 'gone'
+"""
+
+
+def binding(**overrides) -> Binding:
+    return Binding(
+        **{"action_ref": "o/r@v1", "secrets": ("TOKEN",), "inputs": {"SCOPE": "all"}, **overrides}
+    )
+
+
+# --- the codec --------------------------------------------------------------------
+
+
+def test_the_shipped_base_survives_a_parse_and_an_emit_byte_for_byte():
+    """The invariant the whole comment-preserving codec exists to hold.
+
+    It is also what keeps the base honest: the file an author edits is exactly the file
+    the emitter produces, so reviewing a base is reviewing the rendered output.
+    """
+    data, layout = load(SHIPPED, "base")
+    assert emit(data, layout) == SHIPPED
+
+
+def test_a_comment_hanging_off_a_list_item_is_restored_rather_than_dropped():
+    """`key in node` is a VALUE test on a list, so this went missing once, in silence."""
+    source = "on:\n  pull_request:\n    types:\n      - opened\n\njobs: {}\n"
+    data, layout = load(source, "t")
+    assert emit(data, layout) == source
+
+
+def test_a_record_of_a_place_where_nothing_was_written_cannot_be_built():
+    """`_restore` reads `comments[0]` for the single-token slots.
+
+    An empty one would be an IndexError leaving `emit` as a bare traceback, past the
+    exit codes the CLI contracts for — a YAML fault reported as a crash. No document I
+    could write produces one, so this closes the state rather than the path to it:
+    the hole is in the type, and that is where it is filled. [LAW:types-are-the-program]
+    """
+    with pytest.raises(ValidationError):
+        yamldoc.Trivia(path=("jobs",), key="review", slot=0, comments=())
+
+
+def test_a_key_the_model_does_not_name_is_carried_through_untouched():
+    """A base may use `strategy`, `services`, or a key GitHub adds next month."""
+    source = MINIMAL.replace(
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: ubuntu-latest\n    services:\n      db:\n        image: postgres\n",
+    )
+    rendered = render(bind(parse(source, "t"), binding(), "t"))
+    assert "image: postgres" in rendered
+
+
+def test_a_document_that_is_not_a_mapping_is_refused_naming_what_it_is():
+    with pytest.raises(WorkflowError, match="mapping at the top level"):
+        parse("- just a list\n", "t")
+
+
+# --- binding ----------------------------------------------------------------------
+
+
+def test_binding_replaces_the_ref_and_the_whole_with_block():
+    bound = bind(parse(MINIMAL, "t"), binding(), "t")
+    step = bound.jobs["review"].steps[0]
+    assert step.uses == "o/r@v1"
+    assert "OLD" not in step.with_
+    assert step.with_ == {"TOKEN": "${{ secrets.TOKEN }}", "SCOPE": "all"}
+
+
+def test_binding_leaves_the_original_untouched_so_a_plan_can_be_built_before_it_acts():
+    original = parse(MINIMAL, "t")
+    bind(original, binding(), "t")
+    assert original.jobs["review"].steps[0].uses == "placeholder@v0"
+
+
+def test_every_secret_is_wired_before_every_input_and_inputs_come_out_sorted():
+    """Deterministic order, or an unchanged config renders a different file each run."""
+    bound = bind(
+        parse(MINIMAL, "t"),
+        binding(secrets=("B_TOKEN", "A_TOKEN"), inputs={"Z": "1", "A": "2"}),
+        "t",
+    )
+    assert list(bound.jobs["review"].steps[0].with_) == ["B_TOKEN", "A_TOKEN", "A", "Z"]
+
+
+def test_a_step_with_no_id_is_never_mistaken_for_the_review_step():
+    source = MINIMAL.replace("      - id: review\n", "      - name: something else\n")
+    with pytest.raises(WorkflowError, match="exactly one step"):
+        bind(parse(source, "t"), binding(), "t")
+
+
+def test_the_review_step_is_found_by_id_and_not_by_the_ref_it_currently_carries():
+    """Rebinding that ref is the job, so it cannot also be how the step is recognised."""
+    source = MINIMAL.replace("uses: placeholder@v0", "uses: someone/entirely-different@v9")
+    assert bind(parse(source, "t"), binding(), "t").jobs["review"].steps[0].uses == "o/r@v1"
+
+
+def test_the_model_is_not_a_second_place_workflow_defaults_can_live():
+    """A base's `with:` is illustrative. Merging would make its values invisible losers."""
+    bound = bind(parse(MINIMAL, "t"), binding(secrets=(), inputs={}), "t")
+    assert bound.jobs["review"].steps[0].with_ == {}
+
+
+# --- what a rendered document looks like ------------------------------------------
+
+
+def test_rendering_a_parsed_base_produces_a_document_that_parses_back_the_same_way():
+    bound = bind(parse(SHIPPED, "base"), binding(), "base")
+    assert isinstance(parse(render(bound), "rendered"), Workflow)
+
+
+def test_an_actions_expression_is_never_treated_as_anything_but_text():
+    """`${{ }}` collides with a template language's delimiters. It cannot collide here."""
+    bound = bind(parse(MINIMAL, "t"), binding(inputs={"REF": "${{ github.sha }}"}), "t")
+    assert "${{ github.sha }}" in render(bound)
+
+
+@pytest.mark.parametrize("value", ["no", "on", "yes", "off", "true", "null", "5", "~"])
+def test_an_input_spelling_a_yaml_keyword_is_emitted_quoted(value):
+    """Unquoted, the runner reads a boolean where the configuration wrote a string.
+
+    Which words resolve to a boolean differs between YAML 1.1 and 1.2, so the guard is
+    unconditional quoting rather than a list of spellings to keep current.
+    """
+    rendered = render(bind(parse(MINIMAL, "t"), binding(inputs={"SCOPE": value}), "t"))
+    assert f'SCOPE: "{value}"' in rendered
+
+
+@pytest.mark.parametrize("value", ["'no'", "'on'", '"yes"', "'off'", "'true'", "'5'"])
+def test_a_quoted_value_the_installer_only_carries_keeps_its_quotes(value):
+    """The review step's inputs are not the only strings a runner can misread.
+
+    Everything else in a base is copied, not rebound — and ruamel re-derives quoting
+    from what YAML 1.2 needs, which is not what GitHub's 1.1 parser reads. A base
+    author's `verbose: 'no'` came back bare, so the step received false. The installer
+    renders a COPY; a copy that means something else is the one output it may not
+    produce. [FRAMING:representation]
+    """
+    base = MINIMAL.replace(
+        "steps:",
+        f"steps:\n      - uses: acme/unrelated@v1\n        with:\n          VERBOSE: {value}",
+        1,
+    )
+    assert f"VERBOSE: {value}" in render(bind(parse(base, "t"), binding(), "t"))
+
+
+def test_the_review_step_id_is_the_one_the_base_already_depends_on():
+    """The archive step reads `steps.review.outputs`, so the id was load-bearing already."""
+    assert f"steps.{wf.REVIEW_STEP_ID}.outputs" in SHIPPED
+
+
+# --- shapes GitHub accepts that a too-strong model would reject -------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "permissions: read-all",
+        "permissions:\n  contents: read",
+        "concurrency: one-at-a-time",
+        "concurrency:\n  group: g\n  cancel-in-progress: true",
+    ],
+    ids=["permissions-string", "permissions-mapping", "concurrency-string",
+         "concurrency-mapping"],
+)
+def test_a_legal_workflow_shape_the_installer_does_not_transform_is_carried_through(line):
+    """A model stronger than the truth rejects valid bases, which is its own bug."""
+    source = MINIMAL.replace("name: Review\n", f"name: Review\n{line}\n")
+    assert line.splitlines()[0] in render(bind(parse(source, "t"), binding(), "t"))
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["on: push", "on:\n  - push\n  - pull_request", "on:\n  pull_request: {}"],
+    ids=["scalar", "list", "mapping"],
+)
+def test_every_legal_spelling_of_a_trigger_is_accepted(trigger):
+    source = MINIMAL.replace("on:\n  pull_request: {}\n", f"{trigger}\n")
+    assert isinstance(parse(source, "t"), Workflow)
+
+
+def test_a_workflow_with_no_name_is_accepted_and_does_not_gain_one():
+    """GitHub falls back to the file path; inventing a name would change behaviour."""
+    source = MINIMAL.replace("name: Review\n", "")
+    assert "name:" not in render(bind(parse(source, "t"), binding(), "t")).split("jobs:")[0]
+
+
+def test_a_job_that_calls_a_reusable_workflow_does_not_gain_an_empty_steps_list():
+    """`steps: []` in such a job is a workflow GitHub rejects outright."""
+    source = MINIMAL + "  call:\n    uses: org/repo/.github/workflows/w.yml@v1\n"
+    rendered = render(bind(parse(source, "t"), binding(), "t"))
+    assert "steps: []" not in rendered
+    assert "org/repo/.github/workflows/w.yml@v1" in rendered
+
+
+def test_a_null_valued_key_survives_rather_than_being_dropped_as_absent():
+    """`on:\\n  push:` is ordinary YAML, and the key carries meaning with no value."""
+    source = MINIMAL.replace("  pull_request: {}\n", "  push:\n  pull_request: {}\n")
+    assert "push:" in render(bind(parse(source, "t"), binding(), "t"))
+
+
+# --- a base written in some other shape than the model's --------------------------
+
+OWN_SHAPE = """\
+name: demo
+on: push
+
+# This block exists because the runner needs a proxy on the build network.
+# Removing it makes every job fail at the checkout step.
+env:
+  HTTPS_PROXY: http://proxy.internal:3128
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes:
+    steps:
+      - id: review
+        uses: acme/review@v1
+"""
+
+
+def test_a_base_keeps_the_order_it_was_written_in():
+    """Reordering keys is not cosmetic here — it MOVES COMMENTS.
+
+    `model_dump` rebuilds a mapping in the model's declaration order, declared fields
+    first and `extra="allow"` keys appended after, so a base with `env:` above `jobs:`
+    rendered with `env:` at the bottom. ruamel attaches a comment to the node BEFORE
+    it, so the paragraph explaining the proxy block came out sitting on `jobs:`,
+    telling a reader that removing `jobs:` breaks the checkout. That is the failure
+    `_at` refuses one comment at a time, arriving wholesale through the serializer.
+    """
+    rendered = render(parse(OWN_SHAPE, "t"))
+    assert rendered == OWN_SHAPE, "a base the installer only copies comes back unchanged"
+    proxy_note = "# Removing it makes every job fail at the checkout step.\nenv:"
+    assert proxy_note in rendered, "the comment stayed on the block it explains"
+
+
+def test_a_key_written_with_no_value_is_not_the_same_as_a_key_left_out():
+    """`exclude_none` deleted `timeout-minutes:` from a base that wrote it.
+
+    A field the model names had one representation for "absent" and "present and
+    null", so the copy lost a key its original had. [LAW:types-are-the-program]
+    """
+    assert "timeout-minutes:" in render(parse(OWN_SHAPE, "t"))
+    without = OWN_SHAPE.replace("    timeout-minutes:\n", "")
+    assert "timeout-minutes" not in render(parse(without, "t")), "and absent stays absent"
+
+
+def test_rebinding_a_base_in_its_own_shape_still_finds_the_review_step():
+    """Reordering runs between the transformation and the emit; it must not hide it."""
+    bound = bind(parse(OWN_SHAPE, "t"), binding(inputs={"SCOPE": "all"}), "t")
+    rendered = render(bound)
+    assert "uses: o/r@v1" in rendered
+    assert 'SCOPE: "all"' in rendered
+    assert "HTTPS_PROXY" in rendered, "and carries through what it does not touch"
+
+
+# --- is it actually a GitHub Actions workflow -------------------------------------
+
+ACTIONLINT = shutil.which("actionlint")
+
+
+@pytest.mark.skipif(ACTIONLINT is None, reason="actionlint is not installed")
+@pytest.mark.parametrize("stage", ["base", "rendered"], ids=["as-shipped", "as-rendered"])
+def test_actionlint_accepts_it(tmp_path, stage):
+    """The one check that reads it as GitHub Actions rather than as YAML.
+
+    "A base is a complete, runnable workflow" is the claim the whole design rests on,
+    and valid YAML is a far weaker statement than valid Actions. Asserted at BOTH ends,
+    because the transformation between them is the part that could break it.
+    """
+    text = SHIPPED if stage == "base" else render(bind(parse(SHIPPED, "b"), binding(), "b"))
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "pr-review.yml").write_text(text)
+    result = subprocess.run(
+        [ACTIONLINT, "pr-review.yml"], cwd=workflows, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
