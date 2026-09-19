@@ -8,6 +8,8 @@ the file — including the parts no field of the model names. [LAW:behavior-not-
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from importlib import resources
 
 import pytest
@@ -197,3 +199,27 @@ def test_a_null_valued_key_survives_rather_than_being_dropped_as_absent():
     """`on:\\n  push:` is ordinary YAML, and the key carries meaning with no value."""
     source = MINIMAL.replace("  pull_request: {}\n", "  push:\n  pull_request: {}\n")
     assert "push:" in render(bind(parse(source, "t"), binding(), "t"))
+
+
+# --- is it actually a GitHub Actions workflow -------------------------------------
+
+ACTIONLINT = shutil.which("actionlint")
+
+
+@pytest.mark.skipif(ACTIONLINT is None, reason="actionlint is not installed")
+@pytest.mark.parametrize("stage", ["base", "rendered"], ids=["as-shipped", "as-rendered"])
+def test_actionlint_accepts_it(tmp_path, stage):
+    """The one check that reads it as GitHub Actions rather than as YAML.
+
+    "A base is a complete, runnable workflow" is the claim the whole design rests on,
+    and valid YAML is a far weaker statement than valid Actions. Asserted at BOTH ends,
+    because the transformation between them is the part that could break it.
+    """
+    text = SHIPPED if stage == "base" else render(bind(parse(SHIPPED, "b"), binding(), "b"))
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "pr-review.yml").write_text(text)
+    result = subprocess.run(
+        [ACTIONLINT, "pr-review.yml"], cwd=workflows, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
