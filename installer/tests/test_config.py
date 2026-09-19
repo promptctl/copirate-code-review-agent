@@ -21,6 +21,20 @@ from copirate_review.config import (
 
 WORKFLOW = ".github/workflows/code-review.yml"
 
+CREDENTIAL = "secrets:\n  CLAUDE_CODE_OAUTH_TOKEN: keychain:ITEM\n"
+
+
+def machine(tmp_path):
+    """A home layer declaring a credential — what every real machine has.
+
+    The shipped layer declares none on purpose, so a load that reaches a `Config` needs
+    one somewhere, and the machine layer is where a credential belongs.
+    """
+    home = tmp_path / "home"
+    (home / ".config/copirate-review").mkdir(parents=True, exist_ok=True)
+    (home / ".config/copirate-review/config.yaml").write_text(CREDENTIAL)
+    return home
+
 
 def minimal(**overrides) -> dict:
     base = {
@@ -189,30 +203,37 @@ def test_layers_are_ordered_home_first_so_the_repo_has_the_last_word(tmp_path):
     )
 
 
-def test_a_repo_that_declares_nothing_loads_the_shipped_defaults(tmp_path):
-    config, layers = load(tmp_path, tmp_path / "absent-home")
-    assert layers == ()
+def test_a_repo_that_declares_nothing_inherits_every_layer_above_it(tmp_path):
+    home = machine(tmp_path)
+    config, layers = load(tmp_path, home)
+    assert layers == (home / ".config/copirate-review/config.yaml",)
     assert isinstance(config, Config)
     assert config.workflows[0].path == WORKFLOW
 
 
-def test_the_shipped_defaults_declare_nobody_credentials(tmp_path):
+def test_the_shipped_defaults_declare_nobody_credentials():
     """The one layer identical on every machine cannot name one person's keychain item.
 
     A default here is inherited by every repository that never asked for it and is
     silently wrong for all of them — the secret would be provisioned from an item that
-    does not exist, or worse, from one that does and belongs to someone else.
+    does not exist, or worse, from one that does and belongs to someone else. Asserted
+    against the shipped file, before any layer has had a chance to fill it in.
     """
-    config, _ = load(tmp_path, tmp_path / "absent-home")
-    assert config.secrets == {}
+    from importlib import resources
+
+    from copirate_review import yamldoc
+
+    shipped = resources.files("copirate_review").joinpath("defaults.yaml").read_text()
+    assert yamldoc.load(shipped, "defaults")[0]["secrets"] == {}
 
 
 def test_a_repo_layer_changes_only_what_it_declares(tmp_path):
     (tmp_path / ".copirate-review.yaml").write_text(
         f"workflows:\n  {WORKFLOW}:\n    inputs:\n      MAX_REVIEW_ROUNDS: 12\n"
     )
-    config, layers = load(tmp_path, tmp_path / "absent-home")
-    assert layers == (tmp_path / ".copirate-review.yaml",)
+    home = machine(tmp_path)
+    config, layers = load(tmp_path, home)
+    assert layers == (home / ".config/copirate-review/config.yaml", tmp_path / ".copirate-review.yaml")
     inputs = config.workflows[0].inputs
     assert inputs["MAX_REVIEW_ROUNDS"] == "12"
     assert inputs["DEPENDENCY_DIFF"] == "true"  # inherited, not restated
@@ -221,7 +242,7 @@ def test_a_repo_layer_changes_only_what_it_declares(tmp_path):
 
 def test_an_empty_config_file_is_the_empty_layer_not_an_error(tmp_path):
     (tmp_path / ".copirate-review.yaml").write_text("")
-    config, _ = load(tmp_path, tmp_path / "absent-home")
+    config, _ = load(tmp_path, machine(tmp_path))
     assert config.workflows[0].base == "pr-review"
 
 
@@ -240,7 +261,7 @@ def test_a_null_input_in_a_later_layer_drops_it_from_the_rendered_step(tmp_path)
     (tmp_path / ".copirate-review.yaml").write_text(
         f"workflows:\n  {WORKFLOW}:\n    inputs:\n      DEPENDENCY_DIFF: null\n"
     )
-    config, _ = load(tmp_path, tmp_path / "absent-home")
+    config, _ = load(tmp_path, machine(tmp_path))
     assert "DEPENDENCY_DIFF" not in config.workflows[0].inputs
 
 
@@ -251,7 +272,7 @@ def test_a_null_survives_into_no_layer_even_where_the_one_below_declared_nothing
         f"workflows:\n  {other}:\n    base: pr-review\n"
         f"    inputs:\n      MAX_REVIEW_ROUNDS: null\n"
     )
-    config, _ = load(tmp_path, tmp_path / "absent-home")
+    config, _ = load(tmp_path, machine(tmp_path))
     added = next(w for w in config.workflows if w.path == other)
     assert "MAX_REVIEW_ROUNDS" not in added.inputs
 
@@ -268,3 +289,24 @@ def test_a_secret_colliding_with_the_injected_exclude_input_is_refused():
             },
             "test.yaml",
         )
+
+
+def test_declaring_no_credentials_is_refused_rather_than_wiring_a_reviewer_to_nothing():
+    """It would install cleanly and fail on the first pull request.
+
+    The shipped layer names no credential on purpose, so this is the state a brand-new
+    repository starts in — which makes a loud refusal, naming both schemes and both
+    places to declare one, the difference between a working install and a dead reviewer
+    nobody can account for. [LAW:no-silent-failure]
+    """
+    with pytest.raises(ConfigError) as caught:
+        parse(minimal(secrets={}), "test.yaml")
+    message = str(caught.value)
+    assert "keychain:" in message and "env:" in message
+    assert ".copirate-review.yaml" in message
+
+
+def test_a_repo_with_no_configuration_at_all_is_told_what_it_is_missing(tmp_path):
+    """The state a brand-new repository starts in, now that nothing ships a credential."""
+    with pytest.raises(ConfigError, match="no credentials are declared"):
+        load(tmp_path, tmp_path / "absent-home")

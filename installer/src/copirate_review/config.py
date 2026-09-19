@@ -208,6 +208,18 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
     _validate(merged, source, required=REQUIRED)
 
     secrets = {name: _credential(uri, name) for name, uri in merged["secrets"].items()}
+    if not secrets:
+        raise ConfigError(
+            f"{source}: no credentials are declared, so the rendered workflow would pass "
+            f"the review action nothing to authenticate with — it would install cleanly "
+            f"and fail on the first pull request. Declare at least one:\n"
+            f"  secrets:\n"
+            f"    CLAUDE_CODE_OAUTH_TOKEN: keychain:<item>   # a macOS keychain item\n"
+            f"    CLAUDE_CODE_OAUTH_TOKEN: env:<VAR>         # or an exported variable\n"
+            f"in {REPO_CONFIG_PATHS[0]} for this repo, or ~/{HOME_CONFIG_PATH} for every "
+            f"repo on this machine. The installer ships none: the shipped layer is the "
+            f"same on every machine, so a credential there would be someone else's."
+        )
 
     raw_workflows: Mapping[str, Any] = merged["workflows"]
     if not raw_workflows:

@@ -13,8 +13,23 @@ from .test_config import WORKFLOW, minimal
 TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
 
 
+def machine(tmp_path, body=""):
+    """A home layer declaring a credential, which every render needs to be legal.
+
+    It lives in the MACHINE layer rather than each repo's, because that is where a
+    credential belongs for real: declared once for every repository on a machine. The
+    shipped layer declares none, on purpose.
+    """
+    home = tmp_path / "home"
+    (home / ".config/copirate-review").mkdir(parents=True, exist_ok=True)
+    (home / ".config/copirate-review/config.yaml").write_text(
+        f"secrets:\n  {TOKEN}: keychain:ITEM\n{body}"
+    )
+    return home
+
+
 def rendered_for(tmp_path, repo="someone/else", home=None):
-    home = home or tmp_path / "absent-home"
+    home = home or machine(tmp_path)
     config, _ = load(tmp_path, home)
     return render(config, config.workflows[0], resolve_action_ref(config, repo), tmp_path, home)
 
@@ -57,25 +72,23 @@ def test_the_self_review_discriminator_ignores_case_as_github_itself_does():
 
 
 def test_the_rendered_workflow_is_valid_yaml_carrying_the_declared_bindings(tmp_path):
-    step = review_step(rendered_for(declaring(tmp_path, f"secrets:\n  {TOKEN}: keychain:X\n")).text)
+    step = review_step(rendered_for(tmp_path).text)
     assert step["uses"] == "promptctl/copirate-code-review-agent@v1"
     assert step["with"][TOKEN] == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
     assert step["with"]["MAX_REVIEW_ROUNDS"] == "5"
 
 
 def test_every_declared_secret_is_wired_into_the_step_under_its_own_name(tmp_path):
-    root = declaring(tmp_path, f"secrets:\n  {TOKEN}: keychain:X\n  OPENAI_API_KEY: env:OAI\n")
+    root = declaring(tmp_path, "secrets:\n  OPENAI_API_KEY: env:OAI\n")
     step = review_step(rendered_for(root).text)
     assert step["with"]["OPENAI_API_KEY"] == "${{ secrets.OPENAI_API_KEY }}"
     assert step["with"][TOKEN] == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
 
 
 def test_a_deleted_secret_is_neither_provisioned_nor_wired(tmp_path):
-    home = tmp_path / "home"
-    (home / ".config/copirate-review").mkdir(parents=True)
-    (home / ".config/copirate-review/config.yaml").write_text(f"secrets:\n  {TOKEN}: keychain:X\n")
+    """The fleet layer gave it; this repo reviews on a different provider."""
     root = declaring(tmp_path, f"secrets:\n  {TOKEN}: null\n  ZAI_API_KEY: keychain:ZAI\n")
-    step = review_step(rendered_for(root, home=home).text)
+    step = review_step(rendered_for(root).text)
     assert TOKEN not in step["with"]
     assert step["with"]["ZAI_API_KEY"] == "${{ secrets.ZAI_API_KEY }}"
 
@@ -83,7 +96,7 @@ def test_a_deleted_secret_is_neither_provisioned_nor_wired(tmp_path):
 def test_the_bases_own_with_block_is_replaced_rather_than_merged_into(tmp_path):
     """Otherwise a base is a second table of defaults, and the loser is invisible."""
     step = review_step(rendered_for(tmp_path).text)
-    assert set(step["with"]) == {"DEPENDENCY_DIFF", "EXCLUDE_PATTERNS", "MAX_REVIEW_ROUNDS"}
+    assert set(step["with"]) == {TOKEN, "DEPENDENCY_DIFF", "EXCLUDE_PATTERNS", "MAX_REVIEW_ROUNDS"}
 
 
 def test_actions_expressions_survive_rendering_untouched(tmp_path):
@@ -169,7 +182,7 @@ def test_a_repo_base_shadows_the_shipped_one_of_the_same_name(tmp_path):
 
 
 def test_a_home_base_is_used_when_the_repo_has_none(tmp_path):
-    home = tmp_path / "home"
+    home = machine(tmp_path)
     (home / ".config/copirate-review/bases").mkdir(parents=True)
     (home / ".config/copirate-review/bases/pr-review.yml").write_text(
         "name: Fleet\non:\n  push: {}\njobs:\n  review:\n    steps:\n"

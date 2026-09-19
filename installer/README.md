@@ -79,14 +79,20 @@ review can tell "fix a file and re-run" from "retry later" without reading prose
 
 ## Configuration
 
+**At least one credential must be declared somewhere**, or the install is refused: the
+rendered workflow would pass the review action nothing to authenticate with, install
+cleanly, and fail on the first pull request. Nothing ships one — see
+[Credentials](#credentials).
+
 Three layers, each deep-merged over the one before it:
 
 1. the defaults shipped in this package
 2. `~/.config/copirate-review/config.yaml` — fleet policy for this machine
 3. `.copirate-review.yaml`, or `.copirate-review/config.yaml` — the repository's own
 
-A repository declares only its differences. **Nothing needs a config file at all** — a
-repo with none gets the shipped defaults, which is the whole point of the fleet layer.
+A repository declares only its differences. Declare your credential once in the fleet
+layer and a repo with no config file of its own needs nothing else — which is the whole
+point of that layer.
 
 Every file is validated against [`schema.json`](src/copirate_review/schema.json). An
 unknown key is fatal, not ignored: a silently-dropped typo leaves a repo paying for
