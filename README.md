@@ -50,6 +50,17 @@ The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Clau
 
 That's it. Open a PR and the action reviews it. The checkout is optional context for the reviewer — the review itself is fetched and posted through the GitHub API, so it works even without checking out the code.
 
+### Installing it across several repositories
+
+Doing the two steps above by hand is fine for one repo. For a fleet, [`copirate-review`](installer/) does them and keeps them current — run it before every review and it re-renders the workflow from a template, re-syncs the secret from your keychain, and commits any change onto the branch you are already on:
+
+```bash
+uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review
+cd ~/code/your-repo && copirate-review install
+```
+
+What it renders is declared in `.copirate-review.yaml`, layered over machine-wide defaults — see [its README](installer/README.md).
+
 ## Providers
 
 `PROVIDER` selects the engine in simple mode. Each provider needs its own credential secret.
