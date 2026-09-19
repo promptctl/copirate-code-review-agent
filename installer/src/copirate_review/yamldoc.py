@@ -88,6 +88,13 @@ def _yaml() -> YAML:
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
     yaml.width = 4096  # never reflow a long line into a continuation it did not have
+    # Quote style is MEANING here, not formatting, so it is carried rather than
+    # re-derived. ruamel decides quoting by what YAML 1.2 requires, and GitHub Actions
+    # parses YAML 1.1 — so a base author's `verbose: 'no'` came back as bare `no`,
+    # which 1.2 calls a string and 1.1 calls false. The installer renders a copy of
+    # someone's workflow; a copy that means something different from its original is
+    # the one thing it may never produce. [FRAMING:representation]
+    yaml.preserve_quotes = True
     return yaml
 
 

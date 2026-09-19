@@ -146,6 +146,24 @@ def test_an_input_spelling_a_yaml_keyword_is_emitted_quoted(value):
     assert f'SCOPE: "{value}"' in rendered
 
 
+@pytest.mark.parametrize("value", ["'no'", "'on'", '"yes"', "'off'", "'true'", "'5'"])
+def test_a_quoted_value_the_installer_only_carries_keeps_its_quotes(value):
+    """The review step's inputs are not the only strings a runner can misread.
+
+    Everything else in a base is copied, not rebound — and ruamel re-derives quoting
+    from what YAML 1.2 needs, which is not what GitHub's 1.1 parser reads. A base
+    author's `verbose: 'no'` came back bare, so the step received false. The installer
+    renders a COPY; a copy that means something else is the one output it may not
+    produce. [FRAMING:representation]
+    """
+    base = MINIMAL.replace(
+        "steps:",
+        f"steps:\n      - uses: acme/unrelated@v1\n        with:\n          VERBOSE: {value}",
+        1,
+    )
+    assert f"VERBOSE: {value}" in render(bind(parse(base, "t"), binding(), "t"))
+
+
 def test_the_review_step_id_is_the_one_the_base_already_depends_on():
     """The archive step reads `steps.review.outputs`, so the id was load-bearing already."""
     assert f"steps.{wf.REVIEW_STEP_ID}.outputs" in SHIPPED
