@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/promptctl/copirate-code-review-agent/v1/installer/src/copirate_review/schema.json",
+  "title": "CoPirate code review installer configuration",
+  "description": "Bindings for the workflow templates `copirate-review install` renders. Layers: the shipped defaults, then ~/.config/copirate-review/config.yaml, then the repo's own file. A later layer deep-merges over an earlier one; a null value deletes the key it names.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action_ref": {
+      "description": "The `uses:` ref every rendered workflow points its review step at. A moving major tag (promptctl/copirate-code-review-agent@v1) so a consumer tracks releases with no edit here. Rendered as `./` in the action's own source repo, which must review each PR with that PR's code.",
+      "type": "string",
+      "minLength": 1
+    },
+    "commit_message": {
+      "description": "Subject of the commit the installer lands on the current branch when a rendered workflow changed.",
+      "type": "string",
+      "minLength": 1
+    },
+    "secrets": {
+      "description": "Repo secrets to provision, as `SECRET_NAME: <credential source>`. Each is written to BOTH the Actions and the Dependabot store, and each is wired into every rendered workflow's `with:` block under its own name — declaring a secret provisions it and passes it, one fact in one place. Null deletes an inherited entry.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$"
+      },
+      "additionalProperties": {
+        "description": "A macOS keychain generic-password item, by service name, or null to delete an inherited entry. The item is declared, never derived from the secret name: which account's token CLAUDE_CODE_OAUTH_TOKEN holds varies by which account has quota.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^keychain:.+$"
+      }
+    },
+    "workflows": {
+      "description": "Workflow files to converge, keyed by their repo-relative path. Keyed rather than listed so a later layer can override one workflow's inputs, or add a second workflow, without restating either. Null deletes an inherited entry.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$"
+      },
+      "additionalProperties": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "template": {
+            "description": "Template name, resolved against .copirate-review/templates/, then ~/.config/copirate-review/templates/, then the templates shipped in this package — each as <name>.yml.j2. A repo ships its own workflow shape by dropping a file with that name in the first directory; it never forks the installer.",
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "inputs": {
+            "description": "Rendered verbatim into the action step's `with:` block. Deliberately open: every input action.yml accepts is reachable from here, and a new one needs no installer release. A name declared in `secrets` may not be repeated here — the rendered block would carry the key twice.",
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[A-Z][A-Z0-9_]*$"
+            },
+            "additionalProperties": {
+              "description": "A value the action reads as a string, or null to delete an inherited one.",
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+[project]
+name = "copirate-review"
+version = "0.1.0"
+description = "Converge the CoPirate code-review GitHub Action into a repository: render its workflow, sync its credentials, and land the change on the open PR."
+readme = "README.md"
+authors = [
+    { name = "Brandon Fryslie", email = "530235+brandon-fryslie@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "jinja2>=3.1",
+    "jsonschema>=4.21",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+copirate-review = "copirate_review.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

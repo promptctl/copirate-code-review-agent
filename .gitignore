@@ -142,3 +142,11 @@ eval/out/
 
 # Local-only review configs (endpoints on this machine; see review-agent/local-mlx.yml)
 review-agent/local-*.yml
+
+# installer/ — the Python CLI. uv.lock IS committed: every host that installs the
+# tool must resolve the same dependency set, and a lock file is the only thing that
+# says so. [LAW:one-source-of-truth]
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
