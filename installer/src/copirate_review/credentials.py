@@ -13,6 +13,7 @@ which is data, so adding a third kind is a value here and no new branch anywhere
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import subprocess
@@ -138,21 +139,22 @@ def pipe_into(credential: Credential, argv: list[str]) -> str:
     the chain; it cannot observe what travels through it. [LAW:effects-at-boundaries]
 
     Only ONE pipe in the chain is ever read by this process, and it is read last. So
-    every other stream goes somewhere that cannot fill and block: the first reader's
-    stderr to a temporary file, every later stage's to /dev/null. A pipe nobody drains
-    until the chain finishes is a pipe the chain can deadlock on.
-    [LAW:no-ambient-temporal-coupling]
+    every other stream goes somewhere that cannot fill and block — each stage's stderr
+    to its own temporary FILE, which is the point: a file cannot fill, so every stage
+    can be allowed to explain itself without the chain ever deadlocking on a pipe
+    nobody drains until it finishes. [LAW:no-ambient-temporal-coupling]
     """
     stages = credential.stages
-    with tempfile.TemporaryFile() as reader_errors:
+    with contextlib.ExitStack() as stack:
+        said = [stack.enter_context(tempfile.TemporaryFile()) for _ in stages]
         running: list[subprocess.Popen] = []
         upstream = None
-        for index, stage in enumerate(stages):
+        for stage, errors in zip(stages, said):
             process = subprocess.Popen(
                 stage,
                 stdin=upstream,
                 stdout=subprocess.PIPE,
-                stderr=reader_errors if index == 0 else subprocess.DEVNULL,
+                stderr=errors,
             )
             # The FILE OBJECT is closed, never its raw descriptor: `Popen` owns that
             # descriptor and will close it again when the object is collected. Closing
@@ -173,27 +175,41 @@ def pipe_into(credential: Credential, argv: list[str]) -> str:
         consumer_out, consumer_err = consumer.communicate()
         for process in running:
             process.wait()
-        reader_errors.seek(0)
-        reader_err = reader_errors.read().decode(errors="replace").strip()
+        for errors in said:
+            errors.seek(0)
+        # EVERY stage, not only the head of the chain. What the consumer receives is
+        # the credential just in case ALL of the chain ran: a `tr` killed mid-stream
+        # hands `gh secret set` a TRUNCATED token, which it accepts and stores in both
+        # stores, and the run prints its ✓ over a credential that will fail every
+        # review from then on. Measured, not argued: a second stage exiting 3 after six
+        # bytes returned those six bytes and raised nothing. [LAW:no-silent-failure]
+        failed = [
+            (stage, process.returncode, errors.read().decode(errors="replace").strip())
+            for stage, process, errors in zip(stages, running, said)
+            if process.returncode != 0
+        ]
 
-    reader = running[0]
-    # Reader first, but only when the reader has something to SAY. A pipeline fails in
-    # both directions: a consumer that died because its input never arrived reports a
-    # closed pipe and blames the wrong end — but so does the reader, when it is the
-    # CONSUMER that exited first (a rejected `gh secret set`) and the readers behind it
-    # died of EPIPE, nonzero and silent. Reading the order off the exit codes alone
-    # prints "reading … failed:" with nothing after the colon and throws gh's actual
-    # error away. Whoever explained itself is believed. [LAW:no-silent-failure]
-    if reader.returncode != 0 and reader_err:
-        raise EffectError(f"reading {credential.description} failed: {reader_err}")
+    # Readers first, but only where one has something to SAY. A pipeline fails in both
+    # directions: a consumer that died because its input never arrived reports a closed
+    # pipe and blames the wrong end — but so does a reader, when it is the CONSUMER that
+    # exited first (a rejected `gh secret set`) and the whole chain behind it died of
+    # EPIPE, nonzero and silent. Reading the order off the exit codes alone prints
+    # "reading … failed:" with nothing after the colon and throws gh's actual error
+    # away. Whoever explained itself is believed. [LAW:no-silent-failure]
+    explained = [explanation for *_, explanation in failed if explanation]
+    if explained:
+        raise EffectError(
+            f"reading {credential.description} failed: " + "; ".join(explained)
+        )
     if consumer.returncode != 0:
         raise EffectError(
             f"`{' '.join(argv)}` failed (exit {consumer.returncode}): {consumer_err.strip()}"
         )
-    if reader.returncode != 0:
+    if failed:
         raise EffectError(
-            f"reading {credential.description} failed: the reader exited "
-            f"{reader.returncode} without explanation."
+            f"reading {credential.description} failed: "
+            + "; ".join(f"`{' '.join(stage)}` exited {code}" for stage, code, _ in failed)
+            + " — without explanation, so the value that arrived may be incomplete."
         )
     return consumer_out.strip()
 

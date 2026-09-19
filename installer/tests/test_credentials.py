@@ -9,6 +9,8 @@ about what crosses an OS pipe. [LAW:behavior-not-structure]
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 
 from copirate_review import credentials
@@ -173,6 +175,42 @@ def test_a_reader_that_fails_is_reported_as_the_reader_not_as_the_consumer(monke
     monkeypatch.setattr(credentials, "_FIND", ["sh", "-c", "echo nope >&2; exit 44", "security"])
     with pytest.raises(EffectError, match="reading keychain item GONE failed"):
         pipe_into(KeychainCredential(item="GONE"), ["wc", "-c"])
+
+
+@dataclass(frozen=True)
+class TwoStages:
+    """A source whose second stage we choose, standing in for `security | tr`."""
+
+    second: list[str]
+
+    @property
+    def description(self) -> str:
+        return "the stand-in source"
+
+    @property
+    def stages(self) -> list[list[str]]:
+        return [["printf", "%s", "a-long-real-token"], self.second]
+
+
+def test_a_stage_that_dies_mid_chain_is_refused_rather_than_truncating_the_credential():
+    """The chain's output is the credential only if ALL of it ran.
+
+    Only the head of the chain was inspected, so a `tr` killed mid-stream handed the
+    consumer a short token — `gh secret set` accepts that, stores it in both stores,
+    and the run prints its ✓ over a credential that fails every review from then on.
+    Measured before it was fixed: six bytes returned, nothing raised.
+    [LAW:no-silent-failure]
+    """
+    with pytest.raises(EffectError, match="may be incomplete"):
+        pipe_into(TwoStages(["sh", "-c", "head -c 6; exit 3"]), ["cat"])
+
+
+def test_a_later_stage_may_explain_itself_too():
+    """Its stderr used to go to /dev/null, so the one stage that could say what went
+    wrong was the one stage never asked. A temp file cannot fill, so none of them
+    needed to be silenced to keep the chain from deadlocking."""
+    with pytest.raises(EffectError, match="tr: write error"):
+        pipe_into(TwoStages(["sh", "-c", "echo 'tr: write error' >&2; exit 2"]), ["cat"])
 
 
 def test_a_consumer_that_rejects_the_write_is_reported_with_its_own_message(monkeypatch):
