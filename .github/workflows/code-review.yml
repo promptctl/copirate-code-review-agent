@@ -6,7 +6,7 @@
 # To change the SHAPE of this workflow — its triggers, permissions, or steps —
 # edit the base. It is resolved from the first of these that exists, then the
 # bases shipped in promptctl/copirate-code-review-agent:
-#   .copirate-review/bases/pr-review.yml        (this repository)
+#   .copirate-review/bases/pr-review.yml            (this repository)
 #   ~/.config/copirate-review/bases/pr-review.yml   (this machine)
 #
 # To change the ACTION REF, the SECRETS it is passed, or the INPUTS below, edit
