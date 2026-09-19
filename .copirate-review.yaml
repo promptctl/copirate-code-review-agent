@@ -1,0 +1,15 @@
+# This repository's own configuration layer, over ~/.config/copirate-review/config.yaml
+# and the defaults shipped inside the installer. It declares only its differences.
+
+# The credential the reviewer authenticates with. It lives HERE, and not in the
+# installer's shipped defaults, because the shipped layer is identical on every machine
+# in the world — a keychain item name there is one person's, inherited by every
+# repository that never asked for it. The left side is the repo secret's name, which
+# action.yml reads; the right side is where its value comes from on this machine.
+#
+# Which account's token stands behind that name changes when quota does, so swapping
+# accounts is editing the right-hand side and nothing else. `env:VAR` reads an exported
+# environment variable instead, for a machine with no keychain (a CI runner, Linux).
+# [LAW:one-source-of-truth]
+secrets:
+  CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP

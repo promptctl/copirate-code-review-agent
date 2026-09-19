@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from copirate_review import ghops, install, keychain
+from copirate_review import ghops, install
 from copirate_review.config import Config
+from copirate_review.credentials import EnvCredential, KeychainCredential
 from copirate_review.ghops import Repo
 from copirate_review.install import (
     KeepSecret,
@@ -23,12 +24,16 @@ from copirate_review.install import (
 )
 
 
+ITEM = KeychainCredential(item="TOKEN_ITEM")
+
+
 @pytest.fixture
 def world(monkeypatch):
-    """Stand in for the keychain and the repo's two secret stores."""
+    """Stand in for a credential's source and for the repo's two secret stores."""
 
     def configure(*, on_this_machine: bool, missing: tuple[str, ...] = ()) -> None:
-        monkeypatch.setattr(keychain, "has_item", lambda item: on_this_machine)
+        for source in (KeychainCredential, EnvCredential):
+            monkeypatch.setattr(source, "present", lambda self: on_this_machine)
         monkeypatch.setattr(ghops, "stores_missing", lambda repo, name: missing)
 
     return configure
@@ -36,19 +41,19 @@ def world(monkeypatch):
 
 def test_a_credential_on_this_machine_is_resynced_so_a_rotation_propagates(world):
     world(on_this_machine=True)
-    assert plan_secret("o/r", "TOKEN", "TOKEN_ITEM") == SyncSecret("TOKEN", "TOKEN_ITEM")
+    assert plan_secret("o/r", "TOKEN", ITEM) == SyncSecret("TOKEN", ITEM)
 
 
 def test_no_local_copy_but_both_stores_hold_it_is_left_exactly_as_it_is(world):
     """The desired state observably holds; this machine simply cannot refresh it."""
     world(on_this_machine=False, missing=())
-    assert plan_secret("o/r", "TOKEN", "TOKEN_ITEM") == KeepSecret("TOKEN", "TOKEN_ITEM")
+    assert plan_secret("o/r", "TOKEN", ITEM) == KeepSecret("TOKEN", ITEM)
 
 
 def test_a_half_provisioned_repo_fails_and_names_the_store_that_is_short(world):
     """Dependabot PRs would review unauthenticated, and nothing here can repair it."""
     world(on_this_machine=False, missing=("dependabot",))
-    verdict = plan_secret("o/r", "TOKEN", "TOKEN_ITEM")
+    verdict = plan_secret("o/r", "TOKEN", ITEM)
     assert isinstance(verdict, MissingSecret)
     assert "dependabot" in verdict.reason
     assert "unauthenticated" in verdict.reason
@@ -56,7 +61,7 @@ def test_a_half_provisioned_repo_fails_and_names_the_store_that_is_short(world):
 
 def test_a_credential_nowhere_at_all_fails_rather_than_promising_a_clean_review(world):
     world(on_this_machine=False, missing=tuple(ghops.SECRET_STORES))
-    verdict = plan_secret("o/r", "TOKEN", "TOKEN_ITEM")
+    verdict = plan_secret("o/r", "TOKEN", ITEM)
     assert isinstance(verdict, MissingSecret)
     assert "cannot authenticate" in verdict.reason
 
@@ -75,11 +80,24 @@ def test_the_dry_run_reports_the_verdict_the_real_run_will_act_on(capsys):
         layers=(),
         changes=(),
         secrets=(
-            SyncSecret("HAVE_IT", "HAVE_ITEM"),
-            MissingSecret("LOST_IT", "LOST_ITEM", "the reviewer cannot authenticate."),
+            SyncSecret("HAVE_IT", KeychainCredential(item="HAVE_ITEM")),
+            MissingSecret(
+                "LOST_IT", EnvCredential(var="LOST_VAR"), "the reviewer cannot authenticate."
+            ),
         ),
     )
     describe(plan)
     reported = capsys.readouterr().out
     assert "sync      HAVE_IT" in reported
     assert "MISSING   LOST_IT" in reported
+    # Each names the source it actually reads, so the operator knows where to look.
+    assert "keychain item HAVE_ITEM" in reported
+    assert "environment variable $LOST_VAR" in reported
+
+
+def test_a_verdict_is_reached_the_same_way_whatever_source_the_secret_names(world):
+    """The three-way store logic is one rule; a source only answers present or not."""
+    world(on_this_machine=False, missing=tuple(ghops.SECRET_STORES))
+    from_env = plan_secret("o/r", "TOKEN", EnvCredential(var="TOKEN_VAR"))
+    assert isinstance(from_env, MissingSecret)
+    assert "environment variable $TOKEN_VAR" in from_env.reason

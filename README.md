@@ -52,7 +52,7 @@ That's it. Open a PR and the action reviews it. The checkout is optional context
 
 ### Installing it across several repositories
 
-Doing the two steps above by hand is fine for one repo. For a fleet, [`copirate-review`](installer/) does them and keeps them current — run it before every review and it re-renders the workflow from a template, re-syncs the secret from your keychain, and commits any change onto the branch you are already on:
+Doing the two steps above by hand is fine for one repo. For a fleet, [`copirate-review`](installer/) does them and keeps them current — run it before every review and it re-renders the workflow from a base, re-syncs every credential you declared (keychain item or environment variable), and commits any change onto the branch you are already on:
 
 ```bash
 uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review

@@ -32,7 +32,7 @@ TEXT = "name: Review\non: pull_request\n"
 
 
 def rendered(text: str = TEXT) -> Rendered:
-    return Rendered(path=WORKFLOW, text=text, template_file="pr-review.yml.j2")
+    return Rendered(path=WORKFLOW, text=text, base_file="pr-review.yml")
 
 
 def write(root: Path, text: str = TEXT) -> None:
@@ -131,7 +131,7 @@ def test_a_workflow_committed_and_pushed_is_finally_converged(pushed_repo):
     assert plan_for(pushed_repo, change).unlanded_paths == []
 
 
-def test_a_template_change_reaches_every_place_the_old_text_had(pushed_repo):
+def test_a_base_change_reaches_every_place_the_old_text_had(pushed_repo):
     write(pushed_repo)
     git(pushed_repo, "add", "-A")
     git(pushed_repo, "commit", "-qm", "add")
@@ -224,3 +224,27 @@ def test_a_detached_head_still_names_a_remote_to_identify_the_repository(repo):
 def test_a_repository_with_no_remote_says_so_rather_than_failing_obscurely(repo):
     with pytest.raises(EffectError, match="no git remote named 'origin'"):
         remote_url(repo, "origin")
+
+
+def test_the_plan_names_the_base_each_workflow_was_rendered_from(repo, capsys):
+    """The operator's question on seeing an unexpected render is *which file did this*."""
+    from copirate_review.config import Config
+    from copirate_review.ghops import Repo
+    from copirate_review.install import describe, landing_for
+
+    describe(
+        Plan(
+            root=repo,
+            repo=Repo(name_with_owner="o/r", default_branch="main"),
+            branch="feature",
+            remote="origin",
+            upstream=None,
+            landing=landing_for("feature", "main"),
+            config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
+            action_ref="o/r@v1",
+            layers=(),
+            changes=(snap(repo),),
+            secrets=(),
+        )
+    )
+    assert "pr-review.yml" in capsys.readouterr().out

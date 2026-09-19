@@ -1,75 +1,99 @@
-"""Resolve a template by name and render one workflow's desired text.
+"""Resolve a base workflow by name and produce one workflow's desired text.
 
-Rendering is pure: text in, text out, no repository touched. The caller compares the
-result against what is deployed and performs only the writes the difference demands.
-[LAW:effects-at-boundaries]
+Rendering is pure: a base's text in, a workflow's text out, no repository touched. The
+caller compares the result against what is deployed and performs only the writes the
+difference demands. [LAW:effects-at-boundaries]
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
-from jinja2 import ChoiceLoader, Environment, FileSystemLoader, PackageLoader, StrictUndefined
-from jinja2 import TemplateError, TemplateNotFound
+from .config import HOME_BASE_DIR, REPO_BASE_DIR, Config, ConfigError, WorkflowSpec
+from .workflow import Binding, WorkflowError, bind, headed, parse, render as to_yaml
 
-from .config import HOME_TEMPLATE_DIR, REPO_TEMPLATE_DIR, Config, ConfigError, WorkflowSpec
-
-TEMPLATE_SUFFIX = ".yml.j2"
+BASE_SUFFIX = ".yml"
 
 
 @dataclass(frozen=True)
 class Rendered:
-    """One workflow's desired text, and the template file that produced it."""
+    """One workflow's desired text, and the base file that produced it."""
 
     path: str
     text: str
-    template_file: str
+    base_file: str
 
 
-def _environment(repo_root: Path, home: Path) -> Environment:
-    """A Jinja environment whose delimiters cannot collide with GitHub Actions'.
+def base_dirs(repo_root: Path, home: Path) -> tuple[Path, ...]:
+    """Where a base is looked for, most specific first."""
+    return (repo_root / REPO_BASE_DIR, home / HOME_BASE_DIR)
 
-    `${{ secrets.X }}` contains `{{ ... }}`, so under Jinja's defaults every Actions
-    expression in a template would be evaluated as a Jinja variable and render empty.
-    Moving Jinja to `<< >>` lets a template be read and edited as the GitHub Actions
-    YAML it is, with no escaping ritual anywhere in it — the alternative pushes an
-    obligation onto every line of every template a consumer ever writes.
 
-    `StrictUndefined` makes a variable the template asks for and the config does not
-    supply a loud error. The default would render it as empty string, shipping a
-    workflow with a blank `uses:` into a consuming repo. [LAW:no-silent-failure]
+def _locate(name: str, spec_path: str, repo_root: Path, home: Path) -> tuple[str, str]:
+    """The first base with this name: its text, and the file it came from.
+
+    A repository ships its own workflow shape by dropping a file in the first of these
+    directories, and keeps every other part of its configuration. It never forks the
+    installer — which is the difference between a shape one repo needs and a fork that
+    stops receiving everything else. [LAW:composability]
     """
-    return Environment(
-        loader=ChoiceLoader(
-            [
-                FileSystemLoader([repo_root / REPO_TEMPLATE_DIR, home / HOME_TEMPLATE_DIR]),
-                PackageLoader(__package__, "templates"),
-            ]
-        ),
-        variable_start_string="<<",
-        variable_end_string=">>",
-        block_start_string="<%",
-        block_end_string="%>",
-        comment_start_string="<#",
-        comment_end_string="#>",
-        undefined=StrictUndefined,
-        keep_trailing_newline=True,
-        trim_blocks=True,
-        lstrip_blocks=True,
+    filename = name + BASE_SUFFIX
+    for directory in base_dirs(repo_root, home):
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate.read_text(), str(candidate)
+
+    packaged = resources.files(__package__).joinpath("bases", filename)
+    if packaged.is_file():
+        return packaged.read_text(), f"(shipped) {filename}"
+
+    searched = ", ".join(str(d) for d in base_dirs(repo_root, home))
+    raise ConfigError(
+        f"workflows.{spec_path}: no base named {name!r}. Looked for {filename} in "
+        f"{searched}, and in the bases shipped with this installer."
     )
 
 
-def _yaml_quote(value: str) -> str:
-    """Quote a value as a YAML double-quoted scalar.
+def _header(spec: WorkflowSpec) -> str:
+    """The banner a rendered workflow carries instead of its base's own.
 
-    Every JSON string is a valid YAML double-quoted scalar, so `json.dumps` is the whole
-    encoder — and the one that cannot be talked out of escaping a quote or a backslash.
-    Substituting a value raw is how a config that happens to contain `"` silently
-    corrupts a rendered workflow instead of failing. [LAW:parse-dont-validate]
+    It says the file is generated, because the installer overwrites it on every run —
+    an edit here appears to work and is undone the next time anyone installs, which is
+    the worst of both: the change is lost AND the author believes it landed.
+    [LAW:no-silent-failure]
+
+    It names the whole search path rather than the file that won, because the reader's
+    question is "where do I put mine", and answering only "where did this one come
+    from" sends them to edit a file shipped inside a package.
+
+    Every path here is written the way a human writes it — repo-relative, and `~` for
+    home — and NOT as the absolute path this run resolved. A generated file that
+    records the machine that generated it renders differently for every developer, so
+    the installer would commit a fresh churn of it on each of their machines, forever.
+    [FRAMING:representation]
     """
-    return json.dumps(value)
+    places = [
+        (f"{REPO_BASE_DIR}/{spec.base}{BASE_SUFFIX}", "this repository"),
+        (f"~/{HOME_BASE_DIR}/{spec.base}{BASE_SUFFIX}", "this machine"),
+    ]
+    column = max(len(path) for path, _ in places)
+    searched = "\n".join(f"#   {path:{column}}   ({whose})" for path, whose in places)
+    return (
+        f"# GENERATED by `copirate-review install` from the `{spec.base}` base — do not\n"
+        f"# edit by hand. The installer re-renders this file on every run and overwrites\n"
+        f"# local edits silently, so an edit here appears to work and is undone the next\n"
+        f"# time anyone installs. [LAW:one-source-of-truth]\n"
+        f"#\n"
+        f"# To change the SHAPE of this workflow — its triggers, permissions, or steps —\n"
+        f"# edit the base. It is resolved from the first of these that exists, then the\n"
+        f"# bases shipped in promptctl/copirate-code-review-agent:\n"
+        f"{searched}\n"
+        f"#\n"
+        f"# To change the ACTION REF, the SECRETS it is passed, or the INPUTS below, edit\n"
+        f"# .copirate-review.yaml (or the layers above it) and re-run the installer.\n"
+    )
 
 
 def resolve_action_ref(config: Config, repo: str) -> str:
@@ -80,10 +104,10 @@ def resolve_action_ref(config: Config, repo: str) -> str:
     executed is a change the repo ships untested.
 
     This is the whole accommodation, and its shape is the point — it selects a VALUE and
-    nothing else, so the same template converges here as everywhere and every future
-    template change reaches this repo like any other consumer. An exemption that skipped
-    convergence instead is precisely how a deployed workflow and its template drift into
-    two representations of one thing: an operation that does not run cannot receive a
+    nothing else, so the same base converges here as everywhere and every future base
+    change reaches this repo like any other consumer. An exemption that skipped
+    convergence instead is precisely how a deployed workflow and its base drift into two
+    representations of one thing: an operation that does not run cannot receive a
     change. [LAW:dataflow-not-control-flow]
 
     The discriminator derives from `action_ref`, so "which repo is the action" is not a
@@ -99,38 +123,26 @@ def resolve_action_ref(config: Config, repo: str) -> str:
     return "./" if repo.casefold() == owner_and_name.casefold() else config.action_ref
 
 
-def render(config: Config, spec: WorkflowSpec, action_ref: str, repo_root: Path, home: Path) -> Rendered:
-    env = _environment(repo_root, home)
-    env.filters["yaml_quote"] = _yaml_quote
-    name = spec.template + TEMPLATE_SUFFIX
+def render(
+    config: Config, spec: WorkflowSpec, action_ref: str, repo_root: Path, home: Path
+) -> Rendered:
+    """Parse the base, rebind it from the configuration, and serialize the result.
 
-    # Both stages under one arm, because a template is wrong in ways that surface at
-    # either: a syntax error is raised when it is COMPILED by get_template, and an
-    # undefined variable when it is rendered. Every one of them is the operator's file
-    # to fix, so all of them leave here as the same kind of error a malformed config
-    # does, and reach the same exit code. A Jinja traceback would report a configuration
-    # error as "the world did not cooperate". [LAW:parse-dont-validate]
+    A base that is malformed, or that carries no review step to bind, is the operator's
+    file to fix — so it leaves here as the same kind of error a malformed config does,
+    and reaches the same exit code. A pydantic traceback would report a configuration
+    error as "the world did not cooperate". [LAW:parse-dont-validate]
+    """
+    text, base_file = _locate(spec.base, spec.path, repo_root, home)
+    binding = Binding(
+        action_ref=action_ref,
+        secrets=tuple(sorted(config.secrets)),
+        inputs=spec.inputs,
+    )
     try:
-        template = env.get_template(name)
-        text = template.render(
-            action_ref=action_ref,
-            workflow_path=spec.path,
-            template_name=spec.template,
-            inputs=dict(spec.inputs),
-            secrets=sorted(config.secrets),
-        )
-    except TemplateNotFound as exc:
-        searched = ", ".join(
-            str(d) for d in (repo_root / REPO_TEMPLATE_DIR, home / HOME_TEMPLATE_DIR)
-        )
-        raise ConfigError(
-            f"workflows.{spec.path}: no template named {spec.template!r}. Looked for "
-            f"{name} in {searched}, and in the templates shipped with this installer."
-        ) from exc
-    except TemplateError as exc:
-        raise ConfigError(
-            f"workflows.{spec.path}: template {name} could not render — "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
+        bound = bind(parse(text, base_file), binding, base_file)
+    except WorkflowError as exc:
+        raise ConfigError(f"workflows.{spec.path}: {exc}") from exc
 
-    return Rendered(path=spec.path, text=text, template_file=template.filename or name)
+    header = _header(spec)
+    return Rendered(path=spec.path, text=to_yaml(headed(bound, header)), base_file=base_file)

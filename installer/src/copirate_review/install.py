@@ -13,8 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ghops, gitops, keychain
+from . import ghops, gitops
 from .config import Config, load
+from .credentials import Credential
 from .ghops import Repo
 from .render import Rendered, render, resolve_action_ref
 from .shell import EffectError
@@ -100,10 +101,10 @@ class WorkflowChange:
 
 @dataclass(frozen=True)
 class SyncSecret:
-    """The keychain holds it: write it to both stores, so a rotation propagates."""
+    """The source holds it: write it to both stores, so a rotation propagates."""
 
     name: str
-    item: str
+    credential: Credential
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ class KeepSecret:
     """No local copy, but both stores already hold it. Warn, and leave them alone."""
 
     name: str
-    item: str
+    credential: Credential
 
 
 @dataclass(frozen=True)
@@ -119,15 +120,15 @@ class MissingSecret:
     """No local copy, and the repo's stores cannot be repaired from this machine."""
 
     name: str
-    item: str
+    credential: Credential
     reason: str
 
 
 #: What one declared secret needs. Decided while the plan is built rather than midway
 #: through performing it, because `--dry-run` is only worth running if it reaches the
 #: same verdict the real run will: a plan that prints `sync` and exits 0 where the run
-#: exits 1 predicts nothing. Reading the keychain is a local existence check, so the
-#: prediction costs milliseconds. [LAW:effects-at-boundaries]
+#: exits 1 predicts nothing. Asking a source whether it holds the credential is a local
+#: check, so the prediction costs milliseconds. [LAW:effects-at-boundaries]
 SecretPlan = SyncSecret | KeepSecret | MissingSecret
 
 
@@ -228,7 +229,7 @@ def warn(message: str) -> None:
 def preflight(cwd: Path) -> tuple[Path, Repo, str | None, str]:
     """Establish the preconditions both targets need, each failing with its own cause.
 
-    The keychain is deliberately absent: it is an input to exactly one effect, and is
+    Credentials are deliberately absent: each is an input to exactly one effect, and is
     demanded only at the moment that effect must write. A run that changes nothing needs
     no credential and must not stop for one.
 
@@ -273,36 +274,37 @@ def snapshot(root: Path, rendered: Rendered, upstream: str | None) -> WorkflowCh
     )
 
 
-def plan_secret(repo: str, name: str, item: str) -> SecretPlan:
-    """Decide what one secret needs, from the keychain and the repo's own two stores.
+def plan_secret(repo: str, name: str, credential: Credential) -> SecretPlan:
+    """Decide what one secret needs, from its declared source and the repo's two stores.
 
-    The keychain is the canonical copy, so reaching it means re-syncing and a rotated
-    credential propagates. Without it the stores are the only evidence, and they answer
-    three ways: both hold it → the observable desired state already holds; one holds it
-    → broken in a way this machine cannot repair, and the other store's PRs would review
-    unauthenticated; neither → the reviewer cannot authenticate at all, and a later
-    "clean review" would be a lie. [LAW:one-source-of-truth] [LAW:no-silent-failure]
+    The declared source is the canonical copy, so reaching it means re-syncing and a
+    rotated credential propagates. Without it the stores are the only evidence, and they
+    answer three ways: both hold it → the observable desired state already holds; one
+    holds it → broken in a way this machine cannot repair, and the other store's PRs
+    would review unauthenticated; neither → the reviewer cannot authenticate at all, and
+    a later "clean review" would be a lie. [LAW:one-source-of-truth]
+    [LAW:no-silent-failure]
     """
-    if keychain.has_item(item):
-        return SyncSecret(name, item)
+    if credential.present():
+        return SyncSecret(name, credential)
 
     missing = ghops.stores_missing(repo, name)
     if not missing:
-        return KeepSecret(name, item)
+        return KeepSecret(name, credential)
     if len(missing) < len(ghops.SECRET_STORES):
         return MissingSecret(
             name,
-            item,
+            credential,
             f"{name} is missing from the {', '.join(missing)} secret store on {repo}, and "
-            f"keychain item {item!r} is not available to set it — reviews on "
-            f"{'/'.join(missing)}-triggered PRs would run unauthenticated. Add that "
-            f"keychain item and re-run.",
+            f"{credential.description} is not available to set it — reviews on "
+            f"{'/'.join(missing)}-triggered PRs would run unauthenticated. Provide that "
+            f"credential and re-run.",
         )
     return MissingSecret(
         name,
-        item,
-        f"{name} is not set on {repo} and keychain item {item!r} is not available to set "
-        f"it — the reviewer cannot authenticate. Add that keychain item and re-run.",
+        credential,
+        f"{name} is not set on {repo} and {credential.description} is not available to "
+        f"set it — the reviewer cannot authenticate. Provide that credential and re-run.",
     )
 
 
@@ -322,7 +324,7 @@ def build_plan(cwd: Path, home: Path) -> Plan:
         secrets = [
             future.result()
             for future in [
-                pool.submit(plan_secret, repo.name_with_owner, name, credential.item)
+                pool.submit(plan_secret, repo.name_with_owner, name, credential)
                 for name, credential in declared
             ]
         ]
@@ -351,7 +353,7 @@ def describe(plan: Plan) -> None:
     say(f"config   {sources}")
     say(f"action   {plan.action_ref}")
     for change in plan.changes:
-        say(f"workflow {change.verb:9} {change.rendered.path}  ({change.rendered.template_file})")
+        say(f"workflow {change.verb:9} {change.rendered.path}  ({change.rendered.base_file})")
     for secret in plan.secrets:
         say(f"secret   {_secret_verb(secret):9} {secret.name}  ({_secret_detail(secret)})")
     # Said up front, not after the writes: a dry run has to be able to tell you it will
@@ -371,27 +373,27 @@ def _secret_verb(secret: SecretPlan) -> str:
 
 def _secret_detail(secret: SecretPlan) -> str:
     if isinstance(secret, SyncSecret):
-        return f"keychain item {secret.item}"
+        return secret.credential.description
     if isinstance(secret, KeepSecret):
-        return f"keychain item {secret.item} is not on this machine; both stores have it"
-    return f"keychain item {secret.item} is not on this machine"
+        return f"{secret.credential.description} is unavailable here; both stores have it"
+    return f"{secret.credential.description} is unavailable here"
 
 
 def _converge_secret(repo: str, secret: SecretPlan) -> None:
     """Perform one secret's decision. The deciding was done when the plan was built."""
     if isinstance(secret, SyncSecret):
-        ghops.sync_secret(repo, secret.name, secret.item)
+        ghops.sync_secret(repo, secret.name, secret.credential)
         say(
             f"✓ synced {secret.name} on {repo} (Actions + Dependabot) "
-            f"from keychain item {secret.item}"
+            f"from {secret.credential.description}"
         )
         return
     if isinstance(secret, KeepSecret):
         warn(
-            f"! {secret.name} is set on {repo} but keychain item {secret.item!r} is not on "
-            f"this machine,\n  so it cannot be re-synced from here; the existing repo "
-            f"secrets are left as-is.\n  To re-enable syncing: add keychain item "
-            f"{secret.item!r} on this machine."
+            f"! {secret.name} is set on {repo} but {secret.credential.description} is not "
+            f"available here,\n  so it cannot be re-synced from this machine; the existing "
+            f"repo secrets are left as-is.\n  To re-enable syncing: provide "
+            f"{secret.credential.description}."
         )
         return
     raise EffectError(secret.reason)
@@ -425,7 +427,7 @@ def apply(plan: Plan) -> None:
 
 
 def _write_workflows(plan: Plan) -> None:
-    """Make each workflow file on disk match its template.
+    """Make each workflow file on disk match its base.
 
     This step speaks only about the FILE. What the repository ends up running is the
     landing step's sentence to say, and merging the two is how "wrote the file" came to
@@ -433,7 +435,7 @@ def _write_workflows(plan: Plan) -> None:
     """
     for change in plan.changes:
         if not change.needs_write:
-            say(f"✓ {change.rendered.path} matches its template")
+            say(f"✓ {change.rendered.path} matches its base")
             continue
         target = plan.root / change.rendered.path
         # The filesystem is as much "the world" as gh is, and it refuses for the same
@@ -452,7 +454,7 @@ def _write_workflows(plan: Plan) -> None:
 def _land(plan: Plan) -> None:
     """Commit the changed workflows onto the current branch and push them.
 
-    The commit rides the branch the caller is already working on, so a template change
+    The commit rides the branch the caller is already working on, so a base change
     reaches the open PR without costing anyone a second PR to review and merge. Where it
     cannot, the file is still written and the reason is reported — a hold is a fact
     about where we are, not a failure of the install. Which states hold is decided in

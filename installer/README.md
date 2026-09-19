@@ -3,9 +3,9 @@
 Installs the CoPirate code review action into a repository and keeps it current.
 
 It is built to be run *before every review*, not once at setup. Each run re-renders every
-workflow from its template, re-syncs every credential from the keychain, and writes only
-what differs — so a template change or a rotated token reaches a repo the next time
-anyone reviews in it, rather than whenever someone remembers to reinstall.
+workflow from its base, re-syncs every declared credential, and writes only what differs
+— so a base change or a rotated token reaches a repo the next time anyone reviews in it,
+rather than whenever someone remembers to reinstall.
 
 When a rendered workflow does change, the installer commits it to the branch you are on
 and pushes. The change rides the pull request you already have open; it never costs you a
@@ -34,7 +34,7 @@ copirate-review install
 repo     promptctl/copirate-code-review-agent (origin) on my-feature-branch
 config   /Users/you/.config/copirate-review/config.yaml, .copirate-review.yaml
 action   promptctl/copirate-code-review-agent@v1
-workflow update    .github/workflows/code-review.yml  (…/templates/pr-review.yml.j2)
+workflow update    .github/workflows/code-review.yml  ((shipped) pr-review.yml)
 secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
 ✓ synced CLAUDE_CODE_OAUTH_TOKEN on promptctl/… (Actions + Dependabot) from keychain item …
 ✓ wrote .github/workflows/code-review.yml (uses ./)
@@ -63,8 +63,9 @@ nothing, which is the only thing a dry run is for. The `secret` line says which 
 
 ```
 secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
-secret   keep      SOME_OTHER_TOKEN  (keychain item … is not on this machine; both stores have it)
-secret   MISSING   A_THIRD_TOKEN  (keychain item … is not on this machine)
+secret   sync      ZAI_API_KEY  (environment variable $ZAI_API_KEY)
+secret   keep      SOME_OTHER_TOKEN  (keychain item … is unavailable here; both stores have it)
+secret   MISSING   A_THIRD_TOKEN  (keychain item … is unavailable here)
 ```
 
 The repository it provisions is the one the **current branch pushes to** — its upstream's
@@ -101,19 +102,22 @@ commit_message: "chore: converge the AI code review workflow"
 # under its own name — declaring a secret provisions it and passes it.
 secrets:
   CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP
+  ZAI_API_KEY: env:ZAI_API_KEY
 
 # Keyed by the file each one writes.
 workflows:
   .github/workflows/code-review.yml:
-    template: pr-review
+    base: pr-review
     inputs:
       MAX_REVIEW_ROUNDS: 12
 ```
 
-`inputs:` is rendered verbatim into the action step's `with:` block. It is deliberately
-open — every input [`action.yml`](../action.yml) accepts is reachable from here, and a new
-one needs no release of this installer. Values may be strings, numbers, or booleans; all
-three reach the action as the strings it reads.
+`inputs:` becomes the review step's `with:` block, replacing whatever the base carried
+there. It is deliberately open — every input [`action.yml`](../action.yml) accepts is
+reachable from here, and a new one needs no release of this installer. Values may be
+strings, numbers, or booleans; all three reach the action as the strings it reads, and
+all three are emitted quoted, so an input spelled `no` or `5` cannot arrive as a boolean
+or a number.
 
 **A null deletes the key it names.** One rule, at every depth — it is how a repo opts out
 of something the fleet layer gave it:
@@ -130,74 +134,112 @@ workflows:
 
 ### Credentials
 
-The only source is `keychain:<item>` — a macOS keychain generic-password item, by service
-name. The item is *declared*, never derived from the secret name: the action can only read
-`CLAUDE_CODE_OAUTH_TOKEN`, but which account's token that holds varies by which account
-has quota, so swapping accounts is editing the right-hand side.
+**Every credential is declared in the configuration.** Nothing is hardcoded, nothing is
+inferred from a secret's name, and no default ships inside the installer — the layer that
+is identical on every machine in the world is the one layer that cannot name your keychain
+item. Both sides of each line are arbitrary and independent:
 
-No environment variable overrides it. An override is a second, invisible answer to "which
-credential does this repo get", firing from whichever process happened to export it, while
-the config still names the account you would read there.
+```yaml
+secrets:
+  CLAUDE_CODE_OAUTH_TOKEN: keychain:reviewer-acct-b    # macOS keychain item, by service name
+  ZAI_API_KEY: env:ZAI_API_KEY                         # an exported environment variable
+  ANY_SECRET_NAME: keychain:any-item-name
+```
 
-The value never enters the installer's memory: it flows keychain → `gh` over an OS pipe,
-never bound to a variable, never in `argv`, never printed.
+The left side is the GitHub secret the action reads; the right side is where its value
+comes from on the machine running the installer. They are separate because which account's
+token stands behind `CLAUDE_CODE_OAUTH_TOKEN` changes when quota does — deriving one from
+the other would make that swap unexpressible.
+
+**Reading a keychain item fetches that item and nothing else.** The lookup is
+`security find-generic-password -s <item>`, by service name. The keychain is never listed,
+dumped, or searched by pattern, so a run cannot see — let alone forward — a credential it
+was not sent for.
+
+For `keychain:`, the value never enters the installer's memory at all: it flows keychain →
+`gh` over an OS pipe, never bound to a variable, never in `argv`, never printed. For
+`env:`, the honest statement is narrower, and it is stated rather than glossed: the value
+is already in this process's environment because you exported it there, and nothing here
+can undo that. What the installer still guarantees is that it never copies it into a
+variable, never puts it in `argv` where `ps` would show it, and never prints it.
 
 A keychain that cannot be *read* — locked, or an authorization prompt you dismissed — is
 its own error and says so. It is deliberately not folded into "the item is missing": that
 verdict sends you to create a credential you are already looking at, while the real cause
 goes unnamed. Only `security`'s own not-found status means absent.
 
-The keychain is reachable → re-sync, so a rotation propagates. Otherwise the repo's own
+The source is reachable → re-sync, so a rotation propagates. Otherwise the repo's own
 two stores are the only evidence, and they answer three ways: present in **both** → warn
 that re-syncing is impossible from this machine and leave them; present in **one** → fail,
 because the state is broken in a way this machine cannot repair and the missing store's
 PRs would review unauthenticated; present in **neither** → fail, because the reviewer
 cannot authenticate at all and a later "clean review" would be a lie.
 
-## Templates
+## Bases
 
-A workflow names the template it renders from. That name resolves to `<name>.yml.j2` in
-the first of these that has it:
+**There is no template language.** A base is a *complete, runnable GitHub Actions
+workflow* — you can copy it into `.github/workflows/` and it reviews pull requests as-is.
+The installer parses it into typed objects, rebinds the one step whose `id` is `review`,
+and serializes the result back to YAML.
+
+That is not a stylistic preference. A workflow is full of `${{ … }}`, which collides with
+every mainstream template engine's delimiters, so a template has to either move its
+delimiters or escape on every line. And a template renders *text*, which means a
+malformed one produces a malformed workflow that nothing notices until GitHub rejects it.
+Parsing and re-serializing makes the output well-formed by construction, and makes the
+base a file you can lint, run, and review like any other workflow.
+
+A workflow names the base it renders from. That name resolves to `<name>.yml` in the
+first of these that has it:
 
 ```
-.copirate-review/templates/           # this repository
-~/.config/copirate-review/templates/  # this machine
-the templates shipped in this package
+.copirate-review/bases/           # this repository
+~/.config/copirate-review/bases/  # this machine
+the bases shipped in this package
 ```
 
-So a repo ships its own workflow shape by dropping a file in the first directory. It never
-forks the installer, and it keeps every other part of the configuration.
+So a repo ships its own workflow shape by dropping a file in the first directory. It
+never forks the installer, and it keeps every other part of the configuration.
 
-Templates are [Jinja2](https://jinja.palletsprojects.com/), with the delimiters moved out
-of GitHub Actions' way — `<< expression >>`, `<% statement %>`, `<# comment #>`. Actions'
-own `${{ … }}` passes through untouched, so a template reads and edits as the workflow YAML
-it is, with no escaping ritual.
+### What the installer changes, and what it carries
 
-| Variable | |
-|---|---|
-| `action_ref` | the `uses:` ref for the review step |
-| `workflow_path` | where this render will be written |
-| `template_name` | this template's name, for the generated-file header |
-| `inputs` | the declared inputs, every value already a string |
-| `secrets` | the declared secret names, sorted |
+It rebinds exactly one step — the one with `id: review` — setting its `uses:` to the
+resolved `action_ref` and its `with:` to the declared secrets and inputs. A base with no
+such step, or with two, is refused rather than rendered into a workflow that reviews
+nothing.
 
-`| yaml_quote` encodes a value as a YAML scalar — use it on anything from `inputs`, or a
-value containing a quote will corrupt the file it renders into rather than failing.
+That id is not a marker invented for this tool. The base's own transcript-archiving step
+reads `steps.review.outputs.transcript-dir`, so the id is load-bearing inside the base
+whether or not the installer looks at it. (Matching the step by its `uses:` ref instead
+cannot work — rewriting that ref is the entire job.)
 
-A variable a template asks for and the config does not supply is an error, never an empty
-string: the alternative ships a workflow with a blank `uses:` into a consuming repo.
+The review step's `with:` block is **replaced**, not merged into. A base's `with:` is
+illustrative — it is what the base does standing alone — and merging would make it a
+second table of defaults competing with the configuration's, where the loser is invisible.
+
+Everything else is carried through: triggers, permissions, concurrency, other jobs, other
+steps, and keys this installer has never heard of. **Comments are carried too**, which is
+the reason this is not a two-line `yaml.safe_load`/`yaml.safe_dump`. A workflow's comments
+are the only place its security posture is written down — why the trigger is
+`pull_request` and not `pull_request_target`, why the untrusted checkout does not persist
+credentials — and a renderer that dropped them would pass every other test in the suite.
+
+The rendered file's own header is replaced with a generated banner naming the base and the
+search path. Nothing in it is machine-specific: a path like `/Users/you/...` in a
+committed workflow would make the file render differently for every developer and churn
+forever.
 
 ### Two things the installer does to every render
 
 **The paths it generates lead each workflow's `EXCLUDE_PATTERNS`.** Every workflow it
-writes is a derived copy of a template — a finding against one targets the copy, not its
+writes is a derived copy of a base — a finding against one targets the copy, not its
 source, and the fix would be silently reverted by the next install. So they are withheld
 from review, which is also why no workflow path is repeated in the defaults.
 
 **In the action's own repository, `action_ref` renders as `./`.** That repo must review
 each PR with *that PR's* code; a released `@v1` cannot do it. The accommodation selects a
-value and nothing else, so the same template converges there as everywhere and every
-future template change reaches it like any other consumer.
+value and nothing else, so the same base converges there as everywhere and every future
+base change reaches it like any other consumer.
 
 ## Development
 
@@ -207,5 +249,5 @@ uv sync
 uv run pytest
 ```
 
-The decision layer — layering, schema refusal, template resolution, rendering — is pure,
-so none of its tests touch a network, a keychain, or a repository.
+The decision layer — layering, schema refusal, base resolution, parsing, binding and
+rendering — is pure, so none of its tests touch a network, a keychain, or a repository.

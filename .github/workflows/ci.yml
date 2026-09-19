@@ -67,8 +67,10 @@ jobs:
     # seconds.
     #
     # This is the thing that writes every consumer's workflow and provisions their
-    # secrets. Without a job here its 80 tests run only when someone remembers to, and a
-    # regression in it merges green. [LAW:no-silent-failure]
+    # secrets. Without a job here its suite runs only when someone remembers to, and a
+    # regression in it merges green. A count of the tests is deliberately not written
+    # here: it would be a second, stale copy of something the run already reports.
+    # [LAW:no-silent-failure] [LAW:one-source-of-truth]
     runs-on: ubuntu-latest
     defaults:
       run:

@@ -2,7 +2,7 @@
 
 This module is the installer's border checkpoint. Everything downstream — the
 renderer, the planner, the effects — takes a `Config` and never re-asks whether a
-template name is well-formed, whether a credential source is supported, or whether
+base name is well-formed, whether a credential source is supported, or whether
 an input value is a string, because a `Config` carrying any of those could not have
 been built. [LAW:parse-dont-validate]
 """
@@ -15,8 +15,10 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
 from jsonschema import Draft202012Validator
+
+from . import yamldoc
+from .credentials import Credential, EnvCredential, KeychainCredential
 
 #: Repo-relative paths the repository's own layer may live at, in precedence order.
 #: Both existing is fatal rather than first-wins — two files claiming to configure one
@@ -29,15 +31,19 @@ REPO_CONFIG_PATHS = (".copirate-review.yaml", ".copirate-review/config.yaml")
 #: every repo on this machine instead of copied into each.
 HOME_CONFIG_PATH = ".config/copirate-review/config.yaml"
 
-#: Directory name holding a repo's own templates, beside its config.
-REPO_TEMPLATE_DIR = ".copirate-review/templates"
-HOME_TEMPLATE_DIR = ".config/copirate-review/templates"
+#: Directory name holding a repo's own base workflows, beside its config.
+REPO_BASE_DIR = ".copirate-review/bases"
+HOME_BASE_DIR = ".config/copirate-review/bases"
 
 #: The one input whose rendered value the installer composes rather than passes through.
 #: See `_with_generated_excluded`.
 EXCLUDE_INPUT = "EXCLUDE_PATTERNS"
 
-KEYCHAIN_SCHEME = "keychain:"
+#: The credential sources a configuration may name, by scheme. A table rather than a
+#: chain of tests: a third source is a row here and no new branch anywhere, and the
+#: refusal message names the supported set by reading the table instead of restating it.
+#: [LAW:dataflow-not-control-flow] [LAW:one-source-of-truth]
+CREDENTIAL_SOURCES = {"keychain": KeychainCredential, "env": EnvCredential}
 
 #: Keys the MERGED document must carry. Deliberately NOT in schema.json's own
 #: `required`, because that is checked against each LAYER and a layer is a patch — a
@@ -52,27 +58,15 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
-class KeychainCredential:
-    """A macOS keychain generic-password item, named by its service.
-
-    The item is the whole source. There is no fallback to the secret's own name and no
-    ambient override: a wrong declaration must surface as a missing item, never resolve
-    silently to whatever else is filed nearby. [LAW:no-silent-failure]
-    """
-
-    item: str
-
-
-@dataclass(frozen=True)
 class WorkflowSpec:
     """One workflow file to converge: where it goes, what shape it takes, what it binds.
 
-    `inputs` is already normalized to the strings the renderer will quote — the renderer
+    `inputs` is already normalized to the strings the renderer will emit — the renderer
     receives no booleans, no integers, and no absent keys to defend against.
     """
 
     path: str
-    template: str
+    base: str
     inputs: Mapping[str, str]
 
 
@@ -82,7 +76,7 @@ class Config:
 
     action_ref: str
     commit_message: str
-    secrets: Mapping[str, KeychainCredential]
+    secrets: Mapping[str, Credential]
     workflows: tuple[WorkflowSpec, ...]
 
 
@@ -97,9 +91,9 @@ def _read_layer(path: Path) -> dict[str, Any]:
     nothing is a real, ordinary state, not an error. [LAW:dataflow-not-control-flow]
     """
     try:
-        loaded = yaml.safe_load(path.read_text())
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"{path}: not valid YAML — {exc}") from exc
+        loaded, _ = yamldoc.load(path.read_text(), str(path))
+    except yamldoc.YamlError as exc:
+        raise ConfigError(str(exc)) from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
@@ -152,18 +146,21 @@ def merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _credential(source_uri: str, secret_name: str) -> KeychainCredential:
-    """Parse a credential source into the one kind of source there is.
+def _credential(source_uri: str, secret_name: str) -> Credential:
+    """Parse `<scheme>:<name>` into the source it names.
 
-    The scheme is the seam a second kind would arrive through, so the error names the
-    supported set rather than saying the value is malformed. [LAW:parse-dont-validate]
+    Returns a type that could not have existed before the check, so nothing downstream
+    re-asks whether a source is supported or where its value comes from — the arm it
+    got IS the answer. [LAW:parse-dont-validate]
     """
-    if not source_uri.startswith(KEYCHAIN_SCHEME):
+    scheme, separator, name = source_uri.partition(":")
+    supported = ", ".join(f"{s}:<name>" for s in CREDENTIAL_SOURCES)
+    if not separator or scheme not in CREDENTIAL_SOURCES or not name:
         raise ConfigError(
             f"secrets.{secret_name}: unsupported credential source {source_uri!r}. "
-            f"Supported schemes: {KEYCHAIN_SCHEME}<item>."
+            f"Supported: {supported}."
         )
-    return KeychainCredential(item=source_uri[len(KEYCHAIN_SCHEME) :])
+    return CREDENTIAL_SOURCES[scheme](name)
 
 
 def _render_value(value: str | int | float | bool) -> str:
@@ -182,7 +179,7 @@ def _render_value(value: str | int | float | bool) -> str:
 def _with_generated_excluded(inputs: dict[str, str], generated: tuple[str, ...]) -> dict[str, str]:
     """Prepend the paths this installer generates to the review's exclude patterns.
 
-    Every workflow the installer writes is a derived copy of a template: a finding
+    Every workflow the installer writes is a derived copy of a base: a finding
     against one targets the copy, not its source, and any fix would be silently reverted
     by the next install. So they are withheld from review — uniformly, for every path
     the run generates, which is why no workflow path is repeated in `defaults.yaml`.
@@ -224,13 +221,13 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
     for path in generated:
         spec = raw_workflows[path]
         # Required of the MERGED document, not of each layer. A layer is a PATCH — a repo
-        # overriding one input must not have to restate the template it inherits — so the
+        # overriding one input must not have to restate the base it inherits — so the
         # schema cannot carry this and the check lives at the one place holding the whole
         # document. [LAW:single-enforcer]
-        if "template" not in spec:
+        if "base" not in spec:
             raise ConfigError(
-                f"{source}: workflows.{path} has no template. Every workflow names the "
-                f"template it renders from; add `template: <name>`."
+                f"{source}: workflows.{path} has no base. Every workflow names the base "
+                f"workflow it is rendered from; add `base: <name>`."
             )
         # Composed BEFORE the collision check, because the check has to see what will
         # actually be rendered. Checking the declared inputs alone lets an injected name
@@ -252,7 +249,7 @@ def parse(merged: Mapping[str, Any], source: str) -> Config:
         workflows.append(
             WorkflowSpec(
                 path=path,
-                template=spec["template"],
+                base=spec["base"],
                 inputs=inputs,
             )
         )
@@ -289,8 +286,12 @@ def layer_paths(repo_root: Path, home: Path) -> tuple[Path, ...]:
 
 def load(repo_root: Path, home: Path) -> tuple[Config, tuple[Path, ...]]:
     """Read every layer, merge them, and parse the result. Returns the layers it used."""
+    # ONE YAML reader for the whole installer. Two would be two spec versions: YAML 1.1
+    # reads a bare `on` as the boolean true and 1.2 reads it as the string, so the same
+    # line would mean different things in a config file and in a base workflow.
+    # [LAW:one-source-of-truth]
     defaults_text = resources.files(__package__).joinpath("defaults.yaml").read_text()
-    merged: dict[str, Any] = yaml.safe_load(defaults_text)
+    merged: dict[str, Any] = yamldoc.load(defaults_text, "the shipped defaults")[0]
 
     paths = layer_paths(repo_root, home)
     for path in paths:

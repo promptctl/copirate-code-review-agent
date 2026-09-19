@@ -19,19 +19,26 @@ action_ref: promptctl/copirate-code-review-agent@v1
 
 commit_message: "Converge the AI code review workflow"
 
-# Which account's token CLAUDE_CODE_OAUTH_TOKEN holds is declared here and nowhere else.
-# The action can only read one name, but which account has quota varies — so the keychain
-# item is declared rather than derived from the secret name, and swapping accounts is
-# editing the right-hand side. No environment variable overrides it: an override is a
-# second, invisible answer to "which credential does this repo get", firing from whichever
-# process happened to export it while this line still names the account you would read.
-# [LAW:one-source-of-truth] [LAW:no-shared-mutable-globals]
-secrets:
-  CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP
+# EMPTY, deliberately. A credential belongs to whoever runs the installer, and the
+# shipped layer is the one layer that is the same on every machine in the world — so a
+# default here would be one person's keychain item name, inherited by every repository
+# that never asked for it, and silently wrong for all of them. Declare yours in
+# ~/.config/copirate-review/config.yaml to cover every repo on this machine, or in a
+# repository's own .copirate-review.yaml:
+#
+#   secrets:
+#     CLAUDE_CODE_OAUTH_TOKEN: keychain:CLAUDE_CODE_OAUTH_TOKEN_SIGNUP
+#     ZAI_API_KEY: env:ZAI_API_KEY
+#
+# The left side is the repo secret's name, which the action reads; the right side names
+# where its value comes from on this machine. They are separate because which account's
+# token stands behind a name changes when quota does, and deriving one from the other
+# would make that swap unexpressible. [LAW:one-source-of-truth]
+secrets: {}
 
 workflows:
   .github/workflows/code-review.yml:
-    template: pr-review
+    base: pr-review
     inputs:
       # On for EVERY repo — a universal default, not a per-repo divergence that leaked in.
       # On a PR that bumps a dependency the reviewer fetches the bumped module's upstream

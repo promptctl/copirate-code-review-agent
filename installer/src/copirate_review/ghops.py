@@ -6,7 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from . import keychain
+from .credentials import Credential, is_empty, pipe_into
 from .shell import EffectError, require, run, succeeds
 
 #: GitHub feeds Dependabot-triggered runs from a store SEPARATE from the Actions one, so
@@ -91,17 +91,17 @@ def stores_missing(repo: str, name: str) -> tuple[str, ...]:
     return tuple(absent)
 
 
-def sync_secret(repo: str, name: str, item: str) -> None:
-    """Write one keychain item into both of the repo's secret stores.
+def sync_secret(repo: str, name: str, credential: Credential) -> None:
+    """Write one declared credential into both of the repo's secret stores.
 
     `-R` pins the repo `resolve` was given, which is the one the branch pushes to.
     Without it gh re-resolves from the remotes itself and prefers `upstream` over
     `origin`, so in a fork clone the credential would be written to the parent — a repo
     the pull request will never run in, and often one the operator cannot write to.
     """
-    if keychain.is_empty(item):
+    if is_empty(credential):
         raise EffectError(
-            f"keychain item {item!r} has an empty value — refusing to set an empty {name}."
+            f"{credential.description} has an empty value — refusing to set an empty {name}."
         )
     # The two stores are two independent network writes of the same value, so they cost
     # one write's latency rather than two. The installer runs on every review; the
@@ -109,8 +109,8 @@ def sync_secret(repo: str, name: str, item: str) -> None:
     with ThreadPoolExecutor(max_workers=len(SECRET_STORES)) as pool:
         writes = [
             pool.submit(
-                keychain.pipe_into,
-                item,
+                pipe_into,
+                credential,
                 ["gh", "secret", "set", name, "-R", repo, "--app", store],
             )
             for store in SECRET_STORES
