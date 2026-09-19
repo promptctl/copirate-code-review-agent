@@ -13,8 +13,15 @@ import pytest
 
 from copirate_review.config import Config
 from copirate_review.ghops import Repo
-from copirate_review.gitops import UPSTREAM, blob_at, push_remote, remote_url
-from copirate_review.install import Plan, landing_for, snapshot
+from copirate_review.gitops import (
+    UPSTREAM,
+    blob_at,
+    current_branch,
+    push_remote,
+    remote_url,
+    upstream_ref,
+)
+from copirate_review.install import Plan, Unpublished, landing_for, snapshot
 from copirate_review.render import Rendered
 from copirate_review.shell import EffectError
 
@@ -33,17 +40,25 @@ def write(root: Path, text: str = TEXT) -> None:
     (root / WORKFLOW).write_text(text)
 
 
+def snap(root: Path, text: str = TEXT):
+    """Take the snapshot the way a real run does, upstream and all."""
+    return snapshot(root, rendered(text), upstream_ref(root, current_branch(root)))
+
+
 def plan_for(root: Path, *changes) -> Plan:
+    branch = current_branch(root) or "feature"
     return Plan(
         root=root,
         repo=Repo(name_with_owner="o/r", default_branch="main"),
-        branch="feature",
+        branch=branch,
         remote="origin",
-        landing=landing_for("feature", "main"),
+        upstream=upstream_ref(root, branch),
+        landing=landing_for(branch, "not-the-default-branch"),
         config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
         action_ref="o/r@v1",
         layers=(),
         changes=tuple(changes),
+        secrets=(),
     )
 
 
@@ -80,7 +95,7 @@ def test_a_workflow_written_but_never_committed_is_not_reported_as_converged(rep
     then calls that converged — forever, because every later run finds the same file.
     """
     write(repo)
-    change = snapshot(repo, rendered())
+    change = snap(repo)
 
     assert change.needs_write is False, "the file on disk already matches"
     assert change.needs_commit is True, "but HEAD does not have it"
@@ -93,7 +108,7 @@ def test_a_committed_workflow_that_was_never_pushed_still_has_somewhere_to_go(pu
     write(pushed_repo)
     git(pushed_repo, "add", "-A")
     git(pushed_repo, "commit", "-qm", "add")
-    change = snapshot(pushed_repo, rendered())
+    change = snap(pushed_repo)
 
     assert change.needs_write is False
     assert change.needs_commit is False
@@ -109,7 +124,7 @@ def test_a_workflow_committed_and_pushed_is_finally_converged(pushed_repo):
     git(pushed_repo, "add", "-A")
     git(pushed_repo, "commit", "-qm", "add")
     git(pushed_repo, "push", "-q")
-    change = snapshot(pushed_repo, rendered())
+    change = snap(pushed_repo)
 
     assert (change.needs_write, change.needs_commit, change.needs_push) == (False, False, False)
     assert change.verb == "unchanged"
@@ -121,7 +136,7 @@ def test_a_template_change_reaches_every_place_the_old_text_had(pushed_repo):
     git(pushed_repo, "add", "-A")
     git(pushed_repo, "commit", "-qm", "add")
     git(pushed_repo, "push", "-q")
-    change = snapshot(pushed_repo, rendered("name: Review v2\n"))
+    change = snap(pushed_repo, "name: Review v2\n")
 
     assert (change.needs_write, change.needs_commit, change.needs_push) == (True, True, True)
     assert change.verb == "update"
@@ -134,11 +149,57 @@ def test_a_hand_edited_workflow_is_rewritten_without_inventing_a_commit(pushed_r
     git(pushed_repo, "commit", "-qm", "add")
     git(pushed_repo, "push", "-q")
     write(pushed_repo, "name: someone edited this by hand\n")
-    change = snapshot(pushed_repo, rendered())
+    change = snap(pushed_repo)
 
     assert change.needs_write is True
     assert (change.needs_commit, change.needs_push) == (False, False)
     assert plan_for(pushed_repo, change).unlanded_paths == []
+
+
+# --- a branch nobody has published ------------------------------------------------
+
+
+def test_a_private_branch_is_never_published_just_because_it_has_no_upstream(pushed_repo):
+    """The regression: an unpublished branch is not BEHIND the remote, it is absent.
+
+    A developer cuts a branch from a default branch where the workflow is already
+    converged and stacks private commits on it. Nothing needs writing, nothing needs
+    committing — and reading "no upstream" as "the remote is missing this file" made the
+    run push anyway, publishing every one of those commits. The installer converges a
+    workflow; it does not decide that someone's branch should become public.
+    """
+    write(pushed_repo)
+    git(pushed_repo, "add", "-A")
+    git(pushed_repo, "commit", "-qm", "converge on the default branch")
+    git(pushed_repo, "push", "-q")
+
+    git(pushed_repo, "checkout", "-q", "-b", "private-wip")
+    (pushed_repo / "secret-plans.txt").write_text("not for the remote\n")
+    git(pushed_repo, "add", "-A")
+    git(pushed_repo, "commit", "-qm", "WIP")
+
+    change = snap(pushed_repo)
+    assert isinstance(change.remote, Unpublished)
+    assert (change.needs_write, change.needs_commit, change.needs_push) == (False, False, False)
+    assert change.verb == "unchanged"
+    assert plan_for(pushed_repo, change).unlanded_paths == [], "nothing to land, nothing to push"
+
+
+def test_a_workflow_committed_onto_an_unpublished_branch_waits_for_its_own_push(pushed_repo):
+    """There IS something to land, and it still is not ours to publish.
+
+    The commit goes on the branch; the developer's first push carries it. What must not
+    happen is the installer creating the remote branch on their behalf.
+    """
+    git(pushed_repo, "checkout", "-q", "-b", "private-wip")
+    write(pushed_repo)
+    change = snap(pushed_repo)
+
+    assert isinstance(change.remote, Unpublished)
+    assert change.needs_commit is True
+    plan = plan_for(pushed_repo, change)
+    assert plan.commit_paths == [WORKFLOW]
+    assert plan.upstream is None, "and _land refuses to push on that"
 
 
 # --- which remote we are talking about --------------------------------------------

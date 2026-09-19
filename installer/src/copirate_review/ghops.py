@@ -115,5 +115,15 @@ def sync_secret(repo: str, name: str, item: str) -> None:
             )
             for store in SECRET_STORES
         ]
-        for write in writes:
-            write.result()
+        # Both drained, both reported. Stopping at the first raise loses the second
+        # future's exception entirely when the pool shuts down — and one credential
+        # failing usually has one cause, so BOTH stores fail together and the operator
+        # is told about half of it. [LAW:no-silent-failure]
+        failures = []
+        for store, write in zip(SECRET_STORES, writes):
+            try:
+                write.result()
+            except Exception as exc:  # reported below; none is swallowed
+                failures.append(f"{store}: {exc}")
+    if failures:
+        raise EffectError(f"could not write {name} to {repo} — " + "; ".join(failures))

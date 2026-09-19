@@ -86,14 +86,24 @@ def pipe_into(item: str, argv: list[str]) -> str:
         find_errors.seek(0)
         find_err = find_errors.read().decode(errors="replace")
 
-    # Checked reader-first so the most specific cause wins: a consumer that died because
-    # its input never arrived reports a closed pipe, which says nothing about the locked
-    # keychain that actually caused it.
-    if find.returncode != 0:
+    # Reader first, but only when the reader has something to SAY. A pipeline fails in
+    # both directions: a consumer that died because its input never arrived reports a
+    # closed pipe and blames the wrong end — but so does the reader, when it is the
+    # CONSUMER that exited first (a rejected `gh secret set`) and `tr` and `security`
+    # died of EPIPE behind it, nonzero and silent. Reading the order off the exit codes
+    # alone would then print `reading keychain item 'X' failed: ` with nothing after the
+    # colon, and throw away gh's actual error. Whoever explained itself is believed.
+    # [LAW:no-silent-failure]
+    if find.returncode != 0 and find_err.strip():
         raise EffectError(f"reading keychain item {item!r} failed: {find_err.strip()}")
     if consumer.returncode != 0:
         raise EffectError(
             f"`{' '.join(argv)}` failed (exit {consumer.returncode}): {consumer_err.strip()}"
+        )
+    if find.returncode != 0:
+        raise EffectError(
+            f"reading keychain item {item!r} failed: `security` exited "
+            f"{find.returncode} without explanation."
         )
     return consumer_out.strip()
 

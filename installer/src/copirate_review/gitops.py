@@ -71,6 +71,24 @@ def remote_url(root: Path, remote: str) -> str:
         ) from exc
 
 
+def upstream_ref(root: Path, branch: str | None) -> str | None:
+    """This branch's remote-tracking ref, or None when it has never been pushed.
+
+    Asked as its own question because "the remote branch does not have this file" and
+    "there is no remote branch" are different facts, and only the first is a reason to
+    push. Reading them both off a missing blob makes every local branch look one push
+    behind — so a developer who cut a branch from a converged default branch and stacked
+    private commits on it would have the whole branch published by a tool documented as
+    safe to run before every review. [LAW:types-are-the-program]
+    """
+    if branch is None:
+        return None
+    ref = output_or_none(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", UPSTREAM], cwd=root
+    )
+    return ref.strip() if ref else None
+
+
 def blob_at(root: Path, ref: str, path: str) -> str | None:
     """This path's content at a revision, or None where that revision does not have it.
 

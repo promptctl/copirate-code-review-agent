@@ -59,6 +59,40 @@ jobs:
       - name: Test
         run: npm test
 
+  installer:
+    # Its OWN job, and not a step in `test`: the installer is a Python package with its
+    # own toolchain, its own lockfile and its own failure modes, so a red check named
+    # `installer` says which half of the repo broke before anyone opens a log — the same
+    # reason `price-freshness` stands apart. It needs no npm and no bundle, so it costs
+    # seconds.
+    #
+    # This is the thing that writes every consumer's workflow and provisions their
+    # secrets. Without a job here its 80 tests run only when someone remembers to, and a
+    # regression in it merges green. [LAW:no-silent-failure]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: installer
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: installer/uv.lock
+
+      - name: Assert the lockfile matches pyproject.toml
+        # The committed uv.lock is what `--frozen` installs from, here and on every
+        # developer's machine. A lockfile that no longer agrees with its pyproject means
+        # the two disagree about what this package depends on, and the one that wins is
+        # whichever command someone happened to run. [LAW:one-source-of-truth]
+        run: uv lock --check
+
+      - name: Test
+        # `--frozen` so the run is the lockfile's, not whatever resolves today: a suite
+        # that silently upgrades its own dependencies is not a regression test.
+        run: uv run --frozen pytest
+
   price-freshness:
     # Its OWN job, not a step in `test`: this fails for a reason that has nothing to do with whether
     # the code works — the rates were copied by hand off a vendor page and nobody has re-read that page

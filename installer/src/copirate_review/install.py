@@ -21,6 +21,30 @@ from .shell import EffectError
 
 
 @dataclass(frozen=True)
+class Unpublished:
+    """This branch has no counterpart on the remote: it has never been pushed.
+
+    Not the same as a remote branch that lacks the file, and the difference decides
+    whether the installer may push. A branch nobody has published is not BEHIND — it is
+    private, and publishing it is the developer's call, not a side effect of converging
+    a workflow. Whatever the installer commits here rides their own first push.
+    """
+
+
+@dataclass(frozen=True)
+class Published:
+    """The remote branch exists; `content` is its copy of this path, if it has one."""
+
+    content: str | None
+
+
+#: What the remote branch holds for one path. A `str | None` cannot say this: `None`
+#: would have to mean both "the remote branch lacks the file" and "there is no remote
+#: branch", and those two demand opposite actions. [LAW:types-are-the-program]
+RemoteCopy = Unpublished | Published
+
+
+@dataclass(frozen=True)
 class WorkflowChange:
     """One workflow's desired text beside each of the three places it has to reach.
 
@@ -42,7 +66,7 @@ class WorkflowChange:
     rendered: Rendered
     worktree: str | None
     committed: str | None
-    pushed: str | None
+    remote: RemoteCopy
 
     @property
     def needs_write(self) -> bool:
@@ -54,7 +78,8 @@ class WorkflowChange:
 
     @property
     def needs_push(self) -> bool:
-        return self.pushed != self.rendered.text
+        """Whether the remote branch is BEHIND on this path — never merely absent."""
+        return isinstance(self.remote, Published) and self.remote.content != self.rendered.text
 
     @property
     def verb(self) -> str:
@@ -71,6 +96,39 @@ class WorkflowChange:
         if self.needs_push:
             return "push"
         return "unchanged"
+
+
+@dataclass(frozen=True)
+class SyncSecret:
+    """The keychain holds it: write it to both stores, so a rotation propagates."""
+
+    name: str
+    item: str
+
+
+@dataclass(frozen=True)
+class KeepSecret:
+    """No local copy, but both stores already hold it. Warn, and leave them alone."""
+
+    name: str
+    item: str
+
+
+@dataclass(frozen=True)
+class MissingSecret:
+    """No local copy, and the repo's stores cannot be repaired from this machine."""
+
+    name: str
+    item: str
+    reason: str
+
+
+#: What one declared secret needs. Decided while the plan is built rather than midway
+#: through performing it, because `--dry-run` is only worth running if it reaches the
+#: same verdict the real run will: a plan that prints `sync` and exits 0 where the run
+#: exits 1 predicts nothing. Reading the keychain is a local existence check, so the
+#: prediction costs milliseconds. [LAW:effects-at-boundaries]
+SecretPlan = SyncSecret | KeepSecret | MissingSecret
 
 
 @dataclass(frozen=True)
@@ -131,11 +189,13 @@ class Plan:
     repo: Repo
     branch: str | None
     remote: str
+    upstream: str | None
     landing: Landing
     config: Config
     action_ref: str
     layers: tuple[Path, ...]
     changes: tuple[WorkflowChange, ...]
+    secrets: tuple[SecretPlan, ...]
 
     @property
     def write_paths(self) -> list[str]:
@@ -193,11 +253,11 @@ def preflight(cwd: Path) -> tuple[Path, Repo, str | None, str]:
         return root, repo.result(), branch, remote
 
 
-def snapshot(root: Path, rendered: Rendered) -> WorkflowChange:
+def snapshot(root: Path, rendered: Rendered, upstream: str | None) -> WorkflowChange:
     """Read how far this rendered text has already reached, from each place in turn.
 
-    The three reads live together because they answer one question and are only ever
-    right together — the whole defect was one of them standing in for all three.
+    The reads live together because they answer one question and are only ever right
+    together — the whole defect was one of them standing in for all three.
     [LAW:one-source-of-truth]
     """
     worktree_path = root / rendered.path
@@ -205,7 +265,44 @@ def snapshot(root: Path, rendered: Rendered) -> WorkflowChange:
         rendered=rendered,
         worktree=worktree_path.read_text() if worktree_path.is_file() else None,
         committed=gitops.blob_at(root, "HEAD", rendered.path),
-        pushed=gitops.blob_at(root, gitops.UPSTREAM, rendered.path),
+        remote=(
+            Published(gitops.blob_at(root, upstream, rendered.path))
+            if upstream is not None
+            else Unpublished()
+        ),
+    )
+
+
+def plan_secret(repo: str, name: str, item: str) -> SecretPlan:
+    """Decide what one secret needs, from the keychain and the repo's own two stores.
+
+    The keychain is the canonical copy, so reaching it means re-syncing and a rotated
+    credential propagates. Without it the stores are the only evidence, and they answer
+    three ways: both hold it → the observable desired state already holds; one holds it
+    → broken in a way this machine cannot repair, and the other store's PRs would review
+    unauthenticated; neither → the reviewer cannot authenticate at all, and a later
+    "clean review" would be a lie. [LAW:one-source-of-truth] [LAW:no-silent-failure]
+    """
+    if keychain.has_item(item):
+        return SyncSecret(name, item)
+
+    missing = ghops.stores_missing(repo, name)
+    if not missing:
+        return KeepSecret(name, item)
+    if len(missing) < len(ghops.SECRET_STORES):
+        return MissingSecret(
+            name,
+            item,
+            f"{name} is missing from the {', '.join(missing)} secret store on {repo}, and "
+            f"keychain item {item!r} is not available to set it — reviews on "
+            f"{'/'.join(missing)}-triggered PRs would run unauthenticated. Add that "
+            f"keychain item and re-run.",
+        )
+    return MissingSecret(
+        name,
+        item,
+        f"{name} is not set on {repo} and keychain item {item!r} is not available to set "
+        f"it — the reviewer cannot authenticate. Add that keychain item and re-run.",
     )
 
 
@@ -213,22 +310,35 @@ def build_plan(cwd: Path, home: Path) -> Plan:
     root, repo, branch, remote = preflight(cwd)
     config, layers = load(root, home)
     action_ref = resolve_action_ref(config, repo.name_with_owner)
+    upstream = gitops.upstream_ref(root, branch)
 
     changes = [
-        snapshot(root, render(config, spec, action_ref, root, home))
+        snapshot(root, render(config, spec, action_ref, root, home), upstream)
         for spec in config.workflows
     ]
+
+    declared = sorted(config.secrets.items())
+    with ThreadPoolExecutor(max_workers=max(len(declared), 1)) as pool:
+        secrets = [
+            future.result()
+            for future in [
+                pool.submit(plan_secret, repo.name_with_owner, name, credential.item)
+                for name, credential in declared
+            ]
+        ]
 
     return Plan(
         root=root,
         repo=repo,
         branch=branch,
         remote=remote,
+        upstream=upstream,
         landing=landing_for(branch, repo.default_branch),
         config=config,
         action_ref=action_ref,
         layers=layers,
         changes=tuple(changes),
+        secrets=tuple(secrets),
     )
 
 
@@ -242,57 +352,57 @@ def describe(plan: Plan) -> None:
     say(f"action   {plan.action_ref}")
     for change in plan.changes:
         say(f"workflow {change.verb:9} {change.rendered.path}  ({change.rendered.template_file})")
-    for name, credential in sorted(plan.config.secrets.items()):
-        say(f"secret   sync      {name}  (keychain item {credential.item})")
+    for secret in plan.secrets:
+        say(f"secret   {_secret_verb(secret):9} {secret.name}  ({_secret_detail(secret)})")
     # Said up front, not after the writes: a dry run has to be able to tell you it will
-    # not commit, or its whole purpose — predicting the real run — is unmet.
+    # not commit — or will commit and not push — or its whole purpose is unmet.
     if isinstance(plan.landing, Hold) and plan.unlanded_paths:
         say(f"commit   held      {plan.landing.reason}")
+    elif plan.upstream is None and plan.unlanded_paths:
+        say(
+            f"push     held      {plan.branch} is not on {plan.remote} yet; "
+            f"your next push carries it"
+        )
 
 
-def _converge_secret(repo: str, name: str, item: str) -> None:
-    """Re-sync one secret from the keychain, which is its canonical copy.
+def _secret_verb(secret: SecretPlan) -> str:
+    return {SyncSecret: "sync", KeepSecret: "keep", MissingSecret: "MISSING"}[type(secret)]
 
-    Reachable keychain → re-sync, so a rotated credential propagates on the next review.
-    Otherwise the repo's own stores are the only evidence, and they answer three ways:
-    present in both → the observable desired state holds, warn that re-syncing is
-    impossible from here; present in only one → the state is broken and unfixable from
-    this machine, so fail rather than report a half-provisioned repo as fine; present in
-    neither → fail, because the reviewer cannot authenticate and a later "clean review"
-    would be a lie. [LAW:one-source-of-truth] [LAW:no-silent-failure]
-    """
-    if keychain.has_item(item):
-        ghops.sync_secret(repo, name, item)
-        say(f"✓ synced {name} on {repo} (Actions + Dependabot) from keychain item {item}")
+
+def _secret_detail(secret: SecretPlan) -> str:
+    if isinstance(secret, SyncSecret):
+        return f"keychain item {secret.item}"
+    if isinstance(secret, KeepSecret):
+        return f"keychain item {secret.item} is not on this machine; both stores have it"
+    return f"keychain item {secret.item} is not on this machine"
+
+
+def _converge_secret(repo: str, secret: SecretPlan) -> None:
+    """Perform one secret's decision. The deciding was done when the plan was built."""
+    if isinstance(secret, SyncSecret):
+        ghops.sync_secret(repo, secret.name, secret.item)
+        say(
+            f"✓ synced {secret.name} on {repo} (Actions + Dependabot) "
+            f"from keychain item {secret.item}"
+        )
         return
-
-    missing = ghops.stores_missing(repo, name)
-    if not missing:
+    if isinstance(secret, KeepSecret):
         warn(
-            f"! {name} is set on {repo} but keychain item {item!r} is not on this machine,\n"
-            f"  so it cannot be re-synced from here; the existing repo secrets are left as-is.\n"
-            f"  To re-enable syncing: add keychain item {item!r} on this machine."
+            f"! {secret.name} is set on {repo} but keychain item {secret.item!r} is not on "
+            f"this machine,\n  so it cannot be re-synced from here; the existing repo "
+            f"secrets are left as-is.\n  To re-enable syncing: add keychain item "
+            f"{secret.item!r} on this machine."
         )
         return
-    if len(missing) < len(ghops.SECRET_STORES):
-        raise EffectError(
-            f"{name} is missing from the {', '.join(missing)} secret store on {repo}, and "
-            f"keychain item {item!r} is not available to set it — reviews on "
-            f"{'/'.join(missing)}-triggered PRs would run unauthenticated. Add that "
-            f"keychain item and re-run."
-        )
-    raise EffectError(
-        f"{name} is not set on {repo} and keychain item {item!r} is not available to set "
-        f"it — the reviewer cannot authenticate. Add that keychain item and re-run."
-    )
+    raise EffectError(secret.reason)
 
 
 def apply(plan: Plan) -> None:
     """Perform the plan: write what differs, re-sync every secret, land the result."""
-    with ThreadPoolExecutor(max_workers=len(plan.config.secrets) + 1) as pool:
+    with ThreadPoolExecutor(max_workers=len(plan.secrets) + 1) as pool:
         tasks = [
-            pool.submit(_converge_secret, plan.repo.name_with_owner, name, credential.item)
-            for name, credential in sorted(plan.config.secrets.items())
+            pool.submit(_converge_secret, plan.repo.name_with_owner, secret)
+            for secret in plan.secrets
         ]
         tasks.append(pool.submit(_write_workflows, plan))
         # Every task is drained and every failure kept, rather than the first one raising
@@ -326,8 +436,16 @@ def _write_workflows(plan: Plan) -> None:
             say(f"✓ {change.rendered.path} matches its template")
             continue
         target = plan.root / change.rendered.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(change.rendered.text)
+        # The filesystem is as much "the world" as gh is, and it refuses for the same
+        # kinds of reason: a read-only mount, a directory that is really a file, a
+        # permission. Translated here so it reaches the exit-code contract as the `1` it
+        # is, rather than as a traceback carrying whatever code the interpreter picked.
+        # [LAW:parse-dont-validate]
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(change.rendered.text)
+        except OSError as exc:
+            raise EffectError(f"could not write {target}: {exc}") from exc
         say(f"✓ wrote {change.rendered.path} (uses {plan.action_ref})")
 
 
@@ -344,6 +462,10 @@ def _land(plan: Plan) -> None:
     failed to push leaves work whose only remaining step is a push, and gating that on a
     fresh change means the next run — and every run after it — does nothing while the
     pull request still has no workflow.
+
+    It is conditional on the branch already existing on the remote. This tool converges
+    a workflow; it does not decide that someone's local branch should become public, and
+    a push is the one step here that cannot be taken back.
     """
     unlanded = plan.unlanded_paths
     if not unlanded:
@@ -360,5 +482,12 @@ def _land(plan: Plan) -> None:
     if to_commit:
         sha = gitops.commit(plan.root, to_commit, plan.config.commit_message)
         say(f"✓ committed {sha}: {', '.join(to_commit)}")
+    if plan.upstream is None:
+        warn(
+            f"! {plan.landing.branch} is not on {plan.remote} yet, so nothing was pushed "
+            f"— publishing your branch is your call, not this installer's.\n"
+            f"  Your next push carries {', '.join(unlanded)}."
+        )
+        return
     gitops.push(plan.root, plan.landing.branch, plan.remote)
     say(f"✓ pushed {plan.landing.branch} to {plan.remote}: {', '.join(unlanded)}")

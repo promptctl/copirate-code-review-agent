@@ -110,11 +110,13 @@ def test_the_report_names_the_branch_we_are_actually_on_even_when_the_commit_is_
         repo=Repo(name_with_owner="o/r", default_branch="main"),
         branch="main",
         remote="origin",
+        upstream=None,
         landing=landing_for("main", "main"),
         config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
         action_ref="o/r@v1",
         layers=(),
         changes=(),
+        secrets=(),
     )
     describe(plan)
     reported = capsys.readouterr().out

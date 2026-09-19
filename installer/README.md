@@ -16,6 +16,11 @@ would be wrong or impossible: on the default branch, on a detached `HEAD`, or in
 repository with no commits on GitHub yet (whose current branch is about to *become* the
 default). A dry run tells you about the hold before you run for real.
 
+It never pushes a branch that is not on the remote already. Converging a workflow is not
+a reason to publish someone's local branch, and a push is the one step here that cannot
+be taken back — so on an unpublished branch it commits, says so, and lets your own first
+push carry it.
+
 ```bash
 uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review
 
@@ -50,8 +55,17 @@ would agree it was fine, and the repository would have no reviewer.
 
 Preconditions are checked first and each fails with its own cause: `git` and `gh`
 installed, a git repository, `gh` authenticated, a GitHub repo it can resolve and reach.
-The keychain is *not* among them — it is an input to one effect and is demanded only when
-that effect must write, so a run that changes nothing needs no credential.
+
+Everything else — including each credential's verdict — is decided while the plan is
+built, not partway through performing it, so `--dry-run` reaches the same answer the real
+run will act on. A dry run that printed `sync` where the run exits `1` would predict
+nothing, which is the only thing a dry run is for. The `secret` line says which it is:
+
+```
+secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
+secret   keep      SOME_OTHER_TOKEN  (keychain item … is not on this machine; both stores have it)
+secret   MISSING   A_THIRD_TOKEN  (keychain item … is not on this machine)
+```
 
 The repository it provisions is the one the **current branch pushes to** — its upstream's
 remote, or `origin`. That is a deliberate single answer: asked to work it out alone, `gh`
