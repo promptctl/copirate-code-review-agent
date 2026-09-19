@@ -78,6 +78,41 @@ class Trivia(BaseModel):
     comments: Annotated[tuple[CommentSpec, ...], Field(min_length=1)]
 
 
+class KeyOrder(BaseModel):
+    """The order one mapping's keys were written in.
+
+    Only mappings with more than one key are recorded: a mapping with one key or none
+    has exactly one order, so there is nothing to remember and nothing that can drift.
+    """
+
+    model_config = {"frozen": True}
+
+    path: NodePath
+    keys: tuple[Key, ...]
+
+
+class Layout(BaseModel):
+    """Everything about a document that its data does not carry.
+
+    Comments and key order are the same KIND of fact, which is why one type holds both:
+    neither survives a round trip through plain data, both are how a reader navigates
+    the file, and losing either produces a document that is correct and misleading.
+
+    Key order looks like formatting until you remember where ruamel attaches trivia —
+    to the node BEFORE it. Reordering keys therefore MOVES COMMENTS. A base whose
+    `env:` block carries the paragraph explaining why the runner needs a proxy, written
+    above `jobs:`, renders with that paragraph sitting on `jobs:` instead, telling a
+    reader that removing `jobs:` breaks the checkout. That is the exact failure `_at`
+    refuses to commit one comment at a time, arriving wholesale through the serializer.
+    [FRAMING:representation]
+    """
+
+    model_config = {"frozen": True}
+
+    trivia: tuple[Trivia, ...] = ()
+    order: tuple[KeyOrder, ...] = ()
+
+
 class YamlError(Exception):
     """A document that is not YAML at all, with the source named."""
 
@@ -152,15 +187,28 @@ def _collect(node: Any, path: NodePath, found: list[Trivia]) -> None:
             _collect(value, (*path, index), found)
 
 
-def load(text: str, source: str) -> tuple[Any, tuple[Trivia, ...]]:
-    """Parse a document into plain data and the comments that were hanging off it."""
+def _shape(node: Any, path: NodePath, found: list[KeyOrder]) -> None:
+    if isinstance(node, dict):
+        if len(node) > 1:
+            found.append(KeyOrder(path=path, keys=tuple(node.keys())))
+        for key, value in node.items():
+            _shape(value, (*path, key), found)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            _shape(value, (*path, index), found)
+
+
+def load(text: str, source: str) -> tuple[Any, Layout]:
+    """Parse a document into plain data and everything about it the data cannot hold."""
     try:
         document = _yaml().load(text)
     except Exception as exc:  # ruamel raises several unrelated types for bad input
         raise YamlError(f"{source}: not valid YAML — {type(exc).__name__}: {exc}") from exc
-    found: list[Trivia] = []
-    _collect(document, (), found)
-    return _plain(document), tuple(found)
+    trivia: list[Trivia] = []
+    _collect(document, (), trivia)
+    order: list[KeyOrder] = []
+    _shape(document, (), order)
+    return _plain(document), Layout(trivia=tuple(trivia), order=tuple(order))
 
 
 def quoted(value: str) -> str:
@@ -230,10 +278,38 @@ def _restore(root: Any, trivia: tuple[Trivia, ...]) -> None:
         slots[item.slot] = tokens[0] if item.slot in SINGLE_TOKEN_SLOTS else tokens
 
 
-def emit(data: Any, trivia: tuple[Trivia, ...]) -> str:
-    """Render plain data back to YAML with its comments put back where they were."""
+def _reorder(root: Any, order: tuple[KeyOrder, ...]) -> None:
+    """Put each mapping's keys back in the order they were written in.
+
+    Tolerant in both directions, because the transformation between load and emit is
+    allowed to change the document: a key the recorded order names and the data no
+    longer has is skipped, and a key the data has that the record never saw keeps its
+    position relative to the others and follows them. Neither is a fault — one is a
+    rebinding that removed a key, the other one that added one.
+
+    Done BEFORE the comments go back. Re-keying a `CommentedMap` drops what is attached
+    to the keys it moves, and `_restore` is the thing that knows where those belong.
+    [LAW:no-ambient-temporal-coupling]
+    """
+    for item in order:
+        node = _at(root, item.path)
+        if not isinstance(node, dict):
+            continue
+        recorded = [key for key in item.keys if key in node]
+        wanted = recorded + [key for key in node if key not in item.keys]
+        if wanted == list(node):
+            continue
+        values = {key: node[key] for key in wanted}
+        for key in list(node):
+            del node[key]
+        node.update(values)
+
+
+def emit(data: Any, layout: Layout) -> str:
+    """Render plain data back to YAML, laid out the way it was written."""
     document = _commented(data)
-    _restore(document, trivia)
+    _reorder(document, layout.order)
+    _restore(document, layout.trivia)
     stream = io.StringIO()
     _yaml().dump(document, stream)
     return stream.getvalue()

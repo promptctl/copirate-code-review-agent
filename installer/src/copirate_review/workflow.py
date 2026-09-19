@@ -77,10 +77,13 @@ class Job(Node):
 class Workflow(Node):
     """A whole workflow document, comments included.
 
-    `trivia` is the document's comments, as data. A workflow's comments are the only
-    place its security posture is explained — why the trigger is `pull_request`, why
-    the untrusted checkout does not persist credentials — so they are part of what a
-    render has to carry, not formatting to be discarded on the way through.
+    `layout` is everything about the document the model's fields do not hold: its
+    comments and the order its keys were written in. A workflow's comments are the
+    only place its security posture is explained — why the trigger is `pull_request`,
+    why the untrusted checkout does not persist credentials — so they are part of what
+    a render has to carry, not formatting to be discarded on the way through. The order
+    is carried for the same reason and not a weaker one: ruamel attaches a comment to
+    the node BEFORE it, so reordering keys moves comments onto the wrong lines.
     [LAW:no-silent-failure]
     """
 
@@ -96,7 +99,7 @@ class Workflow(Node):
     permissions: Any = None
     concurrency: Any = None
     jobs: dict[str, Job]
-    trivia: tuple[Trivia, ...] = ()
+    layout: yamldoc.Layout = yamldoc.Layout()
 
 
 class Binding(BaseModel):
@@ -136,7 +139,7 @@ def parse(text: str, source: str) -> Workflow:
     [LAW:parse-dont-validate]
     """
     try:
-        data, trivia = yamldoc.load(text, source)
+        data, layout = yamldoc.load(text, source)
     except yamldoc.YamlError as exc:
         raise WorkflowError(str(exc)) from exc
     if not isinstance(data, dict):
@@ -145,7 +148,7 @@ def parse(text: str, source: str) -> Workflow:
             f"{type(data).__name__}."
         )
     try:
-        return Workflow.model_validate({**data, "trivia": trivia})
+        return Workflow.model_validate({**data, "layout": layout})
     except ValidationError as exc:
         detail = "\n".join(
             f"  {'.'.join(str(p) for p in error['loc']) or '(root)'}: {error['msg']}"
@@ -196,7 +199,16 @@ def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
                 )
                 for name, job in workflow.jobs.items()
             },
-            "trivia": _rehome(workflow.trivia, _path_of(workflow, old), old.with_ or {}, bound.with_ or {}),
+            "layout": workflow.layout.model_copy(
+                update={
+                    "trivia": _rehome(
+                        workflow.layout.trivia,
+                        _path_of(workflow, old),
+                        old.with_ or {},
+                        bound.with_ or {},
+                    )
+                }
+            ),
         }
     )
 
@@ -245,17 +257,26 @@ def headed(workflow: Workflow, header: str) -> Workflow:
     repository's `.github/workflows/`, and the first thing they need to know is that
     editing it accomplishes nothing. [FRAMING:representation]
     """
-    kept = tuple(item for item in workflow.trivia if not (item.path == () and item.key is None))
+    kept = tuple(
+        item for item in workflow.layout.trivia if not (item.path == () and item.key is None)
+    )
     banner = Trivia(
         path=(),
         key=None,
         slot=yamldoc.NODE_COMMENT_SLOT,
         comments=(yamldoc.CommentSpec(text=header, column=0),),
     )
-    return workflow.model_copy(update={"trivia": (banner, *kept)})
+    return workflow.model_copy(
+        update={"layout": workflow.layout.model_copy(update={"trivia": (banner, *kept)})}
+    )
 
 
 def render(workflow: Workflow) -> str:
     """Serialize back to YAML, comments and all."""
-    data = workflow.model_dump(by_alias=True, exclude_none=True, exclude={"trivia"})
-    return yamldoc.emit(data, workflow.trivia)
+    # `exclude_unset`, NOT `exclude_none`. The two differ exactly where a base writes a
+    # key with no value — `timeout-minutes:` — which is a key the document HAS and
+    # `exclude_none` deleted, because a field the model names has one representation for
+    # "absent" and "present and null". `exclude_unset` asks the question that actually
+    # distinguishes them: was this key in the document at all. [LAW:types-are-the-program]
+    data = workflow.model_dump(by_alias=True, exclude_unset=True, exclude={"layout"})
+    return yamldoc.emit(data, workflow.layout)

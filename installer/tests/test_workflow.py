@@ -52,15 +52,15 @@ def test_the_shipped_base_survives_a_parse_and_an_emit_byte_for_byte():
     It is also what keeps the base honest: the file an author edits is exactly the file
     the emitter produces, so reviewing a base is reviewing the rendered output.
     """
-    data, trivia = load(SHIPPED, "base")
-    assert emit(data, trivia) == SHIPPED
+    data, layout = load(SHIPPED, "base")
+    assert emit(data, layout) == SHIPPED
 
 
 def test_a_comment_hanging_off_a_list_item_is_restored_rather_than_dropped():
     """`key in node` is a VALUE test on a list, so this went missing once, in silence."""
     source = "on:\n  pull_request:\n    types:\n      - opened\n\njobs: {}\n"
-    data, trivia = load(source, "t")
-    assert emit(data, trivia) == source
+    data, layout = load(source, "t")
+    assert emit(data, layout) == source
 
 
 def test_a_record_of_a_place_where_nothing_was_written_cannot_be_built():
@@ -231,6 +231,63 @@ def test_a_null_valued_key_survives_rather_than_being_dropped_as_absent():
     """`on:\\n  push:` is ordinary YAML, and the key carries meaning with no value."""
     source = MINIMAL.replace("  pull_request: {}\n", "  push:\n  pull_request: {}\n")
     assert "push:" in render(bind(parse(source, "t"), binding(), "t"))
+
+
+# --- a base written in some other shape than the model's --------------------------
+
+OWN_SHAPE = """\
+name: demo
+on: push
+
+# This block exists because the runner needs a proxy on the build network.
+# Removing it makes every job fail at the checkout step.
+env:
+  HTTPS_PROXY: http://proxy.internal:3128
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes:
+    steps:
+      - id: review
+        uses: acme/review@v1
+"""
+
+
+def test_a_base_keeps_the_order_it_was_written_in():
+    """Reordering keys is not cosmetic here — it MOVES COMMENTS.
+
+    `model_dump` rebuilds a mapping in the model's declaration order, declared fields
+    first and `extra="allow"` keys appended after, so a base with `env:` above `jobs:`
+    rendered with `env:` at the bottom. ruamel attaches a comment to the node BEFORE
+    it, so the paragraph explaining the proxy block came out sitting on `jobs:`,
+    telling a reader that removing `jobs:` breaks the checkout. That is the failure
+    `_at` refuses one comment at a time, arriving wholesale through the serializer.
+    """
+    rendered = render(parse(OWN_SHAPE, "t"))
+    assert rendered == OWN_SHAPE, "a base the installer only copies comes back unchanged"
+    proxy_note = "# Removing it makes every job fail at the checkout step.\nenv:"
+    assert proxy_note in rendered, "the comment stayed on the block it explains"
+
+
+def test_a_key_written_with_no_value_is_not_the_same_as_a_key_left_out():
+    """`exclude_none` deleted `timeout-minutes:` from a base that wrote it.
+
+    A field the model names had one representation for "absent" and "present and
+    null", so the copy lost a key its original had. [LAW:types-are-the-program]
+    """
+    assert "timeout-minutes:" in render(parse(OWN_SHAPE, "t"))
+    without = OWN_SHAPE.replace("    timeout-minutes:\n", "")
+    assert "timeout-minutes" not in render(parse(without, "t")), "and absent stays absent"
+
+
+def test_rebinding_a_base_in_its_own_shape_still_finds_the_review_step():
+    """Reordering runs between the transformation and the emit; it must not hide it."""
+    bound = bind(parse(OWN_SHAPE, "t"), binding(inputs={"SCOPE": "all"}), "t")
+    rendered = render(bound)
+    assert "uses: o/r@v1" in rendered
+    assert 'SCOPE: "all"' in rendered
+    assert "HTTPS_PROXY" in rendered, "and carries through what it does not touch"
 
 
 # --- is it actually a GitHub Actions workflow -------------------------------------

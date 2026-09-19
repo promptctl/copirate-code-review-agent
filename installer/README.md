@@ -247,6 +247,13 @@ are the only place its security posture is written down — why the trigger is
 `pull_request` and not `pull_request_target`, why the untrusted checkout does not persist
 credentials — and a renderer that dropped them would pass every other test in the suite.
 
+**Key order is carried for the same reason**, and it is not cosmetic: a comment attaches
+to the node *before* it, so reordering keys moves comments onto the wrong lines. A base
+that writes `env:` above `jobs:`, with a paragraph explaining why the runner needs a
+proxy, would otherwise render with that paragraph sitting on `jobs:` — telling a reader
+that removing `jobs:` breaks the checkout. A base the installer only copies comes back
+byte for byte.
+
 The rendered file's own header is replaced with a generated banner naming the base and the
 search path. Nothing in it is machine-specific: a path like `/Users/you/...` in a
 committed workflow would make the file render differently for every developer and churn
