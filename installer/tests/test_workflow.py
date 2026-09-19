@@ -13,8 +13,10 @@ import subprocess
 from importlib import resources
 
 import pytest
+from pydantic import ValidationError
 
 from copirate_review import workflow as wf
+from copirate_review import yamldoc
 from copirate_review.workflow import Binding, Workflow, WorkflowError, bind, parse, render
 from copirate_review.yamldoc import emit, load
 
@@ -59,6 +61,18 @@ def test_a_comment_hanging_off_a_list_item_is_restored_rather_than_dropped():
     source = "on:\n  pull_request:\n    types:\n      - opened\n\njobs: {}\n"
     data, trivia = load(source, "t")
     assert emit(data, trivia) == source
+
+
+def test_a_record_of_a_place_where_nothing_was_written_cannot_be_built():
+    """`_restore` reads `comments[0]` for the single-token slots.
+
+    An empty one would be an IndexError leaving `emit` as a bare traceback, past the
+    exit codes the CLI contracts for — a YAML fault reported as a crash. No document I
+    could write produces one, so this closes the state rather than the path to it:
+    the hole is in the type, and that is where it is filled. [LAW:types-are-the-program]
+    """
+    with pytest.raises(ValidationError):
+        yamldoc.Trivia(path=("jobs",), key="review", slot=0, comments=())
 
 
 def test_a_key_the_model_does_not_name_is_carried_through_untouched():

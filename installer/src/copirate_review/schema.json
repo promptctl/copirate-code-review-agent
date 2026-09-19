@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/promptctl/copirate-code-review-agent/v1/installer/src/copirate_review/schema.json",
   "title": "CoPirate code review installer configuration",
-  "description": "Bindings for the workflows `copirate-review install` renders from their bases. Layers: the shipped defaults, then ~/.config/copirate-review/config.yaml, then the repo's own file. A later layer deep-merges over an earlier one; a null value deletes the key it names.",
+  "description": "Bindings for the workflows `copirate-review install` renders from their bases. Layers: the shipped defaults, then ~/.config/copirate-review/config.yaml, then the repo's own file. A later layer deep-merges over an earlier one; a null value deletes the ENTRY it names — a secret, a workflow, or one of a workflow's inputs. The four top-level sections are not themselves deletable: every one of them is required of the merged document, so a layer nulling one could only ever produce a configuration that is refused. The single entry a null may not delete is EXCLUDE_PATTERNS, documented where it is declared.",
   "type": "object",
   "additionalProperties": false,
   "properties": {

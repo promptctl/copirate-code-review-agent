@@ -22,9 +22,9 @@ This one is checked instead: `emit(load(text)) == text` for the shipped base.
 from __future__ import annotations
 
 import io
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -70,7 +70,12 @@ class Trivia(BaseModel):
     path: NodePath
     key: Key | None
     slot: int
-    comments: tuple[CommentSpec, ...]
+    #: At least one, because a `Trivia` carrying none is not a fact about the document
+    #: — it is a record of a place where nothing was written. `_restore` reads
+    #: `comments[0]` for the single-token slots, so an empty one is also an IndexError
+    #: escaping as a bare traceback, past the exit codes `cli.py` contracts for. Both
+    #: are closed by the state not existing. [LAW:types-are-the-program]
+    comments: Annotated[tuple[CommentSpec, ...], Field(min_length=1)]
 
 
 class YamlError(Exception):
@@ -124,20 +129,20 @@ def _tokens(slot: Any) -> tuple[CommentSpec, ...]:
 def _collect(node: Any, path: NodePath, found: list[Trivia]) -> None:
     attached = getattr(node, "ca", None)
     if attached is not None:
-        if attached.comment and attached.comment[NODE_COMMENT_SLOT]:
+        # The TOKENS decide, not the slot. A slot can be truthy and still yield nothing
+        # — a list holding only `None` — and "is there a slot here" was never the
+        # question this asks. [LAW:parse-dont-validate]
+        block = _tokens(attached.comment[NODE_COMMENT_SLOT]) if attached.comment else ()
+        if block:
             found.append(
-                Trivia(
-                    path=path,
-                    key=None,
-                    slot=NODE_COMMENT_SLOT,
-                    comments=_tokens(attached.comment[NODE_COMMENT_SLOT]),
-                )
+                Trivia(path=path, key=None, slot=NODE_COMMENT_SLOT, comments=block)
             )
         for key, slots in (attached.items or {}).items():
             for index, slot in enumerate(slots):
-                if slot:
+                comments = _tokens(slot) if slot else ()
+                if comments:
                     found.append(
-                        Trivia(path=path, key=key, slot=index, comments=_tokens(slot))
+                        Trivia(path=path, key=key, slot=index, comments=comments)
                     )
     if isinstance(node, dict):
         for key, value in node.items():

@@ -277,6 +277,21 @@ def test_a_null_survives_into_no_layer_even_where_the_one_below_declared_nothing
     assert "MAX_REVIEW_ROUNDS" not in added.inputs
 
 
+def test_a_top_level_section_is_not_deletable_and_the_refusal_names_the_file(tmp_path):
+    """The null rule is about ENTRIES, and the schema says so now.
+
+    Every top-level section is required of the merged document, so a layer nulling one
+    could only ever produce a configuration that is refused. Widening the schema to
+    admit it would trade this refusal — which names the file the operator just edited —
+    for a later one that names only the merged document. A theorem weaker than the
+    truth admits a state that is never valid. [LAW:types-are-the-program]
+    """
+    (tmp_path / ".copirate-review.yaml").write_text("secrets: null\n")
+    with pytest.raises(ConfigError, match=r"\.copirate-review\.yaml") as refusal:
+        load(tmp_path, machine(tmp_path))
+    assert "secrets" in str(refusal.value)
+
+
 def test_the_one_input_a_null_may_not_delete_is_refused_rather_than_half_honoured(tmp_path):
     """`EXCLUDE_PATTERNS: null` cannot mean what a null means everywhere else.
 

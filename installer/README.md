@@ -128,8 +128,8 @@ strings, numbers, or booleans; all three reach the action as the strings it read
 all three are emitted quoted, so an input spelled `no` or `5` cannot arrive as a boolean
 or a number.
 
-**A null deletes the key it names.** One rule, at every depth — it is how a repo opts out
-of something the fleet layer gave it:
+**A null deletes the entry it names** — a secret, a workflow, or one of a workflow's
+inputs. It is how a repo opts out of something the fleet layer gave it:
 
 ```yaml
 secrets:
