@@ -7,6 +7,7 @@ const {
   sameEngine, pooledFloor, buildBaseline, parseBaseline, evaluateGate, renderBaselineMarkdown, DEGRADATION_RULE,
   BASELINE_SCHEMA,
 } = require('../eval/baseline');
+const { UNVERSIONED_EFFORT_SCHEMA } = require('../src/effort');
 
 // [LAW:verifiable-goals] AC: baseline.js reduces the golden cases' scored summaries into one frozen
 // distribution + a degradation rule. These tests exercise the PURE core (arg parse, input parsers, the
@@ -117,7 +118,9 @@ test('parseCaseSummary keeps the reduced fields and rejects malformed summaries'
   assert.equal(s.effort, null);
   assert.deepEqual(
     parseCaseSummary(summaryFixture({ effort: { roundCap: 3, sweepCap: 0, reasoningTier: null } }), 'x').effort,
-    { roundCap: 3, sweepCap: 0, reasoningTier: null },
+    // Stamped with the arm the summary belongs to — a scorecard-summary.json persists the profile alone,
+    // so the arm has to ride inside it or a second producer's summary would re-read as the engine's.
+    { roundCap: 3, sweepCap: 0, reasoningTier: null, effortSchema: UNVERSIONED_EFFORT_SCHEMA },
   );
   assert.throws(() => parseCaseSummary(summaryFixture({ effort: { roundCap: 3 } }), 'x'), /'effort' must be/);
   // Valid-but-wrong-typed JSON is rejected at the shared object boundary.

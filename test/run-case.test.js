@@ -429,13 +429,13 @@ test('writeRunRecord: a counted run dir is a complete one — findings.json land
     // still a shape a reader could copy. [LAW:one-source-of-truth]
     const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 2, sweepCap: 1, scopeCount: 2, spawns: [] });
     const plan = mintedPlan();
-    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan, findings: [{ path: 'a', line: 1 }] });
+    writeRunRecord(ok, { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, artifacts: { 'schedule.json': schedule, 'plan.json': plan }, findings: [{ path: 'a', line: 1 }] });
     assert.deepEqual(fs.readdirSync(ok).sort(), ['findings.json', 'meta.json', 'plan.json', 'schedule.json', 'summary.txt', 'usage.json']);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ok, 'findings.json'), 'utf8')), [{ path: 'a', line: 1 }]);
 
     const broken = path.join(root, 'case', 'r2');
     fs.mkdirSync(broken, { recursive: true });
-    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, schedule, plan, findings: [1n] }), TypeError);
+    assert.throws(() => writeRunRecord(broken, { meta: { case: 'case' }, summary: 's', usage: {}, artifacts: { 'schedule.json': schedule, 'plan.json': plan }, findings: [1n] }), TypeError);
     assert.deepEqual(fs.readdirSync(broken).sort(), ['meta.json', 'plan.json', 'schedule.json', 'summary.txt', 'usage.json']);
     assert.deepEqual(listRunDirs(path.join(root, 'case')), [ok]);
   } finally {
@@ -447,19 +447,27 @@ test('writeRunRecord: an absent fact fails loudly instead of landing as a file t
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-undef-'));
   try {
     const schedule = require('../src/schedule').scheduleRecord({ plan: 'partition', laneCount: 1, sweepCap: 1, scopeCount: 1, spawns: [] });
-    const record = { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, schedule, plan: mintedPlan(), findings: [] };
+    const record = { meta: { case: 'case' }, summary: 's', usage: { u: 1 }, artifacts: { 'schedule.json': schedule, 'plan.json': mintedPlan() }, findings: [] };
     // `JSON.stringify(undefined)` is the VALUE undefined, and `undefined + '\n'` is the literal text
     // "undefined" — so an unguarded write lands an artifact that reports as JSON and parses as nothing.
     // Every field carries the same exposure, so every field is checked, not just the newest one.
     // summary.txt is raw text rather than JSON, and corrupts by the identical coercion — so it is checked
     // here with the rest. Every field the record carries, not only the ones that render as JSON.
-    const artifact = { meta: 'meta.json', usage: 'usage.json', schedule: 'schedule.json', plan: 'plan.json', findings: 'findings.json', summary: 'summary.txt' };
-    for (const [field, file] of Object.entries(artifact)) {
+    const contract = { meta: 'meta.json', usage: 'usage.json', findings: 'findings.json', summary: 'summary.txt' };
+    const absent = [
+      ...Object.entries(contract).map(([field, file]) => ({ field, file, record: { ...record, [field]: undefined } })),
+      // A producer's own artifacts carry the identical exposure and are checked by the identical rule —
+      // the guard is stated once, for every field the record carries, however it reached the writer.
+      ...['schedule.json', 'plan.json'].map(file => ({
+        field: file, file, record: { ...record, artifacts: { ...record.artifacts, [file]: undefined } },
+      })),
+    ];
+    for (const { field, file, record: broken } of absent) {
       const dir = path.join(root, field);
       fs.mkdirSync(dir, { recursive: true });
       assert.throws(
-        () => writeRunRecord(dir, { ...record, [field]: undefined }),
-        new RegExp(`${field} is undefined`),
+        () => writeRunRecord(dir, broken),
+        new RegExp(`${field.replace('.', '\\.')} is undefined`),
         `${field}: an absent fact must abort the record, not be written as the text "undefined"`,
       );
       assert.equal(fs.existsSync(path.join(dir, file)), false, `${file} must not exist`);
@@ -492,7 +500,7 @@ test('writeRunRecord: a replay\'s wall clock survives as an artifact, readable t
         spawnRecord({ phase: 'worker', scope: 'docs', pass: 0 }, 'completed', { span: { from: '2026-09-08T00:01:00.000Z', to: '2026-09-08T00:02:30.000Z' } }),
       ],
     });
-    writeRunRecord(runDir, { meta: { case: 'case' }, summary: 's', usage: {}, schedule, plan: mintedPlan(), findings: [] });
+    writeRunRecord(runDir, { meta: { case: 'case' }, summary: 's', usage: {}, artifacts: { 'schedule.json': schedule, 'plan.json': mintedPlan() }, findings: [] });
 
     const recorded = JSON.parse(fs.readFileSync(path.join(runDir, 'schedule.json'), 'utf8'));
     assert.deepEqual(recorded, schedule);

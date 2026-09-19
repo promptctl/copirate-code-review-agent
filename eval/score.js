@@ -33,11 +33,6 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 // [LAW:one-source-of-truth] The one src require, and the only kind that keeps this module's pure load:
-// src/effort.js owns the effort TYPE, so it also owns which axis set each schema version had. The scorer
-// reads that rule rather than restating it — a second copy of "which axes did a record of this version carry" is exactly
-// the divergence this import exists to prevent. effort.js is stdlib-free, so importing it still performs
-// no IO. [LAW:effects-at-boundaries]
-const { completeEffort } = require('../src/effort');
 
 // The judge is the SCORER'S OWN measurement instrument, pinned independently of whatever engine a case
 // replayed on, so a score means the same thing across every case — and, critically, so a change to the
@@ -240,48 +235,11 @@ function parseMeta(raw, label) {
   return { case: json.case, config: json.config ?? null, effort: parseEffort(json, label), candidate: parseCandidate(json.candidate, label) };
 }
 
-// The review effort a run was produced under, as run-case.js recorded it: the whole EffortProfile, since
-// each axis is a lever some A/B varies. It takes the RECORD, not the profile alone, because the profile's
-// meaning depends on the schema version written beside it — reading one without the other is how a record
-// loses the very fact that makes its omissions interpretable. [LAW:one-source-of-truth]
-// A wholly absent effort stays a typed absence (null): unlike a missing AXIS, which the schema's back-fill
-// resolves, a record with no profile at all names no version and fixes no value, so what it ran at is
-// genuinely unknown and guessing it is how two arms get averaged into one number.
-// [LAW:one-source-of-truth] That whole-effort absence has ONE meaning and two spellings on the wire, and
-// this parser reads both: a missing key (a legacy meta.json) and an explicit null (what aggregateRuns
-// itself writes into scorecard-summary.json for such a run, since JSON has no `undefined`). A reader that
-// took only the first could not read back what its own writer emits.
-// [LAW:parse-dont-validate] [LAW:no-silent-failure] anything else is a malformed record, refused.
-function parseEffort(record, label) {
-  const raw = record.effort;
-  if (raw === undefined || raw === null) return null;
-  const ok = typeof raw === 'object' && !Array.isArray(raw)
-    && Number.isInteger(raw.roundCap) && raw.roundCap >= 0
-    && Number.isInteger(raw.sweepCap) && raw.sweepCap >= 0
-    && (raw.reasoningTier === null || typeof raw.reasoningTier === 'string');
-  if (!ok) {
-    throw new Error(
-      `${label} 'effort' must be {roundCap: <int ≥0>, sweepCap: <int ≥0>, reasoningTier: <string|null>}, got ${JSON.stringify(raw)}.`,
-    );
-  }
-  // [LAW:parse-dont-validate] The profile leaves here COMPLETE — every axis of the current type carries a
-  // value — so nothing downstream meets a per-axis void or has to decide what one means. A missing axis is
-  // not guessed at: src/effort.js's back-fill answers it from the record's schema version, which is a fact
-  // about what the code could do when the record was written, not an assumption about what it chose.
-  // The record is handed over whole rather than picked apart field by field, so an axis added to the
-  // profile flows through this reader without a second list here learning its name. [LAW:one-source-of-truth]
-  return completeEffort({ effort: raw, effortSchema: record.effortSchema });
-}
-
-// [LAW:one-source-of-truth] ONE rendering of an effort, used both to COMPARE two runs' arms and to name
-// them in the refusal — so the message can never describe a difference the comparison did not make.
-function describeEffort(effort) {
-  return effort === null
-    ? 'unrecorded'
-    // Every axis renders a value because parseEffort hands over a complete profile; only reasoningTier
-    // spells its null, and it spells it as a REAL value ('none' = no raise proposed), never as an absence.
-    : `roundCap=${effort.roundCap} sweepCap=${effort.sweepCap} reasoningTier=${effort.reasoningTier ?? 'none'}`;
-}
+// The effort boundary lives in eval/effort-record.js, which reads a stored record as one of the ARMS a
+// run can belong to — the engine's profile, or Claude Code's built-in `/code-review`. Re-exported under
+// the names every reader here already imports, so the arm gained a second variant without any of them
+// learning a new one. [LAW:one-source-of-truth] [LAW:single-enforcer]
+const { parseEffort, describeEffort } = require('./effort-record');
 
 // [LAW:parse-dont-validate] A case-out dir's runs are one population or they are not scorable: the mean
 // of two cases, or of two review efforts, is a number that names neither. This is the checkpoint that
@@ -376,12 +334,17 @@ function readPriorRuns(root, caseNames) {
 }
 
 // The tree that produced a run, as run-case.js's workingTree() recorded it: `{sha: <commit>, dirty:
-// <boolean>}`. Absent on runs replayed before provenance was kept — a typed absence (null), which
-// compare.js reads as "cannot be proven anyone's". Anything else is a malformed record, refused.
-// [LAW:parse-dont-validate]
+// <boolean>}`. A typed absence (null) means "no tree of this repo can be proven to have produced this
+// run", which compare.js reads as foreign. TWO facts spell themselves that way and both are real: a run
+// replayed before provenance was kept (a missing key, in a legacy meta.json), and a run produced by a
+// DIFFERENT REVIEWER entirely (an explicit null, which eval/run-case-cc.js writes because no tree of
+// this repo produced it and JSON has no `undefined`). One absence, one meaning, both spellings — the
+// same rule parseEffort applies to its own. A reader that took only the first would refuse the record
+// its sibling producer emits. Anything else is a malformed record, refused.
+// [LAW:parse-dont-validate] [LAW:one-source-of-truth]
 function parseCandidate(raw, label) {
-  if (raw === undefined) return null;
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.sha !== 'string' || raw.sha.trim() === '' || typeof raw.dirty !== 'boolean') {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw) || typeof raw.sha !== 'string' || raw.sha.trim() === '' || typeof raw.dirty !== 'boolean') {
     throw new Error(`${label} 'candidate' must be {sha: <commit>, dirty: <boolean>}, got ${JSON.stringify(raw)}.`);
   }
   return { sha: raw.sha, dirty: raw.dirty };
