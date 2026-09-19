@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from copirate_review import ghops, install
+from copirate_review import cli, ghops, install
 from copirate_review.config import Config
 from copirate_review.credentials import EnvCredential, KeychainCredential
 from copirate_review.ghops import Repo
@@ -94,24 +94,29 @@ def test_an_empty_local_source_does_not_fail_a_repo_whose_stores_are_already_goo
     assert plan_secret("o/r", "TOKEN", ITEM) == KeepSecret("TOKEN", ITEM)
 
 
-def test_the_dry_run_reports_the_verdict_the_real_run_will_act_on(capsys):
-    """It used to print `sync` and exit 0 where the run exited 1. That predicts nothing."""
-    plan = Plan(
+def _plan(*secrets) -> Plan:
+    """A plan carrying nothing but the secret verdicts under test."""
+    return Plan(
         root=install.Path("/tmp"),
         repo=Repo(name_with_owner="o/r", default_branch="main"),
         branch="feature",
         remote="origin",
-        upstream="origin/feature",
+        upstream="refs/remotes/origin/feature",
         landing=landing_for("feature", "main"),
         config=Config(action_ref="o/r@v1", commit_message="m", secrets={}, workflows=()),
         action_ref="o/r@v1",
         layers=(),
         changes=(),
-        secrets=(
-            SyncSecret("HAVE_IT", KeychainCredential(item="HAVE_ITEM")),
-            MissingSecret(
-                "LOST_IT", EnvCredential(var="LOST_VAR"), "the reviewer cannot authenticate."
-            ),
+        secrets=secrets,
+    )
+
+
+def test_the_dry_run_reports_the_verdict_the_real_run_will_act_on(capsys):
+    """It used to print `sync` and exit 0 where the run exited 1. That predicts nothing."""
+    plan = _plan(
+        SyncSecret("HAVE_IT", KeychainCredential(item="HAVE_ITEM")),
+        MissingSecret(
+            "LOST_IT", EnvCredential(var="LOST_VAR"), "the reviewer cannot authenticate."
         ),
     )
     describe(plan)
@@ -121,6 +126,28 @@ def test_the_dry_run_reports_the_verdict_the_real_run_will_act_on(capsys):
     # Each names the source it actually reads, so the operator knows where to look.
     assert "keychain item HAVE_ITEM" in reported
     assert "environment variable $LOST_VAR" in reported
+
+
+def test_the_dry_runs_exit_code_predicts_the_real_runs_and_not_just_its_output(monkeypatch):
+    """The half of the answer a script reads has to agree with the half a human reads.
+
+    `describe` printed `MISSING` and the process exited 0, because the `EffectError`
+    that makes the real run exit 1 is raised while PERFORMING the plan and a dry run
+    performs nothing. A pre-review gate scripted on
+    `copirate-review install --dry-run; echo $?` therefore passed clean on a repository
+    whose reviewer cannot authenticate. [LAW:no-silent-failure]
+    """
+    blocked = _plan(
+        MissingSecret("TOKEN", EnvCredential(var="TOKEN"), "the reviewer cannot authenticate.")
+    )
+    fine = _plan(SyncSecret("TOKEN", KeychainCredential(item="ITEM")))
+    assert blocked.blocked_by == ("the reviewer cannot authenticate.",)
+    assert fine.blocked_by == ()
+
+    monkeypatch.setattr(cli, "build_plan", lambda *a, **k: blocked)
+    assert cli.main(["install", "-C", "/tmp", "--dry-run"]) == cli.EXIT_EFFECT_FAILED
+    monkeypatch.setattr(cli, "build_plan", lambda *a, **k: fine)
+    assert cli.main(["install", "-C", "/tmp", "--dry-run"]) == cli.EXIT_OK
 
 
 def test_a_verdict_is_reached_the_same_way_whatever_source_the_secret_names(world):

@@ -61,7 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         current = build_plan(args.directory.resolve(), Path.home())
         describe(current)
-        if not args.dry_run:
+        if args.dry_run:
+            # A dry run's EXIT CODE is its prediction. Printing the verdict and exiting
+            # 0 regardless leaves the one part of the answer a script can read saying
+            # the opposite of the part a human reads. [LAW:no-silent-failure]
+            if current.blocked_by:
+                raise EffectError("; ".join(current.blocked_by))
+        else:
             apply(current)
     except ConfigError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -88,6 +88,32 @@ def test_a_branch_that_was_never_pushed_has_no_upstream_ref_to_read(repo):
 
 # --- the three snapshots ----------------------------------------------------------
 
+def test_a_workflow_committed_with_crlf_is_not_mistaken_for_the_render(repo):
+    """The comparison is about BYTES, so nothing on the way in may rewrite them.
+
+    `git cat-file blob` emits the blob's own bytes, and reading that stream as text
+    translates CRLF to LF — so a workflow committed with CRLF arrived equal to an LF
+    render it is nothing like, and the run reported converged a file it had never
+    written. It would have reported that forever; there is no later run that notices.
+
+    The worktree read has to be honest at the same time. Fixing only the blob leaves
+    `needs_commit` true while `needs_write` is false, so nothing is rewritten, `git add`
+    produces an identical blob, and the commit dies with "nothing to commit" every run.
+    [LAW:one-type-per-behavior]
+    """
+    git(repo, "config", "core.autocrlf", "false")
+    (repo / WORKFLOW).parent.mkdir(parents=True, exist_ok=True)
+    (repo / WORKFLOW).write_bytes(TEXT.replace("\n", "\r\n").encode())
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "committed with CRLF")
+
+    change = snap(repo)
+    assert change.committed == TEXT.replace("\n", "\r\n"), "the blob's own bytes"
+    assert change.needs_commit is True
+    assert change.needs_write is True, "or `git add` re-stages the same blob and the commit fails"
+
+
+
 
 def test_a_workflow_written_but_never_committed_is_not_reported_as_converged(repo):
     """The defect this model exists to prevent.

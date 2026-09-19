@@ -54,6 +54,31 @@ def output_or_none(argv: list[str], *, cwd: Path | None = None) -> str | None:
     whitespace is noise. A file's bytes are not a value: its trailing newline is data,
     and stripping it turns a byte-for-byte comparison into one that silently ignores the
     end of every file it compares. [LAW:one-type-per-behavior]
+
+    Decoded HERE rather than by `text=True`, which would also translate line endings.
+    `git cat-file blob` emits the blob's own bytes, and a workflow committed with CRLF
+    then arrives as LF — equal to a render that is nothing like it, so the run reports
+    a workflow converged that it has never actually written. Verified: a CRLF blob read
+    back identical to an LF render. Newline translation is precisely the "silently
+    ignores" this function exists to refuse, applied to every line instead of the last.
     """
-    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
-    return result.stdout if result.returncode == 0 else None
+    result = subprocess.run(argv, cwd=cwd, capture_output=True)
+    if result.returncode != 0:
+        return None
+    return decoded(result.stdout, " ".join(argv))
+
+
+def decoded(raw: bytes, source: str) -> str:
+    """The text of some bytes, or a refusal naming where they came from.
+
+    A workflow is text. Bytes that are not is a state worth reporting as the failure it
+    is, with the source named — not as a `UnicodeDecodeError` traceback carrying an
+    exit code the CLI's contract does not describe. [LAW:no-silent-failure]
+    """
+    try:
+        return raw.decode()
+    except UnicodeDecodeError as exc:
+        raise EffectError(
+            f"{source} returned bytes that are not UTF-8 ({exc}). A workflow is text; "
+            f"this one is not, so there is nothing here to compare it against."
+        ) from exc

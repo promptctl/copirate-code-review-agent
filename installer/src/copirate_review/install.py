@@ -18,7 +18,7 @@ from .config import Config, load
 from .credentials import Credential, is_empty
 from .ghops import Repo
 from .render import Rendered, render, resolve_action_ref
-from .shell import EffectError
+from .shell import EffectError, decoded
 
 
 @dataclass(frozen=True)
@@ -207,6 +207,20 @@ class Plan:
         return [c.rendered.path for c in self.changes if c.needs_commit]
 
     @property
+    def blocked_by(self) -> tuple[str, ...]:
+        """Why this plan cannot be carried out, empty when it can.
+
+        Read by BOTH paths, which is the point. `apply` raises these while performing
+        the plan; a dry run has nothing to perform, so without this it printed
+        `MISSING` and exited 0 while the run it claims to predict exited 1. A gate
+        scripted on `copirate-review install --dry-run; echo $?` then passes clean on a
+        repository whose reviewer cannot authenticate — the exact shape of lie the
+        plan's own contract was written to forbid, one verdict further along than
+        where it was caught. [LAW:one-source-of-truth]
+        """
+        return tuple(s.reason for s in self.secrets if isinstance(s, MissingSecret))
+
+    @property
     def unlanded_paths(self) -> list[str]:
         """Paths the remote branch does not yet carry, whatever is still missing.
 
@@ -264,7 +278,16 @@ def snapshot(root: Path, rendered: Rendered, upstream: str | None) -> WorkflowCh
     worktree_path = root / rendered.path
     return WorkflowChange(
         rendered=rendered,
-        worktree=worktree_path.read_text() if worktree_path.is_file() else None,
+        # Read as BYTES and decoded here, for the reason `output_or_none` is: `read_text`
+        # translates line endings, and the two reads have to be honest together. Fixing
+        # only the blob leaves `needs_commit` true while `needs_write` is false, so
+        # nothing is rewritten, `git add` produces an identical blob, and the commit dies
+        # with "nothing to commit" on every run. [LAW:one-type-per-behavior]
+        worktree=(
+            decoded(worktree_path.read_bytes(), str(worktree_path))
+            if worktree_path.is_file()
+            else None
+        ),
         committed=gitops.blob_at(root, "HEAD", rendered.path),
         remote=(
             Published(gitops.blob_at(root, upstream, rendered.path))
