@@ -124,6 +124,34 @@ def test_an_exported_but_empty_variable_is_empty(monkeypatch):
     assert is_empty(EnvCredential(var="DECLARED_TOKEN")) is True
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        'A"] ; system("touch /tmp/pwned"); x=ENVIRON["B',  # closes the string, adds statements
+        "A B",
+        "1STARTS_WITH_A_DIGIT",
+        "",
+    ],
+)
+def test_a_variable_name_that_would_be_more_awk_than_name_cannot_be_built(name):
+    """The name is interpolated into an awk PROGRAM, so it has to be a name.
+
+    `.copirate-review.yaml` is a file the repository under review controls, and the
+    installer is documented as safe to run in any repo before every review — so a
+    config-supplied string reaching an interpreter's source is the whole hazard. This
+    was unreachable only because `present()` could not find such a name in the
+    environment, which is a different check having an accidental effect, not a
+    boundary. [LAW:types-are-the-program]
+    """
+    with pytest.raises(ValueError, match="environment variable name"):
+        EnvCredential(name)
+
+
+def test_the_keychain_arm_constrains_nothing_because_its_name_is_argv(monkeypatch):
+    """Not a gap: `security` is exec'd, never interpreted, so any item name is inert."""
+    assert KeychainCredential('weird "item" ; name').stages[0][-2] == 'weird "item" ; name'
+
+
 # --- the pipeline, whichever source feeds it --------------------------------------
 
 

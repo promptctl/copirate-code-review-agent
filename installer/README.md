@@ -138,6 +138,14 @@ workflows:
       DEPENDENCY_DIFF: null         # back to the action's own default
 ```
 
+`EXCLUDE_PATTERNS` is the one input a null may not delete, and the installer refuses a
+config that tries. It always prepends the workflow paths it generates to that list, so
+the key is always rendered — and `action.yml` treats what it receives as a REPLACEMENT
+for its own default rather than an addition. A null therefore could not mean "back to the
+action's own default" here; it rendered a live key carrying only the generated paths, and
+`dist/**`, `build/**` and every lock file came back into review with nothing to say so.
+Write the full list you want, or `""` to exclude nothing beyond the generated paths.
+
 ### Credentials
 
 **Every credential is declared in the configuration.** Nothing is hardcoded, nothing is
@@ -168,6 +176,12 @@ For `keychain:`, the value never enters the installer's memory at all: it flows 
 is already in this process's environment because you exported it there, and nothing here
 can undo that. What the installer still guarantees is that it never copies it into a
 variable, never puts it in `argv` where `ps` would show it, and never prints it.
+
+An `env:` name must be an environment variable name — letters, digits and underscores, not
+starting with a digit — and a config saying otherwise is refused. The name is interpolated
+into the reader's program, and `.copirate-review.yaml` is a file the repository under
+review controls, so a name that is not a name would be more program. A `keychain:` item
+name is unconstrained because it is `argv`: it is exec'd, never interpreted.
 
 A keychain that cannot be *read* — locked, or an authorization prompt you dismissed — is
 its own error and says so. It is deliberately not folded into "the item is missing": that

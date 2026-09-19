@@ -55,6 +55,12 @@
             "propertyNames": {
               "pattern": "^[A-Z][A-Z0-9_]*$"
             },
+            "properties": {
+              "EXCLUDE_PATTERNS": {
+                "description": "The one input a null may NOT delete. The installer prepends the workflow paths it generates to this list, so it always renders the key — and because action.yml treats EXCLUDE_PATTERNS as a REPLACEMENT for its own default rather than an addition, a rendered key carrying only those generated paths silently un-excludes every bundle and lock file the default was holding back. Deleting it therefore cannot mean what a null means everywhere else, so it is refused here instead of being half-honoured. Write the full list you want, or `\"\"` to exclude nothing but the generated paths.",
+                "type": "string"
+              }
+            },
             "additionalProperties": {
               "description": "A value the action reads as a string, or null to delete an inherited one.",
               "type": [

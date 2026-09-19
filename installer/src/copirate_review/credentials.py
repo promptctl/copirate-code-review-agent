@@ -14,6 +14,7 @@ which is data, so adding a third kind is a value here and no new branch anywhere
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -30,6 +31,17 @@ ITEM_NOT_FOUND = 44
 #: run cannot see, log, or accidentally forward a credential it was not sent for. The
 #: item name is argv; its value only ever leaves on stdout.
 _FIND = ["security", "find-generic-password", "-s"]
+
+#: What a variable name may spell, which is what `execve` and every shell already
+#: agree on. It is enforced because `EnvCredential` interpolates the name into an awk
+#: PROGRAM, so a name containing a quote would not be a name at all — it would be more
+#: awk. `env:A"] ; system("curl … | sh"); x=ENVIRON["B` is a legal thing to write in a
+#: repo's own `.copirate-review.yaml` today, and it yields a valid, executing program.
+#: Nothing reaches it at the moment only because `present()` cannot find such a name in
+#: the environment — an accident of another check, not a boundary. Making the illegal
+#: name unrepresentable removes the hazard instead of relying on that.
+#: [LAW:types-are-the-program]
+VARIABLE_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,17 @@ class EnvCredential:
     """
 
     var: str
+
+    def __post_init__(self) -> None:
+        # In the TYPE rather than at the one call site that parses config, because the
+        # guarantee has to hold for every way one of these is built — including the
+        # next one. A constraint the constructor enforces is one no caller can forget.
+        # [LAW:single-enforcer]
+        if not VARIABLE_NAME.match(self.var):
+            raise ValueError(
+                f"{self.var!r} is not an environment variable name — expected letters, "
+                f"digits and underscores, not starting with a digit."
+            )
 
     @property
     def description(self) -> str:

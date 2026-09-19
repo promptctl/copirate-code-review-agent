@@ -277,6 +277,32 @@ def test_a_null_survives_into_no_layer_even_where_the_one_below_declared_nothing
     assert "MAX_REVIEW_ROUNDS" not in added.inputs
 
 
+def test_the_one_input_a_null_may_not_delete_is_refused_rather_than_half_honoured(tmp_path):
+    """`EXCLUDE_PATTERNS: null` cannot mean what a null means everywhere else.
+
+    The installer always prepends the paths it generates, so the key is always
+    rendered — and action.yml REPLACES its own default with whatever it receives. A
+    null therefore did not fall back to that default; it rendered a live key carrying
+    only the generated paths, silently readmitting `dist/**` and every lock file to
+    review. That is the ~700K-token no-signal read `defaults.yaml` exists to prevent,
+    arriving as a config that looked like it was asking for less. [LAW:no-silent-failure]
+    """
+    (tmp_path / ".copirate-review.yaml").write_text(
+        f"workflows:\n  {WORKFLOW}:\n    inputs:\n      EXCLUDE_PATTERNS: null\n"
+    )
+    with pytest.raises(ConfigError, match="EXCLUDE_PATTERNS"):
+        load(tmp_path, machine(tmp_path))
+
+
+def test_excluding_nothing_but_the_generated_paths_is_still_expressible(tmp_path):
+    """The state the null used to produce by accident, asked for on purpose."""
+    (tmp_path / ".copirate-review.yaml").write_text(
+        f'workflows:\n  {WORKFLOW}:\n    inputs:\n      EXCLUDE_PATTERNS: ""\n'
+    )
+    config, _ = load(tmp_path, machine(tmp_path))
+    assert config.workflows[0].inputs["EXCLUDE_PATTERNS"] == WORKFLOW
+
+
 def test_a_secret_colliding_with_the_injected_exclude_input_is_refused():
     """The guard sees what will be RENDERED, not only what was declared."""
     with pytest.raises(ConfigError, match="render the key twice"):

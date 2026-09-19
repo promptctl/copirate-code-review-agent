@@ -160,7 +160,13 @@ def _credential(source_uri: str, secret_name: str) -> Credential:
             f"secrets.{secret_name}: unsupported credential source {source_uri!r}. "
             f"Supported: {supported}."
         )
-    return CREDENTIAL_SOURCES[scheme](name)
+    try:
+        return CREDENTIAL_SOURCES[scheme](name)
+    except ValueError as exc:
+        # The arm decides what its own name may spell — a keychain item is argv and may
+        # be anything, a variable name is interpolated and may not. This boundary names
+        # the secret and reports; it does not restate the rule. [LAW:single-enforcer]
+        raise ConfigError(f"secrets.{secret_name}: {exc}") from exc
 
 
 def _render_value(value: str | int | float | bool) -> str:
