@@ -147,3 +147,53 @@ def test_an_input_spelling_a_yaml_keyword_is_emitted_quoted(value):
 def test_the_review_step_id_is_the_one_the_base_already_depends_on():
     """The archive step reads `steps.review.outputs`, so the id was load-bearing already."""
     assert f"steps.{wf.REVIEW_STEP_ID}.outputs" in SHIPPED
+
+
+# --- shapes GitHub accepts that a too-strong model would reject -------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "permissions: read-all",
+        "permissions:\n  contents: read",
+        "concurrency: one-at-a-time",
+        "concurrency:\n  group: g\n  cancel-in-progress: true",
+    ],
+    ids=["permissions-string", "permissions-mapping", "concurrency-string",
+         "concurrency-mapping"],
+)
+def test_a_legal_workflow_shape_the_installer_does_not_transform_is_carried_through(line):
+    """A model stronger than the truth rejects valid bases, which is its own bug."""
+    source = MINIMAL.replace("name: Review\n", f"name: Review\n{line}\n")
+    assert line.splitlines()[0] in render(bind(parse(source, "t"), binding(), "t"))
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["on: push", "on:\n  - push\n  - pull_request", "on:\n  pull_request: {}"],
+    ids=["scalar", "list", "mapping"],
+)
+def test_every_legal_spelling_of_a_trigger_is_accepted(trigger):
+    source = MINIMAL.replace("on:\n  pull_request: {}\n", f"{trigger}\n")
+    assert isinstance(parse(source, "t"), Workflow)
+
+
+def test_a_workflow_with_no_name_is_accepted_and_does_not_gain_one():
+    """GitHub falls back to the file path; inventing a name would change behaviour."""
+    source = MINIMAL.replace("name: Review\n", "")
+    assert "name:" not in render(bind(parse(source, "t"), binding(), "t")).split("jobs:")[0]
+
+
+def test_a_job_that_calls_a_reusable_workflow_does_not_gain_an_empty_steps_list():
+    """`steps: []` in such a job is a workflow GitHub rejects outright."""
+    source = MINIMAL + "  call:\n    uses: org/repo/.github/workflows/w.yml@v1\n"
+    rendered = render(bind(parse(source, "t"), binding(), "t"))
+    assert "steps: []" not in rendered
+    assert "org/repo/.github/workflows/w.yml@v1" in rendered
+
+
+def test_a_null_valued_key_survives_rather_than_being_dropped_as_absent():
+    """`on:\\n  push:` is ordinary YAML, and the key carries meaning with no value."""
+    source = MINIMAL.replace("  pull_request: {}\n", "  push:\n  pull_request: {}\n")
+    assert "push:" in render(bind(parse(source, "t"), binding(), "t"))

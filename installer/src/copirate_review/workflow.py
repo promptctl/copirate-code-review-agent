@@ -61,10 +61,17 @@ class Step(Node):
 
 
 class Job(Node):
+    """A job. `steps` is absent, not empty, for a job that calls a reusable workflow.
+
+    The distinction is not pedantry: rendering `steps: []` into such a job produces a
+    workflow GitHub rejects, so "has no steps key" and "has an empty steps list" cannot
+    share a value. [LAW:types-are-the-program]
+    """
+
     name: str | None = None
     runs_on: Any = Field(default=None, alias="runs-on")
     timeout_minutes: int | None = Field(default=None, alias="timeout-minutes")
-    steps: list[Step] = Field(default_factory=list)
+    steps: list[Step] | None = None
 
 
 class Workflow(Node):
@@ -77,10 +84,17 @@ class Workflow(Node):
     [LAW:no-silent-failure]
     """
 
-    name: str
-    on: dict[str, Any]
-    permissions: dict[str, str] | None = None
-    concurrency: dict[str, Any] | None = None
+    # `on`, `permissions` and `concurrency` are deliberately untyped beyond "present".
+    # Each has several legal shapes — `on: push`, `on: [push, pull_request]`, the mapping
+    # form; `permissions: read-all` beside the per-scope mapping; `concurrency: my-group`
+    # beside the mapping — and the installer transforms none of them. A narrower
+    # annotation here would be a theorem STRONGER than the truth, which rejects valid
+    # bases just as surely as a weak one admits invalid states. `name` is optional
+    # because GitHub falls back to the file path. [LAW:types-are-the-program]
+    name: str | None = None
+    on: Any
+    permissions: Any = None
+    concurrency: Any = None
     jobs: dict[str, Job]
     trivia: tuple[Trivia, ...] = ()
 
@@ -142,7 +156,10 @@ def parse(text: str, source: str) -> Workflow:
 
 def _review_steps(workflow: Workflow) -> list[Step]:
     return [
-        step for job in workflow.jobs.values() for step in job.steps if step.id == REVIEW_STEP_ID
+        step
+        for job in workflow.jobs.values()
+        for step in (job.steps or ())
+        if step.id == REVIEW_STEP_ID
     ]
 
 
@@ -171,7 +188,11 @@ def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
         update={
             "jobs": {
                 name: job.model_copy(
-                    update={"steps": [bound if step is old else step for step in job.steps]}
+                    update={
+                        "steps": [bound if step is old else step for step in job.steps]
+                        if job.steps is not None
+                        else None
+                    }
                 )
                 for name, job in workflow.jobs.items()
             },
@@ -182,7 +203,7 @@ def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
 
 def _path_of(workflow: Workflow, target: Step) -> yamldoc.NodePath:
     for job_name, job in workflow.jobs.items():
-        for index, step in enumerate(job.steps):
+        for index, step in enumerate(job.steps or ()):
             if step is target:
                 return ("jobs", job_name, "steps", index)
     raise WorkflowError("the review step vanished between finding it and binding it")
