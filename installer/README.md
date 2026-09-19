@@ -59,7 +59,10 @@ installed, a git repository, `gh` authenticated, a GitHub repo it can resolve an
 Everything else — including each credential's verdict — is decided while the plan is
 built, not partway through performing it, so `--dry-run` reaches the same answer the real
 run will act on. A dry run that printed `sync` where the run exits `1` would predict
-nothing, which is the only thing a dry run is for. The `secret` line says which it is:
+nothing, which is the only thing a dry run is for. Reaching it costs one local read of
+each declared credential — a value is measured, never printed and never sent — because
+whether a source holds anything is a fact about this machine, and a dry run is allowed to
+be wrong about the network but not about that. The `secret` line says which it is:
 
 ```
 secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
