@@ -199,10 +199,6 @@ class Plan:
     secrets: tuple[SecretPlan, ...]
 
     @property
-    def write_paths(self) -> list[str]:
-        return [c.rendered.path for c in self.changes if c.needs_write]
-
-    @property
     def commit_paths(self) -> list[str]:
         return [c.rendered.path for c in self.changes if c.needs_commit]
 
