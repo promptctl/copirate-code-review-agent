@@ -54,7 +54,12 @@ BASE_REF="${1:?usage: check-version-bump.sh <base-ref>}"
 # dismiss-block/ is named by its shipped PATHS, not as a directory: the bare entry also matched
 # dismiss-block/README.md, forcing a release for a doc edit that the identical edit to the root
 # README.md is correctly spared — the same fact answered two ways by where the doc happens to live.
-SHIPPED_SURFACE=(src dist action.yml review-agent dismiss-block/action.yml dismiss-block/dist)
+# installer/ is named by its shipped PATHS for the same reason, and it is shipped: a
+# consumer installs `copirate-review` from a git TAG of this repo, so an installer change
+# a release never tagged is a change no consumer can reach. Its README and tests are not
+# shipped, and an edit confined to them needs no release.
+SHIPPED_SURFACE=(src dist action.yml review-agent dismiss-block/action.yml dismiss-block/dist \
+                 installer/src installer/pyproject.toml installer/uv.lock)
 
 mapfile -t CHANGED < <(git diff --name-only "${BASE_REF}...HEAD")
 
