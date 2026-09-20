@@ -59,7 +59,7 @@ uv tool install --from git+https://github.com/promptctl/copirate-code-review-age
 cd ~/code/your-repo && copirate-review install
 ```
 
-What it renders is declared in `.copirate-review.yaml`, layered over machine-wide defaults — see [its README](installer/README.md).
+What it renders comes from three layers, each optional and each declaring only its differences: the installer's shipped defaults, your machine-wide `~/.config/copirate-review/config.yaml`, then a repository's own `.copirate-review.yaml`. Credentials belong in the machine-wide layer — they are a fact about your machine, not about the code, so declaring one there covers every repo you install into. See [its README](installer/README.md).
 
 ## Providers
 
