@@ -32470,6 +32470,15 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // less convenient to read. Nothing is dropped and nothing is silent — the warning names why.
   // [LAW:no-silent-failure]
   //
+  // THE RETRY CARRIES NO `commit_id`, which is the difference between recovering and pretending to.
+  // Re-sending the SHA the host just rejected recovers nothing in the most likely case: a force-push or
+  // rebase does not merely move the head, it removes the old commit from the pull request entirely, so
+  // `createReview` refuses the call on `commit_id` itself and the retry fails identically. The parameter
+  // is documented optional and defaults to the pull request's most recent commit — and with the anchors
+  // gone there is nothing left for it to position, since a SHA was only ever needed to place comments on
+  // lines. So the host resolves the head, and it costs no extra request to ask it to.
+  // [LAW:polishing-by-subtraction] the version that works has one less field in it.
+  //
   // Exactly ONE retry, and only when there were inline comments to displace: if the second attempt
   // fails the cause was never the anchors, and the error belongs to the caller unaltered.
   try {
@@ -32493,7 +32502,6 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
       owner,
       repo,
       pull_number: pullNumber,
-      commit_id: commitId,
       event,
       body: bodyWith(review.findings),
     });

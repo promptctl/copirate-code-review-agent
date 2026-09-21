@@ -686,8 +686,11 @@ describe('submitReview — the host refuses the inline comments', () => {
     // The verdict cannot shift: requestsChanges counts anchored and unanchored alike.
     assert.equal(retry.event, 'REQUEST_CHANGES');
     assert.equal(retry.event, octokit.calls[0].event);
-    // Still filed against the commit the review actually read.
-    assert.equal(retry.commit_id, 'oldsha');
+    // NO commit_id: a force-push removes the old commit from the PR, so re-sending the SHA the host
+    // just rejected recovers nothing. Omitted, the host files the review against the current head —
+    // and with no anchors there is nothing a SHA would have positioned.
+    assert.equal('commit_id' in retry, false);
+    assert.equal(octokit.calls[0].commit_id, 'oldsha', 'the first attempt still names the reviewed commit');
   });
 
   test('an error that is not a 422 is the caller\'s, unretried and unaltered', async () => {

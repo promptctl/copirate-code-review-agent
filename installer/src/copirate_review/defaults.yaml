@@ -117,4 +117,18 @@ workflows:
       # repo that works in stacks declares more headroom. 0 lifts the cap; nothing here
       # defends against a loop that spends without bound, so a repo declaring 0 has chosen
       # that.
+      #
+      # WHAT A ROUND IS depends on the base above, and this table cannot see it. Under
+      # `pr-review` a round is a push, and the cap does what it was built for: it bounds
+      # AUTOMATIC re-review of a long-lived PR. Under the shipped `comment-review` default a
+      # round is a REQUEST — so the sixth time a human types `/review` on one pull request,
+      # they are refused, having asked explicitly and waited. That is a real narrowing, named
+      # here rather than discovered, and lifting it is this one line.
+      #
+      # It is NOT lifted by default, and the reason is the coupling above: this table is
+      # base-independent, so a repository taking the documented route back to `pr-review`
+      # (installer/README.md) would inherit `0` and get an uncapped review on every push. The
+      # value that is safe under one base is a runaway under the other. The two caps that do
+      # NOT depend on the trigger — the per-run token cap and DAILY_BUDGET_USD — still bound
+      # every run either way, so this is the one whose meaning the trigger moved.
       MAX_REVIEW_ROUNDS: 5

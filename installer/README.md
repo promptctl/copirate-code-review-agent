@@ -34,7 +34,7 @@ copirate-review install
 repo     promptctl/copirate-code-review-agent (origin) on my-feature-branch
 config   /Users/you/.config/copirate-review/config.yaml, .copirate-review.yaml
 action   promptctl/copirate-code-review-agent@v1
-workflow update    .github/workflows/code-review.yml  ((shipped) pr-review.yml)
+workflow update    .github/workflows/code-review.yml  ((shipped) comment-review.yml)
 secret   sync      CLAUDE_CODE_OAUTH_TOKEN  (keychain item CLAUDE_CODE_OAUTH_TOKEN_SIGNUP)
 ✓ synced CLAUDE_CODE_OAUTH_TOKEN on promptctl/… (Actions + Dependabot) from keychain item …
 ✓ wrote .github/workflows/code-review.yml (uses ./)
@@ -119,7 +119,18 @@ workflows:
     base: pr-review
     inputs:
       MAX_REVIEW_ROUNDS: 12
+      # Deleting the two inputs the shipped default binds to its gate job is part of
+      # switching base, not an optional tidy-up: `pr-review` reviews every push and has no
+      # gate, so `needs.gate.outputs.*` has nothing to read there. The install REFUSES this
+      # config without these two nulls, rather than rendering a workflow GitHub accepts and
+      # then handing the action an empty PR number.
+      PR_NUMBER: null
+      HEAD_SHA: null
 ```
+
+The shipped default is `comment-review`, which reviews a pull request when someone asks by
+commenting `/review` on it. `pr-review` — a review on every push — is still shipped, and the
+block above is the whole of switching to it.
 
 `inputs:` becomes the review step's `with:` block, replacing whatever the base carried
 there. It is deliberately open — every input [`action.yml`](../action.yml) accepts is

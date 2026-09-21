@@ -236,6 +236,50 @@ def test_the_same_inputs_are_accepted_once_the_review_job_declares_the_dependenc
     assert step["with"]["HEAD_SHA"] == "${{ needs.gate.outputs.head-sha }}"
 
 
+def test_prose_that_merely_mentions_needs_is_not_read_as_an_expression(tmp_path):
+    """Outside `${{ }}`, `needs.x` is text GitHub passes through untouched. Failing an
+    install over it would be a false alarm about a value that works."""
+    root = declaring(
+        tmp_path,
+        f"workflows:\n  {WORKFLOW}:\n    inputs:\n"
+        '      ZAI_REVIEWER_NAME: "this needs.attention from a human"\n',
+    )
+    step = review_step(rendered_for(root).text)
+    assert step["with"]["ZAI_REVIEWER_NAME"] == "this needs.attention from a human"
+
+
+def test_a_misspelled_output_is_refused_rather_than_resolving_to_nothing(tmp_path):
+    """The job is right and the output name is wrong — one underscore, and Actions resolves
+    it to '' without complaint. GitHub catches an unknown JOB; only this catches this."""
+    root = declaring(
+        tmp_path,
+        f"workflows:\n  {WORKFLOW}:\n    inputs:\n"
+        '      HEAD_SHA: "${{ needs.gate.outputs.head_sha }}"\n',
+    )
+    with pytest.raises(ConfigError) as caught:
+        rendered_for(root)
+    message = str(caught.value)
+    assert "needs.gate.outputs.head_sha" in message
+    assert "head-sha" in message, "it names what the gate actually publishes"
+
+
+def test_the_documented_switch_back_to_pr_review_actually_installs(tmp_path):
+    """installer/README.md tells a repository how to go back to reviewing every push. That
+    recipe stopped working the moment the shipped inputs bound themselves to a gate job, and
+    a documented config that fails the install is worse than no documentation. So the recipe
+    is pinned here: if the coupling changes again, this fails before a user's install does.
+    """
+    root = declaring(
+        tmp_path,
+        f"workflows:\n  {WORKFLOW}:\n    base: pr-review\n    inputs:\n"
+        "      MAX_REVIEW_ROUNDS: 12\n      PR_NUMBER: null\n      HEAD_SHA: null\n",
+    )
+    result = rendered_for(root)
+    assert "pr-review.yml" in result.base_file
+    assert "needs.gate" not in result.text, "no reference to a job this base does not have"
+    assert review_step(result.text)["with"]["MAX_REVIEW_ROUNDS"] == "12"
+
+
 def test_an_unknown_base_names_every_directory_that_was_searched(tmp_path):
     root = declaring(tmp_path, f"workflows:\n  {WORKFLOW}:\n    base: nowhere\n")
     with pytest.raises(ConfigError) as caught:
