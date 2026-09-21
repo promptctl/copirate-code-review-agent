@@ -29,6 +29,15 @@ from .test_render import rendered_for
 OPEN_SAME_REPO = '{"state":"open","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
 OPEN_FROM_FORK = '{"state":"open","headSha":"abc123","headRepoId":2,"baseRepoId":1}'
 CLOSED = '{"state":"closed","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
+#: The `--jq` PROJECTION STOPPED MATCHING — `.head` renamed or removed upstream, or a typo in
+#: the filter — so every field under it comes back null, not just the repository id. This is a
+#: malformed response and must stop the gate, NOT be absorbed by the deleted-fork sentinel and
+#: answered as "comes from a fork" for a pull request that is nothing of the kind.
+BROKEN_HEAD_PROJECTION = '{"state":"open","headSha":null,"headRepoId":null,"baseRepoId":1}'
+#: The fork a pull request came from has been DELETED. GitHub answers `head.repo: null`,
+#: which `--jq` renders as a null field rather than omitting it. This is a real domain
+#: state, not a malformed response — src/transport.js's prIsFromFork types it as "fork".
+OPEN_FORK_DELETED = '{"state":"open","headSha":"abc123","headRepoId":null,"baseRepoId":1}'
 
 #: A body that executes `touch $CANARY` if — and only if — it is ever parsed by a shell
 #: instead of being carried as data. A comment body is attacker-authored text, so this is
@@ -292,6 +301,24 @@ def test_an_unauthorized_asker_is_recorded_and_not_replied_to(gate, association)
     assert association in recorded, "the record names the association it refused on"
 
 
+def test_a_deleted_head_repository_is_refused_as_a_fork_not_as_an_error(gate):
+    """A deleted fork must reach the answer the action already has for it.
+
+    GitHub returns `head.repo: null` once the fork is deleted. Read with `jq -re` that
+    exits 1, `set -e` kills the step, and the asker is told "This is an error, not a
+    refusal" — for a state the action types as a real domain value: prIsFromFork returns
+    TRUE for an absent head repo, and its comment calls that a meaningful outcome. The gate
+    said error, the action said fork; two maps of one meaning. The right answer was already
+    enumerated one branch below.
+    """
+    started, code, _ = gate("/review", pr_json=OPEN_FORK_DELETED)
+    assert not started
+    assert code == 0, "a deleted fork is a refusal, which is a decision, not a failure"
+    posted = gate.comments()
+    assert len(posted) == 1, f"expected the fork refusal, got {posted!r}"
+    assert "comes from a fork" in posted[0]
+
+
 def test_a_comment_that_is_not_a_request_says_nothing_at_all(gate):
     """The gate runs on EVERY comment in the repository. Answering the ones that asked for
     nothing would turn every conversation on every pull request into a thread of refusals."""
@@ -307,3 +334,23 @@ def test_a_started_review_is_not_announced_by_the_gate(gate):
     started, _, _ = gate("/review")
     assert started
     assert gate.comments() == []
+
+
+def test_a_projection_that_stopped_matching_stops_the_gate_instead_of_crying_fork(gate):
+    """The deleted-fork sentinel must be reachable ONLY from a deleted fork.
+
+    `--jq` renders a path that stopped matching exactly as it renders a genuinely null field, so
+    `.headRepoId // "deleted-head-repository"` could absorb both and refuse every same-repository
+    PR as a fork — false, unactionable, and no longer the loud stop its `-re` siblings give.
+
+    It cannot, and the reason is the ORDER rather than either line: `head_sha` is read with `-re`
+    first, so a broken `.head` is fatal before the sentinel can be produced. This pins that
+    sequence, because reordering the reads would silently convert a malformed response into a
+    confident lie. [LAW:parse-dont-validate] [LAW:no-silent-failure]
+    """
+    started, code, _ = gate("/review", pr_json=BROKEN_HEAD_PROJECTION)
+    assert not started, "a malformed response must never start a billed review"
+    assert code != 0, "a malformed response is an error, not a refusal"
+    assert gate.comments() == [], (
+        f"it must not tell the asker this PR is from a fork; said: {gate.comments()}"
+    )

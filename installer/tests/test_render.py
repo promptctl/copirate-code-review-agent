@@ -338,3 +338,56 @@ def test_a_base_is_bound_wherever_its_review_step_lives(tmp_path):
     text = rendered_for(write_base(tmp_path, body)).text
     step = read_yaml(text, "r")[0]["jobs"]["second"]["steps"][1]
     assert step["uses"] == "promptctl/copirate-code-review-agent@v1"
+
+
+def test_every_job_that_can_die_silently_answers_on_the_pull_request(tmp_path):
+    """EVERY job owes the asker an answer when it does not succeed, on one condition.
+
+    Under `pull_request` a dead review was at least visible: the run attached to the head
+    commit and a red check appeared on the PR. An `issue_comment` run is attached to no
+    commit and shows up in NO check list, so a job that dies without saying so is
+    indistinguishable from the action not being installed — the exact failure this base
+    exists to end.
+
+    Quantified over `workflow["jobs"]` rather than a hardcoded pair, because a set built
+    only from the jobs that HAVE an answering step can never catch a job that lacks one —
+    it simply never enters the dict. Comparing against the jobs that exist is what makes
+    "a new job shipped without a notification" fail here.
+
+    An answering step is found by its `if:` reading a step OUTCOME, not by merely having
+    some condition. That is what makes this one assertion catch the regression it was
+    written after: the gate's notification used `failure()`, which is FALSE when a job is
+    cancelled, so a gate cancelled by its `timeout-minutes: 5` answered nobody. A job whose
+    condition slips back to `failure()` stops matching and shows up as a job with no
+    answer. The previous version of this test could not see that — it pinned `failure()` for
+    the gate as though the spelling were the requirement. The requirement is the PROPERTY,
+    so every job is held to the same one. [LAW:behavior-not-structure] [LAW:single-enforcer]
+    """
+    workflow, _ = read_yaml(rendered_for(tmp_path).text, "rendered")
+    answering = {}
+    for name, job in workflow["jobs"].items():
+        for step in job["steps"]:
+            if "gh pr comment" in step.get("run", "") and ".outcome" in (step.get("if") or ""):
+                answering.setdefault(name, []).append(step["if"])
+
+    assert set(answering) == set(workflow["jobs"]), (
+        "every job must answer on the PR when it does not succeed, on a condition that reads "
+        f"its own step's outcome; jobs without one: {sorted(set(workflow['jobs']) - set(answering))}"
+    )
+
+    for name, conditions in sorted(answering.items()):
+        condition = " ".join(conditions)
+        # `always()` and not `failure()`: a job CANCELLED by its own timeout-minutes is not a
+        # failure, and that is precisely the "burned the budget and posted nothing" outcome a
+        # human most needs told about.
+        assert "always()" in condition, (
+            f"{name} must still answer when cancelled, not only when it fails; got {condition!r}"
+        )
+        # Its OWN decisive step, which this base names after the job — so the condition cannot
+        # answer for a step in a different job, and an added job must name its own.
+        assert f"steps.{name}.outcome" in condition, (
+            f"{name} must read its own decisive step's outcome; got {condition!r}"
+        )
+        assert "!= 'success'" in condition, (
+            f"success is the one outcome that says nothing; {name} got {condition!r}"
+        )

@@ -234,7 +234,30 @@ jobs:
           # `actions/checkout` would interpret as the default branch.
           state="$(printf '%s' "$pr_json" | jq -re '.state')"
           head_sha="$(printf '%s' "$pr_json" | jq -re '.headSha')"
-          head_repo_id="$(printf '%s' "$pr_json" | jq -re '.headRepoId')"
+          # A DELETED HEAD REPOSITORY IS A FORK, not a broken response. GitHub returns
+          # `head.repo: null` once the fork a pull request came from is deleted, so `jq -re`
+          # exits 1 here and `set -e` kills the step — answering "this is an error, not a
+          # refusal" for a state the action itself types as a real domain value: prIsFromFork
+          # returns TRUE for an absent head repo, with a comment calling it exactly that.
+          # Two maps of one meaning, disagreeing. A sentinel that can never equal a numeric
+          # repository id routes it to the fork refusal one branch below, which is already
+          # the right answer and the one the comment above claims parity with.
+          # [LAW:one-source-of-truth]
+          #
+          # The other three keep `-re`: a missing state, head SHA, or BASE repository is a
+          # malformed response carrying no meaning to recover — the same split prIsFromFork
+          # draws when it throws on an absent base repo and returns true on an absent head.
+          #
+          # THE READ ORDER IS LOAD-BEARING, and it is what keeps this sentinel meaning exactly
+          # one thing. `--jq` emits a null for a path that stopped matching just as it does for a
+          # genuinely null field, so read alone this default could also absorb "the projection
+          # broke" and answer a false "comes from a fork" for every same-repository PR. It cannot,
+          # because `head_sha` is read with `-re` ABOVE: if `.head` were renamed or removed the
+          # gate is already dead by the time this line runs. The sentinel is therefore reachable
+          # only when `.head.sha` is present and `.head.repo` is null — which is the deleted-fork
+          # state and nothing else. A test pins that ordering, because the property lives in the
+          # sequence rather than in either line. [LAW:parse-dont-validate]
+          head_repo_id="$(printf '%s' "$pr_json" | jq -r '.headRepoId // "deleted-head-repository"')"
           base_repo_id="$(printf '%s' "$pr_json" | jq -re '.baseRepoId')"
 
           if [ "$state" != "open" ]; then
@@ -260,19 +283,30 @@ jobs:
           echo "Reviewing pull request #${PR_NUMBER} at ${head_sha}."
 
       # THE ERROR PATH ALSO HAS TO REACH THE PERSON WHO ASKED. The step above fails closed by
-      # design — `set -euo pipefail` plus `jq -re`, so a broken `gh` call or a deleted head
-      # repository stops it rather than guessing — but failing closed inside a job attached to
-      # no commit is failing INVISIBLY: the run appears in the Actions tab and on no check list
-      # this pull request shows. Without this step a maintainer types `/review`, the gate dies
-      # on a transient API fault, and they wait for a review that will never come with nothing
-      # anywhere to tell them so.
+      # design — `set -euo pipefail` plus `jq -re`, so a broken `gh` call or a response missing
+      # a field it must have stops it rather than guessing — but failing closed inside a job
+      # attached to no commit is failing INVISIBLY: the run appears in the Actions tab and on no
+      # check list this pull request shows. Without this step a maintainer types `/review`, the
+      # gate dies on a transient API fault, and they wait for a review that will never come with
+      # nothing anywhere to tell them so.
       #
-      # `if: failure()` and not `always()`: every success path has already said what it owes,
-      # and `always()` would speak over the two that owe the asker nothing — a comment that was
-      # not a request, and a request from someone with no standing to make one.
-      # [LAW:no-silent-failure]
+      # THE CONDITION IS THE REVIEW JOB'S TWIN, WORD FOR WORD, and it has to be. `failure()` is
+      # FALSE when a job is CANCELLED, and this job carries `timeout-minutes: 5` — so a gate
+      # whose single `gh api` call hangs on a congested host is cancelled rather than failed, and
+      # under `failure()` the asker is told nothing. That is the identical silent death the
+      # review job's step exists to close, one job earlier, and one concern may not be enforced
+      # by two conditions that disagree about what counts as not answering.
+      # [LAW:single-enforcer]
+      #
+      # `always()` ALONE would be wrong, and it is NOT this condition: it would speak over the
+      # two paths that owe the asker nothing — a comment that was not a request, and a request
+      # from someone with no standing to make one. Both of those `exit 0` inside the step above,
+      # so both leave `steps.gate.outcome` equal to 'success', and success is the single outcome
+      # this stays silent on. The deliberate silence is kept by reading the step's own outcome,
+      # not by narrowing which events may speak — the answer follows the value the step
+      # produced. [LAW:dataflow-not-control-flow] [LAW:no-silent-failure]
       - name: Say so on the pull request if the gate could not decide
-        if: failure()
+        if: always() && steps.gate.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -280,7 +314,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** The gate that decides whether to review this pull request failed before it could reach a verdict, so no review ran and nothing was spent. This is an error, not a refusal — see the [run log](${RUN_URL}). Commenting \`/review\` again re-runs it."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** The gate that decides whether to review this pull request stopped before it could reach a verdict, so no review ran and nothing was spent. This is an error, not a refusal — see the [run log](${RUN_URL}). Commenting \`/review\` again re-runs it."
 
   review:
     name: Review
@@ -426,3 +460,81 @@ jobs:
           name: review-session-transcript
           path: ${{ steps.review.outputs.transcript-dir }}
           if-no-files-found: ignore
+
+      # THE REVIEW JOB OWES THE SAME ANSWER THE GATE DOES, and for the same reason — this
+      # is the gate's answering step mirrored onto the job that spends the money, carrying the
+      # same condition because "did not answer" is one idea. [LAW:single-enforcer]
+      #
+      # Under `pull_request` a dead review was at least VISIBLE: the run attached to the
+      # head commit and a red check appeared on the pull request. An `issue_comment` run is
+      # attached to no commit and appears in NO check list, so without this step every way
+      # this job can die is completely silent — an expired credential, a runner fault, a
+      # failed checkout, the job's own timeout, or the action crashing before it can post.
+      # The asker sees a comment they typed and then nothing, forever, which is
+      # indistinguishable from this action not being installed. That is the exact failure
+      # this base exists to end, and moving the trigger re-opened it one job over.
+      # [LAW:no-silent-failure]
+      #
+      # ONE DEATH THIS CANNOT ANSWER, named here so the coverage is not read as total. A job
+      # cancelled while still QUEUED executes no steps at all — `always()` included, because
+      # `always()` is a condition a runner evaluates and no runner ever took the job. Nothing
+      # inside such a run can speak for it. The concurrency note above describes exactly that
+      # path: a third `/review` evicts a still-pending second run, unconditionally. The answer
+      # there would have to come from the run that CAUSED the eviction, since it is the only one
+      # still alive to speak, which is a different design and not this step's job. What this step
+      # covers is every death of a job that STARTED.
+      #
+      # `always() && steps.review.outcome != 'success'` rather than `failure()`, because
+      # `failure()` misses the two cases that matter most here. A job CANCELLED by its own
+      # `timeout-minutes` is not a failure, and that is precisely the "burned the budget and
+      # posted nothing" outcome a human most needs told about. And a failure in an EARLIER
+      # step leaves this one's `failure()` true but `steps.review.outcome` equal to
+      # 'skipped' — which this condition still catches, while naming the review step as the
+      # thing that did not succeed. Success is the only outcome that says nothing, because
+      # on that path the review itself has already spoken. [LAW:dataflow-not-control-flow]
+      #
+      # The outcome is read rather than the event, which is what lets ONE condition serve both
+      # jobs: each names its own decisive step, and every non-success value of it — including
+      # the empty string, when the job died before that step was ever reached — is a run that
+      # owes an answer.
+      #
+      # IT ASSERTS NEITHER A COST NOR A DELIVERY, and the second half of that was learned the
+      # hard way. The gate's twin can promise "nothing was spent" truthfully, because it refuses
+      # before any engine starts; by here a review may have run for twenty minutes before dying.
+      #
+      # A FAILED STEP DOES NOT MEAN NO REVIEW WAS POSTED. Two paths in the action deliver and
+      # then fail: the round-cap path posts its `NOT REVIEWED` notice and afterwards
+      # `core.setFailed`s if a stale blocking review cannot be dismissed, and `landedDespite` in
+      # src/run.js deliberately SWALLOWS a post error once it has confirmed the review is on the
+      # pull request — after which the ledger append can still throw. On both, a notice saying
+      # "no review was delivered" would sit directly beneath the review that was.
+      #
+      # So this step asserts only what it holds: one outcome string. Everything else — was a
+      # review posted, was anything spent — is named as unknown and pointed at the log. A notice
+      # that overstates its knowledge is worse than terse; it contradicts the artifact above it.
+      # [FRAMING:representation] the claim is sized to the check.
+      - name: Say so on the pull request if the review could not be delivered
+        if: always() && steps.review.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr-number }}
+          OUTCOME: ${{ steps.review.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # `steps.review.outcome` IS THE EMPTY STRING, not a state name, when the job died
+          # before that step was ever reached — cancelled during `actions/checkout`, or a runner
+          # fault. The condition above deliberately treats empty as non-success, so this step
+          # runs on exactly that path and must not render it as empty backticks naming nothing.
+          # A notice that cannot say what happened is the silence this step exists to end
+          # wearing a comment's clothes. [LAW:no-silent-failure]
+          if [ -n "${OUTCOME:-}" ]; then
+            what="The review step ended \`${OUTCOME}\`."
+          else
+            what="The run ended before the review step started."
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**This review run did not end cleanly.** ${what} A review may or may not have been posted: if one stands above this notice then it is real, and this notice is about the RUN rather than the review. The cause, and whether any tokens were spent, is in the [run log](${RUN_URL}). Commenting \`/review\` again starts a new one."
+
