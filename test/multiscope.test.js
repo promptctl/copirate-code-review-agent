@@ -25,6 +25,7 @@ const { buildReviewInput, buildRepoReviewInput, buildRepoScoutInput } = require(
 const { partitionByDirectory } = require('../src/partition');
 const { parseScopeValue, parseFindingValue, dedupeFindings } = require('../src/review');
 const { fileChurn } = require('../src/diff');
+const { renderDiffFile } = require('../src/diff-files');
 const { TransientError } = require('../src/failover');
 const { BudgetExhaustedError } = require('../src/bounds');
 const { mintTokenCap } = require('../src/token-cap');
@@ -916,16 +917,45 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, /CONCENTRATE THIS REVIEW on one part of the change: cost — src\/usage\.js/);
   });
 
-  // The change reaches the worker as diff files on disk, never inline: the prompt names the repository,
-  // where each changed file's diff lives, and how to list them; the worker decides what to read.
-  test('the worker prompt names the repo root, each diff file path, and the Glob over the diff directory — no inline diff text', () => {
+  // A worker is HANDED its own part of the change and pointed at the rest by path — the two halves of one
+  // contract, so each is asserted against the other. What is inline is bounded by the ASSIGNMENT, which is
+  // what makes this different from inlining the change itself: the whole diff in every one of N prompts was
+  // the cost that moved this material onto disk in the first place, and that is still refused below.
+  //
+  // The measured reason the assignment is handed over at all (links-issue-tracker#557 run 04:10): told to
+  // `Glob` the diff directory "to list every changed file", a worker assigned two markdown files with 22
+  // changed lines read seven other scopes' diffs and one other scope's store.go thirteen times — 76 turns
+  // and 9m15s, the run's smallest scope by churn and its largest by wall clock.
+  test("a worker is handed its OWN scope's diffs inline, and only those — the rest stay on disk, unswept", () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js']);
     assert.match(prompt, new RegExp(`checked out at ${REPO_ROOT}`));
-    assert.ok(prompt.includes(`the diff of <path> is ${DIFF_DIR}/<path>.diff`));
+    // Its own file's patch text is present, on the same LINE grid the diff file carries.
+    assert.match(prompt, /const u = 1;/);
+    assert.match(prompt, /LINE 1/);
+    // No other scope's patch text is inlined: the material a worker holds is its assignment, not the change.
+    assert.doesNotMatch(prompt, /const x = 1;/);
+    assert.doesNotMatch(prompt, /const r = 1;/);
+    // The rest of the change stays reachable by path — withheld from nobody, enumerated for nobody.
+    assert.ok(prompt.includes(`${DIFF_DIR}/<path>.diff`));
+    assert.ok(!prompt.includes(`Glob ${DIFF_DIR}`), 'an assigned worker must not be told to sweep the diff directory');
+  });
+
+  // [LAW:one-source-of-truth] The inline copy is rendered by the writer's own renderer, so a finding's
+  // `line` means the same thing whether the worker read it inline or from the file on disk. A second
+  // renderer here would be a second LINE grid, and every anchor off it lands on the wrong line.
+  test("a worker's inline diff is byte-identical to the diff file written for the same change", () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js']);
+    const onDisk = renderDiffFile(files.find(f => f.filename === 'src/usage.js'));
+    assert.ok(prompt.includes(onDisk), 'the inline material must be the diff file the writer would write');
+  });
+
+  // A whole-diff review (scripts/local-review.js) owns no assignment, so it must still be able to find the
+  // change — the discovery instruction is the value that shape selects, not a mode. [LAW:dataflow-not-control-flow]
+  test('a worker with no assignment is told how to list the change, and gets no inline diff', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
+    assert.ok(prompt.includes(`the diff of <path> is`));
     assert.ok(prompt.includes(`Glob ${DIFF_DIR}`));
-    assert.doesNotMatch(prompt, /```diff/);
-    assert.doesNotMatch(prompt, /LINE 1:/);
-    assert.doesNotMatch(prompt, /const [xur] = 1;/); // no changed file's patch text is inlined
+    assert.doesNotMatch(prompt, /const [xur] = 1;/);
   });
 
   // A finding is anchored to the changed file, never to the diff file the worker read it from.

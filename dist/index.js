@@ -31487,6 +31487,15 @@ const { annotatePatchWithLines } = __nccwpck_require__(9898);
 // [LAW:no-silent-failure] A changed path that resolves outside the directory is refused, never written.
 // The caller names the directory: the diffs hold the change's code, so they belong under a directory the
 // caller already deletes, never an orphan temp dir that outlives the run.
+// [LAW:one-source-of-truth] ONE rendering of a changed file as reviewable material, with TWO sinks:
+// the diff file this module writes, and the same bytes inlined into a worker's prompt (src/prompt.js).
+// A finding's `line` is the LINE value read off this grid, so a second renderer for the inline copy
+// would be a second grid that anchors comments to the wrong lines the moment the two drift.
+// [LAW:effects-at-boundaries] Pure: bytes in, bytes out. The caller decides where they go.
+function renderDiffFile(f) {
+  return `${f.filename} (${f.status})\n${annotatePatchWithLines(f.patch)}\n`;
+}
+
 function writeDiffFiles(files, dir) {
   const root = path.resolve(dir);
   fs.mkdirSync(root, { recursive: true });
@@ -31498,12 +31507,12 @@ function writeDiffFiles(files, dir) {
       throw new Error(`writeDiffFiles: changed path ${JSON.stringify(f.filename)} resolves outside the diff directory ${root}; refusing to write it.`);
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, `${f.filename} (${f.status})\n${annotatePatchWithLines(f.patch)}\n`);
+    fs.writeFileSync(target, renderDiffFile(f));
   }
   return root;
 }
 
-module.exports = { writeDiffFiles };
+module.exports = { renderDiffFile, writeDiffFiles };
 
 
 /***/ }),
@@ -36219,6 +36228,10 @@ module.exports = { preflight, probeConfig, classifyProbe, PROBE_TIMEOUT_MS };
 "use strict";
 
 const { NO_EXCLUSIONS, excludedPathList } = __nccwpck_require__(9898);
+// [LAW:one-source-of-truth] The diff renderer diff-files.js writes with. A worker's inline material and
+// the diff file on disk are the same bytes on the same LINE grid, so a finding anchors identically
+// whichever one the worker read it from — two renderers would be two grids.
+const { renderDiffFile } = __nccwpck_require__(1352);
 const { findingLineText } = __nccwpck_require__(1565);
 
 // [LAW:one-source-of-truth] The REVIEW PHILOSOPHY lives here, once, shared by both the PR-diff and
@@ -36450,15 +36463,57 @@ function buildReviewInput({ files, diffDir, toolNames, reviewedRepoRoot, focus =
     presentation — findings drive the merge decision.\n`
     : '';
 
+  // THE MATERIAL THIS WORKER OWNS, handed to it rather than discovered.
+  //
+  // [LAW:dataflow-not-control-flow] An assignment is a VALUE: a worker with `scopeFiles` gets its own
+  // diffs inline and the material clause that goes with them; a worker with none (a whole-diff review —
+  // scripts/local-review.js — or a repo-mode scope) gets '' and the clause that tells it to discover the
+  // change. Same code path, different values, selected by the domain's own discriminator.
+  //
+  // WHY, measured on promptctl/links-issue-tracker#557 run 04:10 (transcripts archived with the run).
+  // Every worker used to be told to `Glob` the diff directory "to list every changed file", so all N of
+  // them were pointed at the whole change — and they read it. The `doc-v1-total` worker, assigned two
+  // markdown files with 22 changed lines between them, spent 76 turns and 9m15s: it globbed all 16 diff
+  // files, read seven belonging to other scopes, and read one other scope's `internal/store/store.go`
+  // THIRTEEN times. Its churn was the smallest of any scope in the run and its wall clock the largest, so
+  // the cost was never the work — it was N workers each re-reading everything, O(N²) in the scope count.
+  //
+  // The partition already promises "every changed path lands in exactly one scope's `files` by
+  // construction" (src/partition.js); enumerating the whole directory to every worker un-promises it.
+  // [LAW:one-source-of-truth] Handing a worker its own diffs is that promise kept in the prompt too.
+  //
+  // This narrows what a worker is HANDED, never what it may judge: the focus block still has it record a
+  // genuine issue it notices anywhere, the fuller-context reading below is untouched, and the rest of the
+  // change stays on disk and reachable by path. Nothing is withheld — it is simply not enumerated, so a
+  // worker no longer pays turns rediscovering files another worker owns. [LAW:no-silent-failure]
+  const ownedDiffs = files.filter(f => f.patch && scopeFiles.includes(f.filename));
+  const ownedDiffBlock = ownedDiffs.length > 0
+    ? `\n    THE PART OF THE CHANGE YOU OWN, in full — already read for you, do not read these from disk:\n\n`
+      + ownedDiffs.map(renderDiffFile).join('\n')
+    : '';
+
+  // [LAW:one-source-of-truth] One clause per material shape, as a TABLE keyed on whether this worker was
+  // handed an assignment — the same device the timing breakdown uses for its plan provenance
+  // (src/schedule.js). The `assigned` clause deliberately does NOT say "glob the directory": that one
+  // sentence is what turned a 22-line doc review into a 9m15s repo crawl.
+  const MATERIAL_CLAUSE = {
+    assigned: `Every other file in this change is owned by another worker reviewing it in parallel. Their diffs
+    are on disk at ${diffDir}/<path>.diff if a specific one bears on your own part — read that one by path.
+    Do not list or sweep that directory: rediscovering another worker's files is the whole of the waste this
+    assignment exists to avoid.`,
+    whole: `The change is on disk as diff files, one per changed file: the diff of <path> is
+    ${diffDir}/<path>.diff. Glob ${diffDir} to list every changed file.`,
+  };
+  const materialClause = MATERIAL_CLAUSE[ownedDiffs.length > 0 ? 'assigned' : 'whole'];
+
   return {
     prompt: `
 Review this pull request. The repository under review is checked out at ${reviewedRepoRoot}.
     Your working directory is intentionally outside the repository; reach it by that absolute path with your Read tool.
 
-    The change is on disk as diff files, one per changed file: the diff of <path> is ${diffDir}/<path>.diff.
-    Glob ${diffDir} to list every changed file. In a diff file, each line a comment can attach to is prefixed
+    ${materialClause} Each line a comment can attach to is prefixed
     LINE N, where N is that line's number in the changed file.${unpatchedNote}
-${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
+${ownedDiffBlock}${focusBlock}${pushbackBlock}${priorFindingsBlock}${dependencyInstructionBlock}${dependencyAssessBlock}
     You decide what to read. Start from the diffs, then read the changed files in the repository and whatever
     the change touches: most bugs are only visible in the full surrounding context of the function and
     module — a missing guard, a caller you'd break, a value that can't be what this line assumes. When the
