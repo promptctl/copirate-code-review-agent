@@ -136,6 +136,30 @@ jobs:
           # thought about cannot emit a permissive answer.
           echo "review=false" >> "$GITHUB_OUTPUT"
 
+          # [LAW:single-enforcer] THE ONE WAY THIS JOB REFUSES, so a new refusal cannot ship
+          # reaching fewer sinks than the others — which had already happened: the closed-PR
+          # path wrote a log warning while its two siblings also wrote a step summary.
+          #
+          # THE PR COMMENT IS THE SINK THAT MATTERS, and it is the one that was missing. A run
+          # on `issue_comment` is attached to no commit, so unlike a `pull_request` run it
+          # appears in NO check list on the pull request. Refusing in the log and the step
+          # summary means a maintainer who types `/review` on a fork PR sees the workflow go
+          # green and nothing whatsoever on the PR — indistinguishable from this action not
+          # being installed, which is exactly the "asked and got nothing" this base exists to
+          # end. They asked in a comment; they are answered in a comment.
+          #
+          # No `|| true`: a refusal nobody can see is the failure being fixed here, so failing
+          # to deliver it fails the job rather than passing quietly. [LAW:no-silent-failure]
+          refuse() {
+            echo "::warning title=Review not started::$1"
+            {
+              echo "### Review not started"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** $1"
+          }
+
           # THE COMMAND, matched once, here. A line whose first non-blank content is
           # `/review`, ending there or continuing after whitespace — so a `/review` quoted
           # mid-sentence or inside a URL does not start a billed run. `grep -q` exits 1 on
@@ -165,12 +189,7 @@ jobs:
           case "$AUTHOR_ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR) ;;
             *)
-              echo "::warning title=Review not started::@${COMMENT_AUTHOR} asked for a review but has association '${AUTHOR_ASSOCIATION}'; only OWNER, MEMBER or COLLABORATOR may start one."
-              {
-                echo "### Review not started"
-                echo
-                echo "\`@${COMMENT_AUTHOR}\` asked for a review, but only a repository owner, member, or collaborator can start one."
-              } >> "$GITHUB_STEP_SUMMARY"
+              refuse "\`@${COMMENT_AUTHOR}\` asked for a review, but only a repository owner, member, or collaborator can start one (association: \`${AUTHOR_ASSOCIATION}\`)."
               exit 0
               ;;
           esac
@@ -190,19 +209,13 @@ jobs:
           base_repo_id="$(printf '%s' "$pr_json" | jq -re '.baseRepoId')"
 
           if [ "$state" != "open" ]; then
-            echo "::warning title=Review not started::Pull request #${PR_NUMBER} is ${state}, not open."
+            refuse "Pull request #${PR_NUMBER} is ${state}, not open, so there is nothing to review."
             exit 0
           fi
 
           # THE FORK REFUSAL, reached before any pull-request byte is on this runner.
           if [ "$head_repo_id" != "$base_repo_id" ]; then
-            echo "::warning title=Review not started::Pull request #${PR_NUMBER} comes from a fork. This workflow runs with repository secrets in scope, so it does not check out fork code."
-            {
-              echo "### Review not started"
-              echo
-              echo "Pull request #${PR_NUMBER} comes from a fork. A comment-triggered review runs with"
-              echo "this repository's secrets in scope, so it deliberately does not check out fork code."
-            } >> "$GITHUB_STEP_SUMMARY"
+            refuse "Pull request #${PR_NUMBER} comes from a fork. A comment-triggered review runs with this repository's secrets in scope, so it deliberately does not check out fork code."
             exit 0
           fi
 
@@ -216,6 +229,27 @@ jobs:
             echo "head-sha=${head_sha}"
           } >> "$GITHUB_OUTPUT"
           echo "Reviewing pull request #${PR_NUMBER} at ${head_sha}."
+
+      # THE ERROR PATH ALSO HAS TO REACH THE PERSON WHO ASKED. The step above fails closed by
+      # design — `set -euo pipefail` plus `jq -re`, so a broken `gh` call or a deleted head
+      # repository stops it rather than guessing — but failing closed inside a job attached to
+      # no commit is failing INVISIBLY: the run appears in the Actions tab and on no check list
+      # this pull request shows. Without this step a maintainer types `/review`, the gate dies
+      # on a transient API fault, and they wait for a review that will never come with nothing
+      # anywhere to tell them so.
+      #
+      # `if: failure()` and not `always()`: the success path already speaks, either by starting
+      # a review or through `refuse`. [LAW:no-silent-failure]
+      - name: Say so on the pull request if the gate could not decide
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** The gate that decides whether to review this pull request failed before it could reach a verdict, so no review ran and nothing was spent. This is an error, not a refusal — see the [run log](${RUN_URL}). Commenting \`/review\` again re-runs it."
 
   review:
     name: Review

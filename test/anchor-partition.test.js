@@ -712,11 +712,22 @@ describe('submitReview — the host refuses the inline comments', () => {
     assert.equal(octokit.calls.length, 1);
   });
 
-  test('a retry that fails too reports the second failure rather than looping', async () => {
-    const octokit = failingOctokit([httpError(422, 'first'), httpError(422, 'second')]);
+  test('a retry that fails too reports BOTH failures rather than looping or losing one', async () => {
+    const octokit = failingOctokit([
+      httpError(422, 'line must be part of the diff'),
+      httpError(422, 'body is too long'),
+    ]);
     await assert.rejects(
       () => submitReview(octokit, 'o', 'r', 7, 'sha', 'Reviewer', reviewWithFindings(), true, gitHubTransport([], [])),
-      /second/,
+      err => {
+        // Either error alone misleads: the second does not say why a retry happened, and the first does
+        // not say the fallback failed too. A body-too-long 422 fails BOTH attempts (the retry's body is
+        // larger), so the operator must see the size complaint and not only a story about anchors.
+        assert.match(err.message, /line must be part of the diff/);
+        assert.match(err.message, /body is too long/);
+        assert.equal(err.cause.status, 422, 'the original error is preserved as the cause');
+        return true;
+      },
     );
     assert.equal(octokit.calls.length, 2, 'exactly one retry, never a loop');
   });

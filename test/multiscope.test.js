@@ -1004,6 +1004,39 @@ describe('buildPrMaterial', () => {
     assert.match(prompt, /recording it as a finding is the correct response/);
   });
 
+  // THE INLINED MATERIAL IS BOUNDED, because inlining moved the size decision from the worker to the
+  // host. A scope's churn has no ceiling — partition.js rule 4 cuts a large group only on a LOPSIDED
+  // plan, so an even plan of large groups is never cut — and a first request the model refuses does not
+  // degrade the scope, it fails it into `unreviewedScopes`. That is lost coverage, which is worse than a
+  // slow review. src/engine/claude-code.js names the same failure from a 232k first request.
+  //
+  // Coverage is unchanged by the bound: what spills is NAMED to the worker that owns it, so it reads one
+  // diff file from disk — exactly the behaviour that preceded inlining. [LAW:no-silent-failure]
+  test('a scope too large to inline spills to disk by name, and is never silently dropped', () => {
+    const huge = 'y'.repeat(130_000);
+    const files = [
+      { filename: 'src/huge.js', status: 'modified', patch: `@@ -1,1 +1,1 @@\n+${huge}` },
+      { filename: 'src/small.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n+const s = 1;' },
+    ];
+    const prompt = buildPrMaterial({ diffDir: DIFF_DIR, files, reviewedRepoRoot: REPO_ROOT })
+      .buildWorkerPrompt('big', TOOL_NAMES, ['src/huge.js', 'src/small.js']);
+    assert.ok(!prompt.includes(huge), 'the oversized patch is not spliced into the prompt');
+    // Named as ITS OWN, distinct from another worker's files, with where to read it.
+    assert.match(prompt, /Your own file src\/huge\.js is too large to include here/);
+    assert.ok(prompt.includes(`${DIFF_DIR}/<path>.diff`));
+    // An oversized file must not spill the small ones behind it — the fold skips, never stops.
+    assert.match(prompt, /const s = 1;/);
+    // Still an assignment: a spill is not a reason to sweep the whole change.
+    assert.ok(!prompt.includes(`Glob ${DIFF_DIR}`));
+  });
+
+  test('a scope within the budget is inlined whole, with nothing named as spilled', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js', 'src/report.js']);
+    assert.match(prompt, /const u = 1;/);
+    assert.match(prompt, /const r = 1;/);
+    assert.doesNotMatch(prompt, /too large to include here/);
+  });
+
   // THE FENCE MUST NOT BE FORGEABLE BY THE CONTENT, which a fixed literal was: the first version of this
   // framing used a five-'=' marker, and the test file asserting it contained that marker verbatim — so
   // this repository reviewing itself inlined the closing marker as diff content and everything after it
@@ -1035,9 +1068,20 @@ describe('buildPrMaterial', () => {
   });
 
   // A finding is anchored to the changed file, never to the diff file the worker read it from.
-  test("findings are recorded at the changed file's repository path with the LINE value from its diff file", () => {
+  test("findings are recorded at the changed file's repository path, with the LINE value from the diff", () => {
     const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, []);
-    assert.match(prompt, /path \(the changed\s+file's repository path, never its diff file's path\), line \(the LINE value from its diff file\)/);
+    assert.match(prompt, /path \(the changed\s+file's repository path, never its diff file's path\), line \(its LINE value from the diff/);
+  });
+
+  // An assigned worker must not be told two different things about where its LINE values come from: the
+  // inline block says "do not read these from disk", so no instruction may send it to a diff FILE for the
+  // grid it was just handed. The grid is identical either way — this is about the contradiction, not the
+  // number. [FRAMING:representation]
+  test('no instruction sends an assigned worker to a diff file for a grid it holds inline', () => {
+    const prompt = material.buildWorkerPrompt('cost', TOOL_NAMES, ['src/usage.js']);
+    assert.ok(prompt.includes('do not read these from disk'));
+    assert.doesNotMatch(prompt, /the LINE value from its diff file/);
+    assert.doesNotMatch(prompt, /marked LINE N in a diff file/);
   });
 
   // copirate-review-loop-5pw.2 — denser rounds via greater depth: the worker follows a changed symbol

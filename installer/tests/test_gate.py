@@ -61,14 +61,26 @@ def gate(tmp_path):
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     stub = stub_dir / "gh"
+    # `gh pr comment` is recorded rather than answered: it is a SINK the gate writes to, and the
+    # refusals it carries are the only thing the person who typed `/review` can see — an
+    # issue_comment run is attached to no commit, so it appears in no check list on the PR.
+    # Handled before GH_STUB_FAIL so the API-failure case fails the `gh api` call alone.
     stub.write_text(
         "#!/usr/bin/env bash\n"
+        'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+        '  while [ $# -gt 0 ]; do\n'
+        '    if [ "$1" = "--body" ]; then printf \'%s\\n\' "$2" >> "$GH_STUB_COMMENTS"; fi\n'
+        "    shift\n"
+        "  done\n"
+        "  exit 0\n"
+        "fi\n"
         'if [ "${GH_STUB_FAIL:-}" = "1" ]; then echo "gh: API error" >&2; exit 1; fi\n'
         'printf \'%s\\n\' "$GH_STUB_JSON"\n'
     )
     stub.chmod(0o755)
 
     canary = tmp_path / "canary"
+    comments = tmp_path / "comments"
 
     def run(body, association="OWNER", pr_json=OPEN_SAME_REPO, fail_api=False):
         output = tmp_path / "output"
@@ -77,6 +89,7 @@ def gate(tmp_path):
         summary.write_text("")
         if canary.exists():
             canary.unlink()
+        comments.write_text("")
         completed = subprocess.run(
             ["bash", str(script)],
             env={
@@ -92,6 +105,7 @@ def gate(tmp_path):
                 "AUTHOR_ASSOCIATION": association,
                 "GH_STUB_JSON": pr_json,
                 "GH_STUB_FAIL": "1" if fail_api else "0",
+                "GH_STUB_COMMENTS": str(comments),
             },
             capture_output=True,
             text=True,
@@ -100,6 +114,8 @@ def gate(tmp_path):
         return started, completed.returncode, canary.exists()
 
     run.canary = canary
+    #: What the gate said on the pull request itself, one entry per posted comment.
+    run.comments = lambda: [line for line in comments.read_text().splitlines() if line]
     return run
 
 
@@ -213,3 +229,46 @@ def test_injection_in_a_body_that_is_not_even_a_command_is_inert(gate, template)
     started, _, executed = gate(body.replace("/review", "notacommand"))
     assert not started
     assert not executed
+
+
+# --- what the person who asked actually sees ---------------------------------------
+#
+# A refusal that reaches only the run log and the step summary reaches NOBODY: a run on
+# `issue_comment` is attached to no commit, so unlike a `pull_request` run it appears in no
+# check list on the pull request. Green-and-silent is indistinguishable from this action not
+# being installed — the same "asked and got nothing" this base exists to end.
+# [LAW:no-silent-failure]
+
+
+@pytest.mark.parametrize(
+    "case,kwargs,expected",
+    [
+        ("a fork", {"pr_json": OPEN_FROM_FORK}, "comes from a fork"),
+        ("a closed PR", {"pr_json": CLOSED}, "not open"),
+        ("a stranger", {"association": "NONE"}, "owner, member, or collaborator"),
+    ],
+)
+def test_every_refusal_answers_on_the_pull_request(gate, case, kwargs, expected):
+    started, code, _ = gate("/review", **kwargs)
+    assert not started, case
+    assert code == 0, f"{case}: a refusal is a decision, not a failure"
+    posted = gate.comments()
+    assert len(posted) == 1, f"{case}: exactly one answer, not none and not several"
+    assert expected in posted[0], f"{case}: the answer says why — got {posted[0]!r}"
+
+
+def test_a_comment_that_is_not_a_request_says_nothing_at_all(gate):
+    """The gate runs on EVERY comment in the repository. Answering the ones that asked for
+    nothing would turn every conversation on every pull request into a thread of refusals."""
+    started, code, _ = gate("looks good to me, shipping this")
+    assert not started
+    assert code == 0
+    assert gate.comments() == []
+
+
+def test_a_started_review_is_not_announced_by_the_gate(gate):
+    """The review itself speaks — the gate stays quiet on the path where a review follows, so
+    an accepted request produces one artifact rather than two."""
+    started, _, _ = gate("/review")
+    assert started
+    assert gate.comments() == []

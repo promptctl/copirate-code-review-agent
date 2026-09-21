@@ -1082,8 +1082,15 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // lines. So the host resolves the head, and it costs no extra request to ask it to.
   // [LAW:polishing-by-subtraction] the version that works has one less field in it.
   //
-  // Exactly ONE retry, and only when there were inline comments to displace: if the second attempt
-  // fails the cause was never the anchors, and the error belongs to the caller unaltered.
+  // Exactly ONE retry, and only when there were inline comments to displace — never a loop.
+  //
+  // BOTH FAILURES REACH THE OPERATOR when the retry fails too, because either alone misleads. The second
+  // error says the review could not be posted and not why it was ever retried; the first says the anchors
+  // were refused and not that the fallback failed as well. And a 422 is broader than the anchors: a body
+  // past the host's 65,536-character limit answers this same call the same way, and the retry's body is
+  // strictly LARGER than the first — it appends the displaced findings — so that case fails twice and the
+  // operator needs to see a size complaint rather than a story about a moving head.
+  // [LAW:no-silent-failure] the diagnosis is the pair, so the pair is what travels.
   try {
     await octokit.rest.pulls.createReview({
       owner,
@@ -1096,18 +1103,30 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
     });
   } catch (err) {
     if (comments.length === 0 || !anchorsRejected(err)) throw err;
+    // The cause is OFFERED, not asserted: 422 is this call's answer to any validation fault, and naming
+    // the likeliest one as though it were established sent an operator after a moving head when the real
+    // complaint was a body too long. [FRAMING:representation]
     core.warning(
-      `The host refused this review's ${comments.length} inline comment(s) as not part of PR #${pullNumber}'s `
-      + `diff at ${commitId} (${err.message}) — most likely the head moved while the review ran. `
-      + 'Re-posting with every finding in the review body instead; none are dropped.',
+      `The host refused this review with its ${comments.length} inline comment(s) (422: ${err.message}). `
+      + `The usual cause is PR #${pullNumber}'s head moving past ${commitId} while the review ran, though `
+      + 'any validation fault on this call answers the same way. Re-posting with every finding in the '
+      + 'review body instead; none are dropped.',
     );
-    await octokit.rest.pulls.createReview({
-      owner,
-      repo,
-      pull_number: pullNumber,
-      event,
-      body: bodyWith(review.findings),
-    });
+    try {
+      await octokit.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        event,
+        body: bodyWith(review.findings),
+      });
+    } catch (retryErr) {
+      throw new Error(
+        `Could not post this review to PR #${pullNumber}. Carrying its ${comments.length} inline `
+        + `comment(s) the host answered 422: ${err.message}. Carrying none, it answered: ${retryErr.message}.`,
+        { cause: err },
+      );
+    }
   }
   core.info(verdict);
 }
