@@ -81,11 +81,11 @@ def gate(tmp_path):
 
     canary = tmp_path / "canary"
     comments = tmp_path / "comments"
+    summary = tmp_path / "summary"
 
     def run(body, association="OWNER", pr_json=OPEN_SAME_REPO, fail_api=False):
         output = tmp_path / "output"
         output.write_text("")
-        summary = tmp_path / "summary"
         summary.write_text("")
         if canary.exists():
             canary.unlink()
@@ -116,6 +116,10 @@ def gate(tmp_path):
     run.canary = canary
     #: What the gate said on the pull request itself, one entry per posted comment.
     run.comments = lambda: [line for line in comments.read_text().splitlines() if line]
+    #: The repository's own record of the decision — the sink every refusal reaches, including the
+    #: ones deliberately not answered on the pull request. A test asserting only what is WITHHELD
+    #: would still pass if the record were dropped too, which is the original bug.
+    run.summary = summary.read_text
     return run
 
 
@@ -233,11 +237,16 @@ def test_injection_in_a_body_that_is_not_even_a_command_is_inert(gate, template)
 
 # --- what the person who asked actually sees ---------------------------------------
 #
-# A refusal that reaches only the run log and the step summary reaches NOBODY: a run on
-# `issue_comment` is attached to no commit, so unlike a `pull_request` run it appears in no
-# check list on the pull request. Green-and-silent is indistinguishable from this action not
-# being installed — the same "asked and got nothing" this base exists to end.
-# [LAW:no-silent-failure]
+# WHO A REFUSAL IS OWED TO. For someone entitled to ask, a refusal reaching only the run log and
+# the step summary reaches NOBODY: a run on `issue_comment` is attached to no commit, so unlike a
+# `pull_request` run it appears in no check list on the pull request. Green-and-silent is
+# indistinguishable from this action not being installed — the same "asked and got nothing" this
+# base exists to end. [LAW:no-silent-failure]
+#
+# For everyone else the answer is the record alone, and the next two tests are the pair that pins
+# the boundary: one asserts the answer is delivered, the other that it is withheld. Neither holds
+# without the other — visibility with no bound is a spam vector, a bound with no visibility is the
+# original bug.
 
 
 @pytest.mark.parametrize(
@@ -245,16 +254,42 @@ def test_injection_in_a_body_that_is_not_even_a_command_is_inert(gate, template)
     [
         ("a fork", {"pr_json": OPEN_FROM_FORK}, "comes from a fork"),
         ("a closed PR", {"pr_json": CLOSED}, "not open"),
-        ("a stranger", {"association": "NONE"}, "owner, member, or collaborator"),
     ],
 )
-def test_every_refusal_answers_on_the_pull_request(gate, case, kwargs, expected):
+def test_a_refusal_to_someone_who_asked_answers_on_the_pull_request(gate, case, kwargs, expected):
     started, code, _ = gate("/review", **kwargs)
     assert not started, case
     assert code == 0, f"{case}: a refusal is a decision, not a failure"
     posted = gate.comments()
     assert len(posted) == 1, f"{case}: exactly one answer, not none and not several"
     assert expected in posted[0], f"{case}: the answer says why — got {posted[0]!r}"
+
+
+@pytest.mark.parametrize("association", ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"])
+def test_an_unauthorized_asker_is_recorded_and_not_replied_to(gate, association):
+    """The ONE refusal that is recorded without being answered, and the reason is the trigger.
+
+    This job runs on every comment in the repository by anyone who can leave one. Replying to
+    each unauthorized `/review` makes a stranger's comment spawn a bot comment on a pull request
+    the stranger does not own, so repeating the comment is a bot-noise loop with a notification
+    fan-out to every subscriber — the amplification this asserts cannot exist.
+
+    Silence here is not a silent failure: nothing failed, the gate decided correctly not to
+    spend, and the reason is in the run log and the step summary, whose audience is the
+    repository rather than the passer-by. It costs nothing legitimate either — a same-repository
+    branch needs push access to exist, so an asker below COLLABORATOR is a passer-by on someone
+    else's pull request, and a fork PR is refused on its own terms above (with an answer, since
+    by then the asker has standing).
+    """
+    started, code, _ = gate("/review", association=association)
+    assert not started
+    assert code == 0, "a refusal is a decision, not a failure"
+    assert gate.comments() == [], "an unauthorized asker must not draw a reply onto the PR"
+    # ...and the other half of "recorded and not answered", without which this is just silence.
+    recorded = gate.summary()
+    assert "Review not started" in recorded
+    assert "owner, member, or collaborator" in recorded
+    assert association in recorded, "the record names the association it refused on"
 
 
 def test_a_comment_that_is_not_a_request_says_nothing_at_all(gate):

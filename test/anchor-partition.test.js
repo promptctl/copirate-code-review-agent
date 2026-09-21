@@ -677,8 +677,13 @@ describe('submitReview — the host refuses the inline comments', () => {
     const retry = octokit.calls[1];
     // No anchors on the retry — that is the whole point of it.
     assert.equal(retry.comments, undefined);
-    // Every finding survives, in the section the body already has for findings the diff cannot carry.
-    assert.match(retry.body, /Findings outside the reviewed diff/);
+    // Every finding survives — under the heading for its ACTUAL cause. These lines WERE in the
+    // reviewed diff, so filing them as "outside the reviewed diff" would tell the reader something
+    // false about their own pull request, in the direction that wastes their time: hunting a bad
+    // line number in a review whose line numbers were right. [FRAMING:representation]
+    assert.match(retry.body, /### Findings the host would not post inline/);
+    assert.doesNotMatch(retry.body, /Findings outside the reviewed diff/);
+    assert.match(retry.body, /head moved while the review ran/);
     assert.match(retry.body, /`a\.js:10`/);
     assert.match(retry.body, /first bug/);
     assert.match(retry.body, /`b\.js:20`/);
@@ -691,6 +696,34 @@ describe('submitReview — the host refuses the inline comments', () => {
     // and with no anchors there is nothing a SHA would have positioned.
     assert.equal('commit_id' in retry, false);
     assert.equal(octokit.calls[0].commit_id, 'oldsha', 'the first attempt still names the reviewed commit');
+  });
+
+  // THE CASE THAT PROVES THE SPLIT, because it is the only one where conflating the two sets is
+  // invisible to a single-heading check: a review that ALREADY has a genuinely unanchorable finding
+  // and then gets displaced. Under one shared heading the reader is told all three findings point
+  // outside the diff, when exactly one of them does. Each set lands under its own cause, and each
+  // finding lands in its own set. [LAW:one-type-per-behavior]
+  test('an unanchorable finding and a displaced one are not filed under one cause', async () => {
+    const octokit = failingOctokit([httpError(422, 'line must be part of the diff')]);
+    await submitReview(
+      octokit, 'o', 'r', 7, 'oldsha', 'Reviewer',
+      { ...reviewWithFindings(), unanchored: [{ path: 'big.bin', line: 3, body: 'binary bug', severity: 3 }] },
+      true, gitHubTransport([], []),
+    );
+    const { body } = octokit.calls[1];
+    const outside = body.indexOf('### Findings outside the reviewed diff');
+    const refused = body.indexOf('### Findings the host would not post inline');
+    assert.ok(outside >= 0 && refused > outside, 'both headings, the pre-existing one first');
+    const outsideSection = body.slice(outside, refused);
+    const refusedSection = body.slice(refused);
+    // The file with no diff line belongs to the heading that says so, and to that one only.
+    assert.match(outsideSection, /`big\.bin:3`/);
+    assert.doesNotMatch(refusedSection, /big\.bin/);
+    // The two displaced findings belong to the heading that says the host refused them.
+    assert.match(refusedSection, /`a\.js:10`/);
+    assert.match(refusedSection, /`b\.js:20`/);
+    assert.doesNotMatch(outsideSection, /a\.js:10/);
+    assert.doesNotMatch(outsideSection, /b\.js:20/);
   });
 
   test('an error that is not a 422 is the caller\'s, unretried and unaltered', async () => {

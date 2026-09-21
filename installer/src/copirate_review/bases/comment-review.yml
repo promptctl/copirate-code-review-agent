@@ -136,27 +136,40 @@ jobs:
           # thought about cannot emit a permissive answer.
           echo "review=false" >> "$GITHUB_OUTPUT"
 
-          # [LAW:single-enforcer] THE ONE WAY THIS JOB REFUSES, so a new refusal cannot ship
-          # reaching fewer sinks than the others — which had already happened: the closed-PR
-          # path wrote a log warning while its two siblings also wrote a step summary.
+          # A REFUSAL HAS TWO AUDIENCES, and only one of them is always owed an answer.
           #
-          # THE PR COMMENT IS THE SINK THAT MATTERS, and it is the one that was missing. A run
-          # on `issue_comment` is attached to no commit, so unlike a `pull_request` run it
-          # appears in NO check list on the pull request. Refusing in the log and the step
-          # summary means a maintainer who types `/review` on a fork PR sees the workflow go
-          # green and nothing whatsoever on the PR — indistinguishable from this action not
-          # being installed, which is exactly the "asked and got nothing" this base exists to
-          # end. They asked in a comment; they are answered in a comment.
-          #
-          # No `|| true`: a refusal nobody can see is the failure being fixed here, so failing
-          # to deliver it fails the job rather than passing quietly. [LAW:no-silent-failure]
-          refuse() {
+          # [LAW:single-enforcer] THE ONE WAY THIS JOB RECORDS A REFUSAL, so a new refusal
+          # cannot ship reaching fewer sinks than the others — which had already happened: the
+          # closed-PR path wrote a log warning while its two siblings also wrote a step summary.
+          # This half is unconditional, because the repository's own record of why it declined
+          # to spend money is owed on every path. [LAW:no-silent-failure]
+          record_refusal() {
             echo "::warning title=Review not started::$1"
             {
               echo "### Review not started"
               echo
               echo "$1"
             } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # THE ANSWER TO THE PERSON WHO ASKED — the record plus the sink that reaches them,
+          # composed rather than duplicated. A run on `issue_comment` is attached to no commit,
+          # so unlike a `pull_request` run it appears in NO check list on the pull request.
+          # Recording only in the log and the step summary means a maintainer who types
+          # `/review` on a fork PR sees the workflow go green and nothing whatsoever on the PR —
+          # indistinguishable from this action not being installed, which is exactly the "asked
+          # and got nothing" this base exists to end. They asked in a comment; they are answered
+          # in a comment.
+          #
+          # Reached only AFTER the association check below, and that ordering is the security
+          # property: see the comment on the check itself for why an unauthorized asker gets the
+          # record and not the answer. [LAW:composability] the part is usable without the whole.
+          #
+          # No `|| true`: a refusal the asker cannot see is the failure being fixed here, so
+          # failing to deliver it fails the job rather than passing quietly.
+          # [LAW:no-silent-failure]
+          refuse() {
+            record_refusal "$1"
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** $1"
           }
 
@@ -186,10 +199,26 @@ jobs:
           # decides. A stranger's comment must not start a run that costs money. It is
           # NOT what keeps attacker code away from the secrets; the fork refusal below is,
           # and it holds no matter how the asker is associated. [LAW:single-enforcer]
+          #
+          # THIS REFUSAL IS RECORDED AND NOT ANSWERED, the one path that takes the part
+          # instead of the whole, because a reply here is a reply to an UNTRUSTED party and
+          # the trigger it rides on is unbounded. This job runs on every comment in the
+          # repository by anyone who can leave one; answering each unauthorized `/review`
+          # makes a stranger's comment spawn a bot comment, so one attacker turns a public
+          # pull request into a maintainer-owned thread of refusals and fans a notification
+          # out to every subscriber for each one. That is the same reasoning that already
+          # keeps this gate silent on a comment that asked for nothing — an unbounded
+          # external trigger must not be amplified into repository-authored noise — and it
+          # costs nothing legitimate: a same-repository branch needs push access to exist,
+          # so an asker who is neither owner, member, nor collaborator is a passer-by on
+          # someone else's pull request, and a fork PR is refused below on its own terms.
+          #
+          # Nothing is hidden. The run log and the step summary carry the reason, the audience
+          # for which is the repository rather than the passer-by. [LAW:no-silent-failure]
           case "$AUTHOR_ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR) ;;
             *)
-              refuse "\`@${COMMENT_AUTHOR}\` asked for a review, but only a repository owner, member, or collaborator can start one (association: \`${AUTHOR_ASSOCIATION}\`)."
+              record_refusal "\`@${COMMENT_AUTHOR}\` asked for a review, but only a repository owner, member, or collaborator can start one (association: \`${AUTHOR_ASSOCIATION}\`)."
               exit 0
               ;;
           esac
@@ -238,8 +267,10 @@ jobs:
       # on a transient API fault, and they wait for a review that will never come with nothing
       # anywhere to tell them so.
       #
-      # `if: failure()` and not `always()`: the success path already speaks, either by starting
-      # a review or through `refuse`. [LAW:no-silent-failure]
+      # `if: failure()` and not `always()`: every success path has already said what it owes,
+      # and `always()` would speak over the two that owe the asker nothing — a comment that was
+      # not a request, and a request from someone with no standing to make one.
+      # [LAW:no-silent-failure]
       - name: Say so on the pull request if the gate could not decide
         if: failure()
         env:
