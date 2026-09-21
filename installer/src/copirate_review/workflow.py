@@ -17,6 +17,7 @@ everything else is data in transit.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -166,6 +167,68 @@ def _review_steps(workflow: Workflow) -> list[Step]:
     ]
 
 
+#: Every `needs.<job>.…` reference in a configured input value. A base supplies a review
+#: step's inputs from the configuration, and an input is free to read another job's output
+#: — `comment-review` hands the review its PR number and head SHA that way. What it is NOT
+#: free to do is name a dependency the review step's own job never declared.
+_NEEDS_REF = re.compile(r"\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)")
+
+
+def _declared_needs(job: Job) -> frozenset[str]:
+    """The jobs this job declares it needs, in either shape GitHub accepts.
+
+    `needs:` is not modelled on `Job` — it is carried through as data like every other
+    key the installer does not transform — so it is read here rather than annotated.
+    A scalar (`needs: gate`) and a list (`needs: [gate, setup]`) are the same fact in two
+    notations, so they resolve to one set. [LAW:one-type-per-behavior]
+    """
+    needs = (job.model_extra or {}).get("needs")
+    if needs is None:
+        return frozenset()
+    if isinstance(needs, str):
+        return frozenset({needs})
+    return frozenset(str(n) for n in needs)
+
+
+def _refuse_unsatisfiable_needs(job_name: str, job: Job, binding: Binding, source: str) -> None:
+    """Refuse a binding whose inputs read a job output the review step cannot see.
+
+    WHY THIS IS A PARSE AND NOT A DOC COMMENT. The base and the configuration's inputs
+    table are two files, and `comment-review` couples them: it declares a `gate` job and
+    the configuration feeds `needs.gate.outputs.*` into the review step. Nothing in
+    Actions objects when that coupling breaks — `needs.gate.outputs.pr-number` against a
+    base with no `gate` job, or against a review job that never declared `needs: gate`,
+    evaluates to THE EMPTY STRING. The workflow is valid YAML, the run starts, the action
+    receives `PR_NUMBER: ''`, and the failure surfaces as a review that reviewed nothing.
+
+    The shape that reaches this is ordinary, not exotic: the shipped `defaults.yaml` binds
+    those two inputs, `merge()` deep-merges layers, so a repository that overrides nothing
+    but `base: pr-review` keeps them and renders a review job pointing at a job that base
+    does not have. The blast radius is every consuming repository that pins the old base,
+    and the symptom is silent, so the coupling is enforced HERE — at the one boundary that
+    holds the base and the binding at the same time — instead of being described in a
+    comment that nothing checks. [LAW:parse-dont-validate] [LAW:no-silent-failure]
+    """
+    available = _declared_needs(job)
+    for name, value in sorted(binding.inputs.items()):
+        for referenced in _NEEDS_REF.findall(str(value)):
+            if referenced in available:
+                continue
+            raise WorkflowError(
+                f"{source}: input {name} reads `needs.{referenced}`, but the job holding "
+                f"the `id: {REVIEW_STEP_ID}` step ({job_name}) declares "
+                + (
+                    f"needs: {', '.join(sorted(available))}"
+                    if available
+                    else "no `needs:`"
+                )
+                + f". Either use a base whose {job_name} job declares `needs: {referenced}`, "
+                f"or drop {name} from the inputs table — as written it would render a "
+                f"workflow GitHub accepts and then pass the action an empty value."
+            )
+
+
+
 def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
     """Point the review step at the configured action, carrying the configured bindings.
 
@@ -186,6 +249,12 @@ def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
             f"{len(found)}."
         )
     old = found[0]
+    # The job that holds the review step, because that job's `needs:` is what decides
+    # whether the configuration's inputs can see the outputs they reference.
+    job_name, review_job = next(
+        (name, job) for name, job in workflow.jobs.items() if old in (job.steps or ())
+    )
+    _refuse_unsatisfiable_needs(job_name, review_job, binding, source)
     bound = old.model_copy(update={"uses": binding.action_ref, "with_": binding.step_with})
     return workflow.model_copy(
         update={

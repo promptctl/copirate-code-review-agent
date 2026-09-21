@@ -182,7 +182,7 @@ def test_rendering_what_was_rendered_changes_nothing_further(tmp_path):
 def test_a_repo_base_shadows_the_shipped_one_of_the_same_name(tmp_path):
     (tmp_path / ".copirate-review/bases").mkdir(parents=True)
     (tmp_path / f".copirate-review/bases/{SHIPPED_BASE}.yml").write_text(
-        "name: Mine\non:\n  push: {}\njobs:\n  review:\n    steps:\n"
+        "name: Mine\non:\n  push: {}\njobs:\n  review:\n    needs: gate\n    steps:\n"
         "      - id: review\n        uses: nothing@v0\n"
     )
     result = rendered_for(tmp_path)
@@ -195,12 +195,45 @@ def test_a_home_base_is_used_when_the_repo_has_none(tmp_path):
     home = machine(tmp_path)
     (home / ".config/copirate-review/bases").mkdir(parents=True)
     (home / f".config/copirate-review/bases/{SHIPPED_BASE}.yml").write_text(
-        "name: Fleet\non:\n  push: {}\njobs:\n  review:\n    steps:\n"
+        "name: Fleet\non:\n  push: {}\njobs:\n  review:\n    needs: gate\n    steps:\n"
         "      - id: review\n        uses: nothing@v0\n"
     )
     repo = tmp_path / "repo"
     repo.mkdir()
     assert read_yaml(rendered_for(repo, home=home).text, "r")[0]["name"] == "Fleet"
+
+
+def test_a_base_whose_review_job_does_not_declare_the_needed_job_is_refused(tmp_path):
+    """The shipped inputs read `needs.gate`; a base without that dependency renders a
+    workflow GitHub ACCEPTS and then hands the action an empty PR number.
+
+    This is the `pr-review` shape: a repository that overrides nothing but the base name
+    inherits the inputs table, so the incoherent combination is the easy one to reach.
+    """
+    body = (
+        "name: X\non:\n  push: {}\njobs:\n  review:\n    steps:\n"
+        "      - id: review\n        uses: placeholder@v0\n"
+    )
+    with pytest.raises(ConfigError) as caught:
+        rendered_for(write_base(tmp_path, body))
+    message = str(caught.value)
+    assert "needs.gate" in message
+    assert "no `needs:`" in message
+    # It names the input, so the operator knows which line of their config to change.
+    assert "PR_NUMBER" in message or "HEAD_SHA" in message
+
+
+def test_the_same_inputs_are_accepted_once_the_review_job_declares_the_dependency(tmp_path):
+    """The refusal is about the DEPENDENCY, not about the inputs — otherwise the check
+    would forbid the shipped base's own arrangement."""
+    body = (
+        "name: X\non:\n  push: {}\njobs:\n  review:\n    needs: [gate, setup]\n    steps:\n"
+        "      - id: review\n        uses: placeholder@v0\n"
+    )
+    step = review_step(rendered_for(write_base(tmp_path, body)).text)
+    assert step["uses"] == "promptctl/copirate-code-review-agent@v1"
+    assert step["with"]["PR_NUMBER"] == "${{ needs.gate.outputs.pr-number }}"
+    assert step["with"]["HEAD_SHA"] == "${{ needs.gate.outputs.head-sha }}"
 
 
 def test_an_unknown_base_names_every_directory_that_was_searched(tmp_path):
@@ -255,7 +288,7 @@ def test_a_base_is_bound_wherever_its_review_step_lives(tmp_path):
     """The anchor is the step's id, not its position or the job it is in."""
     body = (
         "name: X\non:\n  push: {}\njobs:\n  lint:\n    steps:\n      - run: echo lint\n"
-        "  second:\n    steps:\n      - run: echo first\n"
+        "  second:\n    needs: gate\n    steps:\n      - run: echo first\n"
         "      - id: review\n        uses: placeholder@v0\n"
     )
     text = rendered_for(write_base(tmp_path, body)).text

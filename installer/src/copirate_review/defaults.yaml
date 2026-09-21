@@ -60,10 +60,17 @@ workflows:
       #
       # They live here only because a rendered workflow's `with:` block is REPLACED
       # wholesale from this table, so a base cannot carry an input of its own — which
-      # means base and inputs must agree and nothing yet enforces it. Change `base` above
-      # and these two must change with it. The real fix is for a base to declare its own
-      # structural inputs and for the installer to bind them beneath this table; until
-      # then, this comment is the enforcement. [LAW:no-silent-failure]
+      # means base and inputs must AGREE. That agreement is enforced, not merely described:
+      # `bind()` refuses a base whose review job does not declare the job these inputs read
+      # (`_refuse_unsatisfiable_needs`, installer/src/copirate_review/workflow.py), so
+      # switching `base` above without changing these two fails the install with both names
+      # in the message rather than rendering a workflow that hands the action an empty PR
+      # number. GitHub owns the other half — it rejects a `needs:` naming a job that does
+      # not exist — so between them no incoherent pairing reaches a run.
+      #
+      # It is still a coupling across two files, and the real fix is for a base to declare
+      # its own structural inputs and for the installer to bind them beneath this table.
+      # Until then the coupling is at least loud. [LAW:no-silent-failure] [LAW:parse-dont-validate]
       PR_NUMBER: "${{ needs.gate.outputs.pr-number }}"
       HEAD_SHA: "${{ needs.gate.outputs.head-sha }}"
 

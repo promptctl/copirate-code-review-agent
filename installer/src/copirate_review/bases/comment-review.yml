@@ -45,19 +45,6 @@ permissions:
   issues: write
   pull-requests: write
 
-# One review at a time per pull request, and a request already in flight is NEVER killed
-# by the next one — `cancel-in-progress` is false, deliberately and load-bearingly.
-#
-# This is the opposite choice from the `pr-review` base, for a reason that inverts with
-# the trigger. There, a new push made the in-flight review's SHA stale, so cancelling it
-# discarded work that had already lost its value. Here every run was explicitly asked
-# for, so cancelling one throws away a review a human is waiting on AND the tokens it
-# spent — the exact failure this base exists to end. A second `/review` queues behind the
-# first instead. [LAW:no-silent-failure]
-concurrency:
-  group: code-review-${{ github.event.issue.number }}
-  cancel-in-progress: false
-
 jobs:
   # THE GATE — the one place that decides whether a comment is a review request this
   # repository will honour, and the reason the privileged checkout below is safe.
@@ -73,8 +60,22 @@ jobs:
   #
   # This job is what makes the checkout sound, and it holds THREE conditions, all of
   # which must pass before the review job exists at all:
-  #   1. a human with write access asked — `author_association` is OWNER, MEMBER or
-  #      COLLABORATOR, so a drive-by comment from a stranger cannot start a run;
+  #   1. someone this repository already has a standing relationship with asked —
+  #      `author_association` is OWNER, MEMBER or COLLABORATOR — so a drive-by comment
+  #      from a stranger cannot start a run. Read that as exactly what it says and no
+  #      more: MEMBER is ORGANISATION membership and carries no permission on this
+  #      repository, so in an org with open membership the set of people who can spend
+  #      this repository's tokens is the org, not its writers. That is deliberate and it
+  #      is the weaker of two available checks. The stronger one —
+  #      `repos/{repo}/collaborators/{user}/permission`, demanding `admin` or `write` —
+  #      is NOT taken because that endpoint requires push access to answer, so buying it
+  #      would mean raising this workflow's `permissions:` to `contents: write`: a
+  #      privileged, secret-holding job would gain the ability to write the repository in
+  #      order to check who may ask it to read. That trade makes the posture worse than
+  #      the exposure it closes, and if the token could not answer, `set -e` would fail
+  #      the gate closed and no review would run at all. What this check is FOR is token
+  #      spend; what protects the secrets is condition 2, which no association can
+  #      satisfy. [FRAMING:representation] the claim is sized to the check;
   #   2. the head is in THIS repository, not a fork — so the code checked out beside the
   #      secrets is code that already had write access to this repo;
   #   3. the pull request is open.
@@ -140,15 +141,27 @@ jobs:
           # mid-sentence or inside a URL does not start a billed run. `grep -q` exits 1 on
           # no match, which `set -e` would treat as a failure, so the match is consumed by
           # an `if` that distinguishes "no match" from "grep broke".
-          if printf '%s\n' "$COMMENT_BODY" | grep -qE '^[[:space:]]*/review([[:space:]]|$)'; then
+          #
+          # A HERE-STRING, NOT A PIPE, and the difference is a real bug rather than taste.
+          # `grep -q` stops at the first match, so `printf … | grep -q` leaves printf
+          # writing into a closed pipe: for a body larger than the 64 KiB pipe buffer,
+          # printf takes SIGPIPE and exits 141, and `set -o pipefail` promotes that to the
+          # pipeline's status — so the `if` reads FALSE and a genuine request is silently
+          # dropped. GitHub's comment limit is 65536 characters, which straddles that
+          # buffer exactly, so the failing case is an ordinary long comment and not a
+          # contrived one. A here-string is a file, not a pipe: nothing can take SIGPIPE
+          # and the match is the only thing the status reports. [LAW:no-silent-failure]
+          if grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<< "$COMMENT_BODY"; then
             echo "Comment by @${COMMENT_AUTHOR} requests a review."
           else
             echo "Comment by @${COMMENT_AUTHOR} is not a /review request; nothing to do."
             exit 0
           fi
 
-          # WHO may spend the repository's tokens. A stranger's comment must not start a
-          # run that both costs money and checks their reach against our secrets.
+          # WHO may spend the repository's tokens — and that is the whole of what this
+          # decides. A stranger's comment must not start a run that costs money. It is
+          # NOT what keeps attacker code away from the secrets; the fork refusal below is,
+          # and it holds no matter how the asker is associated. [LAW:single-enforcer]
           case "$AUTHOR_ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR) ;;
             *)
@@ -211,6 +224,35 @@ jobs:
     # because job outputs are strings; `needs.gate.outputs.review` is `'true'` on exactly
     # the one path that wrote it.
     if: needs.gate.outputs.review == 'true'
+    # One review at a time per pull request, and a review already in flight is NEVER
+    # killed by the next one — `cancel-in-progress` is false, deliberately.
+    #
+    # This is the opposite choice from the `pr-review` base, for a reason that inverts
+    # with the trigger. There, a new push made the in-flight review's SHA stale, so
+    # cancelling it discarded work that had already lost its value. Here every run was
+    # explicitly asked for, so cancelling one throws away a review a human is waiting on
+    # AND the tokens it spent — the exact failure this base exists to end.
+    #
+    # WHY THIS SITS ON THE JOB AND NOT ON THE WORKFLOW, which is not a style choice and
+    # was a real defect when it sat above: GitHub's concurrency rule has two halves and
+    # `cancel-in-progress` governs only one of them. A run joining a group that is busy
+    # goes PENDING — and "any previously pending run in the group is canceled",
+    # unconditionally, whatever `cancel-in-progress` says. At workflow level the group's
+    # members were ALL comments on the pull request, so an ordinary "looks good to me"
+    # landing while a review ran would evict a colleague's queued `/review` and it would
+    # simply never happen. Here the group's members are REVIEWS: a comment that is not a
+    # request is skipped by the `if:` above, so it never joins the group and can evict
+    # nothing. [LAW:decomposition] the group's boundary falls on "is this a review",
+    # which is the thing it was always meant to mean.
+    #
+    # What remains, stated rather than glossed: a THIRD `/review` arriving while a second
+    # is still queued does evict the second. That is the intended depth — the evicted run
+    # had not started, so it spent nothing, and the run that survives reviews the same or
+    # newer code. The loss this base exists to prevent is a run that BILLED and delivered
+    # nothing, and no path here does that. [LAW:no-silent-failure]
+    concurrency:
+      group: code-review-${{ github.event.issue.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Cap a hung review (network stall, API retry loop) instead of letting it hold a
     # runner for GitHub's 6-hour default. Reviews finish in ~2-4 min typically, but API
@@ -261,22 +303,26 @@ jobs:
       # `secrets:` whatever `auto` may resolve to. The action fails loudly, before
       # spending anything, if the credential it needs is missing.
       #
-      # PR_NUMBER and HEAD_SHA are REQUIRED under this trigger and come from the
-      # configuration's inputs table like every other input. An `issue_comment` payload
-      # carries no `pull_request` object, so the action's zero-config detection has
-      # nothing to read; `resolveReviewTarget` takes these explicit inputs instead. They
-      # are the gate's outputs, so the review is anchored to the same commit the checkout
-      # placed on disk.
-      # PR_NUMBER and HEAD_SHA are deliberately ABSENT from the illustrative block below,
-      # even though this base cannot work without them. They are declared in the
-      # configuration's inputs table, like every other input, and naming them here would do
-      # worse than duplicate that: a key this block lists PINS ITS POSITION in the rendered
-      # output (the emitter carries the base's key order), while the rebinding decides which
-      # key comes LAST. List them and the two orders disagree, the comment block below gets
-      # anchored to a key that is no longer last, and it is emitted INSIDE the `with:`
-      # block — then dropped entirely on the next render, because a rendered file must be a
-      # fixed point and that one is not. Keeping this block to the two keys `pr-review`
-      # names is what keeps the orders agreeing. [LAW:one-source-of-truth]
+      # PR_NUMBER and HEAD_SHA are REQUIRED under this trigger. An `issue_comment` payload
+      # carries no `pull_request` object, so the action's zero-config detection has nothing
+      # to read; `resolveReviewTarget` takes these explicit inputs instead. They are the
+      # gate's outputs, so the review is anchored to the same commit the checkout placed
+      # on disk.
+      #
+      # They reach the workflow from the configuration's inputs table, like every other
+      # input — so IN THIS BASE the block below does not name them, and in a RENDERED
+      # workflow it does. If you are reading the rendered file, the two extra keys above
+      # came from the binding, not from here, and this paragraph came along with the rest
+      # of the base.
+      #
+      # Why the base must not name them, which is a live constraint and not a preference:
+      # a key this block lists PINS ITS POSITION in the output (the emitter carries the
+      # base's key order), while the rebinding decides which key comes LAST. List them and
+      # the two orders disagree, this comment gets anchored to a key that is no longer
+      # last, and it is emitted INSIDE the `with:` block — then dropped entirely on the
+      # next render, because a rendered file must be a fixed point and that one is not.
+      # Keeping this block to the two keys `pr-review` names is what keeps the orders
+      # agreeing. [LAW:one-source-of-truth]
       - name: Code Review
         id: review
         uses: promptctl/copirate-code-review-agent@v1

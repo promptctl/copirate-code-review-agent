@@ -32347,6 +32347,16 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 // that could not be — but it is still fenced through codeSpan, because backticks are orthogonal to
 // line structure and a backtick-bearing path must not close the span early. The body is the one field
 // that is legitimately block text, so it renders through findingLineText. [LAW:single-enforcer]
+// [LAW:effects-at-boundaries] Pure: does this host error mean "these comment anchors are not in the
+// diff"? GitHub answers an un-anchorable review comment with 422 Unprocessable Entity, which is also how
+// it answers other validation faults on the same call. That breadth is deliberate rather than tolerated:
+// the response to every 422 here is the same — try the review again carrying no anchors — and if the
+// fault was something else, that attempt fails too and the original error reaches the caller. A narrower
+// match on the message text would be a map of GitHub's prose, which changes without notice.
+function anchorsRejected(err) {
+  return err && err.status === 422;
+}
+
 function renderUnanchoredSection(unanchored) {
   if (!unanchored || unanchored.length === 0) return '';
   const items = unanchored
@@ -32435,19 +32445,59 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // '' and the body is byte-identical to before. The section is assembled host-side in run.js (from the
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
-  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}${renderUnreviewableSection(unreviewableFiles)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  // The body as a FUNCTION of which findings could not be posted inline, because that set is not
+  // known until the host has answered. The anchored/unanchored split is a value here, not a branch.
+  // [LAW:dataflow-not-control-flow]
+  const bodyWith = displaced => `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection([...unanchored, ...displaced])}${renderUnreviewableSection(unreviewableFiles)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment({ ...finding, body: `${severityTag(finding)} ${finding.body}` }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
-  await octokit.rest.pulls.createReview({
-    owner,
-    repo,
-    pull_number: pullNumber,
-    commit_id: commitId,
-    event,
-    body,
-    ...(comments.length > 0 ? { comments } : {}),
-  });
+  //
+  // A REJECTED ANCHOR MUST NOT COST THE REVIEW. The anchors and the commit this review is filed
+  // against come from two different reads of the host: the line numbers are computed from the diff
+  // `pulls.listFiles` returned, while `commitId` is the head resolved earlier — by the workflow's gate
+  // under the comment trigger, or from the event payload under the push one. If the pull request's head
+  // moves in between, those two disagree and the host refuses the inline comments as not part of the
+  // diff. Under the old push trigger a new push CANCELLED the run, so this was masked by the very
+  // failure this release exists to remove; with reviews requested on demand and never cancelled,
+  // nothing masks it any more.
+  //
+  // Letting that throw would discard a completed review — every finding, after the full token spend —
+  // and post `REVIEW DID NOT FINISH` in its place, which is precisely the outcome being removed
+  // everywhere else in this release. So the findings are re-filed through the section the review body
+  // ALREADY has for findings whose line the diff cannot carry: same findings, same blocking verdict
+  // (`requestsChanges` counts anchored and unanchored alike, so the verdict cannot shift), one degree
+  // less convenient to read. Nothing is dropped and nothing is silent — the warning names why.
+  // [LAW:no-silent-failure]
+  //
+  // Exactly ONE retry, and only when there were inline comments to displace: if the second attempt
+  // fails the cause was never the anchors, and the error belongs to the caller unaltered.
+  try {
+    await octokit.rest.pulls.createReview({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      commit_id: commitId,
+      event,
+      body: bodyWith([]),
+      ...(comments.length > 0 ? { comments } : {}),
+    });
+  } catch (err) {
+    if (comments.length === 0 || !anchorsRejected(err)) throw err;
+    core.warning(
+      `The host refused this review's ${comments.length} inline comment(s) as not part of PR #${pullNumber}'s `
+      + `diff at ${commitId} (${err.message}) — most likely the head moved while the review ran. `
+      + 'Re-posting with every finding in the review body instead; none are dropped.',
+    );
+    await octokit.rest.pulls.createReview({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      commit_id: commitId,
+      event,
+      body: bodyWith(review.findings),
+    });
+  }
   core.info(verdict);
 }
 
