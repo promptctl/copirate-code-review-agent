@@ -273,19 +273,30 @@ jobs:
           echo "Reviewing pull request #${PR_NUMBER} at ${head_sha}."
 
       # THE ERROR PATH ALSO HAS TO REACH THE PERSON WHO ASKED. The step above fails closed by
-      # design — `set -euo pipefail` plus `jq -re`, so a broken `gh` call or a deleted head
-      # repository stops it rather than guessing — but failing closed inside a job attached to
-      # no commit is failing INVISIBLY: the run appears in the Actions tab and on no check list
-      # this pull request shows. Without this step a maintainer types `/review`, the gate dies
-      # on a transient API fault, and they wait for a review that will never come with nothing
-      # anywhere to tell them so.
+      # design — `set -euo pipefail` plus `jq -re`, so a broken `gh` call or a response missing
+      # a field it must have stops it rather than guessing — but failing closed inside a job
+      # attached to no commit is failing INVISIBLY: the run appears in the Actions tab and on no
+      # check list this pull request shows. Without this step a maintainer types `/review`, the
+      # gate dies on a transient API fault, and they wait for a review that will never come with
+      # nothing anywhere to tell them so.
       #
-      # `if: failure()` and not `always()`: every success path has already said what it owes,
-      # and `always()` would speak over the two that owe the asker nothing — a comment that was
-      # not a request, and a request from someone with no standing to make one.
-      # [LAW:no-silent-failure]
+      # THE CONDITION IS THE REVIEW JOB'S TWIN, WORD FOR WORD, and it has to be. `failure()` is
+      # FALSE when a job is CANCELLED, and this job carries `timeout-minutes: 5` — so a gate
+      # whose single `gh api` call hangs on a congested host is cancelled rather than failed, and
+      # under `failure()` the asker is told nothing. That is the identical silent death the
+      # review job's step exists to close, one job earlier, and one concern may not be enforced
+      # by two conditions that disagree about what counts as not answering.
+      # [LAW:single-enforcer]
+      #
+      # `always()` ALONE would be wrong, and it is NOT this condition: it would speak over the
+      # two paths that owe the asker nothing — a comment that was not a request, and a request
+      # from someone with no standing to make one. Both of those `exit 0` inside the step above,
+      # so both leave `steps.gate.outcome` equal to 'success', and success is the single outcome
+      # this stays silent on. The deliberate silence is kept by reading the step's own outcome,
+      # not by narrowing which events may speak — the answer follows the value the step
+      # produced. [LAW:dataflow-not-control-flow] [LAW:no-silent-failure]
       - name: Say so on the pull request if the gate could not decide
-        if: failure()
+        if: always() && steps.gate.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -293,7 +304,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** The gate that decides whether to review this pull request failed before it could reach a verdict, so no review ran and nothing was spent. This is an error, not a refusal — see the [run log](${RUN_URL}). Commenting \`/review\` again re-runs it."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review not started.** The gate that decides whether to review this pull request stopped before it could reach a verdict, so no review ran and nothing was spent. This is an error, not a refusal — see the [run log](${RUN_URL}). Commenting \`/review\` again re-runs it."
 
   review:
     name: Review
@@ -441,7 +452,8 @@ jobs:
           if-no-files-found: ignore
 
       # THE REVIEW JOB OWES THE SAME ANSWER THE GATE DOES, and for the same reason — this
-      # is the gate's `if: failure()` step mirrored onto the job that spends the money.
+      # is the gate's answering step mirrored onto the job that spends the money, carrying the
+      # same condition because "did not answer" is one idea. [LAW:single-enforcer]
       #
       # Under `pull_request` a dead review was at least VISIBLE: the run attached to the
       # head commit and a red check appeared on the pull request. An `issue_comment` run is
@@ -462,6 +474,11 @@ jobs:
       # thing that did not succeed. Success is the only outcome that says nothing, because
       # on that path the review itself has already spoken. [LAW:dataflow-not-control-flow]
       #
+      # The outcome is read rather than the event, which is what lets ONE condition serve both
+      # jobs: each names its own decisive step, and every non-success value of it — including
+      # the empty string, when the job died before that step was ever reached — is a run that
+      # owes an answer.
+      #
       # It does NOT claim nothing was spent. The gate's twin can say that truthfully — it
       # refuses before any engine starts — but by here a review may have run for twenty
       # minutes before dying, so asserting a cost either way would be inventing a fact this
@@ -476,5 +493,18 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review did not finish.** The review of this pull request was started and did not deliver a result (the review step ended \`${OUTCOME}\`). Whether any tokens were spent before it stopped is in the [run log](${RUN_URL}), along with the cause. Commenting \`/review\` again starts a new one."
+
+          # `steps.review.outcome` IS THE EMPTY STRING, not a state name, when the job died
+          # before that step was ever reached — cancelled during `actions/checkout`, or a runner
+          # fault. The condition above deliberately treats empty as non-success, so this step
+          # runs on exactly that path and must not render it as empty backticks naming nothing.
+          # A notice that cannot say what happened is the silence this step exists to end
+          # wearing a comment's clothes. [LAW:no-silent-failure]
+          if [ -n "${OUTCOME:-}" ]; then
+            what="the review step ended \`${OUTCOME}\`"
+          else
+            what="the run ended before the review step started"
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review did not finish.** This pull request's review did not deliver a result (${what}). Whether any tokens were spent before it stopped is in the [run log](${RUN_URL}), along with the cause. Commenting \`/review\` again starts a new one."
 
