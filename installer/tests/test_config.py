@@ -6,6 +6,8 @@ one parses into — never the shape of the code that decides it. [LAW:behavior-n
 
 from __future__ import annotations
 
+from importlib import resources
+
 import pytest
 
 from copirate_review.config import (
@@ -18,8 +20,28 @@ from copirate_review.config import (
     merge,
     parse,
 )
+from copirate_review.yamldoc import load as read_yaml
 
 WORKFLOW = ".github/workflows/code-review.yml"
+
+
+def _shipped_base() -> str:
+    """The base name the shipped defaults bind to `WORKFLOW`, read from that one file.
+
+    Which base ships as the default is a product decision that has changed once already
+    (`pr-review` to `comment-review`) and will change again. A test that spells the name
+    itself is a second copy of that decision, and the day it moves, a dozen tests fail for
+    a reason none of them is about — which is exactly what happened. Read it from
+    `defaults.yaml` instead, so the name lives in one place.
+    [LAW:one-source-of-truth] [LAW:behavior-not-structure]
+    """
+    text = resources.files("copirate_review").joinpath("defaults.yaml").read_text()
+    data, _ = read_yaml(text, "defaults.yaml")
+    return data["workflows"][WORKFLOW]["base"]
+
+
+#: The default base's NAME, which is also the filename a test must write to shadow it.
+SHIPPED_BASE = _shipped_base()
 
 CREDENTIAL = "secrets:\n  CLAUDE_CODE_OAUTH_TOKEN: keychain:ITEM\n"
 
@@ -243,7 +265,7 @@ def test_a_repo_layer_changes_only_what_it_declares(tmp_path):
 def test_an_empty_config_file_is_the_empty_layer_not_an_error(tmp_path):
     (tmp_path / ".copirate-review.yaml").write_text("")
     config, _ = load(tmp_path, machine(tmp_path))
-    assert config.workflows[0].base == "pr-review"
+    assert config.workflows[0].base == SHIPPED_BASE
 
 
 def test_a_config_file_that_is_not_a_mapping_is_refused(tmp_path):

@@ -693,12 +693,19 @@ async function runPrReview(reviewerName, excludePatterns, defaultEffort, deadlin
     // [LAW:one-source-of-truth] The cap sentence is composed ONCE and read by both sinks — the run log
     // and the notice posted to the PR — so the operator remedy can never differ between the two places
     // it appears. announceNotReviewed owns the logging, so this site only produces the value.
+    //
+    // "review this pull request again", never "review further pushes": what a spent cap withholds
+    // depends on the trigger, and this sentence is written once for all of them. Under `pr-review` the
+    // next push is what goes unreviewed; under the shipped `comment-review` default there is no next
+    // push — a human typed `/review` and is waiting, and each request they make spends a round. Naming
+    // pushes told that person the remedy was for a mechanism they were not using.
+    // [FRAMING:representation] one sentence, true under every trigger that can reach it.
     const message = deRated
       ? `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
         + `the de-rated round cap of ${effort.roundCap} set by ${setters.join(' / ')} (lowered from `
-        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review further pushes, ${remedies.join(' or ')}.`
+        + `MAX_REVIEW_ROUNDS ${defaultEffort.roundCap}). To review this pull request again, ${remedies.join(' or ')}.`
       : `PR #${pullNumber} has already been reviewed ${prior.count} time(s), reaching `
-        + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.`;
+        + `the MAX_REVIEW_ROUNDS cap of ${effort.roundCap}. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review this pull request again.`;
     const noticeResult = await announceNotReviewed(reviewOctokit, {
       owner, repo, pullNumber, commitId: headSha, reviewerName,
       notice: roundCapNotice(message, prior.latestArtifact),

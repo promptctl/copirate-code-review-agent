@@ -17,6 +17,7 @@ everything else is data in transit.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -166,6 +167,112 @@ def _review_steps(workflow: Workflow) -> list[Step]:
     ]
 
 
+#: An Actions expression — the ONLY place `needs.…` means anything. Matched first so the
+#: checks below read references and never prose: an input whose value merely contains the
+#: words "needs.something" is text, and failing an install over it would be a false alarm
+#: about a value GitHub passes through untouched. [LAW:parse-dont-validate]
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+#: Any `needs.<job>` reference, whatever is read off it — `.outputs.x`, `.result`, all of it.
+#: The job segment is what must name a declared dependency.
+_NEEDS_JOB = re.compile(r"\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)")
+
+#: A `needs.<job>.outputs.<name>` reference, where BOTH halves are checkable: the job must be
+#: a declared dependency, and the name must be an output that job actually publishes.
+_NEEDS_OUTPUT = re.compile(r"\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)")
+
+
+def _expressions(value: str) -> list[str]:
+    return _EXPRESSION.findall(str(value))
+
+
+def _declared_outputs(job: Job) -> frozenset[str]:
+    """The output names this job publishes. `outputs:` is carried through, not modelled."""
+    outputs = (job.model_extra or {}).get("outputs")
+    return frozenset(outputs) if isinstance(outputs, Mapping) else frozenset()
+
+
+def _declared_needs(job: Job) -> frozenset[str]:
+    """The jobs this job declares it needs, in either shape GitHub accepts.
+
+    `needs:` is not modelled on `Job` — it is carried through as data like every other
+    key the installer does not transform — so it is read here rather than annotated.
+    A scalar (`needs: gate`) and a list (`needs: [gate, setup]`) are the same fact in two
+    notations, so they resolve to one set. [LAW:one-type-per-behavior]
+    """
+    needs = (job.model_extra or {}).get("needs")
+    if needs is None:
+        return frozenset()
+    if isinstance(needs, str):
+        return frozenset({needs})
+    return frozenset(str(n) for n in needs)
+
+
+def _refuse_unsatisfiable_needs(
+    workflow: Workflow, job_name: str, job: Job, binding: Binding, source: str
+) -> None:
+    """Refuse a binding whose inputs read a job output the review step cannot see.
+
+    WHY THIS IS A PARSE AND NOT A DOC COMMENT. The base and the configuration's inputs
+    table are two files, and `comment-review` couples them: it declares a `gate` job and
+    the configuration feeds `needs.gate.outputs.*` into the review step. Nothing in
+    Actions objects when that coupling breaks — `needs.gate.outputs.pr-number` against a
+    review job that never declared `needs: gate` evaluates to THE EMPTY STRING, so the
+    workflow is valid, the run starts, and the action is handed nothing.
+
+    The shape that reaches this is ordinary, not exotic: the shipped `defaults.yaml` binds
+    those two inputs, `merge()` deep-merges layers, so a repository that overrides nothing
+    but `base: pr-review` keeps them and renders a review job pointing at a job that base
+    does not have. The blast radius is every consuming repository that pins the old base.
+
+    THE DIVISION OF LABOUR, so this does not grow a second copy of a rule GitHub owns:
+      - a `needs:` naming a job that does not exist → GitHub rejects the workflow outright;
+      - a reference to a job the review step's job did not declare → checked here, first
+        branch, because GitHub resolves it to '' instead of complaining;
+      - a MISSPELLED output on a correctly-declared job → also '', also silent to GitHub,
+        so it is checked here too, second branch. `HEAD_SHA: needs.gate.outputs.head_sha`
+        against a gate publishing `head-sha` is one underscore and a review of nothing.
+
+    Read only inside `${{ }}`: outside an expression `needs.x` is text GitHub passes
+    through, and failing an install over prose would be a false alarm.
+    [LAW:parse-dont-validate] [LAW:no-silent-failure]
+    """
+    available = _declared_needs(job)
+    for name, value in sorted(binding.inputs.items()):
+        for expression in _expressions(value):
+            for referenced in _NEEDS_JOB.findall(expression):
+                if referenced in available:
+                    continue
+                raise WorkflowError(
+                    f"{source}: input {name} reads `needs.{referenced}`, but the job holding "
+                    f"the `id: {REVIEW_STEP_ID}` step ({job_name}) declares "
+                    + (
+                        f"needs: {', '.join(sorted(available))}"
+                        if available
+                        else "no `needs:`"
+                    )
+                    + f". Either use a base whose {job_name} job declares `needs: {referenced}`, "
+                    f"or drop {name} from the inputs table — as written it would render a "
+                    f"workflow GitHub accepts and then pass the action an empty value."
+                )
+            for referenced, output in _NEEDS_OUTPUT.findall(expression):
+                producer = workflow.jobs.get(referenced)
+                # A job absent from this workflow is GitHub's refusal to make, not ours, and a
+                # job publishing no `outputs:` at all is a base too different to second-guess.
+                if producer is None:
+                    continue
+                published = _declared_outputs(producer)
+                if not published or output in published:
+                    continue
+                raise WorkflowError(
+                    f"{source}: input {name} reads `needs.{referenced}.outputs.{output}`, but "
+                    f"the {referenced} job publishes "
+                    f"{', '.join(sorted(published))}. Actions resolves an unknown output to "
+                    f"the empty string, so this would render a valid workflow that hands the "
+                    f"action nothing — check the output's spelling."
+                )
+
+
 def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
     """Point the review step at the configured action, carrying the configured bindings.
 
@@ -186,6 +293,12 @@ def bind(workflow: Workflow, binding: Binding, source: str) -> Workflow:
             f"{len(found)}."
         )
     old = found[0]
+    # The job that holds the review step, because that job's `needs:` is what decides
+    # whether the configuration's inputs can see the outputs they reference.
+    job_name, review_job = next(
+        (name, job) for name, job in workflow.jobs.items() if old in (job.steps or ())
+    )
+    _refuse_unsatisfiable_needs(workflow, job_name, review_job, binding, source)
     bound = old.model_copy(update={"uses": binding.action_ref, "with_": binding.step_with})
     return workflow.model_copy(
         update={

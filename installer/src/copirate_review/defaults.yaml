@@ -38,8 +38,42 @@ secrets: {}
 
 workflows:
   .github/workflows/code-review.yml:
-    base: pr-review
+    # ON DEMAND, not on every push. The `pr-review` base reviews every push and cancels
+    # the in-flight review when the next one lands; measured on
+    # promptctl/links-issue-tracker#557, pushes arrived 51 s to 5 m apart while reviews
+    # took 5-9 min, so 4 of 5 runs were SIGINT-killed after spending millions of tokens
+    # and posted `REVIEW DID NOT FINISH` instead of a review. Requesting a review with a
+    # `/review` comment removes that race rather than shortening it. `pr-review` is still
+    # shipped for a repository that wants the old behaviour, and switching back is one
+    # line here — plus dropping the two structural inputs below, which only the
+    # `comment-review` base can bind.
+    base: comment-review
     inputs:
+      # STRUCTURAL to the `comment-review` base — not a repository preference like the
+      # inputs below it, and the one place in this table where that distinction matters.
+      #
+      # An `issue_comment` payload carries no `pull_request` object, so the action's
+      # zero-config target detection (`resolveReviewTarget`, src/transport.js) has nothing
+      # to read and needs both values explicitly. They reference the base's own gate job,
+      # which resolved the head SHA once so that the commit checked out and the commit the
+      # review is anchored to cannot disagree. [LAW:one-source-of-truth]
+      #
+      # They live here only because a rendered workflow's `with:` block is REPLACED
+      # wholesale from this table, so a base cannot carry an input of its own — which
+      # means base and inputs must AGREE. That agreement is enforced, not merely described:
+      # `bind()` refuses a base whose review job does not declare the job these inputs read
+      # (`_refuse_unsatisfiable_needs`, installer/src/copirate_review/workflow.py), so
+      # switching `base` above without changing these two fails the install with both names
+      # in the message rather than rendering a workflow that hands the action an empty PR
+      # number. GitHub owns the other half — it rejects a `needs:` naming a job that does
+      # not exist — so between them no incoherent pairing reaches a run.
+      #
+      # It is still a coupling across two files, and the real fix is for a base to declare
+      # its own structural inputs and for the installer to bind them beneath this table.
+      # Until then the coupling is at least loud. [LAW:no-silent-failure] [LAW:parse-dont-validate]
+      PR_NUMBER: "${{ needs.gate.outputs.pr-number }}"
+      HEAD_SHA: "${{ needs.gate.outputs.head-sha }}"
+
       # On for EVERY repo — a universal default, not a per-repo divergence that leaked in.
       # On a PR that bumps a dependency the reviewer fetches the bumped module's upstream
       # commits and changed files instead of reviewing a bare version string. Stated
@@ -83,4 +117,18 @@ workflows:
       # repo that works in stacks declares more headroom. 0 lifts the cap; nothing here
       # defends against a loop that spends without bound, so a repo declaring 0 has chosen
       # that.
+      #
+      # WHAT A ROUND IS depends on the base above, and this table cannot see it. Under
+      # `pr-review` a round is a push, and the cap does what it was built for: it bounds
+      # AUTOMATIC re-review of a long-lived PR. Under the shipped `comment-review` default a
+      # round is a REQUEST — so the sixth time a human types `/review` on one pull request,
+      # they are refused, having asked explicitly and waited. That is a real narrowing, named
+      # here rather than discovered, and lifting it is this one line.
+      #
+      # It is NOT lifted by default, and the reason is the coupling above: this table is
+      # base-independent, so a repository taking the documented route back to `pr-review`
+      # (installer/README.md) would inherit `0` and get an uncapped review on every push. The
+      # value that is safe under one base is a runaway under the other. The two caps that do
+      # NOT depend on the trigger — the per-run token cap and DAILY_BUDGET_USD — still bound
+      # every run either way, so this is the one whose meaning the trigger moved.
       MAX_REVIEW_ROUNDS: 5

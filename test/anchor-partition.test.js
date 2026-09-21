@@ -629,3 +629,139 @@ describe('submitReview — refused files (unreviewableFiles)', () => {
     assert.match(octokit.calls[0].body, /``` "src\/`` a\\nb\.js" ```/);
   });
 });
+
+// [LAW:verifiable-goals] AC: a host that refuses the inline comments never costs the review.
+// The anchors come from the diff `pulls.listFiles` returned; `commitId` is the head resolved
+// earlier. When the PR's head moves in between the two disagree, GitHub answers 422, and the
+// old behavior threw — discarding a finished review after the full token spend and posting
+// `REVIEW DID NOT FINISH` in its place.
+function failingOctokit(failures) {
+  const calls = [];
+  return {
+    calls,
+    rest: {
+      pulls: {
+        createReview: async args => {
+          calls.push(args);
+          const err = failures[calls.length - 1];
+          if (err) throw err;
+        },
+      },
+    },
+  };
+}
+
+function httpError(status, message) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+describe('submitReview — the host refuses the inline comments', () => {
+  const reviewWithFindings = () => ({
+    summary: 'Summary text.',
+    findings: [
+      { path: 'a.js', line: 10, body: 'first bug', severity: 2 },
+      { path: 'b.js', line: 20, body: 'second bug', severity: 4 },
+    ],
+    unanchored: [],
+    unreviewedScopes: [], unreviewableFiles: [],
+  });
+
+  test('a 422 re-posts every finding in the body instead of losing the review', async () => {
+    const octokit = failingOctokit([httpError(422, 'line must be part of the diff')]);
+    await submitReview(
+      octokit, 'o', 'r', 7, 'oldsha', 'Reviewer', reviewWithFindings(), true, gitHubTransport([], []),
+    );
+    assert.equal(octokit.calls.length, 2, 'exactly one retry');
+    const retry = octokit.calls[1];
+    // No anchors on the retry — that is the whole point of it.
+    assert.equal(retry.comments, undefined);
+    // Every finding survives — under the heading for its ACTUAL cause. These lines WERE in the
+    // reviewed diff, so filing them as "outside the reviewed diff" would tell the reader something
+    // false about their own pull request, in the direction that wastes their time: hunting a bad
+    // line number in a review whose line numbers were right. [FRAMING:representation]
+    assert.match(retry.body, /### Findings the host would not post inline/);
+    assert.doesNotMatch(retry.body, /Findings outside the reviewed diff/);
+    assert.match(retry.body, /head moved while the review ran/);
+    assert.match(retry.body, /`a\.js:10`/);
+    assert.match(retry.body, /first bug/);
+    assert.match(retry.body, /`b\.js:20`/);
+    assert.match(retry.body, /second bug/);
+    // The verdict cannot shift: requestsChanges counts anchored and unanchored alike.
+    assert.equal(retry.event, 'REQUEST_CHANGES');
+    assert.equal(retry.event, octokit.calls[0].event);
+    // NO commit_id: a force-push removes the old commit from the PR, so re-sending the SHA the host
+    // just rejected recovers nothing. Omitted, the host files the review against the current head —
+    // and with no anchors there is nothing a SHA would have positioned.
+    assert.equal('commit_id' in retry, false);
+    assert.equal(octokit.calls[0].commit_id, 'oldsha', 'the first attempt still names the reviewed commit');
+  });
+
+  // THE CASE THAT PROVES THE SPLIT, because it is the only one where conflating the two sets is
+  // invisible to a single-heading check: a review that ALREADY has a genuinely unanchorable finding
+  // and then gets displaced. Under one shared heading the reader is told all three findings point
+  // outside the diff, when exactly one of them does. Each set lands under its own cause, and each
+  // finding lands in its own set. [LAW:one-type-per-behavior]
+  test('an unanchorable finding and a displaced one are not filed under one cause', async () => {
+    const octokit = failingOctokit([httpError(422, 'line must be part of the diff')]);
+    await submitReview(
+      octokit, 'o', 'r', 7, 'oldsha', 'Reviewer',
+      { ...reviewWithFindings(), unanchored: [{ path: 'big.bin', line: 3, body: 'binary bug', severity: 3 }] },
+      true, gitHubTransport([], []),
+    );
+    const { body } = octokit.calls[1];
+    const outside = body.indexOf('### Findings outside the reviewed diff');
+    const refused = body.indexOf('### Findings the host would not post inline');
+    assert.ok(outside >= 0 && refused > outside, 'both headings, the pre-existing one first');
+    const outsideSection = body.slice(outside, refused);
+    const refusedSection = body.slice(refused);
+    // The file with no diff line belongs to the heading that says so, and to that one only.
+    assert.match(outsideSection, /`big\.bin:3`/);
+    assert.doesNotMatch(refusedSection, /big\.bin/);
+    // The two displaced findings belong to the heading that says the host refused them.
+    assert.match(refusedSection, /`a\.js:10`/);
+    assert.match(refusedSection, /`b\.js:20`/);
+    assert.doesNotMatch(outsideSection, /a\.js:10/);
+    assert.doesNotMatch(outsideSection, /b\.js:20/);
+  });
+
+  test('an error that is not a 422 is the caller\'s, unretried and unaltered', async () => {
+    const octokit = failingOctokit([httpError(500, 'bad gateway')]);
+    await assert.rejects(
+      () => submitReview(octokit, 'o', 'r', 7, 'sha', 'Reviewer', reviewWithFindings(), true, gitHubTransport([], [])),
+      /bad gateway/,
+    );
+    assert.equal(octokit.calls.length, 1, 'no retry for a fault the anchors did not cause');
+  });
+
+  test('a 422 with no inline comments to displace is not retried — the anchors were not the cause', async () => {
+    const octokit = failingOctokit([httpError(422, 'something else entirely')]);
+    const review = { summary: 'S', findings: [], unanchored: [], unreviewedScopes: [], unreviewableFiles: [] };
+    await assert.rejects(
+      () => submitReview(octokit, 'o', 'r', 7, 'sha', 'Reviewer', review, true, gitHubTransport([], [])),
+      /something else entirely/,
+    );
+    assert.equal(octokit.calls.length, 1);
+  });
+
+  test('a retry that fails too reports BOTH failures rather than looping or losing one', async () => {
+    const octokit = failingOctokit([
+      httpError(422, 'line must be part of the diff'),
+      httpError(422, 'body is too long'),
+    ]);
+    await assert.rejects(
+      () => submitReview(octokit, 'o', 'r', 7, 'sha', 'Reviewer', reviewWithFindings(), true, gitHubTransport([], [])),
+      err => {
+        // Either error alone misleads: the second does not say why a retry happened, and the first does
+        // not say the fallback failed too. A body-too-long 422 fails BOTH attempts (the retry's body is
+        // larger), so the operator must see the size complaint and not only a story about anchors.
+        assert.match(err.message, /line must be part of the diff/);
+        assert.match(err.message, /body is too long/);
+        assert.equal(err.cause.status, 422, 'the original error is preserved as the cause');
+        return true;
+      },
+    );
+    assert.equal(octokit.calls.length, 2, 'exactly one retry, never a loop');
+  });
+});

@@ -51,10 +51,10 @@ const STRANGER = { login: 'passer-by', type: 'User' };
 
 const PR = 7;
 const CAP_MESSAGE = `PR #${PR} has already been reviewed 5 time(s), reaching the MAX_REVIEW_ROUNDS cap `
-  + 'of 5. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review further pushes.';
+  + 'of 5. Raise MAX_REVIEW_ROUNDS (0 = unlimited) to review this pull request again.';
 // The message a de-rating budget gradient would compose for the SAME reason on a later push.
 const DERATED_MESSAGE = `PR #${PR} has already been reviewed 5 time(s), reaching the de-rated round cap `
-  + 'of 3 set by the DAILY_BUDGET_USD gradient. To review further pushes, raise the daily budget.';
+  + 'of 3 set by the DAILY_BUDGET_USD gradient. To review this pull request again, raise the daily budget.';
 
 const announce = (octokit, notice, commitId = 'sha') => announceNotReviewed(octokit, {
   owner: 'o', repo: 'r', pullNumber: PR, commitId, reviewerName: 'RA', notice,

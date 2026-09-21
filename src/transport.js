@@ -950,12 +950,63 @@ function reviewEvent(requestsChanges, canApprove, transport) {
 // that could not be — but it is still fenced through codeSpan, because backticks are orthogonal to
 // line structure and a backtick-bearing path must not close the span early. The body is the one field
 // that is legitimately block text, so it renders through findingLineText. [LAW:single-enforcer]
-function renderUnanchoredSection(unanchored) {
-  if (!unanchored || unanchored.length === 0) return '';
-  const items = unanchored
+// [LAW:effects-at-boundaries] Pure: does this host error mean "these comment anchors are not in the
+// diff"? GitHub answers an un-anchorable review comment with 422 Unprocessable Entity, which is also how
+// it answers other validation faults on the same call. That breadth is deliberate rather than tolerated:
+// the response to every 422 here is the same — try the review again carrying no anchors — and if the
+// fault was something else, that attempt fails too and the original error reaches the caller. A narrower
+// match on the message text would be a map of GitHub's prose, which changes without notice.
+function anchorsRejected(err) {
+  return err && err.status === 422;
+}
+
+// [LAW:effects-at-boundaries] Pure: render findings that reach the reader in the body because no
+// inline comment could carry them. The ITEM FORMAT lives here once and the HEADING arrives as a
+// value, because the two are not the same kind of thing — the format is how a finding is written
+// down, identical whatever went wrong, while the heading is a CLAIM ABOUT CAUSE and there is more
+// than one cause. [LAW:dataflow-not-control-flow] [LAW:one-source-of-truth]
+function renderFindingSection(heading, explanation, findings) {
+  if (!findings || findings.length === 0) return '';
+  const items = findings
     .map(f => `- ${codeSpan(`${f.path}:${f.line}`)} — ${findingLineText(f)}`)
     .join('\n');
-  return `\n\n### Findings outside the reviewed diff\nThese reference lines not present in this PR's diff, so they could not be posted as inline comments:\n\n${items}`;
+  return `\n\n### ${heading}\n${explanation}\n\n${items}`;
+}
+
+// CAUSE ONE: the finding's line genuinely is not in the diff — a binary or over-large file the
+// worker read in the repository instead, so there was never a diff line to hang a comment on.
+//
+// THIS HEADING IS A CONTRACT, not a label. src/prompt.js names this exact string to the worker
+// three times as the promised destination for such a finding, which is what makes it safe for the
+// worker to record one at the file's real line number. Renaming it here without renaming it there
+// leaves two maps of one section disagreeing. [LAW:one-source-of-truth]
+function renderUnanchoredSection(unanchored) {
+  return renderFindingSection(
+    'Findings outside the reviewed diff',
+    "These reference lines not present in this PR's diff, so they could not be posted as inline comments:",
+    unanchored,
+  );
+}
+
+// CAUSE TWO, AND WHY IT CANNOT BORROW CAUSE ONE'S HEADING. A displaced finding was anchored to a
+// line that WAS in the reviewed diff; the host refused the call carrying it. Filing it under
+// "outside the reviewed diff" tells the reader something false about their own pull request, and
+// falsely in the actionable direction: it sends them hunting for a bad line number in a review
+// whose line numbers were right, when what they need to know is that the diff moved underneath it.
+// Every finding is displaced together, so on that path the wrong heading is the WHOLE review's
+// framing rather than a footnote. [FRAMING:representation] a map that lies is worse than no map.
+//
+// The cause is hedged because the trigger is broader than the usual case — anchorsRejected matches
+// every 422 deliberately (see above), so an over-long body lands here too. "Most often" is the
+// honest strength of the claim; naming one cause as certain would be the same defect one level down.
+function renderDisplacedSection(displaced) {
+  return renderFindingSection(
+    'Findings the host would not post inline',
+    'These were anchored to lines in the reviewed diff, but the host refused the review carrying '
+    + "them — most often because this pull request's head moved while the review ran. The lines "
+    + 'below are the ones the review read, and may sit elsewhere in the current head:',
+    displaced,
+  );
 }
 
 // [LAW:effects-at-boundaries] Pure: render the changed files that never reached a reviewer. This is a
@@ -1038,19 +1089,89 @@ async function submitReview(octokit, owner, repo, pullNumber, commitId, reviewer
   // '' and the body is byte-identical to before. The section is assembled host-side in run.js (from the
   // structured summaries + the model's assessments); this sink only places it. [LAW:single-enforcer]
   const dependencySection = review.dependencySection ? `${review.dependencySection}\n\n` : '';
-  const body = `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}${renderUnreviewableSection(unreviewableFiles)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
+  // The body as a FUNCTION of which findings could not be posted inline, because that set is not
+  // known until the host has answered. The anchored/unanchored split is a value here, not a branch.
+  // [LAW:dataflow-not-control-flow]
+  const bodyWith = displaced => `## ${reviewerName}\n\n${dependencySection}${review.summary}${renderUnanchoredSection(unanchored)}${renderDisplacedSection(displaced)}${renderUnreviewableSection(unreviewableFiles)}\n\n${verdict}${footer}\n\n${REVIEW_MARKER}`;
   const comments = review.findings.map(finding => transport.toComment({ ...finding, body: `${severityTag(finding)} ${finding.body}` }));
 
   // [LAW:single-enforcer] The action owns GitHub review transport; Claude owns only typed review judgment.
-  await octokit.rest.pulls.createReview({
-    owner,
-    repo,
-    pull_number: pullNumber,
-    commit_id: commitId,
-    event,
-    body,
-    ...(comments.length > 0 ? { comments } : {}),
-  });
+  //
+  // A REJECTED ANCHOR MUST NOT COST THE REVIEW. The anchors and the commit this review is filed
+  // against come from two different reads of the host: the line numbers are computed from the diff
+  // `pulls.listFiles` returned, while `commitId` is the head resolved earlier — by the workflow's gate
+  // under the comment trigger, or from the event payload under the push one. If the pull request's head
+  // moves in between, those two disagree and the host refuses the inline comments as not part of the
+  // diff. Under the old push trigger a new push CANCELLED the run, so this was masked by the very
+  // failure this release exists to remove; with reviews requested on demand and never cancelled,
+  // nothing masks it any more.
+  //
+  // Letting that throw would discard a completed review — every finding, after the full token spend —
+  // and post `REVIEW DID NOT FINISH` in its place, which is precisely the outcome being removed
+  // everywhere else in this release. So the findings are re-filed into the body: same findings, same
+  // blocking verdict (`requestsChanges` counts anchored and unanchored alike, so the verdict cannot
+  // shift), one degree less convenient to read. Nothing is dropped and nothing is silent — the
+  // warning names why. [LAW:no-silent-failure]
+  //
+  // They go under their OWN heading, never the unanchored one, because the two sets differ in the
+  // one fact a heading asserts: an unanchored finding's line is not in the diff, while a displaced
+  // finding's line is. See renderDisplacedSection.
+  //
+  // THE RETRY CARRIES NO `commit_id`, which is the difference between recovering and pretending to.
+  // Re-sending the SHA the host just rejected recovers nothing in the most likely case: a force-push or
+  // rebase does not merely move the head, it removes the old commit from the pull request entirely, so
+  // `createReview` refuses the call on `commit_id` itself and the retry fails identically. The parameter
+  // is documented optional and defaults to the pull request's most recent commit — and with the anchors
+  // gone there is nothing left for it to position, since a SHA was only ever needed to place comments on
+  // lines. So the host resolves the head, and it costs no extra request to ask it to.
+  // [LAW:polishing-by-subtraction] the version that works has one less field in it.
+  //
+  // Exactly ONE retry, and only when there were inline comments to displace — never a loop.
+  //
+  // BOTH FAILURES REACH THE OPERATOR when the retry fails too, because either alone misleads. The second
+  // error says the review could not be posted and not why it was ever retried; the first says the anchors
+  // were refused and not that the fallback failed as well. And a 422 is broader than the anchors: a body
+  // past the host's 65,536-character limit answers this same call the same way, and the retry's body is
+  // strictly LARGER than the first — it appends the displaced findings — so that case fails twice and the
+  // operator needs to see a size complaint rather than a story about a moving head.
+  // [LAW:no-silent-failure] the diagnosis is the pair, so the pair is what travels.
+  try {
+    await octokit.rest.pulls.createReview({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      commit_id: commitId,
+      event,
+      body: bodyWith([]),
+      ...(comments.length > 0 ? { comments } : {}),
+    });
+  } catch (err) {
+    if (comments.length === 0 || !anchorsRejected(err)) throw err;
+    // The cause is OFFERED, not asserted: 422 is this call's answer to any validation fault, and naming
+    // the likeliest one as though it were established sent an operator after a moving head when the real
+    // complaint was a body too long. [FRAMING:representation]
+    core.warning(
+      `The host refused this review with its ${comments.length} inline comment(s) (422: ${err.message}). `
+      + `The usual cause is PR #${pullNumber}'s head moving past ${commitId} while the review ran, though `
+      + 'any validation fault on this call answers the same way. Re-posting with every finding in the '
+      + 'review body instead; none are dropped.',
+    );
+    try {
+      await octokit.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        event,
+        body: bodyWith(review.findings),
+      });
+    } catch (retryErr) {
+      throw new Error(
+        `Could not post this review to PR #${pullNumber}. Carrying its ${comments.length} inline `
+        + `comment(s) the host answered 422: ${err.message}. Carrying none, it answered: ${retryErr.message}.`,
+        { cause: err },
+      );
+    }
+  }
   core.info(verdict);
 }
 

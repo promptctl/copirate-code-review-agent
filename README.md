@@ -50,6 +50,12 @@ The review engine is chosen by `PROVIDER`, which defaults to `auto` (today: Clau
 
 That's it. Open a PR and the action reviews it. The checkout is optional context for the reviewer — the review itself is fetched and posted through the GitHub API, so it works even without checking out the code.
 
+#### On every push, or when someone asks
+
+The workflow above reviews **every push** and cancels the in-flight review when the next one lands. Know what that costs before choosing it: a review takes minutes, so on a pull request pushed to at an ordinary working pace the next push usually arrives first, and `cancel-in-progress: true` then kills a review that has already spent its tokens. Measured on one real pull request, 4 of 5 runs died that way and posted `REVIEW DID NOT FINISH` instead of a review.
+
+The alternative is to review **when someone asks**, by commenting `/review` on the pull request. A review nobody requested never starts, and a requested one is not racing anything. It needs more than a trigger swap — `issue_comment` runs from the default branch with repository secrets in scope, so a gate job has to establish that a collaborator asked and that the head is not a fork *before* anything is checked out. The complete workflow is [`comment-review.yml`](installer/src/copirate_review/bases/comment-review.yml); copy it, or let the installer below render it for you, which is what it does by default.
+
 ### Installing it across several repositories
 
 Doing the two steps above by hand is fine for one repo. For a fleet, [`copirate-review`](installer/) does them and keeps them current — run it before every review and it re-renders the workflow from a base, re-syncs every credential you declared (keychain item or environment variable), and commits any change onto the branch you are already on:
@@ -58,6 +64,8 @@ Doing the two steps above by hand is fine for one repo. For a fleet, [`copirate-
 uv tool install --from git+https://github.com/promptctl/copirate-code-review-agent#subdirectory=installer copirate-review
 cd ~/code/your-repo && copirate-review install
 ```
+
+**It renders the on-demand shape by default** — the `comment-review` base, reviewing when someone comments `/review`. If you are already installed with the push-triggered `pr-review` base, the next `copirate-review install` replaces your workflow with it, and reviews will stop happening on push because they now wait to be asked. Staying on the old shape is three lines in your repository's config, shown in [the installer's README](installer/README.md).
 
 What it renders comes from three layers, each optional and each declaring only its differences: the installer's shipped defaults, your machine-wide `~/.config/copirate-review/config.yaml`, then a repository's own `.copirate-review.yaml`. Credentials belong in the machine-wide layer — they are a fact about your machine, not about the code, so declaring one there covers every repo you install into. See [its README](installer/README.md).
 
