@@ -38,8 +38,35 @@ secrets: {}
 
 workflows:
   .github/workflows/code-review.yml:
-    base: pr-review
+    # ON DEMAND, not on every push. The `pr-review` base reviews every push and cancels
+    # the in-flight review when the next one lands; measured on
+    # promptctl/links-issue-tracker#557, pushes arrived 51 s to 5 m apart while reviews
+    # took 5-9 min, so 4 of 5 runs were SIGINT-killed after spending millions of tokens
+    # and posted `REVIEW DID NOT FINISH` instead of a review. Requesting a review with a
+    # `/review` comment removes that race rather than shortening it. `pr-review` is still
+    # shipped for a repository that wants the old behaviour, and switching back is one
+    # line here — plus dropping the two structural inputs below, which only the
+    # `comment-review` base can bind.
+    base: comment-review
     inputs:
+      # STRUCTURAL to the `comment-review` base — not a repository preference like the
+      # inputs below it, and the one place in this table where that distinction matters.
+      #
+      # An `issue_comment` payload carries no `pull_request` object, so the action's
+      # zero-config target detection (`resolveReviewTarget`, src/transport.js) has nothing
+      # to read and needs both values explicitly. They reference the base's own gate job,
+      # which resolved the head SHA once so that the commit checked out and the commit the
+      # review is anchored to cannot disagree. [LAW:one-source-of-truth]
+      #
+      # They live here only because a rendered workflow's `with:` block is REPLACED
+      # wholesale from this table, so a base cannot carry an input of its own — which
+      # means base and inputs must agree and nothing yet enforces it. Change `base` above
+      # and these two must change with it. The real fix is for a base to declare its own
+      # structural inputs and for the installer to bind them beneath this table; until
+      # then, this comment is the enforcement. [LAW:no-silent-failure]
+      PR_NUMBER: "${{ needs.gate.outputs.pr-number }}"
+      HEAD_SHA: "${{ needs.gate.outputs.head-sha }}"
+
       # On for EVERY repo — a universal default, not a per-repo divergence that leaked in.
       # On a PR that bumps a dependency the reviewer fetches the bumped module's upstream
       # commits and changed files instead of reviewing a bare version string. Stated
