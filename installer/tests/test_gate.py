@@ -29,6 +29,11 @@ from .test_render import rendered_for
 OPEN_SAME_REPO = '{"state":"open","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
 OPEN_FROM_FORK = '{"state":"open","headSha":"abc123","headRepoId":2,"baseRepoId":1}'
 CLOSED = '{"state":"closed","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
+#: The `--jq` PROJECTION STOPPED MATCHING — `.head` renamed or removed upstream, or a typo in
+#: the filter — so every field under it comes back null, not just the repository id. This is a
+#: malformed response and must stop the gate, NOT be absorbed by the deleted-fork sentinel and
+#: answered as "comes from a fork" for a pull request that is nothing of the kind.
+BROKEN_HEAD_PROJECTION = '{"state":"open","headSha":null,"headRepoId":null,"baseRepoId":1}'
 #: The fork a pull request came from has been DELETED. GitHub answers `head.repo: null`,
 #: which `--jq` renders as a null field rather than omitting it. This is a real domain
 #: state, not a malformed response — src/transport.js's prIsFromFork types it as "fork".
@@ -329,3 +334,23 @@ def test_a_started_review_is_not_announced_by_the_gate(gate):
     started, _, _ = gate("/review")
     assert started
     assert gate.comments() == []
+
+
+def test_a_projection_that_stopped_matching_stops_the_gate_instead_of_crying_fork(gate):
+    """The deleted-fork sentinel must be reachable ONLY from a deleted fork.
+
+    `--jq` renders a path that stopped matching exactly as it renders a genuinely null field, so
+    `.headRepoId // "deleted-head-repository"` could absorb both and refuse every same-repository
+    PR as a fork — false, unactionable, and no longer the loud stop its `-re` siblings give.
+
+    It cannot, and the reason is the ORDER rather than either line: `head_sha` is read with `-re`
+    first, so a broken `.head` is fatal before the sentinel can be produced. This pins that
+    sequence, because reordering the reads would silently convert a malformed response into a
+    confident lie. [LAW:parse-dont-validate] [LAW:no-silent-failure]
+    """
+    started, code, _ = gate("/review", pr_json=BROKEN_HEAD_PROJECTION)
+    assert not started, "a malformed response must never start a billed review"
+    assert code != 0, "a malformed response is an error, not a refusal"
+    assert gate.comments() == [], (
+        f"it must not tell the asker this PR is from a fork; said: {gate.comments()}"
+    )

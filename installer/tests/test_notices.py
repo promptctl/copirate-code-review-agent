@@ -36,6 +36,20 @@ NON_SUCCESS_OUTCOMES = ("failure", "cancelled", "skipped", "")
 #: does not have. The asker reads "the review step ended ``" and learns nothing.
 EMPTY_CODE_SPAN = re.compile(r"`\s*`")
 
+#: Claims the review job's notice DOES NOT HOLD, so it may not make them. It knows exactly one
+#: fact — an outcome string — and a failed step does not mean no review was posted:
+#:   - the round-cap path posts its `NOT REVIEWED` notice and afterwards `core.setFailed`s when a
+#:     stale blocking review cannot be dismissed (src/transport.js);
+#:   - `landedDespite` in src/run.js deliberately swallows a post error once it has confirmed the
+#:     review IS on the pull request, after which the ledger append can still throw.
+#: On either, a notice asserting "no review was delivered" contradicts the artifact above it.
+#: Spend is unknowable here for the same reason — the run may have burned twenty minutes.
+CLAIMS_THE_REVIEW_NOTICE_CANNOT_MAKE = (
+    "did not deliver",
+    "posted no review",
+    "nothing was spent",
+)
+
 
 def answering_step(tmp_path: Path, job: str) -> str:
     """The shell of `job`'s answering step, taken from the RENDERED workflow.
@@ -118,10 +132,22 @@ def test_the_review_notice_names_what_happened_for_every_outcome(notice, outcome
     posted = notice("review", outcome)
     assert len(posted) == 1, f"exactly one notice, got {posted}"
     body = posted[0]
-    assert "Review did not finish." in body
     assert not EMPTY_CODE_SPAN.search(body), f"the notice names no state: {body!r}"
     if outcome:
         assert f"`{outcome}`" in body, f"the outcome must be named; got {body!r}"
+
+
+@pytest.mark.parametrize("outcome", NON_SUCCESS_OUTCOMES)
+def test_the_review_notice_claims_no_more_than_it_knows(notice, outcome):
+    """It may report the outcome and nothing else — not that a review was absent.
+
+    A failed step routinely sits UNDER a delivered review, so "did not deliver a result" is a
+    statement this step cannot support and, on those paths, one the artifact above it
+    contradicts. [FRAMING:representation] the claim is sized to the check.
+    """
+    body = notice("review", outcome)[0]
+    for claim in CLAIMS_THE_REVIEW_NOTICE_CANNOT_MAKE:
+        assert claim not in body, f"the notice asserts {claim!r}, which it cannot know: {body!r}"
 
 
 def test_the_review_notice_survives_an_unset_outcome(notice):
@@ -146,3 +172,6 @@ def test_the_gate_notice_says_nothing_was_spent(notice):
     assert len(posted) == 1, f"exactly one notice, got {posted}"
     assert "nothing was spent" in posted[0]
     assert "nothing was spent" not in notice("review", "failure")[0]
+    # And it may say "not started", which the review job's notice may never say: by there, a
+    # review has begun and may even have landed.
+    assert "Review not started." in posted[0]
