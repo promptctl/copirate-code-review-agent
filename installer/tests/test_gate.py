@@ -29,6 +29,10 @@ from .test_render import rendered_for
 OPEN_SAME_REPO = '{"state":"open","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
 OPEN_FROM_FORK = '{"state":"open","headSha":"abc123","headRepoId":2,"baseRepoId":1}'
 CLOSED = '{"state":"closed","headSha":"abc123","headRepoId":1,"baseRepoId":1}'
+#: The fork a pull request came from has been DELETED. GitHub answers `head.repo: null`,
+#: which `--jq` renders as a null field rather than omitting it. This is a real domain
+#: state, not a malformed response — src/transport.js's prIsFromFork types it as "fork".
+OPEN_FORK_DELETED = '{"state":"open","headSha":"abc123","headRepoId":null,"baseRepoId":1}'
 
 #: A body that executes `touch $CANARY` if — and only if — it is ever parsed by a shell
 #: instead of being carried as data. A comment body is attacker-authored text, so this is
@@ -290,6 +294,24 @@ def test_an_unauthorized_asker_is_recorded_and_not_replied_to(gate, association)
     assert "Review not started" in recorded
     assert "owner, member, or collaborator" in recorded
     assert association in recorded, "the record names the association it refused on"
+
+
+def test_a_deleted_head_repository_is_refused_as_a_fork_not_as_an_error(gate):
+    """A deleted fork must reach the answer the action already has for it.
+
+    GitHub returns `head.repo: null` once the fork is deleted. Read with `jq -re` that
+    exits 1, `set -e` kills the step, and the asker is told "This is an error, not a
+    refusal" — for a state the action types as a real domain value: prIsFromFork returns
+    TRUE for an absent head repo, and its comment calls that a meaningful outcome. The gate
+    said error, the action said fork; two maps of one meaning. The right answer was already
+    enumerated one branch below.
+    """
+    started, code, _ = gate("/review", pr_json=OPEN_FORK_DELETED)
+    assert not started
+    assert code == 0, "a deleted fork is a refusal, which is a decision, not a failure"
+    posted = gate.comments()
+    assert len(posted) == 1, f"expected the fork refusal, got {posted!r}"
+    assert "comes from a fork" in posted[0]
 
 
 def test_a_comment_that_is_not_a_request_says_nothing_at_all(gate):

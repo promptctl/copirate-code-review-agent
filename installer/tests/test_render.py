@@ -338,3 +338,37 @@ def test_a_base_is_bound_wherever_its_review_step_lives(tmp_path):
     text = rendered_for(write_base(tmp_path, body)).text
     step = read_yaml(text, "r")[0]["jobs"]["second"]["steps"][1]
     assert step["uses"] == "promptctl/copirate-code-review-agent@v1"
+
+
+def test_every_job_that_can_die_silently_answers_on_the_pull_request(tmp_path):
+    """Both jobs owe the asker an answer when they fail, and neither may lose it alone.
+
+    Under `pull_request` a dead review was at least visible: the run attached to the head
+    commit and a red check appeared on the PR. An `issue_comment` run is attached to no
+    commit and shows up in NO check list, so a job that dies without saying so is
+    indistinguishable from the action not being installed — the exact failure this base
+    exists to end. The gate got its answer first; the review job, which is the one that
+    spends the money, was shipped without one.
+
+    Asserted as a PAIR so the two cannot drift: a change that drops either notification
+    fails here, and so does one that adds a third job without giving it one.
+    """
+    workflow, _ = read_yaml(rendered_for(tmp_path).text, "rendered")
+    answering = {}
+    for name, job in workflow["jobs"].items():
+        for step in job["steps"]:
+            run = step.get("run", "")
+            if "gh pr comment" in run and step.get("if", "") not in ("", None):
+                answering.setdefault(name, []).append(step["if"])
+
+    assert set(answering) == {"gate", "review"}, (
+        f"every job must answer on the PR when it dies; answering jobs: {sorted(answering)}"
+    )
+    assert "failure()" in " ".join(answering["gate"])
+    # The review job's condition is deliberately NOT `failure()`: a job cancelled by its own
+    # timeout-minutes is not a failure, and that is exactly the "burned the budget and posted
+    # nothing" outcome a human most needs told about.
+    review_if = " ".join(answering["review"])
+    assert "always()" in review_if, f"a cancelled review must still answer; got {review_if!r}"
+    assert "steps.review.outcome" in review_if
+    assert "!= 'success'" in review_if, "success is the only outcome that says nothing"

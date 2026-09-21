@@ -234,7 +234,20 @@ jobs:
           # `actions/checkout` would interpret as the default branch.
           state="$(printf '%s' "$pr_json" | jq -re '.state')"
           head_sha="$(printf '%s' "$pr_json" | jq -re '.headSha')"
-          head_repo_id="$(printf '%s' "$pr_json" | jq -re '.headRepoId')"
+          # A DELETED HEAD REPOSITORY IS A FORK, not a broken response. GitHub returns
+          # `head.repo: null` once the fork a pull request came from is deleted, so `jq -re`
+          # exits 1 here and `set -e` kills the step — answering "this is an error, not a
+          # refusal" for a state the action itself types as a real domain value: prIsFromFork
+          # returns TRUE for an absent head repo, with a comment calling it exactly that.
+          # Two maps of one meaning, disagreeing. A sentinel that can never equal a numeric
+          # repository id routes it to the fork refusal one branch below, which is already
+          # the right answer and the one the comment above claims parity with.
+          # [LAW:one-source-of-truth]
+          #
+          # The other three keep `-re`: a missing state, head SHA, or BASE repository is a
+          # malformed response carrying no meaning to recover — the same split prIsFromFork
+          # draws when it throws on an absent base repo and returns true on an absent head.
+          head_repo_id="$(printf '%s' "$pr_json" | jq -r '.headRepoId // "deleted-head-repository"')"
           base_repo_id="$(printf '%s' "$pr_json" | jq -re '.baseRepoId')"
 
           if [ "$state" != "open" ]; then
@@ -426,3 +439,42 @@ jobs:
           name: review-session-transcript
           path: ${{ steps.review.outputs.transcript-dir }}
           if-no-files-found: ignore
+
+      # THE REVIEW JOB OWES THE SAME ANSWER THE GATE DOES, and for the same reason — this
+      # is the gate's `if: failure()` step mirrored onto the job that spends the money.
+      #
+      # Under `pull_request` a dead review was at least VISIBLE: the run attached to the
+      # head commit and a red check appeared on the pull request. An `issue_comment` run is
+      # attached to no commit and appears in NO check list, so without this step every way
+      # this job can die is completely silent — an expired credential, a runner fault, a
+      # failed checkout, the job's own timeout, or the action crashing before it can post.
+      # The asker sees a comment they typed and then nothing, forever, which is
+      # indistinguishable from this action not being installed. That is the exact failure
+      # this base exists to end, and moving the trigger re-opened it one job over.
+      # [LAW:no-silent-failure]
+      #
+      # `always() && steps.review.outcome != 'success'` rather than `failure()`, because
+      # `failure()` misses the two cases that matter most here. A job CANCELLED by its own
+      # `timeout-minutes` is not a failure, and that is precisely the "burned the budget and
+      # posted nothing" outcome a human most needs told about. And a failure in an EARLIER
+      # step leaves this one's `failure()` true but `steps.review.outcome` equal to
+      # 'skipped' — which this condition still catches, while naming the review step as the
+      # thing that did not succeed. Success is the only outcome that says nothing, because
+      # on that path the review itself has already spoken. [LAW:dataflow-not-control-flow]
+      #
+      # It does NOT claim nothing was spent. The gate's twin can say that truthfully — it
+      # refuses before any engine starts — but by here a review may have run for twenty
+      # minutes before dying, so asserting a cost either way would be inventing a fact this
+      # step does not hold. It reports what it knows and points at the log for the rest.
+      - name: Say so on the pull request if the review could not be delivered
+        if: always() && steps.review.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr-number }}
+          OUTCOME: ${{ steps.review.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "**Review did not finish.** The review of this pull request was started and did not deliver a result (the review step ended \`${OUTCOME}\`). Whether any tokens were spent before it stopped is in the [run log](${RUN_URL}), along with the cause. Commenting \`/review\` again starts a new one."
+
